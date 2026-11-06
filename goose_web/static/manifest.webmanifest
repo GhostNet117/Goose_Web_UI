@@ -1,0 +1,22 @@
+{
+  "name": "Goose Web",
+  "short_name": "Goose",
+  "description": "Your Goose AI agents in the browser - chats, herd, recipes and schedules.",
+  "id": "/",
+  "start_url": "/#/new",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone"],
+  "orientation": "any",
+  "background_color": "#0b0b0f",
+  "theme_color": "#0b0b0f",
+  "categories": ["productivity", "developer"],
+  "icons": [
+    { "src": "/static/icons/goose.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/static/icons/goose-maskable.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "New chat", "url": "/#/new" },
+    { "name": "Herd", "url": "/#/herd" }
+  ]
+}

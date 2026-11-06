@@ -1,2 +1,193 @@
-# Goose_Web_UI
-A Web UI for shared Goose Agentic Solutions. 
+# Goose AI Web Interface
+
+**One Goose install on one machine, shared by many people through the browser.**
+
+goose-web is a multi-user web front end and gateway for the [Goose](https://github.com/aaif-goose/goose) AI agent.
+It runs `goose serve` workers on the machine where Goose is already installed and gives every user a browser UI for
+it, on a desktop or a phone.
+
+- **Each person gets an isolated Goose profile.** Their worker runs with `GOOSE_PATH_ROOT=<profiles_root>/<user>`,
+  so their chats, recipes, skills, extensions, providers and secrets stay in their own folder. All workers run as
+  the same OS account.
+- **The admin keeps their native Goose profile.** The admin is bound to the existing Goose profile (for example
+  `%APPDATA%\Block\goose`) with all of its chats, recipes and settings. Nothing gets copied around, and Goose
+  Desktop keeps working on the same profile.
+
+`goose-web 1.0.0` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
+
+## Features
+
+- **Chat**: streaming responses, tool calls, and tool-permission cards (approve or deny, first answer wins across
+  all your tabs). Recipe parameters and elicitation forms. Mode and model switching. File upload into your
+  workspace.
+- **Sessions grouped by folder** (as in Goose Desktop), with pinning, search, rename, archive and fork.
+- **Recipes, skills, schedules, MCP Apps and extensions**, each with its own page. MCP Apps run in a sandboxed
+  frame at an opaque origin, both standalone and **inline in the chat** when a tool has an app UI (as in Desktop).
+- **Extension status** in every chat: "N/M extensions" in the header, with a warning and the error text when one
+  fails to start, and Retry.
+- **Live sync with Goose Desktop, the CLI and schedules**: a chat continued elsewhere refreshes in the open web chat
+  within about 2 seconds, and the session list re-sorts.
+- **Settings**: providers and models, system prompts, goose hints, tool permissions, preferences, themes,
+  notifications, account security.
+- **Teams and policies**: per-team permissions (shell, extensions, providers, schedules, config...), allowed modes,
+  providers, models and folders, and concurrency limits. Team recipes, skills, extensions and providers are
+  provisioned into members' profiles.
+- **Shared goosehints library**: hints documents assigned to users or teams, combined with personal hints.
+- **Sign-in**: local accounts, LDAP/Active Directory, OpenID Connect, optional TOTP two-factor, API tokens for
+  automation.
+- **Audit log** of sign-ins, admin changes, impersonation and sensitive agent calls.
+- **Herd dashboard** (inspired by [herdr.dev](https://herdr.dev)): every live agent with its status (working,
+  needs you, done, error), so you see which agent needs you. Agents keep running after you close the tab, because
+  the gateway owns the Goose connection. Reopening a chat replays it. Peers let you watch agents on other machines.
+- **Windows ownership safety**: the gateway refuses to run elevated and relaunches itself with a normal-user token.
+  It has an ownership check for profile files and an elevation audit of the host's scheduled tasks.
+- **PWA**: installable, with browser notifications, an optional sound, and per-user webhooks (Slack/Teams/ntfy
+  style) for "needs you", "done" and "error".
+
+## Architecture
+
+```mermaid
+flowchart LR
+  B["Browser / PWA (many users, many tabs)"] -- "HTTPS" --> RP["Reverse proxy (TLS)"]
+  RP -- "HTTP: REST /api + /ws JSON-RPC" --> GW["goose-web gateway :8710<br/>auth, policy firewall, hub, herd, audit"]
+  GW --- DB[("SQLite<br/>_system/goose-web.db")]
+  GW -- "one persistent ACP websocket per profile<br/>ws://127.0.0.1:random/acp + per-worker secret" --> W1["goose serve<br/>admin, native profile"]
+  GW -- "ws://127.0.0.1:random/acp" --> W2["goose serve<br/>GOOSE_PATH_ROOT=profiles_root/alice"]
+  GW -- "ws://127.0.0.1:random/acp" --> W3["goose serve<br/>GOOSE_PATH_ROOT=profiles_root/bob"]
+```
+
+- The browser talks JSON-RPC over `/ws`. The hub rewrites request ids and holds **one** upstream ACP connection
+  per profile, shared by all of that user's tabs. A closed tab never cancels a run.
+- Workers start on first use, on loopback, with a random port and a random secret. They stop when idle and restart
+  with backoff after a crash. On Windows a kill-on-close Job Object ties them to the gateway.
+- Every non-admin ACP call goes through a default-deny method firewall (`goose_web/policy.py`).
+
+REST and WebSocket contract: [docs/API.md](docs/API.md).
+
+## Quick start
+
+You need Goose (the `goose` CLI, or Goose Desktop, which bundles it) and Python 3.11+ or [uv](https://docs.astral.sh/uv/).
+
+### Windows
+
+From a **normal, non-elevated** PowerShell in the repository folder (the installer refuses to run elevated):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+scripts\start-gateway.cmd          # or sign out and in again: the logon task starts it
+```
+
+Then open <http://127.0.0.1:8710> and sign in as **your Windows user name (`%USERNAME%`)** with the password
+**`ChangeMe`**. You must change it right away.
+
+- The admin profile is found automatically at `%APPDATA%\Block\goose`. If it is not there, the installer asks for
+  the folder. If you leave the answer empty, you get a fresh profile in `C:\Goose_Web_Profiles\appdata`.
+- The installer registers a logon task (runs as you, non-elevated) and a firewall rule through **one** elevation
+  prompt. Use `-NoService` to skip that.
+- LAN or reverse proxy example:
+  `scripts\install.ps1 -BindHost 10.0.0.5 -PublicUrl https://goose.example.org -TrustedProxy 10.0.0.2 -FirewallRemoteAddress 10.0.0.2`
+
+### Linux / macOS
+
+As your normal user (not root), with `goose` on `PATH`:
+
+```bash
+./scripts/install.sh            # add --systemd for a user service, --public-url / --trusted-proxy for a proxy
+.venv/bin/python -m goose_web --config ~/.local/share/goose-web/_system/config.yaml serve
+```
+
+Sign in as `$USER` / `ChangeMe` (forced change). The admin starts with a fresh profile in
+`<profiles-root>/appdata` unless `--goose-appdata` points at a `GOOSE_PATH_ROOT`-style folder (`config/`, `data/`,
+`state/`).
+
+### Docker
+
+```bash
+docker compose -f docker/compose.yaml up -d --build
+```
+
+Open <http://127.0.0.1:8710> and sign in as `admin` / `ChangeMe` (forced change). Everything persistent lives in
+the `/data` volume (`goose-web-data`): database, profiles and the admin profile `/data/appdata`. The compose file
+already includes this hardening:
+
+- runs as non-root uid 1000, read-only root filesystem, tmpfs `/tmp` and `/home/goose`
+- `cap_drop: [ALL]`, `no-new-privileges`, `pids_limit: 1024`, `mem_limit: 4g`
+- port published on `127.0.0.1` only
+
+For a proxy, set `GOOSE_WEB__SERVER__PUBLIC_URL` and `GOOSE_WEB__SERVER__TRUSTED_PROXIES` in `environment:`.
+
+## Reverse proxy
+
+Terminate TLS at a reverse proxy. The gateway has no TLS of its own. Caddy example (it proxies WebSockets and
+sets `X-Forwarded-*` by default):
+
+```
+goose.example.org {
+    reverse_proxy 10.0.0.5:8710
+}
+```
+
+Then tell the gateway its public URL and trust only the proxy:
+
+```yaml
+# <profiles_root>/_system/config.yaml
+server:
+  host: "10.0.0.5"
+  public_url: "https://goose.example.org"   # Secure __Host- cookie, HSTS, Origin checks, OIDC redirects
+  trusted_proxies: ["127.0.0.1", "::1", "10.0.0.2"]
+```
+
+Limit the gateway port to the proxy in the firewall (`register-service.ps1 -FirewallRemoteAddress <proxy ip>`).
+
+## Configuration
+
+Settings come from built-in defaults, then `config.yaml` (`--config`, `GOOSE_WEB_CONFIG` or
+`<profiles_root>/_system/config.yaml`), then environment variables `GOOSE_WEB__SECTION__KEY`. Sign-in methods,
+branding, peers and policies are managed in the admin UI. `goose-web check` diagnoses a setup.
+
+Every key, the CLI, policies, profile layout, scheduler rules and scripts are described in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+## Security
+
+- Passwords are hashed with scrypt. Session and API tokens are random and stored as hashes. Cookies are HttpOnly and
+  SameSite=Strict (`__Host-`/Secure behind HTTPS).
+- Writes need a CSRF header plus an Origin check, and the WebSocket checks the Origin. The CSP is strict.
+- Sign-in is rate limited with a lockout. TOTP and LDAP/OIDC are supported.
+- Non-admins go through a default-deny ACP firewall with folder confinement. Shell extensions are off unless
+  `allow_shell` is set.
+- Workers listen on loopback only, each with its own secret. The gateway never runs elevated.
+
+Full threat model and findings: [docs/SECURITY-ASSESSMENT.md](docs/SECURITY-ASSESSMENT.md). To report a
+vulnerability, see [SECURITY.md](SECURITY.md).
+
+## Limitations
+
+- **Profile isolation is a privacy boundary, not a hard security boundary.** All workers run as one OS user, so a
+  tool that can read files or run commands can reach other profiles. That is why the shell/developer extensions are
+  off for non-admins unless their policy sets `allow_shell`. Admins have the full power of that OS account.
+- **Home-folder skill and recipe folders are shared.** `~/.agents/skills`, `~/.agents/recipes` and similar folders
+  are not moved by `GOOSE_PATH_ROOT` and are visible to all profiles.
+- **On Linux an existing `~/.config/goose` profile is not imported automatically.** The admin starts fresh unless
+  `--goose-appdata` points at a `GOOSE_PATH_ROOT`-style folder.
+- **One scheduler per profile.** Goose Desktop and the gateway must not both run the scheduler for the native
+  profile, or jobs fire twice. `native_scheduler: auto` (the default) runs it in the gateway only while Desktop is
+  closed.
+- There is no built-in TLS: use a reverse proxy.
+
+## Development
+
+```bash
+uv venv
+uv pip install -e ".[dev]"
+python -m pytest             # use the venv's python: .venv\Scripts\python -m pytest on Windows
+```
+
+The tests need no Goose: the hub tests use a fake ACP agent. Code lives in `goose_web/` (Starlette + uvicorn, SQLite)
+and a build-free ES-module SPA in `goose_web/static/` (vendored libraries listed in
+[goose_web/static/vendor/README.md](goose_web/static/vendor/README.md)). Design notes are in
+`specs/001-goose-web-gateway/`.
+
+## License
+
+[Apache License 2.0](LICENSE). Copyright 2026 Goose AI Web Interface contributors.
