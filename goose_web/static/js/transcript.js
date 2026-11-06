@@ -4,7 +4,7 @@ import { h, prettyJson, copyBtn, iconBtn, toDate, fmtNum, fmtCost, btn } from '.
 import { icon, logo } from './icons.js';
 import { setMarkdown } from './markdown.js';
 import { askCard } from './asks.js';
-import { prefs } from './prefs.js';
+import { prefs, activityPrefs } from './prefs.js';
 
 const WINDOW = 80;
 const PAGE = 60;
@@ -23,8 +23,72 @@ export class Transcript {
     this.root = h('div', { class: 'transcript', role: 'log', 'aria-live': 'polite', 'aria-relevant': 'additions' });
     this.moreBtn = h('div', { class: 'tr-more' }, btn('Show earlier messages', () => this.showEarlier(), { size: 'sm', icon: 'chevronUp' }));
     this.list = h('div', { class: 'tr-list' });
-    this.root.append(this.moreBtn, this.list);
+    // Live activity bar (Desktop's "goose is thinking / working on it" line): phase, tool count, elapsed time.
+    this.activityBar = h('div', { class: 'tr-activity', role: 'status', title: 'Jump to the current step' });
+    this.activityBar.addEventListener('click', () => {
+      const t = this.turn && this.turn.target;
+      if (t && t.el && t.el.isConnected) t.el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    });
+    this.activityEl = h('div', { class: 'tr-item tr-agent-side tr-activity-wrap', hidden: true }, this.activityBar);
+    this.turn = null;
+    this.root.append(this.moreBtn, this.list, this.activityEl);
     this.clear();
+  }
+
+  // ---------- live activity (one "turn" = one run of the agent) ----------
+  startTurn() {
+    if (this.turn) return;
+    this.turn = { start: Date.now(), tools: 0, phase: 'thinking', label: '', target: null, thoughts: new Set() };
+    this.activityTimer = setInterval(() => this.renderActivity(), 1000);
+    this.renderActivity();
+  }
+  endTurn() {
+    const t = this.turn;
+    if (!t) return;
+    this.turn = null;
+    clearInterval(this.activityTimer); this.activityTimer = 0;
+    if (activityPrefs().thinking === 'auto') {
+      for (const it of t.thoughts) if (!it.userToggled && it.details) it.details.open = false;
+    }
+    this.activityEl.hidden = true;
+  }
+  setPhase(phase, label = '', target = null) {
+    const t = this.turn;
+    if (!t || this.bulk) return;
+    if (t.phase === phase && t.label === label && (!target || t.target === target)) return;
+    t.phase = phase; t.label = label;
+    if (target) t.target = target;
+    this.renderActivity();
+  }
+  askResolved(id) {
+    if (id) this.resolvedAsks.add(id);
+    const t = this.turn;
+    if (!t || t.phase !== 'waiting') return;
+    // Another approval of this turn still open: show that one. Otherwise show what the tool is doing now.
+    const next = [...this.asks.values()].find((a) => !this.resolvedAsks.has(a.ask.id) && a.time.getTime() >= t.start);
+    if (next) { t.phase = ''; this.setPhase('waiting', next.askTitle, next); return; }
+    const tool = t.target && t.target.kind === 'ask' ? t.target.tool : t.target;
+    const st = tool && tool.data && tool.data.status;
+    if (tool && st !== 'completed' && st !== 'failed') this.setPhase('tool', this.toolTitle(tool), tool);
+    else this.setPhase('working', '', tool || null);
+  }
+  renderActivity() {
+    const t = this.turn;
+    if (!t || !activityPrefs().statusBar) { this.activityEl.hidden = true; return; }
+    const text = t.phase === 'tool' ? 'Running ' + (t.label || 'a tool')
+      : t.phase === 'waiting' ? 'Waiting for your approval: ' + (t.label || 'tool call')
+        : t.phase === 'writing' ? 'Writing the reply\u2026'
+          : t.phase === 'progress' ? t.label
+            : t.phase === 'working' ? 'Working\u2026' : 'Thinking\u2026';
+    const meta = [];
+    if (t.tools) meta.push(t.tools + (t.tools === 1 ? ' tool call' : ' tool calls'));
+    meta.push(fmtElapsed(Date.now() - t.start));
+    this.activityEl.hidden = false;
+    this.activityBar.dataset.phase = t.phase;
+    this.activityBar.replaceChildren(
+      t.phase === 'waiting' ? icon('alert', 13) : h('span', { class: 'spinner', style: { width: '12px', height: '12px' } }),
+      h('span', { class: 'tr-act-label' }, text),
+      h('span', { class: 'tr-act-meta' }, meta.join(' \u00b7 ')));
   }
 
   clear() {
@@ -36,6 +100,7 @@ export class Transcript {
     this.tools = new Map();     // toolCallId -> tool item
     this.users = new Map();
     this.asks = new Map();
+    this.resolvedAsks = new Set();
     this.firstAttached = 0;
     this.lastPlan = null;
     this.list.replaceChildren();
@@ -189,8 +254,13 @@ export class Transcript {
   }
 
   buildThought(item) {
-    item.pre = h('div', { class: 'thought-text' }, item.text);
-    item.details = h('details', { class: 'thought' }, h('summary', null, icon('brain', 14), h('span', null, 'Thinking'), h('span', { class: 'thought-len muted' })), item.pre);
+    item.pre = h('div', { class: 'thought-text md' });
+    setMarkdown(item.pre, item.text, { final: true });
+    const summary = h('summary', null, icon('brain', 14), h('span', null, 'Thinking'), h('span', { class: 'thought-len muted' }, item.text ? fmtNum(item.text.length) + ' chars' : ''));
+    summary.addEventListener('click', () => { item.userToggled = true; });
+    item.details = h('details', { class: 'thought' }, summary, item.pre);
+    const mode = activityPrefs().thinking;
+    item.details.open = mode === 'expanded' || (mode === 'auto' && !!item.live && !!this.turn);
     return this.wrapAgent(item, item.details);
   }
 
@@ -201,6 +271,10 @@ export class Transcript {
     item.head = head; item.body = body; item.card = el;
     head.addEventListener('click', () => { item.userToggled = true; this.setToolOpen(item, body.hidden); });
     this.renderTool(item);
+    const mode = activityPrefs().tools;
+    const st = item.data.status;
+    if (mode === 'detailed') this.setToolOpen(item, true);
+    else if (mode === 'auto' && item.liveTurn && this.turn && st !== 'completed' && st !== 'failed') { this.setToolOpen(item, true); item.autoOpened = true; }
     return this.wrapAgent(item, el);
   }
   setToolOpen(item, open) {
@@ -349,15 +423,21 @@ export class Transcript {
     }
     item.text += text;
     this.scheduleAgent(item);
+    if (text.trim()) this.setPhase('writing', '', item);
     return item;
   }
   thoughtChunk(content, messageId, meta) {
     const text = content && content.text ? content.text : '';
     const last = this.items[this.items.length - 1];
     let item = last && last.kind === 'thought' && (!messageId || last.messageId === messageId) ? last : null;
-    if (!item) { item = { kind: 'thought', text: '', messageId, time: timeOf(meta) || new Date() }; this.push(item); }
+    if (!item) {
+      item = { kind: 'thought', text: '', messageId, time: timeOf(meta) || new Date(), live: !this.bulk && !!this.turn };
+      if (item.live) this.turn.thoughts.add(item);
+      this.push(item);
+    }
     item.text += text;
-    if (item.pre && !this.bulk) { item.pre.textContent = item.text; const l = item.details.querySelector('.thought-len'); if (l) l.textContent = fmtNum(item.text.length) + ' chars'; }
+    if (item.pre && !this.bulk) { setMarkdown(item.pre, item.text, { final: true }); const l = item.details.querySelector('.thought-len'); if (l) l.textContent = fmtNum(item.text.length) + ' chars'; this.chat.emit('transcript:grow'); }
+    this.setPhase('thinking', '', item);
     return item;
   }
   toolCall(u) {
@@ -365,11 +445,25 @@ export class Transcript {
     // A finished tool call re-announced with the same id (e.g. id reuse by a provider) starts a new card.
     const st = item && item.data && item.data.status;
     if (item && (st === 'completed' || st === 'failed')) item = null;
-    if (item) { item.data = { ...item.data, ...strip(u) }; takeApp(item, u); if (!this.bulk) this.renderTool(item); return item; }
-    item = { kind: 'tool', data: strip(u), id: u.toolCallId, live: '', time: timeOf(u._meta) || new Date() };
+    if (item) { item.data = { ...item.data, ...strip(u) }; takeApp(item, u); if (!this.bulk) { this.renderTool(item); this.toolPhase(item); } return item; }
+    item = { kind: 'tool', data: strip(u), id: u.toolCallId, live: '', time: timeOf(u._meta) || new Date(), liveTurn: !this.bulk && !!this.turn };
     takeApp(item, u);
     this.tools.set(u.toolCallId, item);
-    return this.push(item);
+    if (item.liveTurn) this.turn.tools++;
+    this.push(item);
+    this.toolPhase(item);
+    return item;
+  }
+  toolTitle(item) {
+    const tc = item.data || {};
+    return tc.title || (tc._meta && tc._meta.goose && tc._meta.goose.toolCall && tc._meta.goose.toolCall.toolName) || 'a tool';
+  }
+  toolPhase(item) {
+    const t = this.turn;
+    if (!t || this.bulk || t.phase === 'waiting') return;   // askResolved() moves on from an approval
+    const st = item.data.status;
+    if (st === 'completed' || st === 'failed') { if (t.target === item) this.setPhase('working', '', item); }
+    else this.setPhase('tool', this.toolTitle(item), item);
   }
   toolUpdate(u) {
     let item = this.tools.get(u.toolCallId);
@@ -385,7 +479,8 @@ export class Transcript {
     delete patch._meta;
     item.data = { ...item.data, ...patch };
     if (this.bulk) return item;
-    if (item.live && item.data.status === 'in_progress' && !item.userToggled && !item.open && item.el) { this.setToolOpen(item, true); item.autoOpened = true; }
+    this.toolPhase(item);
+    if (item.live && item.data.status === 'in_progress' && !item.userToggled && !item.open && item.el && activityPrefs().tools !== 'concise') { this.setToolOpen(item, true); item.autoOpened = true; }
     if ((item.data.status === 'completed' || item.data.status === 'failed') && item.autoOpened && !item.userToggled && item.el) { this.setToolOpen(item, false); item.autoOpened = false; }
     if (item.livePre && tn && item.open && item.data.status === 'in_progress') {
       item.livePre.textContent = item.live;
@@ -412,6 +507,10 @@ export class Transcript {
     this.asks.set(ask.id, item);
     const tcId = ask.params && ask.params.toolCall && ask.params.toolCall.toolCallId;
     const tool = tcId ? this.tools.get(tcId) : null;
+    const p = ask.params || {};
+    item.tool = tool;
+    item.askTitle = (p.toolCall && p.toolCall.title) || (tool && this.toolTitle(tool)) || p.message || 'a request';
+    if (this.turn && !this.bulk && !this.resolvedAsks.has(ask.id)) this.setPhase('waiting', item.askTitle, item);
     if (tool && !this.bulk) {
       item.agentSide = true; item.first = false;
       const idx = this.items.indexOf(tool);
@@ -443,6 +542,13 @@ function appToolResult(tc) {
   const res = { content, isError: tc.status === 'failed' };
   if (ro && typeof ro === 'object' && ro.structuredContent) res.structuredContent = ro.structuredContent;
   return res;
+}
+function fmtElapsed(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ' + String(s % 60).padStart(2, '0') + 's';
+  return Math.floor(m / 60) + 'h ' + String(m % 60).padStart(2, '0') + 'm';
 }
 function lastLine(s) { const t = String(s).replace(/\s+$/, ''); const i = t.lastIndexOf('\n'); return (i >= 0 ? t.slice(i + 1) : t).slice(0, 140); }
 

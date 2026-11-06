@@ -23,10 +23,19 @@ export const DEFAULT_PREFS = {
   notifications: { browser: false, sound: false, events: ['needs_you', 'done', 'error'] },
   sidebar: { collapsed: {}, showArchived: false, includeScheduled: true, width: 288 },
   herd: { all: false },
+  // Live agent activity in chat. thinking: auto|expanded|collapsed; tools: auto|detailed|concise.
+  activity: { thinking: 'auto', tools: 'auto', statusBar: true },
 };
 
 export function prefs() { return { ...DEFAULT_PREFS, ...(store.get('prefs') || {}) }; }
 export function pref(k) { return prefs()[k]; }
+export function activityPrefs() {
+  const a = { ...DEFAULT_PREFS.activity, ...((store.get('prefs') || {}).activity || {}) };
+  if (!['auto', 'expanded', 'collapsed'].includes(a.thinking)) a.thinking = 'auto';
+  if (!['auto', 'detailed', 'concise'].includes(a.tools)) a.tools = 'auto';
+  a.statusBar = a.statusBar !== false;
+  return a;
+}
 
 export async function loadPrefs() {
   try {

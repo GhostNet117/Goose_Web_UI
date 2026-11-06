@@ -164,7 +164,8 @@ export class ChatSession extends Emitter {
     const was = this.running;
     this.running = !!v;
     if (was !== this.running) {
-      if (!this.running) { this.transcript.finalizeAll(); this.progress = null; this.emit('run:end'); this.drainQueue(); }
+      if (this.running) this.transcript.startTurn();
+      if (!this.running) { this.transcript.endTurn(); this.transcript.finalizeAll(); this.progress = null; this.emit('run:end'); this.drainQueue(); }
       this.emit('state');
     }
   }
@@ -239,7 +240,7 @@ export class ChatSession extends Emitter {
         break;
       case 'status_message': {
         const s = u.status || {};
-        if (s.type === 'progress') { this.progress = s.message; this.emit('progress', s.message); }
+        if (s.type === 'progress') { this.progress = s.message; this.emit('progress', s.message); if (s.message) this.transcript.setPhase('progress', s.message); }
         else if (s.message) this.transcript.sys(s.message, 'info');
         break;
       }
@@ -342,6 +343,9 @@ export class ChatSession extends Emitter {
 bus.on('ask:new', (ask) => {
   const c = ask.sessionId && chats.get(ask.sessionId);
   if (c && c.loaded) c.transcript.addAsk(ask);
+});
+bus.on('ask:resolved', (ev) => {
+  for (const c of chats.values()) c.transcript.askResolved(ev && ev.id);
 });
 store.on('change:herd', () => {
   for (const c of chats.values()) {

@@ -13,13 +13,16 @@ it, on a desktop or a phone.
   `%APPDATA%\Block\goose`) with all of its chats, recipes and settings. Nothing gets copied around, and Goose
   Desktop keeps working on the same profile.
 
-`goose-web 1.0.0` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
+`goose-web 1.1.0` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
 
 ## Features
 
 - **Chat**: streaming responses, tool calls, and tool-permission cards (approve or deny, first answer wins across
   all your tabs). Recipe parameters and elicitation forms. Mode and model switching. File upload into your
   workspace.
+- **Live activity** (as in Goose Desktop): the model's thinking, every tool call with its input, live output
+  and result, and a live bar with the current step, tool-call count and elapsed time. How much stays open is a
+  per-user preference.
 - **Sessions grouped by folder** (as in Goose Desktop), with pinning, search, rename, archive and fork.
 - **Recipes, skills, schedules, MCP Apps and extensions**, each with its own page. MCP Apps run in a sandboxed
   frame at an opaque origin, both standalone and **inline in the chat** when a tool has an app UI (as in Desktop).
@@ -63,6 +66,18 @@ flowchart LR
 - Every non-admin ACP call goes through a default-deny method firewall (`goose_web/policy.py`).
 
 REST and WebSocket contract: [docs/API.md](docs/API.md).
+
+## Documentation
+
+| Guide | For |
+|---|---|
+| [docs/USER-GUIDE.md](docs/USER-GUIDE.md) | Everyone who signs in: every screen, chat, live activity, recipes, schedules, settings |
+| [docs/ADMINISTRATION.md](docs/ADMINISTRATION.md) | Whoever runs the gateway: install, users, teams, policies, backups, upgrades |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every configuration key |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Symptom, cause and fix |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Developers: how it works inside |
+| [docs/API.md](docs/API.md), [docs/acp-reference.md](docs/acp-reference.md) | REST/WebSocket contract and the Goose ACP methods used |
+| [docs/SECURITY-ASSESSMENT.md](docs/SECURITY-ASSESSMENT.md), [SECURITY.md](SECURITY.md) | Threat model, findings, how to report a vulnerability |
 
 ## Deployment options
 
