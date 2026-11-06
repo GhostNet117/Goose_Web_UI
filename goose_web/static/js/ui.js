@@ -15,6 +15,19 @@ for (const proto of [Element.prototype, DocumentFragment.prototype]) {
   }
 }
 
+// URL-valued attributes are checked before they are set: only http(s), mailto, blob, data (on <img src>
+// only) and relative / hash / same-origin URLs pass; anything else (javascript:, vbscript:, file:, …)
+// is dropped with a console warning.
+const URL_ATTRS = new Set(['href', 'src', 'action', 'formaction', 'xlink:href']);
+const SAFE_URL_SCHEMES = new Set(['http:', 'https:', 'mailto:', 'blob:']);
+export function isSafeUrlAttr(tag, attr, value) {
+  let u;
+  try { u = new URL(String(value), location.href); } catch { return false; }
+  if (SAFE_URL_SCHEMES.has(u.protocol)) return true;
+  if (u.protocol === 'data:') return String(tag).toLowerCase() === 'img' && attr === 'src';
+  return u.origin === location.origin && u.origin !== 'null';
+}
+
 export function h(tag, props, ...children) {
   const el = tag === 'frag' ? document.createDocumentFragment() : document.createElement(tag);
   if (props && (typeof props !== 'object' || props instanceof Node || Array.isArray(props))) {
@@ -32,6 +45,7 @@ export function h(tag, props, ...children) {
       else if (k === 'ref' && typeof v === 'function') v(el);
       else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2).toLowerCase(), v);
       else if (k === 'value' || k === 'checked' || k === 'disabled' || k === 'selected' || k === 'indeterminate') el[k] = v;
+      else if (URL_ATTRS.has(k.toLowerCase()) && !isSafeUrlAttr(tag, k.toLowerCase(), v === true ? '' : v)) console.warn('h(): dropped unsafe ' + k + ' on <' + tag + '>', String(v).slice(0, 80));
       else if (v === true) el.setAttribute(k, '');
       else el.setAttribute(k, String(v));
     }

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import secrets
+import sqlite3
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -26,9 +27,22 @@ DEFAULT_AUTH = {
     "localEnabled": True,
     "ldap": {"enabled": False, "label": "Active Directory", "url": "", "bindDn": "", "bindPassword": "",
              "userBase": "", "userFilter": "(&(objectClass=user)(sAMAccountName={username}))",
-             "adminGroupDn": "", "groupTeamMap": {}, "startTls": False, "autoCreate": True, "caFile": ""},
+             "adminGroupDn": "", "groupTeamMap": {}, "startTls": False, "autoCreate": True, "caFile": "",
+             # Plain ldap:// without StartTLS sends passwords in cleartext; refused unless this is true (GW-13).
+             "allowInsecure": False},
     "oidc": [],   # [{id,label,issuer,clientId,clientSecret,scopes,adminClaim,adminValue,teamClaim,autoCreate}]
 }
+
+
+LDAP_INSECURE_MESSAGE = ("The LDAP URL uses plain ldap:// without StartTLS, which would send passwords in "
+                         "cleartext. Use an ldaps:// URL, turn on StartTLS, or (only on a trusted network) set "
+                         "allowInsecure to true in the LDAP settings.")
+
+
+def ldap_transport_insecure(c: dict) -> bool:
+    """True when an LDAP config would bind without TLS and the admin has not opted in to that."""
+    url = str(c.get("url") or "").strip().lower()
+    return not (url.startswith("ldaps://") or bool(c.get("startTls")) or c.get("allowInsecure") is True)
 
 
 class AuthError(Exception):
@@ -81,6 +95,9 @@ class AuthService:
         ldap = {**old["ldap"], **(new.get("ldap") or {})}
         if ldap.get("bindPassword") == MASK:
             ldap["bindPassword"] = old["ldap"].get("bindPassword", "")
+        ldap["allowInsecure"] = ldap.get("allowInsecure") is True  # strict bool; anything else = secure default
+        if ldap.get("enabled") and ldap_transport_insecure(ldap):
+            raise ValueError(LDAP_INSECURE_MESSAGE)
         oidc_old = {o["id"]: o for o in old["oidc"] if o.get("id")}
         oidc = []
         for o in new.get("oidc") or []:
@@ -107,6 +124,14 @@ class AuthService:
             raise AuthError("locked", "Account temporarily locked after failed attempts. Try again later.", 423)
         ok = False
         if user is None or user["auth_source"] == "ldap":
+            if cfg["ldap"].get("enabled") and ldap_transport_insecure(cfg["ldap"]):
+                # Refuse before any bind: never send the password in cleartext (GW-13). Not counted as a
+                # failed attempt - it is a server configuration problem, not a wrong password.
+                log.error("LDAP sign-in refused: %s", LDAP_INSECURE_MESSAGE)
+                self.db.audit("auth.ldap", ip=ip, target=username, ok=False,
+                              detail={"error": "ldap_insecure", "fix": LDAP_INSECURE_MESSAGE})
+                raise AuthError("ldap_insecure", "Directory sign-in is not configured securely. "
+                                "Ask an administrator to check the LDAP settings.", 503)
             if cfg["ldap"].get("enabled"):
                 user = self._ldap_login(username, password, user, cfg["ldap"])
                 ok = user is not None
@@ -120,12 +145,7 @@ class AuthService:
                 self.db.update_user(user["id"], password_hash=security.hash_password(password))
         if not ok or not user:
             if user:
-                fails = user["failed_logins"] + 1
-                fields: dict[str, Any] = {"failed_logins": fails}
-                if fails >= int(self.s.get("auth", "lockout_threshold") or 8):
-                    fields["locked_until"] = time.time() + 60 * float(self.s.get("auth", "lockout_minutes") or 15)
-                    fields["failed_logins"] = 0
-                self.db.update_user(user["id"], **fields)
+                self._record_failure(user)
             self.db.audit("auth.login", user=user, ip=ip, target=username, ok=False)
             raise AuthError("invalid_credentials", "Invalid username or password")
         if user["disabled"]:
@@ -134,16 +154,44 @@ class AuthService:
         if user["totp_enabled"]:
             if not totp:
                 raise AuthError("totp_required", "Enter the code from your authenticator app")
-            if not security.verify_totp(user["totp_secret"], totp):
-                self.db.update_user(user["id"], failed_logins=user["failed_logins"] + 1)
+            # A wrong or replayed code counts toward the same lockout as a wrong password.
+            if not self.accept_totp(user, str(totp)):
+                self._record_failure(user)
                 self.db.audit("auth.totp", user=user, ip=ip, ok=False)
                 raise AuthError("totp_invalid", "That code is not valid")
         self.db.update_user(user["id"], failed_logins=0, locked_until=0, last_login_at=time.time())
         self.user_limiter.reset(f"{ip}|{username.lower()}")
         return self.db.user_by_id(user["id"])
 
+    def _record_failure(self, user: dict) -> None:
+        """Count one failed sign-in factor (password or TOTP) toward the account lockout."""
+        fresh = self.db.user_by_id(user["id"]) or user
+        fails = int(fresh["failed_logins"] or 0) + 1
+        fields: dict[str, Any] = {"failed_logins": fails}
+        if fails >= int(self.s.get("auth", "lockout_threshold") or 8):
+            fields["locked_until"] = time.time() + 60 * float(self.s.get("auth", "lockout_minutes") or 15)
+            fields["failed_logins"] = 0
+        self.db.update_user(user["id"], **fields)
+
+    def accept_totp(self, user: dict, code: str, secret: str | None = None) -> bool:
+        """Verify a TOTP code and consume its time step so it can never be used again (GW-14).
+
+        The step is claimed with a conditional UPDATE, so two concurrent requests carrying the same
+        code cannot both succeed."""
+        secret = secret if secret is not None else user.get("totp_secret")
+        last = (self.db.user_by_id(user["id"]) or user).get("totp_last_counter")
+        counter = security.totp_match(secret or "", code, last_counter=last)
+        if counter is None:
+            return False
+        return self.db.execute_count(
+            "UPDATE users SET totp_last_counter=? WHERE id=? AND (totp_last_counter IS NULL OR totp_last_counter < ?)",
+            (counter, user["id"], counter)) == 1
+
     # ------------------------------------------------------------ LDAP / AD
     def _ldap_login(self, username: str, password: str, existing: dict | None, c: dict) -> dict | None:
+        if ldap_transport_insecure(c):  # defence in depth; login() already refuses with a clear error
+            log.error("LDAP bind refused: %s", LDAP_INSECURE_MESSAGE)
+            return None
         try:
             import ldap3
             from ldap3.utils.conv import escape_filter_chars
@@ -152,7 +200,7 @@ class AuthService:
             return None
         try:
             tls = None
-            if c.get("caFile") or str(c.get("url", "")).startswith("ldaps") or c.get("startTls"):
+            if c.get("caFile") or str(c.get("url", "")).strip().lower().startswith("ldaps") or c.get("startTls"):
                 import ssl
                 tls = ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=c.get("caFile") or None)
             server = ldap3.Server(c["url"], get_info=ldap3.NONE, tls=tls, connect_timeout=8)
@@ -294,15 +342,42 @@ class AuthService:
             tv = tv if isinstance(tv, list) else [tv]
             names = {str(x).lower() for x in tv}
             teams = [t["id"] for t in self.db.query("SELECT id, name FROM teams") if t["name"].lower() in names]
-        existing = self.db.user_by_name(username)
-        if existing and existing["auth_source"] not in ("oidc", f"oidc:{pid}"):
-            raise AuthError("oidc_conflict", "A local account with this name already exists", 409)
+        # Accounts are bound to the stable (issuer, subject) pair, not to the display username (GW-12).
+        iss = str(claims.get("iss") or "").rstrip("/")
+        sub = str(claims.get("sub") or "")
+        if not iss or not sub or len(sub) > 255:
+            raise AuthError("oidc_claims", "The identity token failed validation", 401)
+        oidc_sources = ("oidc", f"oidc:{pid}")
+        existing = self.db.one("SELECT * FROM users WHERE oidc_issuer=? AND oidc_subject=?", (iss, sub))
+        if existing:
+            if existing["auth_source"] not in oidc_sources:
+                # bound once, but an admin has since switched it to local/LDAP: keep it protected
+                raise AuthError("oidc_conflict", "A local account with this name already exists", 409)
+        else:
+            existing = self.db.user_by_name(username)
+            if existing and existing["auth_source"] not in oidc_sources:
+                raise AuthError("oidc_conflict", "A local account with this name already exists", 409)
+            if existing and existing.get("oidc_subject"):
+                # same username, but bound to a different identity (other provider or other person)
+                log.warning("OIDC sign-in for %s refused: account is bound to a different identity", username)
+                raise AuthError("oidc_conflict", "This account is linked to a different sign-in identity", 409)
         user = self._upsert_external(existing, username, "oidc", claims.get("name") or username,
                                      claims.get("email") or "", role, teams, o.get("autoCreate", True))
         if not user or user["disabled"]:
             raise AuthError("oidc_denied", "This account is not allowed to sign in", 403)
+        if not user.get("oidc_subject"):
+            # First sign-in of a new account, or migration of an account created before binding existed.
+            try:
+                bound = self.db.execute_count(
+                    "UPDATE users SET oidc_issuer=?, oidc_subject=? WHERE id=? AND oidc_subject IS NULL",
+                    (iss, sub, user["id"]))
+            except sqlite3.IntegrityError:  # (iss, sub) bound to another account concurrently
+                bound = 0
+            if bound != 1:
+                raise AuthError("oidc_conflict", "This account is linked to a different sign-in identity", 409)
+            self.db.audit("user.oidc.bind", user=user, target=user["username"], detail={"issuer": iss, "provider": pid})
         self.db.update_user(user["id"], last_login_at=time.time())
-        return user
+        return self.db.user_by_id(user["id"])
 
     # ------------------------------------------------------------ sessions
     def session_seconds(self, remember: bool) -> float:
@@ -333,7 +408,8 @@ class AuthService:
         if not user or user["disabled"]:
             return None
         if now - row["last_seen"] > 60:
-            # sliding expiry for non-remembered sessions: extend while in use (bounded by session length)
+            # Session lifetimes are fixed: expires_at is set once at sign-in and never extended (no sliding
+            # expiry). last_seen is only activity bookkeeping for the "signed-in devices" list.
             self.db.execute("UPDATE auth_sessions SET last_seen=? WHERE token_hash=?", (now, row["token_hash"]))
         return Identity(user=user, session=row, via="cookie")
 
@@ -358,6 +434,15 @@ class AuthService:
             self.db.execute("DELETE FROM auth_sessions WHERE user_id=? AND token_hash<>?", (uid, keep_hash))
         else:
             self.db.execute("DELETE FROM auth_sessions WHERE user_id=?", (uid,))
+
+    def totp_enrolment_required(self, user: dict) -> bool:
+        """True for an administrator without two-factor while 'require two-factor for admins' is on."""
+        return bool(user.get("role") == "admin" and not user.get("totp_enabled")
+                    and self.db.get_setting("require_totp_admins"))
+
+    def revoke_user_tokens(self, uid: int) -> int:
+        """Delete every API token of a user (password reset/change, account disabled - GW-21)."""
+        return self.db.execute_count("DELETE FROM api_tokens WHERE user_id=?", (uid,))
 
     def create_api_token(self, user: dict, name: str, days: int | None) -> tuple[int, str]:
         token = API_TOKEN_PREFIX + security.new_token(32)

@@ -286,7 +286,7 @@ function authTab(body) {
   (async () => {
     let cfg, teams = [];
     try { [cfg, teams] = await Promise.all([GET('/api/admin/auth'), loadTeams().catch(() => [])]); } catch (e) { body.replaceChildren(banner('error', errMsg(e))); return; }
-    const l = { enabled: false, url: '', bindDn: '', userBase: '', userFilter: '(sAMAccountName={username})', adminGroupDn: '', groupTeamMap: {}, startTls: false, label: 'Active Directory', ...(cfg.ldap || {}) };
+    const l = { enabled: false, url: '', bindDn: '', userBase: '', userFilter: '(sAMAccountName={username})', adminGroupDn: '', groupTeamMap: {}, startTls: false, allowInsecure: false, label: 'Active Directory', ...(cfg.ldap || {}) };
     let localEnabled = cfg.localEnabled !== false;
     const oidc = (cfg.oidc || []).map((o) => ({ ...o }));
     const I = (k, ph, type = 'text') => { const i = input({ value: l[k] ?? '', placeholder: ph, type, class: 'inp mono', autocomplete: 'new-password' }); i.addEventListener('input', () => { l[k] = i.value; }); return i; };
@@ -312,6 +312,8 @@ function authTab(body) {
         h('div', { class: 'grid2' }, field('Server URL', I('url', 'ldaps://dc01.corp.local:636')), field('Login screen label', I('label', 'Active Directory')), field('Bind DN', I('bindDn', 'CN=svc-goose,OU=Service,DC=corp,DC=local')), field('Bind password', bindPw),
           field('User search base', I('userBase', 'OU=Users,DC=corp,DC=local')), field('User filter', I('userFilter', '(sAMAccountName={username})')), field('Admin group DN', I('adminGroupDn', 'CN=Goose Admins,…'))),
         checkbox(!!l.startTls, 'Use StartTLS (for ldap://)', (v) => { l.startTls = v; }),
+        checkbox(!!l.allowInsecure, 'Allow unencrypted LDAP (not recommended)', (v) => { l.allowInsecure = v; }),
+        h('div', { class: 'muted small' }, 'Plain ldap:// without StartTLS sends the bind password and user passwords in clear text and is refused unless this is on. Prefer ldaps:// or StartTLS.'),
         field('Group → team mapping', gmap, 'One per line: <group DN> = <team id>. Teams: ' + (teams.map((t) => t.name + ' = ' + t.id).join(', ') || 'none')))),
       section('OpenID Connect providers', btn('Add provider', () => { oidc.push({ id: '', label: '', issuer: '', clientId: '', scopes: 'openid profile email', autoCreate: false }); drawOidc(); }, { icon: 'plus', size: 'sm' }), oidcBox),
       h('div', { class: 'row sticky-foot' }, actionBtn('Save auth settings', async () => {

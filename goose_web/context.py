@@ -7,6 +7,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from starlette.requests import HTTPConnection, Request
 from starlette.responses import JSONResponse
@@ -56,10 +57,18 @@ class Ctx:
     def allowed_origins(self, conn: HTTPConnection) -> set[str]:
         out = set(self.settings.get("server", "allowed_origins") or [])
         if self.settings.public_url:
+            # A public URL is configured: only its origin (and configured extras) count. The request's Host
+            # is not used, so a rebound DNS name cannot make its own origin acceptable. Add other direct-access
+            # origins (for example http://127.0.0.1:8710) to server.allowed_origins if they are needed.
             out.add(self.settings.public_url)
+            origin = url_origin(self.settings.public_url)
+            if origin:
+                out.add(origin)
+            return out
         host = conn.headers.get("host")
         if host:
-            # direct access (e.g. http://127.0.0.1:8710 on the box itself)
+            # No public URL: direct access (e.g. http://127.0.0.1:8710 on the gateway host itself). The Host
+            # header is on the allow-list here (app.HostGuard refuses any other Host).
             scheme = "https" if conn.url.scheme in ("https", "wss") else "http"
             out.add(f"{scheme}://{host}")
             fwd = conn.headers.get("x-forwarded-proto") if self.from_trusted_proxy(conn) else None
@@ -142,6 +151,23 @@ class Ctx:
     def audit(self, request: HTTPConnection, action: str, user: dict | None, target: str = "",
               detail: dict | None = None, ok: bool = True) -> None:
         self.db.audit(action, user=user, ip=self.client_ip(request), target=target, detail=detail, ok=ok)
+
+
+def url_origin(url: str) -> str:
+    """The browser Origin of an absolute URL: scheme://host[:port], lower-cased, default port omitted."""
+    try:
+        u = urlsplit(url)
+        port = u.port
+    except ValueError:
+        return ""
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return ""
+    host = u.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    if port and port != {"http": 80, "https": 443}[u.scheme]:
+        host = f"{host}:{port}"
+    return f"{u.scheme}://{host}"
 
 
 def _ip_in(ip: str, nets: list[str]) -> bool:

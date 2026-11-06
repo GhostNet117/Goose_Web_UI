@@ -64,9 +64,26 @@ flowchart LR
 
 REST and WebSocket contract: [docs/API.md](docs/API.md).
 
+## Deployment options
+
+- **Native install (Windows, Linux, macOS).** The gateway runs in a Python virtual environment next to the Goose you
+  installed yourself, and you update Goose yourself as usual. On Windows the admin can share the existing Goose
+  Desktop profile (`%APPDATA%\Block\goose`), so Desktop and the browser see the same chats, recipes and settings.
+- **Docker (Linux image, amd64/arm64).** The image bundles a pinned goose CLI whose release tarball is checked
+  against a SHA-256 at build time. To update Goose, change `GOOSE_VERSION` and the matching `GOOSE_SHA256_AMD64` /
+  `GOOSE_SHA256_ARM64` build args (see `docker/Dockerfile`), then rebuild.
+
+Both install the Python dependencies from the hash-locked `requirements.lock` (`pip install --require-hashes`),
+and then goose-web itself with `--no-deps`.
+
 ## Quick start
 
 You need Goose (the `goose` CLI, or Goose Desktop, which bundles it) and Python 3.11+ or [uv](https://docs.astral.sh/uv/).
+
+There is no default password. `goose-web init` creates the first admin with a **random initial password and prints
+it once**. The installers show it at the end of their output, and the Docker container prints it to its log on the
+first start. Store it, sign in, and choose a new password (the change is enforced). If you lose it, reset it with
+`goose-web user reset NAME`, which prints a new temporary password.
 
 ### Windows
 
@@ -77,15 +94,15 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 scripts\start-gateway.cmd          # or sign out and in again: the logon task starts it
 ```
 
-Then open <http://127.0.0.1:8710> and sign in as **your Windows user name (`%USERNAME%`)** with the password
-**`ChangeMe`**. You must change it right away.
+Then open <http://127.0.0.1:8710> and sign in as **your Windows user name (`%USERNAME%`)** with the initial
+password the installer printed at the end. You must change it right away.
 
 - The admin profile is found automatically at `%APPDATA%\Block\goose`. If it is not there, the installer asks for
   the folder. If you leave the answer empty, you get a fresh profile in `C:\Goose_Web_Profiles\appdata`.
 - The installer registers a logon task (runs as you, non-elevated) and a firewall rule through **one** elevation
   prompt. Use `-NoService` to skip that.
-- LAN or reverse proxy example:
-  `scripts\install.ps1 -BindHost 10.0.0.5 -PublicUrl https://goose.example.org -TrustedProxy 10.0.0.2 -FirewallRemoteAddress 10.0.0.2`
+- LAN or reverse proxy example (gateway host `192.168.1.10`, proxy `192.168.1.2`):
+  `scripts\install.ps1 -BindHost 192.168.1.10 -PublicUrl https://goose.example.org -TrustedProxy 192.168.1.2 -FirewallRemoteAddress 192.168.1.2`
 
 ### Linux / macOS
 
@@ -96,7 +113,8 @@ As your normal user (not root), with `goose` on `PATH`:
 .venv/bin/python -m goose_web --config ~/.local/share/goose-web/_system/config.yaml serve
 ```
 
-Sign in as `$USER` / `ChangeMe` (forced change). The admin starts with a fresh profile in
+Sign in as `$USER` with the initial password the installer printed at the end (forced change). The admin starts
+with a fresh profile in
 `<profiles-root>/appdata` unless `--goose-appdata` points at a `GOOSE_PATH_ROOT`-style folder (`config/`, `data/`,
 `state/`).
 
@@ -106,15 +124,26 @@ Sign in as `$USER` / `ChangeMe` (forced change). The admin starts with a fresh p
 docker compose -f docker/compose.yaml up -d --build
 ```
 
-Open <http://127.0.0.1:8710> and sign in as `admin` / `ChangeMe` (forced change). Everything persistent lives in
-the `/data` volume (`goose-web-data`): database, profiles and the admin profile `/data/appdata`. The compose file
-already includes this hardening:
+On the first start the container prints a random initial admin password to its log, **once**:
+
+```bash
+docker compose -f docker/compose.yaml logs goose-web
+```
+
+Open <http://127.0.0.1:8710> and sign in as `admin` with that password (forced change). The password is not printed
+again on later starts. To preset it instead, set `GOOSE_WEB_ADMIN_PASSWORD_FILE` to a file such as a compose
+secret (see the commented example in `docker/compose.yaml`). It is read on the first start only and removed from
+the environment before the gateway starts. Everything persistent lives in the `/data` volume (`goose-web-data`):
+database, profiles and the admin profile `/data/appdata`. The compose file already includes this hardening:
 
 - runs as non-root uid 1000, read-only root filesystem, tmpfs `/tmp` and `/home/goose`
 - `cap_drop: [ALL]`, `no-new-privileges`, `pids_limit: 1024`, `mem_limit: 4g`
 - port published on `127.0.0.1` only
 
 For a proxy, set `GOOSE_WEB__SERVER__PUBLIC_URL` and `GOOSE_WEB__SERVER__TRUSTED_PROXIES` in `environment:`.
+The container listens on `0.0.0.0`, so only `localhost`, `127.0.0.1`, `::1` and the `public_url` host are accepted
+in the Host header. If users open it under another name or IP, add that to `GOOSE_WEB__SERVER__ALLOWED_HOSTS`
+(comma separated). See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ## Reverse proxy
 
@@ -123,7 +152,7 @@ sets `X-Forwarded-*` by default):
 
 ```
 goose.example.org {
-    reverse_proxy 10.0.0.5:8710
+    reverse_proxy 192.168.1.10:8710
 }
 ```
 
@@ -132,12 +161,16 @@ Then tell the gateway its public URL and trust only the proxy:
 ```yaml
 # <profiles_root>/_system/config.yaml
 server:
-  host: "10.0.0.5"
+  host: "192.168.1.10"
   public_url: "https://goose.example.org"   # Secure __Host- cookie, HSTS, Origin checks, OIDC redirects
-  trusted_proxies: ["127.0.0.1", "::1", "10.0.0.2"]
+  trusted_proxies: ["127.0.0.1", "::1", "192.168.1.2"]
 ```
 
 Limit the gateway port to the proxy in the firewall (`register-service.ps1 -FirewallRemoteAddress <proxy ip>`).
+The gateway accepts only allow-listed Host headers (the `public_url` host, `localhost`, `127.0.0.1`, `::1`, the bind
+address and `server.allowed_hosts`). With `public_url` set, browser origins come from it. If you also open the
+gateway directly, for example at `http://192.168.1.10:8710`, add that origin to `server.allowed_origins`. Single
+sign-on (OIDC) needs `public_url`.
 
 ## Configuration
 
@@ -152,11 +185,18 @@ Every key, the CLI, policies, profile layout, scheduler rules and scripts are de
 
 - Passwords are hashed with scrypt. Session and API tokens are random and stored as hashes. Cookies are HttpOnly and
   SameSite=Strict (`__Host-`/Secure behind HTTPS).
-- Writes need a CSRF header plus an Origin check, and the WebSocket checks the Origin. The CSP is strict.
-- Sign-in is rate limited with a lockout. TOTP and LDAP/OIDC are supported.
-- Non-admins go through a default-deny ACP firewall with folder confinement. Shell extensions are off unless
-  `allow_shell` is set.
+- Writes need a CSRF header plus an Origin check, and the WebSocket checks the Origin. The Host header is
+  allow-listed (DNS-rebinding guard). The CSP is strict.
+- No default password: the first admin gets a random password that is shown once, and must change it at first
+  sign-in.
+- Sign-in is rate limited with a lockout. TOTP (with replay protection), LDAP/AD (TLS required by default) and OIDC
+  (accounts bound to issuer + subject) are supported. API tokens are sent only in the `Authorization` header.
+- Non-admins go through a default-deny ACP firewall with folder confinement (symlinks resolved). Shell extensions
+  are off unless `allow_shell` is set. MCP Apps can only call tools of their own extension.
 - Workers listen on loopback only, each with its own secret. The gateway never runs elevated.
+- Personal webhooks cannot reach internal addresses unless `notify.allow_private_targets` is turned on.
+- Dependencies are installed from a hash-locked `requirements.lock`. The Docker base image and the goose CLI are
+  pinned and checksum-verified.
 
 Full threat model and findings: [docs/SECURITY-ASSESSMENT.md](docs/SECURITY-ASSESSMENT.md). To report a
 vulnerability, see [SECURITY.md](SECURITY.md).
@@ -179,14 +219,23 @@ vulnerability, see [SECURITY.md](SECURITY.md).
 
 ```bash
 uv venv
-uv pip install -e ".[dev]"
+uv pip install --require-hashes -r requirements.lock   # the locked runtime dependencies
+uv pip install --no-deps -e .
+uv pip install pytest pytest-asyncio
 python -m pytest             # use the venv's python: .venv\Scripts\python -m pytest on Windows
 ```
 
 The tests need no Goose: the hub tests use a fake ACP agent. Code lives in `goose_web/` (Starlette + uvicorn, SQLite)
 and a build-free ES-module SPA in `goose_web/static/` (vendored libraries listed in
-[goose_web/static/vendor/README.md](goose_web/static/vendor/README.md)). Design notes are in
-`specs/001-goose-web-gateway/`.
+[goose_web/static/vendor/README.md](goose_web/static/vendor/README.md), checked against `SHA256SUMS` by the
+tests). When you change dependencies in `pyproject.toml`, regenerate the lock file with
+`pip-compile --generate-hashes --strip-extras -o requirements.lock pyproject.toml`.
+
+## Contributing
+
+Issues and pull requests are welcome. Please run `python -m pytest` before you open a pull request, and add tests
+for behaviour you change. Report security problems privately as described in [SECURITY.md](SECURITY.md), not
+in a public issue.
 
 ## License
 

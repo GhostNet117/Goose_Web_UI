@@ -47,4 +47,8 @@ Out of scope (report these upstream or to the relevant vendor):
 ## Security design and known risks
 
 The threat model, verified controls, findings and the deployment hardening checklist are in
-[docs/SECURITY-ASSESSMENT.md](docs/SECURITY-ASSESSMENT.md).
+[docs/SECURITY-ASSESSMENT.md](docs/SECURITY-ASSESSMENT.md) (the project's security assessment for v1.0.0).
+
+Main hardening defaults: the gateway binds to `127.0.0.1` (Docker publishes on `127.0.0.1` only), the first admin
+gets a random password that is shown once and must be changed at first sign-in, the `Host` header is checked
+against an allow-list, and Python dependencies are installed from a hash-locked `requirements.lock`.

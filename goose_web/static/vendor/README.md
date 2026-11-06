@@ -16,4 +16,33 @@ Local modifications:
 * `marked.esm.js`, `purify.es.mjs`: the trailing `//# sourceMappingURL=...` comment was removed (no map files are shipped).
 * `qrcode.esm.js`: the original UMD file with `export default qrcode;` appended so it can be imported as an ES module. The UMD tail is a no-op in the browser.
 
-To update: download the new versions from the URLs above, re-apply the modifications, save as UTF-8 without BOM, and bump the versions in this table and the `VERSION` constant in `/static/sw.js`.
+To update: download the new versions from the URLs above, re-apply the modifications, save as UTF-8 without BOM, and bump the versions in this table and the `VERSION` constant in `/static/sw.js`. Then regenerate `SHA256SUMS` (below).
+
+## Integrity (`SHA256SUMS`)
+
+`SHA256SUMS` lists the SHA-256 of every vendored file in `sha256sum` format (LF line endings, sorted by
+file name; this README and `SHA256SUMS` itself are not listed). `tests/test_platform_hardening.py` fails when a
+file is changed, added or removed without updating it, so a tampered or accidentally edited library is caught
+in CI.
+
+Verify (from this folder):
+
+```sh
+sha256sum -c SHA256SUMS                    # Linux / macOS (macOS: shasum -a 256 -c SHA256SUMS)
+```
+
+```powershell
+# Windows PowerShell
+Get-Content SHA256SUMS | ForEach-Object { $h, $f = $_ -split '\s+', 2
+  if ((Get-FileHash $f -Algorithm SHA256).Hash -ne $h.ToUpper()) { "MISMATCH $f" } else { "OK $f" } }
+```
+
+Update after changing a vendored file (from this folder, then review the diff):
+
+```sh
+LC_ALL=C sha256sum $(LC_ALL=C ls | grep -v -e '^README.md$' -e '^SHA256SUMS$') > SHA256SUMS
+```
+
+The sums are over the files with LF line endings. A Windows clone with `core.autocrlf=true` checks the files
+out with CRLF, so `sha256sum -c` reports mismatches there (the test compares the LF-normalised content in that
+case); clone with `git -c core.autocrlf=false -c core.eol=lf` to verify byte for byte.

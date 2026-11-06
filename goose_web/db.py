@@ -8,7 +8,25 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Audit rows older than this are deleted when the database is opened (GW-23).
+AUDIT_RETENTION_DAYS = 365
+
+# Additive, idempotent column migrations: (table, column, SQL type/default). Applied on every open
+# with ALTER TABLE ... ADD COLUMN when the column is missing, so databases created by older versions
+# pick them up. Only ever ADD nullable columns here; never rename or drop.
+#   v2: users.totp_last_counter - last accepted TOTP time step (replay protection, GW-14)
+#       users.oidc_issuer / users.oidc_subject - OIDC identity binding by (iss, sub) (GW-12)
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("users", "totp_last_counter", "INTEGER"),
+    ("users", "oidc_issuer", "TEXT"),
+    ("users", "oidc_subject", "TEXT"),
+)
+POST_MIGRATION_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_oidc ON users(oidc_issuer, oidc_subject)"
+    " WHERE oidc_subject IS NOT NULL",
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -34,6 +52,7 @@ CREATE TABLE IF NOT EXISTS users (
   locked_until REAL NOT NULL DEFAULT 0,
   created_at REAL NOT NULL,
   last_login_at REAL
+  -- later columns (totp_last_counter, oidc_issuer, oidc_subject) are added by MIGRATIONS in db.py
 );
 CREATE TABLE IF NOT EXISTS teams (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,6 +150,27 @@ class Database:
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(SCHEMA)
             self._conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
+            self._migrate()
+        self.purge_audit()
+
+    def _table_columns(self, table: str) -> set[str]:
+        if table not in {t for t, _, _ in MIGRATIONS} | {"users"}:
+            raise ValueError(f"unknown table {table!r}")
+        # table is checked against the fixed MIGRATIONS allow-list above, never user input.
+        return {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}  # nosec B608
+
+    def _migrate(self) -> None:
+        """Apply MIGRATIONS idempotently (safe to run on every start, new or old databases)."""
+        with self._lock:
+            for table, column, decl in MIGRATIONS:
+                if column not in self._table_columns(table):
+                    # Identifiers and types come from the MIGRATIONS constant, never user input.
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")  # nosec B608
+            for sql in POST_MIGRATION_SQL:
+                self._conn.execute(sql)
+            self._conn.execute("UPDATE meta SET value=? WHERE key='schema_version' AND CAST(value AS INTEGER) < ?",
+                               (str(SCHEMA_VERSION), SCHEMA_VERSION))
+            self._user_columns = frozenset(self._table_columns("users"))
 
     # -- helpers -----------------------------------------------------------------
     @staticmethod
@@ -157,6 +197,14 @@ class Database:
         with self._lock:
             cur = self._conn.execute(sql, tuple(params))
             return cur.lastrowid if cur.lastrowid else cur.rowcount
+
+    def execute_count(self, sql: str, params: Iterable[Any] = ()) -> int:
+        """Run an UPDATE/DELETE and return the number of rows changed.
+
+        (execute() may return a stale lastrowid for non-INSERT statements, so use this when the
+        caller needs to know whether a conditional UPDATE matched.)"""
+        with self._lock:
+            return self._conn.execute(sql, tuple(params)).rowcount
 
     def transaction(self, statements: list[tuple[str, Iterable[Any]]]) -> None:
         with self._lock:
@@ -202,9 +250,12 @@ class Database:
         for k in ("prefs", "policy_overrides"):
             if k in fields and not isinstance(fields[k], str):
                 fields[k] = json.dumps(fields[k])
+        self._check_user_columns(fields)
         cols = ", ".join(fields)
         marks = ", ".join("?" for _ in fields)
-        return self.execute(f"INSERT INTO users({cols}) VALUES({marks})", list(fields.values()))
+        # Column names are checked against the users table's real columns (_check_user_columns);
+        # all values are bound parameters.
+        return self.execute(f"INSERT INTO users({cols}) VALUES({marks})", list(fields.values()))  # nosec B608
 
     def update_user(self, uid: int, **fields: Any) -> None:
         if not fields:
@@ -212,13 +263,28 @@ class Database:
         for k in ("prefs", "policy_overrides"):
             if k in fields and not isinstance(fields[k], str):
                 fields[k] = json.dumps(fields[k])
+        self._check_user_columns(fields)
         sets = ", ".join(f"{k}=?" for k in fields)
-        self.execute(f"UPDATE users SET {sets} WHERE id=?", [*fields.values(), uid])
+        # Column names are checked against the users table's real columns (_check_user_columns);
+        # all values are bound parameters.
+        self.execute(f"UPDATE users SET {sets} WHERE id=?", [*fields.values(), uid])  # nosec B608
+
+    def _check_user_columns(self, fields: dict) -> None:
+        """Allow-list the column names that create_user/update_user interpolate into SQL."""
+        bad = set(fields) - (self._user_columns - {"id"})
+        if bad:
+            raise ValueError(f"unknown or read-only user field(s): {sorted(bad)}")
 
     def user_teams(self, uid: int) -> list[dict]:
         return self.query("SELECT t.* FROM teams t JOIN team_members m ON m.team_id=t.id WHERE m.user_id=? ORDER BY t.name", (uid,))
 
     # -- audit -----------------------------------------------------------------------
+    def purge_audit(self, days: float = AUDIT_RETENTION_DAYS) -> int:
+        """Delete audit rows older than `days` days; return how many were removed (GW-23)."""
+        if days is None or days <= 0:
+            return 0
+        return self.execute_count("DELETE FROM audit WHERE ts < ?", (time.time() - 86400 * float(days),))
+
     def audit(self, action: str, *, user: dict | None = None, ip: str = "", target: str = "",
               detail: dict | None = None, ok: bool = True) -> None:
         self.execute(

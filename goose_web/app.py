@@ -3,15 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
+import socket
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 from starlette.applications import Starlette
+from starlette.datastructures import Headers
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -20,7 +24,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from . import __version__, api
 from .auth import AuthService
 from .config import Settings
-from .context import Ctx, HTTPError
+from .context import Ctx, HTTPError, _ip_in
 from .db import Database
 from .hub import Client, Hub
 from .profiles import Profiles
@@ -68,6 +72,93 @@ class SecurityHeaders:
         await self.app(scope, receive, wrapped)
 
 
+# ---------------------------------------------------------------------- Host allow-list (NEW-04)
+_WILDCARD_BINDS = {"", "0.0.0.0", "::", "*"}
+
+
+def host_only(value: str | None) -> str:
+    """The host part of a Host header (or a configured host): port removed, IPv6 brackets removed,
+    lower-cased, trailing dot removed. Returns "" for a malformed value."""
+    v = (value or "").strip().lower()
+    if not v:
+        return ""
+    if v.startswith("["):
+        end = v.find("]")
+        rest = v[end + 1:] if end > 0 else "x"
+        if end <= 1 or (rest and not (rest[0] == ":" and rest[1:].isdigit())):
+            return ""
+        return v[1:end]
+    if v.count(":") == 1:
+        v, _, port = v.partition(":")
+        if port and not port.isdigit():
+            return ""
+    # more than one ':' = a bare IPv6 literal (only meaningful in configuration values)
+    return v.rstrip(".") if v.count(":") <= 1 else v
+
+
+def allowed_hosts(settings: Settings) -> set[str]:
+    """Effective Host allow-list: public_url's host name, loopback names, the bind address (unless it is a
+    wildcard address) and server.allowed_hosts."""
+    out = {"localhost", "127.0.0.1", "::1"}
+    if settings.public_url:
+        try:
+            name = urlsplit(settings.public_url).hostname
+        except ValueError:
+            name = None
+        if name:
+            out.add(name.lower().rstrip("."))
+    bind = host_only(str(settings.get("server", "host") or ""))
+    if bind not in _WILDCARD_BINDS:
+        out.add(bind)
+    extra = settings.get("server", "allowed_hosts") or []
+    if isinstance(extra, str):
+        extra = extra.split(",")
+    for h in extra:
+        h = host_only(str(h))
+        if h:
+            out.add(h)
+    return out
+
+
+class HostGuard:
+    """Refuses HTTP and WebSocket requests whose Host is not on the allow-list (DNS rebinding).
+
+    X-Forwarded-Host is only looked at when the peer is a trusted proxy (the same rule `Ctx.allowed_origins`
+    uses before it honours that header); then it must be allow-listed as well. GET/HEAD /healthz is exempt
+    so container and load-balancer health checks work with any Host.
+    """
+
+    def __init__(self, app: ASGIApp, settings: Settings):
+        self.app = app
+        self.settings = settings
+        self.hosts = allowed_hosts(settings)
+
+    def host_ok(self, scope: Scope) -> bool:
+        headers = Headers(scope=scope)
+        if host_only(headers.get("host")) not in self.hosts:
+            return False
+        fwd = headers.get("x-forwarded-host")
+        if fwd is not None:
+            peer = (scope.get("client") or ("", 0))[0] or ""
+            if _ip_in(peer, self.settings.get("server", "trusted_proxies") or []):
+                return all(host_only(h) in self.hosts for h in fwd.split(","))
+        return True
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        if scope["type"] == "http" and scope.get("path") == "/healthz" and scope.get("method") in ("GET", "HEAD"):
+            return await self.app(scope, receive, send)
+        if self.host_ok(scope):
+            return await self.app(scope, receive, send)
+        bad = PlainTextResponse("invalid host", status_code=400)
+        if scope["type"] == "http":
+            return await bad(scope, receive, send)
+        if "websocket.http.response" in (scope.get("extensions") or {}):
+            return await WebSocket(scope, receive, send).send_denial_response(bad)
+        await send({"type": "websocket.close", "code": 1008, "reason": "invalid host"})
+
+
 async def index(request: Request):
     return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
 
@@ -94,9 +185,13 @@ async def ws_endpoint(websocket: WebSocket):
     c: Ctx = websocket.app.state.ctx
     origin = websocket.headers.get("origin")
     ident = None
-    token = websocket.query_params.get("token")
-    if token and not origin:
-        ident = c.auth.resolve_token(token)
+    # API tokens come only in the handshake's "Authorization: Bearer gwt_..." header, never in the URL (where
+    # access and proxy logs would record them). Browsers cannot set that header, and a token socket must not
+    # carry an Origin; browser sockets authenticate with the session cookie from an allowed Origin.
+    authz = websocket.headers.get("authorization") or ""
+    if authz:
+        if not origin and authz[:7].lower() == "bearer ":
+            ident = c.auth.resolve_token(authz[7:].strip())
     elif origin and origin in c.allowed_origins(websocket):
         ident = c.identity(websocket)
     if ident is None or ident.user["must_change_pw"]:
@@ -153,20 +248,105 @@ async def ws_endpoint(websocket: WebSocket):
 
 
 # ---------------------------------------------------------------------- notifications (webhooks)
+class WebhookBlocked(Exception):
+    """The webhook target is not an allowed destination (SSRF guard, GW-20)."""
+
+
+# Well-known NAT64 prefix: a "global" IPv6 address that reaches an embedded IPv4 address.
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def address_blocked(address: str) -> bool:
+    """True if `address` (an IP literal, optionally with an IPv6 %scope) must not receive webhooks.
+
+    Refuses loopback, private, link-local, reserved, multicast, unspecified and every other non-global
+    address (for example 100.64.0.0/10 carrier-grade NAT). IPv6 addresses that embed an IPv4 address
+    (IPv4-mapped, 6to4, Teredo, NAT64) are judged by the embedded IPv4 address as well. Anything that
+    cannot be parsed is blocked.
+    """
+    try:
+        ip = ipaddress.ip_address(str(address).split("%", 1)[0].strip("[]"))
+    except ValueError:
+        return True
+    candidates = [ip]
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        candidates = [ip.ipv4_mapped]   # ::ffff:a.b.c.d is a.b.c.d (Python versions classify the v6 form differently)
+    elif ip.version == 6:
+        if ip.sixtofour is not None:
+            candidates.append(ip.sixtofour)
+        if ip.teredo is not None:
+            candidates.extend(ip.teredo)
+        if ip in _NAT64:
+            candidates.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    for a in candidates:
+        if (a.is_loopback or a.is_private or a.is_link_local or a.is_reserved or a.is_multicast
+                or a.is_unspecified or not a.is_global):
+            return True
+    return False
+
+
+async def _resolve(host: str, port: int) -> list[str]:
+    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return list(dict.fromkeys(info[4][0] for info in infos))
+
+
+async def webhook_target(url: str, allow_private: bool = False) -> tuple[httpx.URL, str, str]:
+    """Validate a webhook URL and pin it to a resolved address.
+
+    Returns (url_with_ip, host_header, sni_hostname). Every address the host resolves to must pass
+    `address_blocked` unless `allow_private`; the request then goes to the checked address, so a DNS
+    answer that changes between the check and the connection (DNS rebinding) cannot redirect it.
+    """
+    try:
+        u = httpx.URL(url)
+    except (httpx.InvalidURL, TypeError, ValueError) as e:
+        raise WebhookBlocked(f"invalid URL: {e}") from None
+    if u.scheme not in ("http", "https") or not u.host:
+        raise WebhookBlocked("webhook must be an absolute http(s) URL")
+    port = u.port or (443 if u.scheme == "https" else 80)
+    try:
+        addresses = await _resolve(u.host, port)
+    except (OSError, UnicodeError) as e:
+        raise WebhookBlocked(f"cannot resolve {u.host}: {e}") from None
+    if not addresses:
+        raise WebhookBlocked(f"cannot resolve {u.host}")
+    if not allow_private:
+        bad = [a for a in addresses if address_blocked(a)]
+        if bad:
+            raise WebhookBlocked(f"{u.host} resolves to a non-public address ({', '.join(bad)}); "
+                                 "set notify.allow_private_targets to allow internal targets")
+    pinned = u.copy_with(host=addresses[0].split("%", 1)[0])
+    return pinned, u.netloc.decode("ascii"), u.host
+
+
+async def send_webhook(url: str, *, allow_private: bool = False, transport: httpx.AsyncBaseTransport | None = None,
+                       **kwargs) -> httpx.Response:
+    """POST to a user webhook after the SSRF checks. Redirects are never followed."""
+    pinned, host_header, sni = await webhook_target(url, allow_private)
+    headers = {**(kwargs.pop("headers", None) or {}), "Host": host_header}
+    # trust_env=False: an HTTP(S)_PROXY / ALL_PROXY from the environment would connect on our behalf and
+    # bypass the pinned, checked address.
+    async with httpx.AsyncClient(timeout=8, follow_redirects=False, transport=transport, trust_env=False) as client:
+        return await client.post(pinned, headers=headers, extensions={"sni_hostname": sni}, **kwargs)
+
+
 def make_event_handler(c: Ctx):
     async def post(url: str, event: str, agent: dict):
         title = {"needs_you": "Goose needs you", "done": "Goose finished", "error": "Goose hit an error"}[event]
         link = f"{c.settings.public_url}/#/chat/{agent['sessionId']}" if c.settings.public_url else ""
         msg = f"{agent.get('title') or agent['sessionId']}: {agent.get('lastText') or ''}"[:500]
+        allow_private = bool(c.settings.get("notify", "allow_private_targets"))
         try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                if "ntfy" in url:
-                    await client.post(url, content=msg.encode(), headers={
-                        "Title": title, "Tags": "goose", "Click": link,
-                        "Priority": "high" if event == "needs_you" else "default"})
-                else:
-                    await client.post(url, json={"event": event, "title": title, "message": msg, "url": link,
-                                                 "agent": agent})
+            if "ntfy" in url:
+                await send_webhook(url, allow_private=allow_private, content=msg.encode(), headers={
+                    "Title": title, "Tags": "goose", "Click": link,
+                    "Priority": "high" if event == "needs_you" else "default"})
+            else:
+                await send_webhook(url, allow_private=allow_private,
+                                   json={"event": event, "title": title, "message": msg, "url": link,
+                                         "agent": agent})
+        except WebhookBlocked as e:
+            log.warning("webhook refused for %s: %s", agent.get("username"), e)
         except httpx.HTTPError as e:
             log.info("webhook failed for %s: %s", agent.get("username"), e)
 
@@ -251,6 +431,7 @@ def create_app(settings: Settings) -> Starlette:
     app = Starlette(routes=routes, lifespan=lifespan,
                     exception_handlers={HTTPError: http_error, 404: not_found, 500: server_error,
                                         ValueError: _bad_request})
+    app.add_middleware(HostGuard, settings=settings)   # innermost: its 400 still gets the security headers
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     app.add_middleware(SecurityHeaders, hsts=settings.public_url.startswith("https://"))
     return app

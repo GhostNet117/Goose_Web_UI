@@ -1,8 +1,8 @@
 # Configuration reference
 
 This page covers every setting goose-web reads, where it comes from, and the scripts that install it. The REST and
-WebSocket contract is in [API.md](API.md). The security implications are in
-[SECURITY-ASSESSMENT.md](SECURITY-ASSESSMENT.md).
+WebSocket contract is in [API.md](API.md). The security implications (threat model, findings GW-01 to GW-38 and
+NEW-01 to NEW-10, hardening checklist) are in [SECURITY-ASSESSMENT.md](SECURITY-ASSESSMENT.md).
 
 ## 1. Precedence
 
@@ -37,6 +37,8 @@ Other environment variables:
 | `GOOSE_WEB_LOG_LEVEL` | `__main__.py: _setup_logging` | log level, default `INFO` |
 | `GOOSE_WEB_ADMIN` | `docker/entrypoint.sh` | admin username at first container start (default `admin`) |
 | `GOOSE_WEB_NATIVE_ROOT` | `docker/entrypoint.sh` | admin profile folder at first start (default `fresh`) |
+| `GOOSE_WEB_ADMIN_PASSWORD_FILE` | `docker/entrypoint.sh` | file with the initial admin password, for example a compose secret `/run/secrets/...` (first start only; preferred) |
+| `GOOSE_WEB_ADMIN_PASSWORD` | `docker/entrypoint.sh` | the initial admin password itself (first start only). Plain environment variables are visible in `docker inspect`, so prefer the `_FILE` variant. Without either, a random password is generated and printed to the container log once. Both variables are removed from the environment before the gateway starts |
 | `GOOSE_WEB_UNELEVATED` | `winsec.py` | internal guard set during the de-elevation relaunch; do not set it |
 
 ## 2. config.yaml keys and defaults
@@ -48,6 +50,7 @@ server:
   public_url: ""
   trusted_proxies: ["127.0.0.1", "::1"]
   allowed_origins: []
+  allowed_hosts: []
   max_upload_mb: 25
   allow_elevated: false
 paths:
@@ -66,6 +69,8 @@ auth:
   lockout_threshold: 8
   lockout_minutes: 15
   min_password_length: 10
+notify:
+  allow_private_targets: false
 host_tasks:
   enabled: true
   path_filter: "\\*"
@@ -75,9 +80,10 @@ host_tasks:
 |---|---|---|
 | `server.host` | `127.0.0.1` | Listen address. Use the LAN IP when a reverse proxy on another host connects. |
 | `server.port` | `8710` | Listen port. |
-| `server.public_url` | `""` | External URL, for example `https://goose.example.org`. It is always an allowed Origin. When it starts with `https://` the session cookie becomes `__Host-gw` with Secure, and HSTS is sent. It is also the OIDC redirect base and the link in webhook messages. |
-| `server.trusted_proxies` | `["127.0.0.1", "::1"]` | IPs or CIDRs whose `X-Forwarded-For` (rightmost entry), `X-Forwarded-Proto` and `X-Forwarded-Host` are trusted. |
-| `server.allowed_origins` | `[]` | Extra Origins accepted for the WebSocket and for cookie-authenticated writes. `public_url` and the request's own `scheme://Host` are always accepted. |
+| `server.public_url` | `""` | External URL, for example `https://goose.example.org`. When it is set, the allowed Origins are its origin plus `server.allowed_origins`, and the request's own Host is **not** used. Its host name is always on the Host allow-list. When it starts with `https://` the session cookie becomes `__Host-gw` with Secure, and HSTS is sent. It is the OIDC redirect base (**OIDC sign-in is refused without it**, `oidc_needs_public_url`) and the link in webhook messages. |
+| `server.trusted_proxies` | `["127.0.0.1", "::1"]` | IPs or CIDRs whose `X-Forwarded-For` (rightmost entry), `X-Forwarded-Proto` and `X-Forwarded-Host` are trusted. A trusted `X-Forwarded-Host` must also be on the Host allow-list. |
+| `server.allowed_origins` | `[]` | Extra Origins (`scheme://host[:port]`) accepted for the WebSocket and for cookie-authenticated writes. Without `public_url`, the request's own `scheme://Host` is accepted as well (its Host has passed the allow-list). With `public_url` set, direct access under another address, for example `http://192.168.1.10:8710` or `http://127.0.0.1:8710`, works only if that origin is listed here. |
+| `server.allowed_hosts` | `[]` | Extra host names or IPs (no ports, no wildcards) accepted in the `Host` header. This guards against DNS rebinding (`app.py: HostGuard`). Always allowed: the `public_url` host, `localhost`, `127.0.0.1`, `::1`, and `server.host` unless it is `0.0.0.0` or `::`. Other Host values get `400 invalid host`, and `GET /healthz` is exempt. Environment: `GOOSE_WEB__SERVER__ALLOWED_HOSTS=goose,192.168.1.10` (comma separated) or a YAML list. |
 | `server.max_upload_mb` | `25` | Size limit per uploaded file (`/api/fs/upload`, at most 20 files per request). |
 | `server.allow_elevated` | `false` | If true, the gateway runs with an elevated token (Windows) or as root (POSIX) instead of refusing. Leave it false. |
 | `paths.profiles_root` | `C:\Goose_Web_Profiles` (Windows), `$GOOSE_WEB_PROFILES` or `/var/lib/goose-web/profiles` | Parent of all isolated profiles and of `_system`. |
@@ -93,11 +99,18 @@ host_tasks:
 | `auth.lockout_threshold` | `8` | Failed passwords before a lockout. |
 | `auth.lockout_minutes` | `15` | Lockout duration. |
 | `auth.min_password_length` | `10` | Minimum length for new passwords. |
+| `notify.allow_private_targets` | `false` | Personal notification webhooks may only reach public internet addresses. Every resolved address is checked. Loopback, private, link-local, CGNAT, reserved, multicast and unspecified targets (including IPv4 embedded in IPv6) are refused, both when the webhook is saved (`400 webhook_blocked`) and when it is sent. Requests go to the checked IP, never follow redirects and ignore proxy environment variables. Set `true` only if users really need internal targets, such as a self-hosted ntfy on the LAN. |
 | `host_tasks.enabled` | `true` | Turns the admin host-task view on or off (Windows only). |
 | `host_tasks.path_filter` | `\*` | Task Scheduler folder filter. `\Microsoft\*` is always excluded. |
 
 Fixed limits (not configurable): 2 MiB JSON bodies, 64 MiB WebSocket frames, 12 MiB live buffer per session,
-256 MiB total, login limits of 40 attempts per 5 minutes per IP and 10 per 5 minutes per IP+username.
+256 MiB total, login limits of 40 attempts per 5 minutes per IP and 10 per 5 minutes per IP+username (wrong TOTP
+codes count toward the account lockout like wrong passwords), worker logs rotated at 10 MiB with 3 backups (checked
+before each worker start), audit rows kept for 365 days (older rows are deleted at startup).
+
+API tokens (Settings > Account > API tokens) are sent as `Authorization: Bearer gwt_...`, for REST calls and for
+the `/ws` handshake of non-browser clients. They are never accepted in a URL. A user's tokens are revoked when the
+password is changed, set or reset, and when the account is disabled. See [API.md](API.md).
 
 ## 3. Command line
 
@@ -105,11 +118,11 @@ Fixed limits (not configurable): 2 MiB JSON bodies, 64 MiB WebSocket frames, 12 
 
 | Command | Flags | What it does |
 |---|---|---|
-| `serve` | `--host`, `--port` | Runs the gateway. It first checks the token (`winsec.ensure_unelevated`): when elevated on Windows it relaunches itself with a normal-user, Medium-integrity token, and on POSIX it refuses to run as root (exit 3). Logs go to `<system_dir>/logs/gateway.log` (5 MB x 5) and to stderr. |
-| `init` | `--admin NAME` (default: current OS user), `--password` (default `ChangeMe`), `--native-root auto\|fresh\|PATH` (default `auto`), `--force` | Creates the database and the first admin (local, `must_change_pw`, profile mode `native`), creates the team **Everyone** and makes it the default team. `auto` uses Goose's default profile folder if it has a `config` subfolder, otherwise `fresh` (`<profiles_root>/appdata` with `config/`, `data/`, `state/`). A path ending in `config` is accepted and its parent is used. Without `--force`, an existing database is left as it is. |
+| `serve` | `--host`, `--port` (a `--host` value also joins the Host allow-list) | Runs the gateway. It first checks the token (`winsec.ensure_unelevated`): when elevated on Windows it relaunches itself with a normal-user, Medium-integrity token, and on POSIX it refuses to run as root (exit 3). Logs go to `<system_dir>/logs/gateway.log` (5 MB x 5) and to stderr. |
+| `init` | `--admin NAME` (default: current OS user), `--password PW`, `--password-file FILE` (first line of FILE, `-` = stdin), `--native-root auto\|fresh\|PATH` (default `auto`), `--force` | Creates the database and the first admin (local, `must_change_pw`, profile mode `native`), creates the team **Everyone** and makes it the default team. Without `--password`/`--password-file` it generates a **random 20-character initial password and prints it once**. Only its hash is stored and it is not shown again. If you lose it, run `user reset`. A given password that is weak only triggers a warning, because it must be changed at first sign-in anyway. `auto` uses Goose's default profile folder if it has a `config` subfolder, otherwise `fresh` (`<profiles_root>/appdata` with `config/`, `data/`, `state/`). A path ending in `config` is accepted and its parent is used. Without `--force`, an existing database is left as it is. |
 | `user list` | | Lists users. |
 | `user add NAME` | `--password`, `--admin` | Creates a local user (temporary password printed if none is given, change forced). |
-| `user reset NAME` | `--password` | Sets a temporary password, forces a change, unlocks the account, switches it to local auth and signs it out everywhere. |
+| `user reset NAME` | `--password` | Sets a temporary password (printed), forces a change, unlocks the account, switches it to local auth, signs it out everywhere and revokes its API tokens. Use it if the initial admin password is lost. |
 | `check` | | Diagnostics: version, config file, goose binary and version, OS user and integrity (fails if elevated), profiles root, Goose Desktop running (Windows), whether the port is free. Exit code 1 if something is wrong. |
 | `version` | | Prints the version. |
 
@@ -124,8 +137,8 @@ Admins change these in the UI (Admin > Settings / Sign-in). They are stored in t
 | `default_team_id` | the Everyone team | Team for users created in the admin UI without explicit teams. Users auto-created by LDAP/OIDC join only their mapped teams. |
 | `brand` | `{name: "Goose Web", tagline: ...}` | `name`, `tagline`, `machine` (shown in Herd). |
 | `session_hours` | config `auth.session_hours` | 1 to 720. |
-| `allow_self_totp` | `true` | Stored and shown in the UI. Note: `/api/me/totp/setup` does not currently check it. |
-| `require_totp_admins` | `false` | Admins cannot turn off their TOTP. It does not force enrolment. |
+| `allow_self_totp` | `true` | When false, non-admins cannot set up or enable TOTP themselves (`403 totp_self_disabled`). Admins can always enrol. |
+| `require_totp_admins` | `false` | Admins cannot turn off their TOTP. It can only be switched on by an admin who already uses TOTP (`409 totp_needed_first`). The login response and `/api/me` report `totpEnrolmentRequired` for an admin without TOTP. Enrolment is not yet forced at sign-in. |
 | `peers` | `[]` | Herd peers: `{name, url, token, verifyTls}` (max 50). The gateway calls `<url>/api/herd` with `Bearer <token>`. Tokens are masked in reads. |
 | `auth` | see below | Sign-in methods. |
 
@@ -144,9 +157,10 @@ stored value.
 | `ldap.adminGroupDn` | `""` | `memberOf` value that makes the user an admin (native admins are never demoted). |
 | `ldap.groupTeamMap` | `{}` | `{groupDn: teamId}`. |
 | `ldap.startTls` | `false` | StartTLS on `ldap://`. |
-| `ldap.caFile` | `""` | CA bundle. TLS with certificate checking is used for `ldaps://`, `startTls` or `caFile`; otherwise the bind is in clear text. |
+| `ldap.caFile` | `""` | CA bundle for a private CA. TLS uses certificate checking (`CERT_REQUIRED`). |
+| `ldap.allowInsecure` | `false` | A plain `ldap://` URL without `startTls` is refused when the settings are saved (`400 bad_config`) and at sign-in (`503 ldap_insecure`, no bind is attempted), because it would send passwords in clear text. Setting this to `true` (admin UI checkbox "Allow unencrypted LDAP (not recommended)") allows it anyway. |
 | `ldap.autoCreate` | `true` | Create users at their first sign-in. |
-| `oidc[]` | `[]` | Providers: `id` (safe name), `label`, `issuer` (discovery at `<issuer>/.well-known/openid-configuration`), `clientId`, `clientSecret`, `scopes` (default `openid profile email`), `adminClaim`, `adminValue` (if empty, the claim must be `true`), `teamClaim` (matched against team names), `autoCreate` (default true), `stripDomain` (default true: `alice@x` becomes `alice`). Redirect URI: `<public_url>/api/auth/oidc/<id>/callback`. |
+| `oidc[]` | `[]` | Providers: `id` (safe name), `label`, `issuer` (discovery at `<issuer>/.well-known/openid-configuration`), `clientId`, `clientSecret`, `scopes` (default `openid profile email`), `adminClaim`, `adminValue` (if empty, the claim must be `true`), `teamClaim` (matched against team names), `autoCreate` (default true), `stripDomain` (default true: `alice@x` becomes `alice`). Redirect URI: `<public_url>/api/auth/oidc/<id>/callback`. **Needs `server.public_url`.** An OIDC account is bound to the issuer + subject (`sub`) of its first sign-in. Existing unbound OIDC users are bound at their next sign-in. Another identity for the same name gets `oidc_conflict`, and local and LDAP accounts with that name are never taken over. |
 
 ## 5. Policies and teams
 
@@ -223,7 +237,11 @@ Every ACP method a non-admin sends goes through `policy.check`. Methods that are
 - Not relocatable by `GOOSE_PATH_ROOT`: home-folder skill and recipe folders such as `~/.agents/skills` and
   `~/.agents/recipes` are shared by every profile on the machine.
 - Usernames: letters, digits, `.`, `_`, `-`, starting with a letter or digit, up to 64 characters, no Windows device
-  names. Avoid `appdata` and `workspace` (see SECURITY-ASSESSMENT GW-04).
+  names. Reserved names are refused (case-insensitive): `appdata`, `workspace`, `_system`, `_deleted`, `library`,
+  `backups`, `logs` (see [SECURITY-ASSESSMENT.md](SECURITY-ASSESSMENT.md) GW-04).
+- Uploaded file names are sanitised (last path component only, no Windows-invalid characters, no trailing dots or
+  spaces, device names such as `CON` get a `_` prefix). An existing file is never overwritten: the upload is saved as
+  `name (1).ext`, `name (2).ext` and so on.
 
 ## 7. Scheduler ownership
 
@@ -238,9 +256,10 @@ Every ACP method a non-admin sends goes through `policy.check`. Methods that are
 
 In `auto` mode the monitor checks every 15 seconds (Desktop detection is cached for 20 s). When Desktop starts or
 stops, it restarts the native worker once no run is active, which hands the scheduler over. Desktop counts as
-running when a `goose.exe` process exists whose image path does not end in `\resources\bin\goose.exe` (Windows only;
-on other systems `auto` behaves like `on`). If your goose CLI lives elsewhere, for example
-`%USERPROFILE%\.local\bin\goose.exe`, the gateway's own workers match that rule, so set `on` or `off` explicitly.
+running when a `goose.exe` process exists that is not a CLI binary (Windows only; on other systems `auto` behaves
+like `on`). A process counts as a CLI binary if its image path ends in `\resources\bin\goose.exe`, if it is the
+configured `goose.binary`, or if there is no `resources\app.asar` next to it. If the detection itself fails, the
+gateway logs the error and treats Desktop as running, so the scheduler never runs twice.
 
 Profiles that have jobs in `data/schedule.json` and own their scheduler are started even when nobody is connected,
 are not stopped when idle, and are restarted with backoff (up to 5 minutes) after a crash.
@@ -249,11 +268,11 @@ are not stopped when idle, and are restarted with backoff (up to 5 minutes) afte
 
 | Script | Run as | What it does |
 |---|---|---|
-| `scripts/install.ps1` | the normal Windows user, **not elevated** (it exits with code 3 when elevated unless `-AllowElevated`) | Creates `.venv` (uv, else `py -3`/`python -m venv`) and installs the package. Finds the Goose profile: `-GooseAppData`, else `%APPDATA%\Block\goose` if it has `config\`, else asks (Enter = fresh, `<ProfilesRoot>\appdata`). Writes `<ProfilesRoot>\_system\config.yaml` only if it is missing. Runs `init --admin <-Admin> --native-root <profile>` (password `ChangeMe`, forced change), then `check`, then `register-service.ps1` through one elevation prompt. Parameters: `-ProfilesRoot` (`C:\Goose_Web_Profiles`), `-GooseAppData`, `-BindHost` (`127.0.0.1`), `-Port` (8710), `-PublicUrl`, `-TrustedProxy` (added to loopback), `-FirewallRemoteAddress` (`LocalSubnet`), `-TaskPath` (`\GooseWeb\`), `-Admin` (`%USERNAME%`), `-NoService`, `-NonInteractive`, `-AllowElevated`. It never writes into the Goose profile folder. |
+| `scripts/install.ps1` | the normal Windows user, **not elevated** (it exits with code 3 when elevated unless `-AllowElevated`) | Creates `.venv` (uv, else `py -3`/`python -m venv`), installs the dependencies from `requirements.lock` with `--require-hashes`, then the package with `--no-deps`. Finds the Goose profile: `-GooseAppData`, else `%APPDATA%\Block\goose` if it has `config\`, else asks (Enter = fresh, `<ProfilesRoot>\appdata`). Writes `<ProfilesRoot>\_system\config.yaml` only if it is missing, and restricts the profiles root ACL to the installing user, SYSTEM and Administrators. Runs `init --admin <-Admin> --native-root <profile>` (random initial password, **shown once at the end of the installer output**, forced change at first sign-in; an existing installation keeps its password), then `check`, then `register-service.ps1` through one elevation prompt. Parameters: `-ProfilesRoot` (`C:\Goose_Web_Profiles`), `-GooseAppData`, `-BindHost` (`127.0.0.1`), `-Port` (8710), `-PublicUrl`, `-TrustedProxy` (added to loopback), `-FirewallRemoteAddress` (`LocalSubnet`), `-TaskPath` (`\GooseWeb\`), `-Admin` (`%USERNAME%`), `-NoService`, `-NonInteractive`, `-AllowElevated`. It never writes into the Goose profile folder. |
 | `scripts/register-service.ps1` | elevated | Registers the logon task and the firewall rule (section 9). Parameters: `-User`, `-InstallDir`, `-ConfigPath` (required), `-Port`, `-TaskPath`, `-TaskName` (`GooseWeb_Gateway`), `-FirewallRemoteAddress` (comma separated, `LocalSubnet`), `-NoFirewall`, `-NoTask`. |
 | `scripts/uninstall.ps1` | elevated | Stops and removes the task and the firewall rule (`-Port`, `-TaskPath`, `-TaskName`). Profiles, database and logs are kept. |
 | `scripts/start-gateway.cmd` | the normal user | Runs `.venv\Scripts\python.exe -m goose_web <args> serve` in the foreground. Pass `--config FILE` or set `GOOSE_WEB_CONFIG`. |
-| `scripts/install.sh` | the normal user, **not root** | Linux/macOS. Needs `goose` on `PATH`. Creates `.venv`, installs, writes `<profiles-root>/_system/config.yaml` if missing (with `goose.binary` set), runs `chmod 700` on the profiles root, then `init --admin $USER` and `check`. Options: `--profiles-root` (`~/.local/share/goose-web`), `--goose-appdata DIR\|fresh` (default `auto`; an existing `~/.config/goose` is not picked up because it has no `config/` subfolder, so the admin starts fresh in `<root>/appdata`), `--host`, `--port`, `--public-url`, `--trusted-proxy` (repeatable), `--systemd` (user unit `goose-web.service`, `Restart=on-failure`, `NoNewPrivileges=yes`; run `loginctl enable-linger $USER` to start it at boot). |
+| `scripts/install.sh` | the normal user, **not root** | Linux/macOS. Needs `goose` on `PATH`. Creates `.venv`, installs the dependencies from `requirements.lock` with `--require-hashes` and then the package with `--no-deps`, writes `<profiles-root>/_system/config.yaml` if missing (with `goose.binary` set), runs `chmod 700` on the profiles root, then `init --admin $USER` (random initial password, **shown once at the end**, forced change) and `check`. Options: `--profiles-root` (`~/.local/share/goose-web`), `--goose-appdata DIR\|fresh` (default `auto`; an existing `~/.config/goose` is not picked up because it has no `config/` subfolder, so the admin starts fresh in `<root>/appdata`), `--host`, `--port`, `--public-url`, `--trusted-proxy` (repeatable), `--systemd` (user unit `goose-web.service`, `Restart=on-failure`, `NoNewPrivileges=yes`; run `loginctl enable-linger $USER` to start it at boot). |
 
 ## 9. Windows service model
 
@@ -277,12 +296,18 @@ lists the host's scheduled tasks with an elevation warning (`hosttasks.elevation
 
 ## 10. Docker
 
-`docker/compose.yaml` builds `docker/Dockerfile` (Python 3.13 slim, goose CLI `GOOSE_VERSION` 1.57.0 from the
-official release) and sets these through environment variables: `HOST=0.0.0.0`, `PORT=8710`, `PROFILES_ROOT=/data`,
-`BINARY=/usr/local/bin/goose`, `NATIVE_SCHEDULER=on`, `DEFAULT_WORKDIR_NATIVE=/data/workspace`, and
-`GOOSE_DISABLE_KEYRING=1`. On first start, `entrypoint.sh` runs `init --admin ${GOOSE_WEB_ADMIN:-admin}
---native-root ${GOOSE_WEB_NATIVE_ROOT:-fresh}`. The admin is `admin` / `ChangeMe` (forced change), with the profile
-in `/data/appdata`. Add `GOOSE_WEB__SERVER__PUBLIC_URL` and `GOOSE_WEB__SERVER__TRUSTED_PROXIES` for a reverse
-proxy. Hardening already in compose: non-root uid 1000, `read_only: true`, tmpfs `/tmp` and `/home/goose`,
+`docker/compose.yaml` builds `docker/Dockerfile` (Python 3.13 slim, pinned by digest; goose CLI `GOOSE_VERSION` 1.57.0
+from the official release, verified against `GOOSE_SHA256_AMD64` / `GOOSE_SHA256_ARM64`; Python dependencies from
+`requirements.lock` with `--require-hashes`). To update goose, change `GOOSE_VERSION` and both checksums together
+and rebuild; a mismatch fails the build. The image sets these through `GOOSE_WEB__...` environment variables:
+`HOST=0.0.0.0`, `PORT=8710`, `PROFILES_ROOT=/data`, `BINARY=/usr/local/bin/goose`, `NATIVE_SCHEDULER=on`,
+`DEFAULT_WORKDIR_NATIVE=/data/workspace`, and `GOOSE_DISABLE_KEYRING=1`. On first start, `entrypoint.sh` runs
+`init --admin ${GOOSE_WEB_ADMIN:-admin} --native-root ${GOOSE_WEB_NATIVE_ROOT:-fresh}`. The admin is `admin`, with
+the profile in `/data/appdata`. Its random initial password is printed to the container log **once**, on the first
+start only (`docker compose -f docker/compose.yaml logs goose-web`). Alternatively, preset it with
+`GOOSE_WEB_ADMIN_PASSWORD_FILE` (for example a compose secret) or `GOOSE_WEB_ADMIN_PASSWORD`. Either way it must
+be changed at first sign-in. Add `GOOSE_WEB__SERVER__PUBLIC_URL` and `GOOSE_WEB__SERVER__TRUSTED_PROXIES` for a
+reverse proxy. Because the bind address is `0.0.0.0`, the Host allow-list holds only `localhost`, `127.0.0.1`, `::1`
+and the `public_url` host. Add any other name or IP users open with `GOOSE_WEB__SERVER__ALLOWED_HOSTS`. Hardening already in compose: non-root uid 1000, `read_only: true`, tmpfs `/tmp` and `/home/goose`,
 `cap_drop: [ALL]`, `no-new-privileges:true`, `pids_limit: 1024`, `mem_limit: 4g`, and the port published on
 `127.0.0.1` only.
