@@ -218,21 +218,23 @@ class WorkerManager:
         self.log_dir = settings.system_dir / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._desktop = False
-        self._desktop_checked = 0.0
+        self._desktop_checked = float("-inf")   # monotonic time of the last check
         self.on_restart = None       # async callback(worker) set by the hub
         self.activity = None         # callable(key) -> (clients, active_runs) set by the hub
         self._monitor_task: asyncio.Task | None = None
 
     # ---------------------------------------------------------- scheduler ownership
     def desktop_running(self, max_age: float = 20.0) -> bool:
-        if time.time() - self._desktop_checked > max_age:
+        # max_age <= 0 always re-checks: on Windows before Python 3.13 the clock has ~15.6 ms resolution,
+        # so two calls in the same tick would otherwise see an age of 0 and reuse the cached answer
+        if max_age <= 0 or time.monotonic() - self._desktop_checked > max_age:
             try:
                 self._desktop = desktop_running(self.s.goose_binary)
             except Exception:  # pragma: no cover
                 # Fail SAFE: if detection breaks, assume Desktop is running so its scheduler is never doubled.
                 log.exception("Goose Desktop detection failed; assuming it is running")
                 self._desktop = True
-            self._desktop_checked = time.time()
+            self._desktop_checked = time.monotonic()
         return self._desktop
 
     def wants_scheduler(self, w: Worker) -> tuple[bool, str]:
