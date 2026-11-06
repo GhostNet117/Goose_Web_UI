@@ -1022,7 +1022,8 @@ To turn it on:
 
 From then on, sign-in asks for a code. To turn it off, click **Disable** and confirm with your password.
 Your administrator can turn off self-service two-factor for non-administrators, and can require it for
-administrator accounts. See [ADMINISTRATION.md](ADMINISTRATION.md).
+administrator accounts. See [ADMINISTRATION.md](ADMINISTRATION.md). If you lose your phone, an administrator can
+reset your two-factor so you can sign in with your password and set it up again (see the FAQ).
 
 **Active sign-ins**: every browser where you are signed in, with device, address, sign-in time and last activity.
 The current browser is marked "this browser". Click **Revoke** to sign out another one.
@@ -1109,7 +1110,10 @@ Your policy does not allow changes there. See [section 15](#15-what-your-policy-
 Goose only allows app tool calls in `auto` mode. Switch the chat to `auto` if you trust the app.
 
 **I lost my two-factor device. What now?**
-Ask an administrator to help you regain access. See [ADMINISTRATION.md](ADMINISTRATION.md).
+Ask an administrator to reset your two-factor (Admin > Users > Reset two-factor). You are signed out
+everywhere and your API tokens are revoked; then you sign in with your password alone. Set up two-factor again
+with your new phone straight away (Settings > Account > Two-factor authentication). Administrators: see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#lost-authenticator).
 
 **The connection indicator says "Goose down". What do I do?**
 Wait a moment: the server restarts your agent automatically. If it stays down, see

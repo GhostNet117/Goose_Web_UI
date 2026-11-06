@@ -36,8 +36,8 @@ it, on a desktop or a phone.
   providers, models and folders, and concurrency limits. Team recipes, skills, extensions and providers are
   provisioned into members' profiles.
 - **Shared goosehints library**: hints documents assigned to users or teams, combined with personal hints.
-- **Sign-in**: local accounts, LDAP/Active Directory, OpenID Connect, optional TOTP two-factor, API tokens for
-  automation.
+- **Sign-in**: local accounts, LDAP/Active Directory, OpenID Connect, optional TOTP two-factor (admins can reset it
+  when a user loses their authenticator), API tokens for automation.
 - **Audit log** of sign-ins, admin changes, impersonation and sensitive agent calls.
 - **Herd dashboard** (inspired by [herdr.dev](https://herdr.dev)): every live agent with its status (working,
   needs you, done, error), so you see which agent needs you. Agents keep running after you close the tab, because

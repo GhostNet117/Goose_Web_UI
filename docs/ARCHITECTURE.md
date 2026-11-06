@@ -135,7 +135,7 @@ The main ideas:
 |---|---|
 | `index.html` | Shell page: theme stylesheets, `modulepreload` of `js/app.js`, boot spinner. |
 | `manifest.webmanifest` | PWA manifest. |
-| `sw.js` | Service worker (`gw-shell-v6`): offline shell, network-first for app code, cache-first for vendor files. |
+| `sw.js` | Service worker (`gw-shell-v7`): offline shell, network-first for app code, cache-first for vendor files. |
 | `css/app.css` | All styles and themes. |
 | `icons/` | `goose.svg`, `goose-maskable.svg`. |
 | `vendor/` | Vendored libraries (marked, DOMPurify, highlight.js, qrcode-generator) with `README.md` and `SHA256SUMS`. |
@@ -1041,7 +1041,7 @@ data:
 - **Install** pre-caches the shell list on a best-effort basis and calls
   `skipWaiting()`.
 - **Activate** deletes every cache whose name is not the current `VERSION`
-  (`gw-shell-v6`) and claims open clients.
+  (`gw-shell-v7`) and claims open clients.
 - **notificationclick** focuses an open window, or opens one, at
   `/#/chat/<sessionId>` or `/#/herd`.
 
@@ -1305,6 +1305,13 @@ lists the mechanisms.
   - `require_totp_admins` forces admins to enrol, and the SPA reports
     `totpEnrolmentRequired`. An admin can only turn it on after enrolling
     themselves (`409 totp_needed_first`).
+- **Admin reset (lost authenticator).** `api.admin_user_reset_totp`
+  (`POST /api/admin/users/{id}/reset-totp`) and the CLI `user reset-totp`
+  clear `totp_enabled`, `totp_secret`, `totp_last_counter`, the failure
+  counter and the lock, delete the user's sessions and API tokens, and audit
+  `user.totp.reset`. It is refused for the caller's own account (`400 self`),
+  so a stolen admin session cannot drop its owner's second factor without the
+  password (self-disable checks it).
 
 ### 12.5 External identity
 
@@ -1665,7 +1672,7 @@ location) and disables the cache plugin.
 | `tests/test_policy.py` | Admin bypass, forced `session/new` client metadata, cwd outside roots, unknown method denied, extension permissions, mode/model allow-lists, sources by type, config read allow-list, team merge, shell tool calls by name prefix, reserved usernames. |
 | `tests/test_profiles.py` | Isolated layout and base extensions, team items and secrets, library listing, native scheduler yielding to Goose Desktop. |
 | `tests/test_hub.py` | A `FakeAgent` WebSocket server (`initialize`, `session/new`, `session/load`, `session/prompt`). Tests: a run survives a tab disconnect and is replayed, policy denial, the second answer to an ask loses, idle replay only while unchanged elsewhere, the watcher announces external changes. |
-| `tests/test_auth_hardening.py` | TOTP replay and lockout, TOTP settings, OIDC subject binding and takeover protection, LDAP plaintext refusal, token revocation on reset, disable and password change, column and link-table allow-lists, audit purge, additive migration of a legacy database. |
+| `tests/test_auth_hardening.py` | TOTP replay and lockout, TOTP settings, OIDC subject binding and takeover protection, LDAP plaintext refusal, token revocation on reset, disable and password change, admin and CLI two-factor reset, column and link-table allow-lists, audit purge, additive migration of a legacy database. |
 | `tests/test_platform_hardening.py` | Generated admin password and one-time printing, `init` password options, path containment including symlink escapes, `address_blocked`, webhook pinning and no redirects, log rotation, vendored file checksums, hashed lock file covering `pyproject.toml`, Dockerfile download verification, SHA-pinned actions. |
 | `tests/test_release_fixes.py` | Regression tests for the `NEW-nn` findings: WebSocket token only in the header and never with `Origin`, Host allow-list and `HostGuard` (including WebSockets and forwarded hosts), allowed origins with and without `public_url`, OIDC requires `public_url`, `tools/call` prefix matching, upload name sanitising and exclusive create, download headers, app frame CSP and policy check, webhook validation at save time, `trust_env=False`, CLI reset revokes tokens, vendored files not EOL-converted. |
 | `tests/test_api.py` | Helpers of the apps frame endpoint (HTML extraction from resource contents). |

@@ -82,6 +82,10 @@ function usersTab(body) {
           try { const r = await POST('/api/admin/users/' + encodeURIComponent(u.id) + '/reset-password', {}); showSecretOnce('Temporary password', 'password', r.tempPassword); load(); } catch (e) { toastError(e); }
         } },
         { label: 'Unlock', icon: 'lock', onClick: async () => { try { await POST('/api/admin/users/' + encodeURIComponent(u.id) + '/unlock', {}); toast('Unlocked', { kind: 'success' }); load(); } catch (e) { toastError(e); } } },
+        { label: 'Reset two-factor', icon: 'shield', hidden: !u.totpEnabled || u.id === (store.get('me').user || {}).id, onClick: async () => {
+          if (!(await confirmDialog({ title: 'Reset two-factor for ' + u.username + '?', message: 'Use this when the user lost their authenticator. Two-factor is removed, the account is unlocked, all of their sessions end and their API tokens are revoked. They sign in with their password only and should enrol a new authenticator straight away.', confirmText: 'Reset two-factor', danger: true }))) return;
+          try { const r = await POST('/api/admin/users/' + encodeURIComponent(u.id) + '/reset-totp', {}); toast('Two-factor removed for ' + u.username + (r.tokensRevoked ? ' (' + r.tokensRevoked + ' API token(s) revoked)' : ''), { kind: 'success' }); load(); } catch (e) { toastError(e); }
+        } },
         { label: 'Re-provision profile', icon: 'refresh', onClick: async () => {
           try { const r = await POST('/api/admin/users/' + encodeURIComponent(u.id) + '/provision', {}); modal({ title: 'Provisioned ' + u.username, body: h('div', { class: 'stack' }, (r.changes || []).length ? h('ul', { class: 'plain-list small' }, ...r.changes.map((c) => h('li', null, typeof c === 'string' ? c : prettyJson(c)))) : h('div', { class: 'muted' }, 'No changes needed.'), r.restartPending ? banner('info', 'The worker restarts when the user is idle.') : null) }); } catch (e) { toastError(e); }
         } },

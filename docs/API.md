@@ -97,6 +97,7 @@ is a number.
 | GET/POST | `/api/admin/users` | POST `{username, displayName?, email?, role:"user"\|"admin", password?, mustChangePassword?:true, teams:[id], hints:[id], profileMode:"isolated"\|"native", authSource:"local"\|"ldap"\|"oidc"}` → `{user, tempPassword?}` |
 | GET/PATCH/DELETE | `/api/admin/users/{id}` | PATCH accepts any of the POST fields plus `disabled`, `policyOverrides`. Disabling a user or setting a password revokes the user's sessions and API tokens. DELETE `?purgeProfile=1` deletes the profile folder; otherwise the folder is renamed to `_deleted/<name>-<ts>` |
 | POST | `/api/admin/users/{id}/reset-password` | → `{tempPassword}` (the user must change it at next login). Revokes the user's sessions and API tokens |
+| POST | `/api/admin/users/{id}/reset-totp` | removes the user's two-factor (lost authenticator): clears the secret, unlocks, ends the user's sessions and revokes their API tokens → `{user, sessionsEnded:true, tokensRevoked:n}`. `409 totp_not_enabled` if the user has no two-factor, `400 self` for your own account. Audit `user.totp.reset` |
 | POST | `/api/admin/users/{id}/unlock` | |
 | POST | `/api/admin/users/{id}/provision` | re-applies teams, hints and policy to the profile → `{changes:[...], restartPending}` |
 | GET/POST | `/api/admin/teams` | `{name, description, policy}` |
