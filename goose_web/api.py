@@ -821,6 +821,26 @@ async def admin_user_unlock(request: Request):
     return ok()
 
 
+async def admin_user_reset_totp(request: Request):
+    """Remove a user's two-factor enrolment (lost authenticator). The user signs in with the password only and can
+    enrol again. Ends every session and API token, like a password reset: the lost device may still be signed in."""
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    u = _get_user(c, request)
+    if u["id"] == admin["id"]:
+        # your own two-factor is turned off in Account settings, where the password is checked
+        raise HTTPError(400, "self", "Turn off your own two-factor in your account settings")
+    if not u["totp_enabled"]:
+        raise HTTPError(409, "totp_not_enabled", "This user does not use two-factor")
+    c.db.update_user(u["id"], totp_enabled=0, totp_secret=None, totp_last_counter=None, failed_logins=0,
+                     locked_until=0)
+    c.auth.revoke_user_sessions(u["id"])
+    revoked = c.auth.revoke_user_tokens(u["id"])
+    c.audit(request, "user.totp.reset", admin, target=u["username"], detail={"tokensRevoked": revoked})
+    return ok({"user": _admin_user_view(c, c.db.user_by_id(u["id"])), "sessionsEnded": True,
+               "tokensRevoked": revoked})
+
+
 async def admin_user_provision(request: Request):
     c = ctx(request)
     admin = c.require(request, admin=True).user
@@ -1255,6 +1275,7 @@ routes = [
     Route("/api/admin/users/{uid:int}", admin_user, methods=["GET", "PATCH", "DELETE"]),
     Route("/api/admin/users/{uid:int}/reset-password", admin_user_reset, methods=["POST"]),
     Route("/api/admin/users/{uid:int}/unlock", admin_user_unlock, methods=["POST"]),
+    Route("/api/admin/users/{uid:int}/reset-totp", admin_user_reset_totp, methods=["POST"]),
     Route("/api/admin/users/{uid:int}/provision", admin_user_provision, methods=["POST"]),
     Route("/api/admin/teams", admin_teams, methods=["GET", "POST"]),
     Route("/api/admin/teams/{tid:int}", admin_team, methods=["GET", "PATCH", "DELETE"]),

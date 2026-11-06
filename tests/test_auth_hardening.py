@@ -354,6 +354,89 @@ def test_admin_reset_and_disable_revoke_api_tokens(web):
     assert token_count(db, u["id"]) == 0
 
 
+def session_count(db, uid) -> int:
+    return db.one("SELECT COUNT(*) AS n FROM auth_sessions WHERE user_id=?", (uid,))["n"]
+
+
+# ---------------------------------------------------------------- 8. admin "Reset two-factor" (lost authenticator)
+def test_admin_reset_totp_clears_two_factor_and_signs_out(web):
+    client, _, db, auth = web
+    admin = mk_user(db, "root", role="admin")
+    user, secret = with_totp(db, mk_user(db, "quinn"))
+    db.update_user(user["id"], totp_last_counter=123, failed_logins=5, locked_until=time.time() + 900)
+    auth.create_session(user, "1.1.1.1", "phone", "password")
+    auth.create_api_token(user, "t", None)
+    h = sign_in(client, auth, admin)
+    r = client.post(f"/api/admin/users/{user['id']}/reset-totp", headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["tokensRevoked"] == 1 and body["sessionsEnded"] is True
+    assert body["user"]["totpEnabled"] is False
+    u = db.user_by_id(user["id"])
+    assert (u["totp_enabled"], u["totp_secret"], u["totp_last_counter"]) == (0, None, None)
+    assert u["failed_logins"] == 0 and not u["locked_until"]
+    assert session_count(db, user["id"]) == 0 and token_count(db, user["id"]) == 0
+    row = db.one("SELECT * FROM audit WHERE action='user.totp.reset'")
+    assert row["username"] == "root" and row["target"] == "quinn"
+    assert auth.login("quinn", PW, None, "1.1.1.1")["id"] == user["id"]   # password alone is enough now
+    # nothing left to reset
+    r = client.post(f"/api/admin/users/{user['id']}/reset-totp", headers=h)
+    assert r.status_code == 409 and r.json()["error"] == "totp_not_enabled"
+
+
+def test_admin_reset_totp_refuses_self_and_non_admins(web):
+    client, _, db, auth = web
+    admin, _ = with_totp(db, mk_user(db, "root", role="admin"))
+    h = sign_in(client, auth, admin)
+    r = client.post(f"/api/admin/users/{admin['id']}/reset-totp", headers=h)
+    assert r.status_code == 400 and r.json()["error"] == "self"
+    assert db.user_by_id(admin["id"])["totp_enabled"] == 1
+    other, _ = with_totp(db, mk_user(db, "rita"))
+    h = sign_in(client, auth, mk_user(db, "sam"))
+    assert client.post(f"/api/admin/users/{other['id']}/reset-totp", headers=h).status_code == 403
+    assert client.post(f"/api/admin/users/{other['id']}/reset-totp").status_code in (401, 403)   # no session
+    assert db.user_by_id(other["id"])["totp_enabled"] == 1
+
+
+def test_admin_reset_totp_of_admin_under_require_totp_admins(web):
+    client, _, db, auth = web
+    root, _ = with_totp(db, mk_user(db, "root", role="admin"))
+    other, _ = with_totp(db, mk_user(db, "tess", role="admin"))
+    db.set_setting("require_totp_admins", True)
+    h = sign_in(client, auth, root)
+    assert client.post(f"/api/admin/users/{other['id']}/reset-totp", headers=h).status_code == 200
+    r = client.post("/api/auth/login", json={"username": "tess", "password": PW})
+    assert r.status_code == 200 and r.json()["totpEnrolmentRequired"] is True   # must enrol again
+
+
+def test_cli_user_reset_totp(tmp_path, capsys):
+    from goose_web import __main__ as cli
+    data = copy.deepcopy(DEFAULTS)
+    data["paths"]["system_dir"] = str(tmp_path / "sys")      # cmd_user opens <system_dir>/goose-web.db
+    settings = Settings(data, None)
+    (tmp_path / "sys").mkdir()
+    db = Database(tmp_path / "sys" / "goose-web.db")
+    auth = AuthService(db, settings)
+    user, _ = with_totp(db, mk_user(db, "uma"))
+    auth.create_session(user, "1.1.1.1", "phone", "password")
+    auth.create_api_token(user, "t", None)
+    db.close()
+    args = types.SimpleNamespace(action="reset-totp", name="uma", password=None, admin=False)
+    assert cli.cmd_user(args, settings) == 0
+    assert "Two-factor removed for uma" in capsys.readouterr().out
+    db2 = Database(tmp_path / "sys" / "goose-web.db")
+    try:
+        u = db2.user_by_id(user["id"])
+        assert (u["totp_enabled"], u["totp_secret"]) == (0, None)
+        assert session_count(db2, user["id"]) == 0 and token_count(db2, user["id"]) == 0
+        row = db2.one("SELECT * FROM audit WHERE action='user.totp.reset'")
+        assert row["target"] == "uma" and row["detail"] == {"via": "cli", "tokensRevoked": 1}
+        assert cli.cmd_user(args, settings) == 0                       # already off: harmless no-op
+        assert "does not use two-factor" in capsys.readouterr().out
+    finally:
+        db2.close()
+
+
 def test_self_password_change_revokes_api_tokens_keeps_session(web):
     client, _, db, auth = web
     u = mk_user(db, "pete")

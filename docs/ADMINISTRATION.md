@@ -537,6 +537,7 @@ How it works:
 | Disable or enable | "Disable account" / "Enable account". Disabling ends every session and revokes every API token of the user. A disabled user cannot sign in (the sign-in page says "Invalid username or password") and their worker is not started at gateway start. | none |
 | Unlock after failed sign-ins | "Unlock" (clears the failure counter and the lock) | `user reset NAME` also unlocks |
 | Reset password | "Reset password" (local accounts only): shows a temporary password once, forces a change, ends all sessions, revokes all API tokens, unlocks | `user reset NAME [--password PW]`: same effect, prints the temporary password, also re-enables a disabled account and switches the account to local sign-in |
+| Reset two-factor (lost authenticator) | "Reset two-factor" (only for users with the "2FA" badge, never your own account): removes the two-factor enrolment, unlocks, ends all sessions, revokes all API tokens. The user signs in with the password and enrols again (section 7.8) | `user reset-totp NAME`: same effect |
 | Set a password | Edit > password field (admin API `PATCH`), with "must change" on by default; ends sessions and revokes tokens | none |
 | Re-provision the profile | "Re-provision profile": applies teams, hints and policy again and lists the changes | none |
 | Delete | "Delete...": stops the worker and removes the account. The isolated profile folder is moved to `<profiles_root>/_deleted/<user>-<timestamp>`, or deleted permanently if you tick the box. The native profile is never moved or deleted. | none |
@@ -578,8 +579,13 @@ docker compose -f docker/compose.yaml exec goose-web python -m goose_web user re
   their two-factor off. Admins without two-factor are reported as `totpEnrolmentRequired` by the sign-in response
   and `/api/me`; enrolment is not forced at sign-in, so check that every admin has enrolled (the user list shows a
   "2FA" badge).
-- There is no admin button or console command that removes another user's two-factor. If a user loses their
-  authenticator, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#lost-authenticator).
+- **Lost authenticator.** Admin > Users > actions menu > "Reset two-factor" (or `user reset-totp NAME` on the
+  gateway host, or `POST /api/admin/users/{id}/reset-totp`) removes the user's two-factor, clears the lock, ends
+  all of their sessions and revokes their API tokens. It is audited as `user.totp.reset`. The user signs in with
+  the password alone and enrols a new authenticator. The admin console does not offer it for your own account
+  (`400 self`): turn your own two-factor off in your account settings, or have another admin reset it. Resetting
+  another admin while "Require two-factor for administrators" is on is allowed; that admin is then reported as
+  `totpEnrolmentRequired` until they enrol again. Step by step: [TROUBLESHOOTING.md](TROUBLESHOOTING.md#lost-authenticator).
 
 ## 8. API tokens
 
@@ -600,6 +606,7 @@ A token stops working when:
 | the user deletes it | deleted |
 | the user changes their password | all of the user's tokens are deleted |
 | an admin sets or resets the password (UI, API or `user reset`) | all tokens deleted |
+| an admin resets the user's two-factor (UI, API or `user reset-totp`) | all tokens deleted |
 | the account is disabled | all tokens deleted (and refused while disabled) |
 | the account must change its password | refused until the password is changed |
 | the account is deleted | deleted with the account |
@@ -894,7 +901,7 @@ Recorded actions:
 | System | `system.init`, `system.start`, `system.stop` |
 | Sign-in | `auth.login` (success and failure), `auth.logout`, `auth.totp` (wrong code), `auth.ldap` (insecure LDAP refused), `auth.oidc` (OIDC failure), `user.oidc.bind` |
 | Own account | `user.password`, `user.totp.enable`, `user.totp.disable`, `user.token.create`, `user.token.delete`, `hints.personal.save`, `hints.native.save` |
-| User admin | `user.create`, `user.update` (changed field names, never the password), `user.delete`, `user.reset_password`, `user.unlock`, `user.provision` |
+| User admin | `user.create`, `user.update` (changed field names, never the password), `user.delete`, `user.reset_password`, `user.totp.reset` (two-factor reset, `"via": "cli"` from the console), `user.unlock`, `user.provision` |
 | Teams and hints | `team.create`, `team.update`, `team.delete`, `team.item.add`, `team.item.remove`, `hints.create`, `hints.update`, `hints.delete` |
 | Settings | `settings.auth`, `settings.update` |
 | Operations | `worker.restart`, `worker.stop`, `hosttask.<action>`, `fs.upload` |
@@ -1149,6 +1156,7 @@ the command):
 | `user list` | list users (id, name, role, profile mode, disabled) |
 | `user add NAME [--password PW] [--admin]` | create a local user |
 | `user reset NAME [--password PW]` | temporary password, forced change, unlock, re-enable, switch to local sign-in, sign out everywhere, revoke API tokens |
+| `user reset-totp NAME` | remove the user's two-factor (lost authenticator), unlock, sign out everywhere, revoke API tokens |
 | `check` | diagnostics; exit code 1 if something is wrong |
 | `version` | print the version |
 
@@ -1156,8 +1164,8 @@ Admin console tabs: Users, Teams & policy, Hints library, Auth providers, Settin
 tasks, Audit log, Logs.
 
 Admin REST endpoints (all under `/api/admin/`, admin session or admin API token; details in [API.md](API.md)):
-`users`, `users/{id}`, `users/{id}/reset-password`, `users/{id}/unlock`, `users/{id}/provision`, `teams`,
-`teams/{id}`, `teams/{id}/items`, `teams/{id}/items/{item}`, `library`, `hints`, `hints/{id}`, `auth`, `settings`,
+`users`, `users/{id}`, `users/{id}/reset-password`, `users/{id}/reset-totp`, `users/{id}/unlock`,
+`users/{id}/provision`, `teams`, `teams/{id}`, `teams/{id}/items`, `teams/{id}/items/{item}`, `library`, `hints`, `hints/{id}`, `auth`, `settings`,
 `audit`, `system`, `system/workers/{key}/{restart|stop}`, `ownership`, `hosttasks`, `hosttasks/action`, `logs`.
 
 Health check: `GET /healthz` returns `ok` (exempt from the Host allow-list). It shows that the gateway process

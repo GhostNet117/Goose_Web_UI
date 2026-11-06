@@ -123,6 +123,7 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 | `user list` | | Lists users. |
 | `user add NAME` | `--password`, `--admin` | Creates a local user (temporary password printed if none is given, change forced). |
 | `user reset NAME` | `--password` | Sets a temporary password (printed), forces a change, unlocks the account, switches it to local auth, signs it out everywhere and revokes its API tokens. Use it if the initial admin password is lost. |
+| `user reset-totp NAME` | | Removes the user's two-factor (lost authenticator), unlocks the account, signs it out everywhere and revokes its API tokens; audited as `user.totp.reset`. Same as Admin > Users > Reset two-factor, and the way back in when the only admin lost their authenticator. |
 | `check` | | Diagnostics: version, config file, goose binary and version, OS user and integrity (fails if elevated), profiles root, Goose Desktop running (Windows), whether the port is free. Exit code 1 if something is wrong. |
 | `version` | | Prints the version. |
 

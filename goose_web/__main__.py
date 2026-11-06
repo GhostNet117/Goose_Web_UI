@@ -181,6 +181,21 @@ def cmd_user(args, settings) -> int:
         db.audit("user.reset_password", target=u["username"], detail={"via": "cli", "tokensRevoked": True})
         print(f"Temporary password for {u['username']}: {pw}")
         return 0
+    if args.action == "reset-totp":
+        # break-glass for a lost authenticator, same effect as Admin > Users > Reset two-factor
+        if not u:
+            raise SystemExit("no such user")
+        if not u["totp_enabled"]:
+            print(f"{u['username']} does not use two-factor; nothing changed")
+            return 0
+        db.update_user(u["id"], totp_enabled=0, totp_secret=None, totp_last_counter=None, failed_logins=0,
+                       locked_until=0)
+        db.execute("DELETE FROM auth_sessions WHERE user_id=?", (u["id"],))
+        revoked = db.execute_count("DELETE FROM api_tokens WHERE user_id=?", (u["id"],))
+        db.audit("user.totp.reset", target=u["username"], detail={"via": "cli", "tokensRevoked": revoked})
+        print(f"Two-factor removed for {u['username']}: signed out everywhere, {revoked} API token(s) revoked. "
+              "They sign in with their password and can enrol a new authenticator.")
+        return 0
     if args.action == "add":
         if u:
             raise SystemExit("user exists")
@@ -257,7 +272,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="Goose profile folder to bind the admin to: auto | fresh | <path>")
     i.add_argument("--force", action="store_true")
     u = sub.add_parser("user", help="manage users from the console")
-    u.add_argument("action", choices=["list", "add", "reset"])
+    u.add_argument("action", choices=["list", "add", "reset", "reset-totp"])
     u.add_argument("name", nargs="?")
     u.add_argument("--password")
     u.add_argument("--admin", action="store_true")

@@ -223,6 +223,7 @@ In Admin > Users, select the user:
 
 - **Unlock** clears the failure counter and the lock.
 - **Reset password** sets a temporary password (shown once) that must be changed at the next sign-in.
+- **Reset two-factor** removes the user's two-factor enrolment after a lost authenticator (section 4).
 - **Enable** re-enables a disabled account.
 
 Directory (LDAP) and SSO (OIDC) accounts have their passwords managed elsewhere; changing them in Goose Web gives
@@ -265,7 +266,8 @@ User names from SSO have the domain part removed by default (`stripDomain`), so 
 
 `user reset` sets a temporary password, clears the failure counter and lock, re-enables the account, converts it
 to a local account, and deletes all of its sign-in sessions and API tokens. It does **not** turn off two-factor
-(section 4). It prints `Temporary password for <user>: <password>`; the user must change it at the next sign-in.
+(use `user reset-totp`, section 4). It prints `Temporary password for <user>: <password>`; the user must change
+it at the next sign-in.
 
 Always pass the service's configuration file:
 
@@ -291,59 +293,50 @@ sessions were deleted.
 
 ## Lost authenticator
 
-A user who lost the phone or app that generates two-factor codes cannot sign in. Goose Web has no button or CLI
-command that removes another user's two-factor enrolment, and `user reset` deliberately leaves it in place. Users
-can turn two-factor off themselves only while they can still sign in (in their account settings, with their password),
-and administrators cannot do so while **Require two-factor for administrators** is on.
+A user who lost the phone or app that generates their two-factor codes cannot sign in. An administrator removes
+their two-factor enrolment (version 1.2.0 and later); the user then signs in with the password alone and enrols a
+new authenticator. No database editing is needed.
 
-The recovery is a direct database change. Do it with the gateway stopped and a backup taken.
+**From the admin console** (any administrator who can still sign in):
 
-1. Stop the gateway (section 5 of [ADMINISTRATION.md](ADMINISTRATION.md)).
+1. Open Admin > Users, open the user's **Actions** menu and choose **Reset two-factor**. The item is shown only for
+   users with the "2FA" badge, and never for your own account.
+2. Confirm. Two-factor is removed, the failure counter and lock are cleared, all of the user's sessions end and all
+   of their API tokens are revoked (the lost device may still be signed in). The audit log records
+   `user.totp.reset` with the administrator and the user.
+3. Ask the user to sign in and enrol a new authenticator straight away. This is required for administrators when
+   **Require two-factor for administrators** is on; until they enrol they are reported as `totpEnrolmentRequired`.
 
-   ```powershell
-   Stop-ScheduledTask -TaskPath '\GooseWeb\' -TaskName 'GooseWeb_Gateway'
-   ```
+The same action is available to scripts as `POST /api/admin/users/{id}/reset-totp` ([API.md](API.md)).
 
-   ```sh
-   systemctl --user stop goose-web
-   ```
+**From the command line** (for example when the only administrator lost their authenticator). Run it on the
+gateway machine with the service's configuration file; the gateway may keep running:
 
-   ```sh
-   docker compose -f docker/compose.yaml stop goose-web
-   ```
+```bat
+C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles\_system\config.yaml user reset-totp alice
+```
 
-2. Copy the database file `<system_dir>/goose-web.db` (with any `-wal` and `-shm` files next to it) to a safe
-   place.
+```sh
+/opt/goose-web/.venv/bin/python -m goose_web --config ~/.local/share/goose-web/_system/config.yaml user reset-totp alice
+```
 
-3. Clear the two-factor fields for the user (here `alice`). The gateway's own Python can do this; no `sqlite3`
-   tool is needed.
+```sh
+docker compose -f docker/compose.yaml exec goose-web python -m goose_web user reset-totp alice
+```
 
-   Windows:
+It prints `Two-factor removed for alice: signed out everywhere, N API token(s) revoked. ...` and has the same effect
+as the button. The audit entry `user.totp.reset` carries `"via": "cli"`. A user without two-factor is left
+unchanged (`alice does not use two-factor; nothing changed`). If the password is in doubt as well, also run
+`user reset alice` (section 3.6), which on its own deliberately leaves two-factor in place.
 
-   ```bat
-   C:\GooseWeb\.venv\Scripts\python.exe -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); n=c.execute('UPDATE users SET totp_enabled=0, totp_secret=NULL, totp_last_counter=NULL WHERE username=?', (sys.argv[2],)).rowcount; c.commit(); print(n, 'row(s) updated')" C:\Goose_Web_Profiles\_system\goose-web.db alice
-   ```
-
-   Linux / macOS:
-
-   ```sh
-   /opt/goose-web/.venv/bin/python -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); n=c.execute('UPDATE users SET totp_enabled=0, totp_secret=NULL, totp_last_counter=NULL WHERE username=?', (sys.argv[2],)).rowcount; c.commit(); print(n, 'row(s) updated')" ~/.local/share/goose-web/_system/goose-web.db alice
-   ```
-
-   Docker (the container is stopped, so run a one-off container on the same volume):
-
-   ```sh
-   docker compose -f docker/compose.yaml run --rm --no-deps --entrypoint python goose-web -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); n=c.execute('UPDATE users SET totp_enabled=0, totp_secret=NULL, totp_last_counter=NULL WHERE username=?', (sys.argv[2],)).rowcount; c.commit(); print(n, 'row(s) updated')" /data/_system/goose-web.db alice
-   ```
-
-   `1 row(s) updated` means it worked; `0` means the user name is wrong (user names are stored as created; check
-   with `user list`).
-
-4. Start the gateway again. Optionally also run `user reset alice` if the password is in doubt.
-5. Ask the user to sign in and enrol a new authenticator straight away (required for administrators when
-   **Require two-factor for administrators** is on).
-
-The change is not written to the audit log because it bypasses the gateway; record it in your own change log.
+| Situation | What to do |
+| --- | --- |
+| A user lost their authenticator | **Reset two-factor** in Admin > Users, or `user reset-totp NAME`. |
+| You (an administrator) still can sign in and want to change phones | Turn two-factor off and on again in your own account settings (password required). Not possible while **Require two-factor for administrators** is on: ask another administrator to reset it. |
+| You lost your own authenticator | Another administrator resets it, or run `user reset-totp NAME` on the gateway machine. The admin console never offers the reset for your own account, so a stolen session cannot remove its owner's second factor. |
+| `This user does not use two-factor` (409 `totp_not_enabled`) | Nothing to reset; reload the user list. |
+| `Turn off your own two-factor in your account settings` (400 `self`) | The API was called for your own account; see the rows above. |
+| A version before 1.2.0 | Upgrade first; the database needs no change. |
 
 ---
 
@@ -673,7 +666,7 @@ chat link) and `Priority` (`high` for "needs you", otherwise `default`). Other U
 
 ## 14. Old user interface after an upgrade
 
-The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v6`). The
+The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v7`). The
 page, scripts and styles are fetched from the network first, and the cache is used only when the gateway cannot
 be reached; `/api/` and `/ws` are never cached. Third-party libraries and icons are served from the cache first.
 The gateway sends these files with `Cache-Control: no-cache`.
@@ -709,7 +702,7 @@ The gateway sends these files with `Cache-Control: no-cache`.
 | `names may contain letters, digits, '.', '_' and '-' and must start with a letter or digit` / `reserved name` | Invalid user, team or item name. Reserved: `appdata`, `workspace`, `_system`, `_deleted`, `library`, `backups`, `logs`. | Choose another name. |
 | `Internal error (see the gateway log)` (500 `server_error`) | Unexpected error. | Read `gateway.log` for `unhandled error on <path>` and the traceback. |
 | A policy change has no effect | Policies are captured when the WebSocket connects. | The user reloads the page. |
-| An API token stopped working | Tokens are refused once expired, for disabled accounts, and while a password change is required; `user reset` and account deletion remove them. | Create a new token. |
+| An API token stopped working | Tokens are refused once expired, for disabled accounts, and while a password change is required; `user reset`, a two-factor reset and account deletion remove them. | Create a new token. |
 
 ---
 
