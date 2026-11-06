@@ -1,0 +1,13 @@
+.git
+.venv
+.pytest_tmp
+.pytest_cache
+**/__pycache__
+*.db
+*.db-*
+backups
+specs
+.specify
+.goose
+tests
+docs

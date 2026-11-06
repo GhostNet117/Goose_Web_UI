@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tests
+.pytest_tmp/
+.pytest_cache/
+.coverage
+
+# Runtime data - never commit profiles, databases, logs or secrets
+*.db
+*.db-shm
+*.db-wal
+logs/
+backups/
+profiles/
+_system/
+secrets.yaml
+config.local.yaml
+*.pem
+*.key
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
