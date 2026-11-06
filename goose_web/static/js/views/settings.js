@@ -6,7 +6,7 @@ import { GET, POST, PUT, PATCH, DEL } from '../api.js';
 import { store, policy, policyList } from '../store.js';
 import { setBaseTitle, chime } from '../herd.js';
 import { router } from '../router.js';
-import { THEMES, ACCENTS, prefs, pref, setPref, patchPref } from '../prefs.js';
+import { THEMES, ACCENTS, prefs, pref, setPref, patchPref, activityPrefs } from '../prefs.js';
 import { mdElement } from '../markdown.js';
 import { passwordForm } from './login.js';
 import { sessionsState, sessionTitle } from '../sessions.js';
@@ -272,10 +272,17 @@ const PREF_META = {
 function preferencesTab(body) {
   const goose = h('div', { class: 'card' }, skeleton(4));
   const p = prefs();
+  const ap = activityPrefs();
   body.replaceChildren(
     section('Chat', null, h('div', { class: 'card stack' },
       settingRow('Enter sends the message', 'When off, use Ctrl+Enter to send and Enter for a new line.', toggle(p.enterToSend !== false, (v) => setPref('enterToSend', v))),
-      settingRow('Show message timestamps', null, toggle(!!p.showTimestamps, (v) => setPref('showTimestamps', v))))),
+      settingRow('Show message timestamps', null, toggle(!!p.showTimestamps, (v) => setPref('showTimestamps', v))),
+      settingRow('Thinking', 'Goose\'s reasoning before each step. Auto keeps it open while Goose works and folds it when the turn ends.',
+        select([{ value: 'auto', label: 'Auto' }, { value: 'expanded', label: 'Always expanded' }, { value: 'collapsed', label: 'Collapsed' }], ap.thinking, { class: 'inp inp-sm', 'aria-label': 'Thinking', onchange: (e) => patchPref('activity', { thinking: e.target.value }) })),
+      settingRow('Tool details', 'Auto opens a tool call while it runs (input, live output, approval) and folds it when done. Detailed keeps every call open; Concise shows headers only.',
+        select([{ value: 'auto', label: 'Auto' }, { value: 'detailed', label: 'Detailed' }, { value: 'concise', label: 'Concise' }], ap.tools, { class: 'inp inp-sm', 'aria-label': 'Tool details', onchange: (e) => patchPref('activity', { tools: e.target.value }) })),
+      settingRow('Live activity bar', 'While Goose works, show what it is doing, how many tool calls it has made and for how long, under the last message.',
+        toggle(ap.statusBar, (v) => patchPref('activity', { statusBar: v }))))),
     section('Goose preferences', null, goose));
   (async () => {
     try {

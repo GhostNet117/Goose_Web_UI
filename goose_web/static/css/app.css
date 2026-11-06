@@ -716,6 +716,16 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .thought > summary:hover { color: var(--fg-2); }
 .thought-text { white-space: pre-wrap; color: var(--fg-2); font-size: .9em; padding: 6px 0 4px; max-height: 360px; overflow: auto; }
 .thought-len { font-size: .9em; }
+.thought-text.md { white-space: normal; font-style: italic; }
+.thought-text.md > :first-child { margin-top: 0; }
+.thought-text.md > :last-child { margin-bottom: 0; }
+/* Live activity bar (spec 005): what Goose is doing right now, under the last message. */
+.tr-activity-wrap[hidden] { display: none !important; }
+.tr-activity { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; margin: 8px 0 4px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-2, transparent); font-size: .84em; color: var(--fg-2); cursor: pointer; }
+.tr-activity:hover { background: var(--bg-hover); }
+.tr-activity[data-phase="waiting"] { color: var(--warn, #b45309); border-color: color-mix(in srgb, var(--warn, #b45309) 45%, transparent); }
+.tr-act-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tr-act-meta { flex: none; color: var(--fg-3); font-variant-numeric: tabular-nums; }
 
 /* Tool cards */
 .tool { margin: 6px 0; border: 1px solid var(--border); border-radius: var(--r); background: var(--bg-2); overflow: hidden; }
