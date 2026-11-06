@@ -11,9 +11,17 @@ is a number.
   name is `gw` and it is not Secure. Every non-GET request must send the header `X-CSRF-Token: <csrf>`,
   using the `csrf` value from the login response or from `GET /api/me`.
 * **Automation:** send the header `Authorization: Bearer gwt_<token>`. Users create tokens in Settings →
-  Account → API tokens. Bearer requests need no CSRF header.
+  Account → API tokens. Bearer requests need no CSRF header. The same header authenticates the `/ws`
+  handshake for non-browser clients (see below). Tokens are never accepted in a URL (`?token=` is not
+  supported). A user's tokens are revoked when their password is changed, set or reset, and when the
+  account is disabled.
 * **Error format:** `{ "error": "<code>", "message": "<human text>" }` with status 400/401/403/404/409/
-  413/429/500. When `GET /api/me` returns 401, the SPA shows the login screen.
+  413/423/429/500/503. When `GET /api/me` returns 401, the SPA shows the login screen.
+* **Host check:** every request (HTTP and WebSocket) must carry an allow-listed `Host` header: the
+  `server.public_url` host, `localhost`, `127.0.0.1`, `::1`, the bind address, or a name in
+  `server.allowed_hosts`. Other hosts get `400` with the plain-text body `invalid host`. A WebSocket is refused
+  with an HTTP 400 denial response where the server supports it, otherwise it is closed with code 1008.
+  `GET /healthz` is exempt.
 * **Forced password change:** when a login returns `mustChangePassword: true`, every API call except
   `/api/me`, `/api/me/password` and `/api/auth/logout` returns `403 {error:"password_change_required"}`.
 
@@ -23,22 +31,22 @@ is a number.
 |---|---|---|
 | GET | `/healthz` | `ok` (text) |
 | GET | `/api/auth/config` | `{ brand:{name, tagline}, version, local:true, ldap:{enabled, label}, oidc:[{id,label}] }` |
-| POST | `/api/auth/login` | `{username, password, totp?, remember?}` → `{user, csrf, mustChangePassword}`. Errors: `401 invalid_credentials`, `401 totp_required` (ask for the code and resend), `423 locked`, `429 rate_limited` |
+| POST | `/api/auth/login` | `{username, password, totp?, remember?}` → `{user, csrf, mustChangePassword, totpEnrolmentRequired}`. Errors: `401 invalid_credentials`, `401 totp_required` (ask for the code and resend), `401 totp_invalid` (wrong or already used code; counts toward the lockout), `423 locked`, `429 rate_limited`, `503 ldap_insecure` (LDAP configured without TLS, see `ldap.allowInsecure`), `403 bad_origin` |
 | POST | `/api/auth/logout` | `{}` → `{ok:true}` |
-| GET | `/api/auth/oidc/{id}/start` | 302 to the IdP |
-| GET | `/api/auth/oidc/{id}/callback` | 302 to `/` (or to `/#/login?error=...`) |
+| GET | `/api/auth/oidc/{id}/start` | 302 to the IdP. On an error, 302 to `/#/login?error=<code>`, for example `oidc_needs_public_url` (OIDC needs `server.public_url`) |
+| GET | `/api/auth/oidc/{id}/callback` | 302 to `/` (or to `/#/login?error=...`, for example `oidc_conflict` when the name belongs to a local/LDAP account or is bound to another issuer + subject) |
 
 ## Current user
 
 | Method | Path | Body / result |
 |---|---|---|
-| GET | `/api/me` | `{user, csrf, policy, teams:[{id,name}], scheduler:{enabled, owner, reason}, version, gooseVersion, isAdmin}` |
-| POST | `/api/me/password` | `{current, new}` → `{ok}`. Error: `400 weak_password {problems:[...]}` |
+| GET | `/api/me` | `{user, csrf, policy, teams:[{id,name}], scheduler:{enabled, owner, reason}, version, gooseVersion, isAdmin, totpEnrolmentRequired}`. `totpEnrolmentRequired` is true for an admin without TOTP while "Require two-factor for administrators" is on |
+| POST | `/api/me/password` | `{current, new}` → `{ok}`. Signs out your other sessions and revokes all your API tokens. Error: `400 weak_password {problems:[...]}` |
 | PATCH | `/api/me` | `{displayName?, email?}` |
 | GET/PUT | `/api/me/prefs` | free-form JSON for UI preferences: theme, accent, density, fontSize, notifications, sidebar, herd, enterToSend, showTimestamps, codeTheme, pinned. PUT replaces the whole object. Max 64 KB |
-| POST | `/api/me/totp/setup` | → `{secret, uri}` |
-| POST | `/api/me/totp/enable` | `{code}` → `{ok}` |
-| POST | `/api/me/totp/disable` | `{password}` → `{ok}` |
+| POST | `/api/me/totp/setup` | → `{secret, uri}`. `403 totp_self_disabled` for non-admins when self-service two-factor is turned off, `409 already_enabled` |
+| POST | `/api/me/totp/enable` | `{code}` → `{ok}`. `400 totp_invalid`. The code's time step is used up, so the same code cannot be used to sign in |
+| POST | `/api/me/totp/disable` | `{password}` → `{ok}`. `403 required` for admins while two-factor is required for administrators |
 | GET | `/api/me/tokens` | `[{id,name,prefix,createdAt,lastUsed,expiresAt}]` |
 | POST | `/api/me/tokens` | `{name, days?}` → `{id, token}`. The token is shown once |
 | DELETE | `/api/me/tokens/{id}` | |
@@ -46,7 +54,7 @@ is a number.
 | DELETE | `/api/me/logins/{id}` | revoke one browser session (`id` = first 12 hex chars of its hash) |
 | GET | `/api/me/hints` | `{personal, assigned:[{id,name,description}], effective, editable}` |
 | PUT | `/api/me/hints` | `{personal}`. Requires `policy.hints_edit`. For the admin's native profile this writes `<native>/config/.goosehints` and backs up the previous file first |
-| GET | `/api/me/notify` / PUT | `{webhook?: url, events:["needs_you","done","error"]}`. A webhook requires `policy.notify_webhook` |
+| GET | `/api/me/notify` / PUT | `{webhook?: url, events:["needs_you","done","error"]}`. A webhook requires `policy.notify_webhook` (`403 forbidden`) and must be an absolute http(s) URL of at most 500 characters (`400 bad_url`). Unless `notify.allow_private_targets` is true, every address the host resolves to must be a public internet address, otherwise `400 webhook_blocked`. Webhooks are sent to the checked address, without following redirects |
 
 ## Files (scoped to the user's allowed roots; admin: any path)
 
@@ -55,15 +63,15 @@ is a number.
 | GET | `/api/fs/roots` | `{roots:[{path,label}], home, defaultCwd}` |
 | GET | `/api/fs/list?path=` | `{path, parent, entries:[{name, path, dir, size, mtime}]}` (max 2000 entries) |
 | POST | `/api/fs/mkdir` | `{path}` |
-| POST | `/api/fs/upload?dir=<abs dir>` | multipart `file` (one or more) → `{files:[{name,path,size,mime}]}`. Max size `server.max_upload_mb` |
-| GET | `/api/fs/download?path=` | the file as an attachment |
+| POST | `/api/fs/upload?dir=<abs dir>` | multipart `file` (one or more, at most 20) → `{files:[{name,path,size,mime}]}`. Max size per file `server.max_upload_mb` (`413 too_large`). Names are sanitised: last path component only, Windows-invalid characters and trailing dots/spaces removed, device names such as `CON` prefixed with `_`, `upload.bin` if nothing is left. Existing files are never overwritten: the file is saved as `name (1).ext`, `name (2).ext` and so on. `name` and `path` in the result are the names actually used |
+| GET | `/api/fs/download?path=` | the file as an attachment: always `Content-Type: application/octet-stream`, `Content-Disposition: attachment`, `Content-Security-Policy: sandbox; default-src 'none'`, `Cache-Control: no-store` |
 | GET | `/api/fs/read?path=` | `{path, content, truncated}` (text, max 1 MB) |
 
 ## Apps
 
 | Method | Path | Body / result |
 |---|---|---|
-| GET | `/api/apps/frame?name=<app name>&sessionId=<optional>` | The app's HTML (from `_goose/unstable/apps/export`). It is served with `Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups; default-src * data: blob: 'unsafe-inline' 'unsafe-eval'`, which gives it an opaque origin with no cookie or DOM access to the gateway. Embed it as `<iframe sandbox="allow-scripts allow-forms allow-popups" src="/api/apps/frame?name=...">`. Never use `srcdoc`, because a srcdoc frame inherits the SPA's strict CSP. The SPA bridges `postMessage` calls from the app to ACP methods (for example `tools/call` → `_goose/unstable/tools/call`). Every bridged call is checked again by the gateway policy |
+| GET | `/api/apps/frame?name=<app name>` or `/api/apps/frame?sessionId=<id>&ext=<extension>&uri=ui://...` | The app's HTML: a saved app (from `_goose/unstable/apps/export`), or the `ui://` resource of a tool in one of your sessions for an inline app (from `_goose/unstable/resources/read`). These ACP reads pass the same policy check as `/ws` calls, and denials are audited (`403 forbidden`). Other errors: `400 bad_name` / `400 bad_app_ref`, `404 app_not_found`. It is served with `Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups; default-src * data: blob: 'unsafe-inline' 'unsafe-eval'; frame-ancestors 'self'`, `X-Frame-Options: SAMEORIGIN`, `Cache-Control: no-store` and `Referrer-Policy: no-referrer`, which gives it an opaque origin with no cookie or DOM access to the gateway. Embed it as `<iframe sandbox="allow-scripts allow-forms allow-popups" src="/api/apps/frame?name=...">`. Never use `srcdoc`, because a srcdoc frame inherits the SPA's strict CSP. The SPA bridges `postMessage` calls from the app to ACP methods (for example `tools/call` → `_goose/unstable/tools/call`). Every bridged call is checked again by the gateway policy. An app may only call tools of its own extension: a `tools/call` whose `<extension>__` name prefix differs from `extensionName` is denied for every user, admins included. Calls into `developer`, `computercontroller`, `code_execution` or `orchestrator` from grid or imported apps need the user's confirmation each time. Chat messages sent by an app (`ui/message`) need confirmation, are capped at 8 KB and limited to one per 5 seconds |
 
 ## Static / SPA
 
@@ -87,8 +95,8 @@ is a number.
 | Method | Path | Notes |
 |---|---|---|
 | GET/POST | `/api/admin/users` | POST `{username, displayName?, email?, role:"user"\|"admin", password?, mustChangePassword?:true, teams:[id], hints:[id], profileMode:"isolated"\|"native", authSource:"local"\|"ldap"\|"oidc"}` → `{user, tempPassword?}` |
-| GET/PATCH/DELETE | `/api/admin/users/{id}` | PATCH accepts any of the POST fields plus `disabled`, `policyOverrides`. DELETE `?purgeProfile=1` deletes the profile folder; otherwise the folder is renamed to `_deleted/<name>-<ts>` |
-| POST | `/api/admin/users/{id}/reset-password` | → `{tempPassword}` (the user must change it at next login) |
+| GET/PATCH/DELETE | `/api/admin/users/{id}` | PATCH accepts any of the POST fields plus `disabled`, `policyOverrides`. Disabling a user or setting a password revokes the user's sessions and API tokens. DELETE `?purgeProfile=1` deletes the profile folder; otherwise the folder is renamed to `_deleted/<name>-<ts>` |
+| POST | `/api/admin/users/{id}/reset-password` | → `{tempPassword}` (the user must change it at next login). Revokes the user's sessions and API tokens |
 | POST | `/api/admin/users/{id}/unlock` | |
 | POST | `/api/admin/users/{id}/provision` | re-applies teams, hints and policy to the profile → `{changes:[...], restartPending}` |
 | GET/POST | `/api/admin/teams` | `{name, description, policy}` |
@@ -98,8 +106,8 @@ is a number.
 | GET/POST | `/api/admin/hints` | `{name, description, content}` |
 | GET/PUT/DELETE | `/api/admin/hints/{id}` | |
 | GET | `/api/admin/library?profile=<username>&kind=recipe\|skill\|extension\|provider` | read-only listing of items in a profile that can be added to a team `[{kind, ref, name, description, source}]` |
-| GET/PUT | `/api/admin/auth` | `{ldap:{enabled, url, bindDn, bindPassword?, userBase, userFilter, adminGroupDn?, groupTeamMap:{groupDn: teamId}, startTls, label}, oidc:[{id,label,issuer,clientId,clientSecret?,scopes,adminClaim?,adminValue?,teamClaim?,autoCreate}], localEnabled}`. Secrets are write-only: reads return `"********"` when they are set |
-| GET/PUT | `/api/admin/settings` | `{brand:{name,tagline}, defaultTeamId, sessionHours, allowSelfTotp, requireTotpForAdmins, peers:[{name,url,token?}]}` |
+| GET/PUT | `/api/admin/auth` | `{ldap:{enabled, url, bindDn, bindPassword?, userBase, userFilter, adminGroupDn?, groupTeamMap:{groupDn: teamId}, startTls, caFile?, allowInsecure, label}, oidc:[{id,label,issuer,clientId,clientSecret?,scopes,adminClaim?,adminValue?,teamClaim?,autoCreate,stripDomain}], localEnabled}`. Secrets are write-only: reads return `"********"` when they are set. `400 bad_config` for an invalid configuration, for example an enabled `ldap://` URL without `startTls` while `allowInsecure` is false |
+| GET/PUT | `/api/admin/settings` | `{brand:{name,tagline}, defaultTeamId, sessionHours, allowSelfTotp, requireTotpForAdmins, peers:[{name,url,token?}]}`. Turning `requireTotpForAdmins` on returns `409 totp_needed_first` unless the calling admin already uses TOTP |
 | GET | `/api/admin/audit?limit=&before=&user=&action=` | `[{id, ts, username, ip, action, target, detail, ok}]` |
 | GET | `/api/admin/system` | `{version, gooseVersion, gooseBinary, integrity, elevated, user, profilesRoot, nativeRoot, desktopRunning, scheduler:{owner}, workers:[{key, username, pid, port, state, startedAt, clients, activeRuns, scheduler, restarts, lastError}]}` |
 | POST | `/api/admin/system/workers/{key}/{action}` | `action` = `restart` \| `stop` |
@@ -110,9 +118,13 @@ is a number.
 
 ## Real-time channel: `GET /ws` (WebSocket)
 
-The socket is authenticated with the session cookie, and the `Origin` header must match the public
-origin. API tokens can use `?token=gwt_...`, which is only accepted when no Origin header is present.
-Each socket is bound to the user's own profile worker. Admins can add `?profile=<username>` to drive
+Browsers authenticate the socket with the session cookie, and the `Origin` header must be an allowed
+origin (the `server.public_url` origin plus `server.allowed_origins`; without `public_url`, the request's
+own `scheme://Host`). Non-browser clients send `Authorization: Bearer gwt_...` in the handshake request.
+This is only accepted when the request has **no** `Origin` header. Tokens in the query string
+(`?token=`) are not supported, because URLs end up in access and proxy logs. Unauthenticated sockets, and
+sockets of users with a pending password change, are refused before the handshake completes (close code
+4401, seen by browsers as HTTP 403). Each socket is bound to the user's own profile worker. Admins can add `?profile=<username>` to drive
 another user's profile (audited).
 
 Frames are JSON-RPC 2.0 text frames.

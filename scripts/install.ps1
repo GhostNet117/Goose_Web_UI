@@ -10,12 +10,14 @@
   manage them.
 
   Steps:
-    1. Creates .venv in the install folder and installs goose-web (uv if available, else python -m venv + pip).
+    1. Creates .venv in the install folder (uv if available, else python -m venv + pip), installs the
+       dependencies from requirements.lock with --require-hashes, then goose-web itself with --no-deps.
     2. Finds the existing Goose profile (%APPDATA%\Block\goose). If it is missing you are asked for the
        folder; leave the answer empty for a fresh install (<ProfilesRoot>\appdata).
     3. Writes <ProfilesRoot>\_system\config.yaml (only if it does not exist yet).
-    4. Runs "goose-web init": the admin is %USERNAME% with password ChangeMe (must be changed at first sign-in)
-       and is bound to the existing Goose profile, so it keeps all chats, recipes and settings.
+    4. Runs "goose-web init": the admin is %USERNAME% with a random initial password, shown once at the end
+       of the installer (must be changed at first sign-in), and is bound to the existing Goose profile, so it
+       keeps all chats, recipes and settings.
     5. Registers the logon task and the firewall rule via register-service.ps1 (asks for elevation once;
        the task itself always runs as you, non-elevated).
 
@@ -70,8 +72,17 @@ try {
         }
         if (-not (Test-Path $venvPy)) { throw "Could not create the virtualenv (install Python 3.11+ or uv)." }
     }
-    Say "Installing dependencies"
-    if ($uv) { & $uv pip install --python $venvPy -e . } else { & $venvPy -m pip install --upgrade pip; & $venvPy -m pip install -e . }
+    Say "Installing dependencies (hash-locked, requirements.lock)"
+    if ($uv) {
+        & $uv pip install --python $venvPy --require-hashes -r requirements.lock
+        if ($LASTEXITCODE) { throw "Dependency installation failed." }
+        & $uv pip install --python $venvPy --no-deps -e .
+    } else {
+        & $venvPy -m pip install --upgrade pip
+        & $venvPy -m pip install --require-hashes -r requirements.lock
+        if ($LASTEXITCODE) { throw "Dependency installation failed." }
+        & $venvPy -m pip install --no-deps -e .
+    }
     if ($LASTEXITCODE) { throw "Dependency installation failed." }
 } finally { Pop-Location }
 
@@ -118,9 +129,10 @@ if (-not (Test-Path $cfg)) {
 } else { Say "Keeping existing $cfg" }
 
 # --- 4. database + admin ---------------------------------------------------------------
-Say "Initialising (admin '$Admin', password 'ChangeMe' - you must change it at first sign-in)"
-& $venvPy -m goose_web --config $cfg init --admin $Admin --native-root $native
-if ($LASTEXITCODE) { throw "goose-web init failed." }
+Say "Initialising (admin '$Admin'; a random initial password is generated and shown at the end)"
+# init prints the generated password (first install only); keep its output and show it once, at the end.
+$initOut = @(& $venvPy -m goose_web --config $cfg init --admin $Admin --native-root $native)
+if ($LASTEXITCODE) { $initOut | ForEach-Object { Write-Host $_ }; throw "goose-web init failed." }
 & $venvPy -m goose_web --config $cfg check
 
 # --- 5. service ----------------------------------------------------------------------------
@@ -142,4 +154,9 @@ if (-not $NoService) {
 $url = if ($PublicUrl) { $PublicUrl } else { "http://$(if ($BindHost -eq '0.0.0.0') { 'localhost' } else { $BindHost }):$Port" }
 Write-Host ""
 Write-Host "Done. Start now with:  scripts\start-gateway.cmd   (or sign out/in to start the logon task)" -ForegroundColor Green
-Write-Host "Open $url and sign in as '$Admin' / 'ChangeMe'." -ForegroundColor Green
+Write-Host "Open $url and sign in as '$Admin'." -ForegroundColor Green
+Write-Host ""
+$initOut | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+if (($initOut -join "`n") -match 'Already initialised') {
+    Write-Host "(Existing installation: the admin password was not changed.)" -ForegroundColor Green
+}

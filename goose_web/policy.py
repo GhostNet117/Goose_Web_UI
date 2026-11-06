@@ -118,15 +118,40 @@ def _norm(p: str) -> str:
     return p.lower() if sys.platform == "win32" else p
 
 
+def _real(p: str) -> str | None:
+    """The path with every symlink / junction that exists resolved (None if it cannot be resolved)."""
+    try:
+        p = os.path.normpath(os.path.realpath(os.path.expanduser(p)))
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return p.lower() if sys.platform == "win32" else p
+
+
+def _within(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("\\/") + os.sep)
+
+
 def path_allowed(path: str, roots: list[str]) -> bool:
+    """True if `path` lies inside one of `roots`.
+
+    Two checks must both pass (GW-19): the lexical one (normpath/abspath, so `..` cannot climb out) and the
+    resolved one (os.path.realpath on the candidate and on every root, so a symlink or junction inside an
+    allowed root that points elsewhere cannot be used to escape).
+    """
     if not path or "\x00" in path:
         return False
     if not os.path.isabs(os.path.expanduser(path)):
         return False
-    np = _norm(path)
+    roots = [r for r in roots if r and "\x00" not in r]
+    np, rp = _norm(path), _real(path)
+    if rp is None:
+        return False
+    lexical = any(_within(np, _norm(r)) for r in roots)
+    if not lexical:
+        return False
     for r in roots:
-        nr = _norm(r)
-        if np == nr or np.startswith(nr.rstrip("\\/") + os.sep):
+        rr = _real(r)
+        if rr is not None and _within(rp, rr):
             return True
     return False
 
@@ -142,6 +167,27 @@ def _ext_name(ext: dict | None) -> str:
         server = ext.get("server") or {}
         return str(server.get("name") or "").lower()
     return str(ext.get("name") or "").lower()
+
+
+TOOLS_CALL = P + "tools/call"
+
+
+def check_tool_call_target(params: dict) -> None:
+    """A direct tool call (MCP Apps bridge) may only call a tool of the extension it names.
+
+    Prefixed tool names have the form `<extension>__<tool>`. If the prefix differs from `extensionName`, an
+    app of one extension could reach the tools of another (for example a shell tool), so the call is refused
+    for every user. Unprefixed names are resolved inside `extensionName` by Goose and need no check; without
+    `extensionName` there is nothing to mismatch (the allow_shell check in `check` still examines the prefix).
+    """
+    ext = params.get("extensionName")
+    if ext is None or ext == "":
+        return
+    for key in ("name", "toolName"):
+        name = str(params.get(key) or "")
+        if "__" in name and name.split("__", 1)[0].lower() != str(ext).lower():
+            raise Denied(f"tool '{name[:200]}' does not belong to extension '{str(ext)[:200]}': a tool call may "
+                         "only use tools of the extension it names")
 
 
 def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list[str]) -> None:
@@ -160,6 +206,8 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
             raise Denied("per-session MCP servers need the allow_shell permission")
         if not is_admin and meta.get("enabledExtensions") is not None and not policy.get("extensions_edit"):
             raise Denied("choosing session extensions needs the extensions_edit permission")
+    if method == TOOLS_CALL:
+        check_tool_call_target(params)  # every user, admins included (NEW-01)
     if is_admin:
         return
     if method in ("session/new", "session/load", "session/fork", "session/resume"):

@@ -128,6 +128,34 @@ def desktop_running(cli_binary: str = "") -> bool:
     return False
 
 
+WORKER_LOG_MAX_BYTES = 10 * 1024 * 1024
+WORKER_LOG_BACKUPS = 3
+
+
+def rotate_log(path: Path, max_bytes: int = WORKER_LOG_MAX_BYTES, backups: int = WORKER_LOG_BACKUPS) -> bool:
+    """Rotate `path` to .1 (and .1 -> .2 ... up to `backups` copies) when it is larger than `max_bytes`.
+
+    Called before a worker starts (GW-23); goose writes its stdout/stderr straight into the file, so the
+    gateway cannot use a RotatingFileHandler. Returns True if the file was rotated. Failures (for example a
+    file still held open by a lingering process on Windows) are logged and the old file keeps growing.
+    """
+    try:
+        if not path.is_file() or path.stat().st_size <= max_bytes:
+            return False
+        oldest = path.with_name(f"{path.name}.{backups}")
+        if oldest.exists():
+            oldest.unlink()
+        for i in range(backups - 1, 0, -1):
+            src = path.with_name(f"{path.name}.{i}")
+            if src.exists():
+                os.replace(src, path.with_name(f"{path.name}.{i + 1}"))
+        os.replace(path, path.with_name(f"{path.name}.1"))
+        return True
+    except OSError as e:
+        log.warning("could not rotate %s: %s", path, e)
+        return False
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -273,6 +301,7 @@ class WorkerManager:
         args = [binary, "serve", "--host", "127.0.0.1", "--port", str(w.port), "--platform", "desktop"]
         if w.scheduler:
             args.append("--enable-scheduler")
+        rotate_log(self.log_dir / f"worker-{w.key}.log")
         logf = open(self.log_dir / f"worker-{w.key}.log", "ab", buffering=0)
         logf.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} start {' '.join(args[1:])} "
                    f"root={w.path_root or '(default)'}\n".encode())

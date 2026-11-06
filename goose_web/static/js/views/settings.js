@@ -490,7 +490,7 @@ function accountTab(body) {
     isLocal ? section('Password', null, h('div', { class: 'card narrow' }, passwordForm({ username: u.username || '', onDone: () => toast('Password changed', { kind: 'success' }) }))) : section('Password', null, h('div', { class: 'muted' }, 'Your password is managed by ' + u.authSource.toUpperCase() + '.')),
     section('Two-factor authentication', null, totpBox),
     section('Active sign-ins', iconBtn('refresh', 'Refresh', () => loadLogins()), loginsBox),
-    section('API tokens', btn('New token', () => newToken(), { icon: 'plus', size: 'sm', variant: 'primary' }), h('p', { class: 'muted small' }, 'Tokens let scripts call the gateway API and WebSocket (?token=…) as you.'), tokensBox));
+    section('API tokens', btn('New token', () => newToken(), { icon: 'plus', size: 'sm', variant: 'primary' }), h('p', { class: 'muted small' }, 'Tokens let scripts call the gateway API and WebSocket as you. Send the token in the Authorization: Bearer gwt_… header (for the WebSocket: in the handshake, from a non-browser client without an Origin header).'), tokensBox));
 
   const drawTotp = () => {
     const on = !!(u.totpEnabled ?? u.totp);

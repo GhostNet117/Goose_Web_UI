@@ -114,15 +114,34 @@ def totp(secret: str, at: float | None = None, step: int = 30, digits: int = 6) 
     return str(code).zfill(digits)
 
 
-def verify_totp(secret: str, code: str, at: float | None = None, window: int = 1) -> bool:
+def totp_match(secret: str, code: str, at: float | None = None, window: int = 1,
+               last_counter: int | None = None) -> int | None:
+    """Return the time-step counter that `code` matches within +/-window steps, or None.
+
+    Replay protection (RFC 6238 section 5.2): a counter <= `last_counter` (the last step this
+    user successfully used) is never accepted, so each code works at most once.
+    """
     code = (code or "").strip().replace(" ", "")
     if not secret or not code.isdigit() or len(code) != 6:
-        return False
+        return None
     now = time.time() if at is None else at
-    ok = False
+    base = int(now // 30)
+    found: int | None = None
     for w in range(-window, window + 1):
-        ok |= hmac.compare_digest(totp(secret, now + w * 30), code)
-    return ok
+        try:
+            hit = hmac.compare_digest(totp(secret, (base + w) * 30), code)
+        except (ValueError, TypeError):  # malformed secret
+            return None
+        if hit and found is None:  # keep looping: constant work regardless of which step matched
+            found = base + w
+    if found is None or (last_counter is not None and found <= last_counter):
+        return None
+    return found
+
+
+def verify_totp(secret: str, code: str, at: float | None = None, window: int = 1,
+                last_counter: int | None = None) -> bool:
+    return totp_match(secret, code, at, window, last_counter) is not None
 
 
 def totp_uri(secret: str, account: str, issuer: str = "Goose Web") -> str:

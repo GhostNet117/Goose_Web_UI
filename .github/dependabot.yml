@@ -1,0 +1,16 @@
+# Weekly dependency update PRs. Review them like any other change; for pip, regenerate requirements.lock
+# (pip-compile --generate-hashes --strip-extras -o requirements.lock pyproject.toml) in the same PR.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

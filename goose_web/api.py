@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import mimetypes
 import os
 import secrets
@@ -17,12 +18,14 @@ from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, R
 from starlette.routing import Route
 
 from . import hosttasks, security, winsec
+from . import policy as acp_policy
 from .auth import AuthError
 from .context import Ctx, HTTPError, body_json
 from .hub import RpcError
 from .policy import BOOL_KEYS, DEFAULT_POLICY, LIST_KEYS
 
 MAX_PREFS = 64 * 1024
+log = logging.getLogger("goose_web")
 
 
 def ctx(request: Request) -> Ctx:
@@ -69,7 +72,8 @@ async def login(request: Request):
     c.audit(request, "auth.login", user)
     if not c.profiles.is_native(user) and not (c.profiles.root_for(user) / ".goose-web").exists():
         await asyncio.to_thread(c.profiles.provision, user)
-    resp = ok({"user": c.public_user(user), "csrf": csrf, "mustChangePassword": bool(user["must_change_pw"])})
+    resp = ok({"user": c.public_user(user), "csrf": csrf, "mustChangePassword": bool(user["must_change_pw"]),
+               "totpEnrolmentRequired": c.auth.totp_enrolment_required(user)})
     _set_cookie(c, resp, token, remember)
     return resp
 
@@ -87,9 +91,15 @@ async def logout(request: Request):
     return resp
 
 
+OIDC_NEEDS_PUBLIC_URL = ("Single sign-on (OIDC) needs server.public_url (the https:// address users open) so the "
+                         "redirect URI never depends on the request's Host header")
+
+
 def _redirect_uri(c: Ctx, request: Request, pid: str) -> str:
-    base = c.settings.public_url or f"{request.url.scheme}://{request.headers.get('host')}"
-    return f"{base}/api/auth/oidc/{pid}/callback"
+    if not c.settings.public_url:
+        log.warning("OIDC sign-in refused: %s", OIDC_NEEDS_PUBLIC_URL)
+        raise AuthError("oidc_needs_public_url", OIDC_NEEDS_PUBLIC_URL, 400)
+    return f"{c.settings.public_url}/api/auth/oidc/{pid}/callback"
 
 
 async def oidc_start(request: Request):
@@ -150,6 +160,7 @@ async def me(request: Request):
     sched_on, reason = c.workers.wants_scheduler(w) if w else (True, "")
     return ok({"user": c.public_user(u), "csrf": ident.session["csrf"] if ident.session else "",
                "policy": policy, "isAdmin": u["role"] == "admin",
+               "totpEnrolmentRequired": c.auth.totp_enrolment_required(u),
                "teams": [{"id": t["id"], "name": t["name"]} for t in c.db.user_teams(u["id"])],
                "scheduler": {"enabled": sched_on, "owner": "gateway" if sched_on else "desktop", "reason": reason},
                "workspace": str(c.profiles.workspace(u)), "version": c.version, "gooseVersion": c.goose_version})
@@ -174,7 +185,8 @@ async def me_password(request: Request):
         raise HTTPError(400, "weak_password", "Password " + "; ".join(problems), problems=problems)
     c.db.update_user(u["id"], password_hash=await asyncio.to_thread(security.hash_password, new), must_change_pw=0)
     c.auth.revoke_user_sessions(u["id"], keep_hash=ident.session["token_hash"] if ident.session else None)
-    c.audit(request, "user.password", u)
+    revoked = c.auth.revoke_user_tokens(u["id"])  # a password change also ends API-token access (GW-21)
+    c.audit(request, "user.password", u, detail={"tokensRevoked": revoked})
     return ok()
 
 
@@ -188,13 +200,23 @@ async def me_prefs(request: Request):
     return ok()
 
 
+def _check_self_totp_allowed(c: Ctx, u: dict) -> None:
+    """Admin setting 'Users may enable two-factor themselves' (allow_self_totp, default on).
+    Administrators can always enrol, so 'require two-factor for admins' stays satisfiable."""
+    if u["role"] != "admin" and not c.db.get_setting("allow_self_totp", True):
+        raise HTTPError(403, "totp_self_disabled",
+                        "Your administrator has turned off self-service two-factor enrolment")
+
+
 async def totp_setup(request: Request):
     c = ctx(request)
     u = c.require(request).user
     if u["totp_enabled"]:
         raise HTTPError(409, "already_enabled", "Two-factor is already on")
+    _check_self_totp_allowed(c, u)
     secret = security.new_totp_secret()
-    c.db.update_user(u["id"], totp_secret=secret)
+    # new secret: forget the previous secret's last-used time step
+    c.db.update_user(u["id"], totp_secret=secret, totp_last_counter=None)
     brand = (c.db.get_setting("brand") or {}).get("name") or "Goose Web"
     return ok({"secret": secret, "uri": security.totp_uri(secret, u["username"], brand)})
 
@@ -202,8 +224,12 @@ async def totp_setup(request: Request):
 async def totp_enable(request: Request):
     c = ctx(request)
     u = c.require(request).user
+    if u["totp_enabled"]:
+        raise HTTPError(409, "already_enabled", "Two-factor is already on")
+    _check_self_totp_allowed(c, u)
     b = await body_json(request)
-    if not u["totp_secret"] or not security.verify_totp(u["totp_secret"], str(b.get("code") or "")):
+    # accept_totp consumes the code's time step, so the enrolment code cannot be replayed at sign-in
+    if not u["totp_secret"] or not c.auth.accept_totp(u, str(b.get("code") or "")):
         raise HTTPError(400, "totp_invalid", "That code is not valid. Check the time on your phone.")
     c.db.update_user(u["id"], totp_enabled=1)
     c.audit(request, "user.totp.enable", u)
@@ -218,7 +244,7 @@ async def totp_disable(request: Request):
         raise HTTPError(400, "wrong_password", "Password is not correct")
     if u["role"] == "admin" and c.db.get_setting("require_totp_admins"):
         raise HTTPError(403, "required", "Two-factor is required for administrators")
-    c.db.update_user(u["id"], totp_enabled=0, totp_secret=None)
+    c.db.update_user(u["id"], totp_enabled=0, totp_secret=None, totp_last_counter=None)
     c.audit(request, "user.totp.disable", u)
     return ok()
 
@@ -308,8 +334,13 @@ async def me_notify(request: Request):
     if hook:
         if not c.policy_for(u).get("notify_webhook"):
             raise HTTPError(403, "forbidden", "Webhooks are not enabled for your account")
-        if not str(hook).startswith(("https://", "http://")) or len(hook) > 500:
+        if not isinstance(hook, str) or not hook.startswith(("https://", "http://")) or len(hook) > 500:
             raise HTTPError(400, "bad_url", "Webhook must be an http(s) URL")
+        from .app import WebhookBlocked, webhook_target  # local import: app imports this module
+        try:
+            await webhook_target(hook, bool(c.settings.get("notify", "allow_private_targets")))
+        except WebhookBlocked as e:
+            raise HTTPError(400, "webhook_blocked", f"This webhook address is not allowed: {e}")
     events = [e for e in (b.get("events") or []) if e in ("needs_you", "done", "error")]
     prefs["_notify"] = {"webhook": hook, "events": events}
     c.db.update_user(u["id"], prefs=prefs)
@@ -389,6 +420,52 @@ async def fs_mkdir(request: Request):
     return ok({"path": str(p)})
 
 
+# Windows device names: "CON", "con.txt", "COM1.tar.gz" all open the device instead of a file. Same list as
+# security.safe_name plus the console devices and the superscript-digit COM/LPT aliases.
+_RESERVED_DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "CLOCK$",
+                                    *(f"COM{i}" for i in [*"0123456789", "¹", "²", "³"]),
+                                    *(f"LPT{i}" for i in [*"0123456789", "¹", "²", "³"])})
+_BAD_NAME_CHARS = frozenset('<>:"/\\|?*') | {chr(i) for i in range(32)} | {"\x7f"}
+
+
+def safe_upload_name(raw: str | None) -> str:
+    """A safe file name for an uploaded file (NEW-05).
+
+    Keeps only the last path component, drops characters Windows does not allow, strips leading spaces and
+    trailing dots/spaces (Windows silently removes them, so "a.txt." would land on "a.txt") before and after
+    truncating, prefixes Windows device names (CON, con.txt, COM1, ...) with "_" and falls back to
+    "upload.bin" when nothing usable is left.
+    """
+    name = os.path.basename(str(raw or "").replace("\\", "/"))
+    name = "".join(ch for ch in name if ch not in _BAD_NAME_CHARS)
+    name = name.strip().rstrip(". ")
+    name = name[:180]
+    while len(name.encode("utf-8")) > 200:  # stay below the 255-byte limit of common Linux file systems
+        name = name[:-1]
+    name = name.rstrip(". ")
+    if not name:
+        return "upload.bin"
+    if name.split(".", 1)[0].rstrip(" ").upper() in _RESERVED_DEVICE_NAMES:
+        name = "_" + name
+    return name
+
+
+def _create_exclusive(d: Path, name: str):
+    """Open d/name for writing with exclusive create ('xb'); on a clash try 'name (1).ext', 'name (2).ext', ...
+    An existing file is never truncated or overwritten, even if it appears between two attempts."""
+    first = Path(name)
+    stem, suf = first.stem, first.suffix
+    target = d / name
+    for n in range(1, 1001):
+        try:
+            return target, open(target, "xb")
+        except (FileExistsError, IsADirectoryError, PermissionError):
+            if not os.path.lexists(target):
+                raise
+        target = d / f"{stem} ({n}){suf}"
+    raise HTTPError(409, "name_taken", "Too many files with that name in this folder")
+
+
 async def fs_upload(request: Request):
     c = ctx(request)
     u = c.require(request).user
@@ -403,15 +480,10 @@ async def fs_upload(request: Request):
         for key, f in form.multi_items():
             if not hasattr(f, "filename") or not f.filename:
                 continue
-            name = os.path.basename(f.filename.replace("\\", "/")).strip() or "upload.bin"
-            name = "".join(ch for ch in name if ch not in '<>:"|?*\x00')[:180] or "upload.bin"
-            target = d / name
-            stem, suf, n = target.stem, target.suffix, 1
-            while target.exists():
-                target = d / f"{stem} ({n}){suf}"
-                n += 1
+            name = safe_upload_name(f.filename)
+            target, out = _create_exclusive(d, name)
             size = 0
-            with open(target, "wb") as out:
+            with out:
                 while chunk := await f.read(1024 * 1024):
                     size += len(chunk)
                     if size > limit:
@@ -433,8 +505,10 @@ async def fs_download(request: Request):
     p = _check_path(c, u, os.path.abspath(request.query_params.get("path") or ""))
     if not p.is_file():
         raise HTTPError(404, "not_found", "File not found")
-    return FileResponse(p, filename=p.name, headers={"Cache-Control": "no-store",
-                                                     "Content-Security-Policy": "sandbox; default-src 'none'"})
+    # Always a download: octet-stream (never a type a browser renders inline) + attachment + sandbox CSP.
+    return FileResponse(p, filename=p.name, media_type="application/octet-stream",
+                        content_disposition_type="attachment",
+                        headers={"Cache-Control": "no-store", "Content-Security-Policy": "sandbox; default-src 'none'"})
 
 
 async def fs_read(request: Request):
@@ -449,7 +523,7 @@ async def fs_read(request: Request):
 
 
 # ====================================================================== apps frame + herd
-APP_FRAME_CSP = ("sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox; "
+APP_FRAME_CSP = ("sandbox allow-scripts allow-forms allow-popups; "
                  "default-src * data: blob: 'unsafe-inline' 'unsafe-eval'; frame-ancestors 'self'")
 
 
@@ -477,6 +551,20 @@ def _resource_html(contents: list) -> str | None:
     return best
 
 
+async def _acp_request(c: Ctx, request: Request, user: dict, up, method: str, params: dict,
+                       timeout: float = 30) -> Any:
+    """An ACP call the gateway makes for a REST route: runs the same method firewall as calls sent over /ws
+    (policy.check) and audits a denial the same way the hub does ("acp.denied")."""
+    policy = c.policy_for(user)
+    try:
+        acp_policy.check(method, params, is_admin=user["role"] == "admin", policy=policy,
+                         roots=c.roots_for(user, policy))
+    except acp_policy.Denied as e:
+        c.audit(request, "acp.denied", user, target=method, detail={"reason": str(e), "via": "rest"}, ok=False)
+        raise HTTPError(403, "forbidden", f"forbidden: {e}")
+    return await up.request(method, params, timeout=timeout)
+
+
 async def apps_frame(request: Request):
     c = ctx(request)
     u = c.require(request).user
@@ -490,8 +578,8 @@ async def apps_frame(request: Request):
         if not uri.startswith("ui://") or len(uri) > 2000 or not sid or len(sid) > 200 or not ext or len(ext) > 200:
             raise HTTPError(400, "bad_app_ref")
         try:
-            res = await up.request("_goose/unstable/resources/read",
-                                   {"sessionId": sid, "uri": uri, "extensionName": ext}, timeout=30)
+            res = await _acp_request(c, request, u, up, "_goose/unstable/resources/read",
+                                     {"sessionId": sid, "uri": uri, "extensionName": ext})
         except RpcError as e:
             raise HTTPError(404, "app_not_found", e.message)
         html = _resource_html(((res or {}).get("result") or {}).get("contents") or [])
@@ -502,7 +590,7 @@ async def apps_frame(request: Request):
         if not name or len(name) > 200:
             raise HTTPError(400, "bad_name")
         try:
-            res = await up.request("_goose/unstable/apps/export", {"name": name}, timeout=30)
+            res = await _acp_request(c, request, u, up, "_goose/unstable/apps/export", {"name": name})
         except RpcError as e:
             raise HTTPError(404, "app_not_found", e.message)
         html = (res or {}).get("html") or ""
@@ -552,10 +640,20 @@ async def herd(request: Request):
 
 
 # ====================================================================== admin: users
+# (table, linked column, owner column) combinations _set_links may touch.
+_LINK_TABLES = frozenset({("team_members", "team_id", "user_id"), ("user_hints", "hints_id", "user_id"),
+                          ("team_hints", "hints_id", "team_id")})
+
+
 def _set_links(c: Ctx, table: str, col: str, owner_col: str, owner_id: int, ids: list) -> None:
-    stmts = [(f"DELETE FROM {table} WHERE {owner_col}=?", (owner_id,))]
+    if (table, col, owner_col) not in _LINK_TABLES:
+        raise ValueError(f"unsupported link table {table}.{col}/{owner_col}")
+    # The identifiers are checked against the constant _LINK_TABLES allow-list (never user input);
+    # owner_id and ids are bound parameters (ids are int()-converted).
+    stmts = [(f"DELETE FROM {table} WHERE {owner_col}=?", (int(owner_id),))]  # nosec B608
     for i in ids or []:
-        stmts.append((f"INSERT OR IGNORE INTO {table}({owner_col}, {col}) VALUES(?,?)", (owner_id, int(i))))
+        stmts.append((f"INSERT OR IGNORE INTO {table}({owner_col}, {col}) VALUES(?,?)",  # nosec B608
+                       (int(owner_id), int(i))))
     c.db.transaction(stmts)
 
 
@@ -691,8 +789,10 @@ async def admin_user(request: Request):
         _set_links(c, "team_members", "team_id", "user_id", u["id"], b["teams"])
     if "hints" in b:
         _set_links(c, "user_hints", "hints_id", "user_id", u["id"], b["hints"])
-    if fields.get("disabled"):
+    if fields.get("disabled") or "password_hash" in fields:
+        # disabling or an admin password reset ends every session and API token of the user (GW-21)
         c.auth.revoke_user_sessions(u["id"])
+        c.auth.revoke_user_tokens(u["id"])
     u2 = c.db.user_by_id(u["id"])
     changes = await _reprovision(c, [u2]) if {"teams", "hints", "policyOverrides"} & b.keys() else {}
     c.audit(request, "user.update", admin, target=u["username"], detail={"fields": sorted(b.keys() - {"password"})})
@@ -707,6 +807,7 @@ async def admin_user_reset(request: Request):
     c.db.update_user(u["id"], password_hash=await asyncio.to_thread(security.hash_password, temp), must_change_pw=1,
                      auth_source="local", failed_logins=0, locked_until=0)
     c.auth.revoke_user_sessions(u["id"])
+    c.auth.revoke_user_tokens(u["id"])  # GW-21: a reset must also cut off API-token access
     c.audit(request, "user.reset_password", admin, target=u["username"])
     return ok({"tempPassword": temp})
 
@@ -965,6 +1066,11 @@ async def admin_settings(request: Request):
                    "allowSelfTotp": c.db.get_setting("allow_self_totp", True),
                    "requireTotpForAdmins": bool(c.db.get_setting("require_totp_admins")), "peers": peers})
     b = await body_json(request)
+    # Validate before writing anything (the UI saves every field in one request).
+    if b.get("requireTotpForAdmins") and not c.db.get_setting("require_totp_admins") and not admin["totp_enabled"]:
+        # Only an admin who already uses two-factor may switch the requirement on.
+        raise HTTPError(409, "totp_needed_first",
+                        "Turn on two-factor for your own account before requiring it for administrators")
     if "brand" in b and isinstance(b["brand"], dict):
         c.db.set_setting("brand", {k: str(v)[:120] for k, v in b["brand"].items() if k in ("name", "tagline", "machine")})
     if "defaultTeamId" in b:

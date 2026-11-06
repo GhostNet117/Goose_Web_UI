@@ -50,6 +50,10 @@ DEFAULTS: dict[str, Any] = {
         "public_url": "",                 # e.g. https://goose.example.org (used for Origin checks + OIDC redirect)
         "trusted_proxies": ["127.0.0.1", "::1"],
         "allowed_origins": [],            # extra Origins allowed for the WebSocket (public_url is always allowed)
+        # Host header allow-list (DNS-rebinding guard). Always allowed: the host name of public_url, localhost,
+        # 127.0.0.1, ::1 and the bind address (server.host unless 0.0.0.0 / ::). Add other names users type
+        # in the address bar here (no ports, no wildcards). Other Host values get "400 invalid host".
+        "allowed_hosts": [],
         "max_upload_mb": 25,
         "allow_elevated": False,          # Windows: refuse to run with an admin token (ownership guarantee)
     },
@@ -71,6 +75,12 @@ DEFAULTS: dict[str, Any] = {
         "lockout_threshold": 8,
         "lockout_minutes": 15,
         "min_password_length": 10,
+    },
+    "notify": {
+        # Personal notification webhooks may only reach public internet addresses: loopback, private (RFC 1918,
+        # ULA), link-local, CGNAT, reserved, multicast and unspecified targets are refused (SSRF guard).
+        # Set true only if users really need internal targets such as a self-hosted ntfy on the LAN.
+        "allow_private_targets": False,
     },
     "host_tasks": {
         "enabled": True,

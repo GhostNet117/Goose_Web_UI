@@ -2,7 +2,8 @@
 # Installs Goose AI Web Interface for the CURRENT (non-root) user on Linux or macOS.
 #   ./scripts/install.sh [--profiles-root DIR] [--goose-appdata DIR|fresh] [--host H] [--port P]
 #                        [--public-url URL] [--trusted-proxy IP]... [--systemd]
-# The admin is $USER with password ChangeMe (forced change at first sign-in).
+# The admin is $USER with a random initial password that is shown once at the end (forced change at first
+# sign-in). Dependencies are installed from requirements.lock with --require-hashes.
 # On Linux/macOS the admin starts with a fresh profile under <profiles-root>/appdata unless --goose-appdata
 # points at a folder that contains config/ data/ state/ (a GOOSE_PATH_ROOT style layout).
 set -euo pipefail
@@ -25,7 +26,7 @@ while [ $# -gt 0 ]; do
     --public-url) PUBLIC_URL="$2"; shift 2 ;;
     --trusted-proxy) PROXIES+=("$2"); shift 2 ;;
     --systemd) SYSTEMD=1; shift ;;
-    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -45,8 +46,15 @@ if [ ! -x .venv/bin/python ]; then
   if command -v uv >/dev/null 2>&1; then uv venv --python 3.13 .venv || uv venv .venv
   else python3 -m venv .venv; fi
 fi
-if command -v uv >/dev/null 2>&1; then uv pip install --python .venv/bin/python -e .
-else .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install -e .; fi
+# Dependencies from the hash-locked requirements.lock, then the app itself without dependency resolution.
+if command -v uv >/dev/null 2>&1; then
+  uv pip install --python .venv/bin/python --require-hashes -r requirements.lock
+  uv pip install --python .venv/bin/python --no-deps -e .
+else
+  .venv/bin/python -m pip install --upgrade pip
+  .venv/bin/python -m pip install --require-hashes -r requirements.lock
+  .venv/bin/python -m pip install --no-deps -e .
+fi
 
 SYS="$PROFILES_ROOT/_system"
 CFG="$SYS/config.yaml"
@@ -68,7 +76,12 @@ if [ ! -f "$CFG" ]; then
   echo "==> wrote $CFG"
 fi
 
-.venv/bin/python -m goose_web --config "$CFG" init --admin "${USER:-admin}" --native-root "$NATIVE"
+# init prints the generated initial admin password (first install only); keep its output for the end.
+if ! INIT_OUT="$(.venv/bin/python -m goose_web --config "$CFG" init --admin "${USER:-admin}" --native-root "$NATIVE")"; then
+  printf '%s\n' "$INIT_OUT"
+  echo "goose-web init failed." >&2
+  exit 1
+fi
 .venv/bin/python -m goose_web --config "$CFG" check || true
 
 if [ "$SYSTEMD" = 1 ]; then
@@ -96,4 +109,9 @@ fi
 
 echo
 echo "Done. Start with: .venv/bin/python -m goose_web --config \"$CFG\" serve"
-echo "Then open http://$HOST:$PORT and sign in as '${USER:-admin}' / 'ChangeMe'."
+echo "Then open http://$HOST:$PORT and sign in as '${USER:-admin}'."
+echo
+printf '%s\n' "$INIT_OUT"
+case "$INIT_OUT" in
+  *"Already initialised"*) echo "(Existing installation: the admin password was not changed.)" ;;
+esac

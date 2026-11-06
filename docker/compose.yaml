@@ -1,5 +1,8 @@
 # docker compose -f docker/compose.yaml up -d --build
-# Then open http://<host>:8710 and sign in as admin / ChangeMe (you must change it immediately).
+# On the first start a random initial admin password is printed ONCE to the log:
+#   docker compose -f docker/compose.yaml logs goose-web
+# (or preset one with GOOSE_WEB_ADMIN_PASSWORD_FILE, see below). Open http://127.0.0.1:8710, sign in as admin
+# with that password and change it (enforced). The password is not printed again on later starts.
 # Put a TLS reverse proxy in front for anything beyond localhost and set GOOSE_WEB__SERVER__PUBLIC_URL.
 name: goose-web
 
@@ -9,16 +12,26 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
       args:
+        # Changing the version also needs the matching GOOSE_SHA256_AMD64 / GOOSE_SHA256_ARM64 build args
+        # (see docker/Dockerfile); the build fails on a checksum mismatch.
         GOOSE_VERSION: "1.57.0"
     image: goose-web:latest
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8710:8710"          # change to "8710:8710" only behind a firewall / reverse proxy
+      # Published on loopback only. Change to "8710:8710" only behind a firewall / reverse proxy.
+      - "127.0.0.1:8710:8710"
     environment:
       GOOSE_WEB_ADMIN: admin
+      # Preset the initial admin password instead of a generated one (read on the first start only):
+      # GOOSE_WEB_ADMIN_PASSWORD_FILE: /run/secrets/goose_web_admin_password
       # GOOSE_WEB__SERVER__PUBLIC_URL: https://goose.example.org
+      # Trusted proxies may set X-Forwarded-For. Trust only your reverse proxy's own address: every host in a
+      # trusted range (such as the whole Docker network 172.16.0.0/12 below) can spoof the client IP that
+      # rate limiting, lockout and the audit log rely on.
       # GOOSE_WEB__SERVER__TRUSTED_PROXIES: '["127.0.0.1", "172.16.0.0/12"]'
       TZ: UTC
+    # secrets:
+    #   - goose_web_admin_password
     volumes:
       - goose-web-data:/data
       # Workspaces users may work in (add them to a team's allowed roots):
@@ -35,3 +48,7 @@ services:
 
 volumes:
   goose-web-data:
+
+# secrets:
+#   goose_web_admin_password:
+#     file: ./admin_password.txt

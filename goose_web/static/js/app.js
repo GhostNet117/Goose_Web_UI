@@ -247,16 +247,19 @@ rpc.on('_gw/notice', (p) => {
 });
 rpc.on(G('providers/authentication/device-code'), (p) => {
   let left = Number(p.expiresIn) || 600;
+  const verifyUrl = httpsUrl(p.verificationUri); // only an https: URL becomes a link; anything else is shown as text
   const timer = h('span', { class: 'muted small' });
   const tick = () => { timer.textContent = 'Expires in ' + Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0'); left--; if (left < 0) { clearInterval(iv); m.close(); } };
   const iv = setInterval(tick, 1000);
   const m = modal({ title: 'Sign in to ' + (p.providerId || 'provider'), size: 'sm', onClose: () => clearInterval(iv),
     body: h('div', { class: 'stack center' }, h('p', { class: 'muted' }, 'Open the link below and enter this code:'), h('div', { class: 'device-code mono' }, p.userCode), copyBtn(p.userCode, 'Copy code'),
-      h('a', { href: p.verificationUri, target: '_blank', rel: 'noopener noreferrer', class: 'btn btn-primary' }, icon('external', 14), ' Open ', safeHost(p.verificationUri)), timer),
+      verifyUrl ? h('a', { href: verifyUrl, target: '_blank', rel: 'noopener noreferrer', class: 'btn btn-primary' }, icon('external', 14), ' Open ', safeHost(verifyUrl))
+        : h('div', { class: 'mono small' }, String(p.verificationUri || '')), timer),
     footer: [btn('Close', () => m.close())] });
   tick();
 });
 function safeHost(u) { try { return new URL(u).host; } catch { return 'link'; } }
+function httpsUrl(u) { try { const x = new URL(String(u || '')); return x.protocol === 'https:' ? x.href : null; } catch { return null; } }
 
 bus.on('ask:new', (ask, opts) => {
   refreshBadges();

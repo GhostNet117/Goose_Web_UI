@@ -1,5 +1,5 @@
 // Apps: MCP Apps grid, sandboxed frame (served by the gateway, opaque origin) + postMessage bridge.
-import { h, btn, iconBtn, pageHeader, toast, toastError, confirmDialog, modal, empty, skeleton, banner, errMsg, input, textarea, field, tabs, downloadBlob, pickFile, readFileText, menu, debounce } from '../ui.js';
+import { h, btn, iconBtn, pageHeader, toast, toastError, confirmDialog, modal, empty, skeleton, banner, errMsg, input, textarea, field, tabs, downloadBlob, pickFile, readFileText, menu, debounce, prettyJson } from '../ui.js';
 import { icon } from '../icons.js';
 import { rpc, G } from '../rpc.js';
 import { policy } from '../store.js';
@@ -120,7 +120,9 @@ function renderAppRunner(ctx, name) {
     if (app && app.resizable !== false) iframe.classList.add('resizable');
     frameWrap.replaceChildren(iframe);
     bridge = createAppBridge(iframe, {
-      app, extensionName: (app && app.mcpServers && app.mcpServers[0]) || 'apps', ensureSession,
+      // extensionName comes from app metadata (author-controlled), so tool calls into powerful
+      // built-in extensions need the user's OK each time (confirmSensitiveTools).
+      app, extensionName: (app && app.mcpServers && app.mcpServers[0]) || 'apps', ensureSession, confirmSensitiveTools: true,
       onInitialized: () => { status.textContent = 'Running · sandboxed'; },
       onMessage: (text) => openChatWith(text),
     });
@@ -157,11 +159,48 @@ function renderAppRunner(ctx, name) {
   };
 }
 
+// Built-in extensions whose tools can run commands, control the machine or spawn agents. A grid/imported
+// app picks its extension from its own metadata, so each call into one of these needs the user's OK.
+const SENSITIVE_EXTENSIONS = new Set(['developer', 'computercontroller', 'code_execution', 'orchestrator']);
+const MAX_APP_MESSAGE_BYTES = 8 * 1024;
+const APP_MESSAGE_INTERVAL_MS = 5000;
+
+function bridgeError(code, message) { const e = new Error(message); e.code = code; return e; }
+function truncate(s, max) { s = String(s); return s.length > max ? s.slice(0, max) + '\n… (' + (s.length - max) + ' more characters)' : s; }
+
+// Confirmation dialog for app-initiated actions. Default is deny: Cancel has the focus, and closing
+// the dialog (Esc, overlay click, X, bridge destroyed) counts as Cancel. Returns { promise, close }.
+function appConsent({ title, body, confirmText }) {
+  let m;
+  const promise = new Promise((resolve) => {
+    const cancel = btn('Cancel', () => m.close(false), { variant: 'primary' });
+    m = modal({
+      title, size: 'md',
+      body: h('div', { class: 'confirm-body stack' }, body),
+      footer: [cancel, btn(confirmText, () => m.close(true), { variant: 'danger' })],
+      onClose: (r) => resolve(r === true),
+    });
+    setTimeout(() => cancel.focus(), 30);
+  });
+  return { promise, close: () => m && m.close(false) };
+}
+
 // MCP Apps host bridge (JSON-RPC 2.0 over postMessage). The frame has an opaque origin
 // ('null'), so we authenticate messages by event.source === iframe.contentWindow.
-export function createAppBridge(iframe, { app, extensionName, ensureSession, onInitialized, onMessage, toolInput, toolResult }) {
+// Security: an app may only call tools of its own extension (extensionName); any other prefix is
+// refused. With confirmSensitiveTools (grid/imported apps, extension taken from app metadata) calls into
+// SENSITIVE_EXTENSIONS need a per-call confirmation. ui/message (send a chat prompt as the user) always
+// needs a confirmation, is capped at 8 KB and limited to one message per 5 s per bridge.
+export function createAppBridge(iframe, { app, extensionName, ensureSession, onInitialized, onMessage, toolInput, toolResult, confirmSensitiveTools = false }) {
   let initialized = false;
   let autoHinted = false;
+  let destroyed = false;
+  let toolConsent = null;   // open tool-call confirmation, if any
+  let msgConsent = null;    // open ui/message confirmation, if any
+  let lastMsgAt = 0;
+  const ext = String(extensionName || '');
+  const appLabel = String((app && app.name) || ext || 'This app');
+  const sensitive = !!confirmSensitiveTools && SENSITIVE_EXTENSIONS.has(ext.toLowerCase());
   const post = (msg) => { try { iframe.contentWindow && iframe.contentWindow.postMessage(msg, '*'); } catch (e) { console.warn('postMessage failed', e); } };
   const reply = (id, result) => post({ jsonrpc: '2.0', id, result });
   const fail = (id, code, message) => post({ jsonrpc: '2.0', id, error: { code, message } });
@@ -192,11 +231,31 @@ export function createAppBridge(iframe, { app, extensionName, ensureSession, onI
     }),
     'ping': async () => ({}),
     'tools/call': async (p) => {
-      const sessionId = await ensureSession();
       const toolName = String(p.name || '');
+      // Only tools of this app's own server: strip a matching "<ext>__" prefix, refuse any other prefix.
+      let bareName = toolName;
+      if (toolName.toLowerCase().startsWith(ext.toLowerCase() + '__')) bareName = toolName.slice(ext.length + 2);
+      if (!ext || !bareName || bareName.includes('__')) throw bridgeError(-32602, "tool not in this app's server: " + toolName);
+      const args = p.arguments && typeof p.arguments === 'object' ? p.arguments : {};
+      if (sensitive) {
+        if (toolConsent) throw bridgeError(-32000, 'Another tool call is waiting for the user to confirm');
+        toolConsent = appConsent({
+          title: 'Allow app to run a tool?',
+          confirmText: 'Run tool',
+          body: [
+            h('p', null, h('strong', null, appLabel), ' wants to run ', h('code', null, ext + '__' + bareName), '. This extension can run commands or control this machine. Only allow it if you trust this app.'),
+            h('div', { class: 'muted small' }, 'Arguments'),
+            h('pre', { class: 'mono small', style: { whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '40vh', overflow: 'auto' } }, truncate(prettyJson(args), 2000)),
+          ],
+        });
+        let ok;
+        try { ok = await toolConsent.promise; } finally { toolConsent = null; }
+        if (!ok || destroyed) throw bridgeError(-32000, 'The user declined the tool call');
+      }
+      const sessionId = await ensureSession();
       let r;
       try {
-        r = await rpc.call(G('tools/call'), { sessionId, extensionName, name: toolName.includes('__') ? toolName : extensionName + '__' + toolName, arguments: p.arguments || {} });
+        r = await rpc.call(G('tools/call'), { sessionId, extensionName: ext, name: ext + '__' + bareName, arguments: args });
       } catch (e) {
         // Goose only lets apps run tools when the session is in Auto mode (same rule as Desktop); say so in the host UI.
         if (/auto mode/i.test(errMsg(e)) && !autoHinted) { autoHinted = true; toast('This app tried to run the tool "' + toolName + '". Goose only allows app tool calls when the chat is in Auto mode.', { kind: 'warn', timeout: 8000 }); }
@@ -210,8 +269,26 @@ export function createAppBridge(iframe, { app, extensionName, ensureSession, onI
       return r.result || { contents: [] };
     },
     'ui/message': async (p) => {
-      const text = (p.content || []).filter((c) => c && c.type === 'text').map((c) => c.text).join('\n') || (p.text || '');
-      if (text && onMessage) onMessage(text);
+      if (!onMessage) throw bridgeError(-32601, 'Sending messages is not supported here');
+      const parts = Array.isArray(p.content) ? p.content : [];
+      const text = parts.filter((c) => c && c.type === 'text' && typeof c.text === 'string').map((c) => c.text).join('\n') || (typeof p.text === 'string' ? p.text : '');
+      if (!text.trim()) return {};
+      if (new TextEncoder().encode(text).length > MAX_APP_MESSAGE_BYTES) throw bridgeError(-32602, 'Message too long (max 8 KB)');
+      if (msgConsent) throw bridgeError(-32000, 'A previous message is still waiting for the user to confirm');
+      if (Date.now() - lastMsgAt < APP_MESSAGE_INTERVAL_MS) throw bridgeError(-32000, 'Too many messages: at most one every 5 seconds');
+      lastMsgAt = Date.now();
+      msgConsent = appConsent({
+        title: 'Send message from app?',
+        confirmText: 'Send',
+        body: [
+          h('p', null, h('strong', null, appLabel), ' wants to send this message:'),
+          h('pre', { class: 'small', style: { whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '40vh', overflow: 'auto' } }, text),
+        ],
+      });
+      let ok;
+      try { ok = await msgConsent.promise; } finally { msgConsent = null; lastMsgAt = Date.now(); }
+      if (!ok || destroyed) throw bridgeError(-32000, 'The user did not send the message');
+      onMessage(text);
       return {};
     },
     'ui/open-link': async (p) => {
@@ -254,7 +331,12 @@ export function createAppBridge(iframe, { app, extensionName, ensureSession, onI
   });
   themeObs.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'data-scheme'] });
   return {
-    destroy() { window.removeEventListener('message', onMsg); themeObs.disconnect(); },
+    destroy() {
+      destroyed = true;
+      window.removeEventListener('message', onMsg); themeObs.disconnect();
+      if (toolConsent) toolConsent.close();
+      if (msgConsent) msgConsent.close();
+    },
     sendToolInput(args) { post({ jsonrpc: '2.0', method: 'ui/notifications/tool-input', params: { arguments: args } }); },
     sendToolResult(res) { post({ jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: res }); },
   };
