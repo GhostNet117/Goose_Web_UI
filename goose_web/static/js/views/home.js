@@ -1,12 +1,14 @@
 // New chat / home view: hero composer with folder chip + optional recipe; creates session/new then sends.
-import { h, btn, iconBtn, toastError, shortPath, baseName, menu, relTime, spinner } from '../ui.js';
+import { h, btn, iconBtn, toast, toastError, shortPath, baseName, menu, relTime, spinner } from '../ui.js';
 import { icon, logo } from '../icons.js';
 import { rpc, G } from '../rpc.js';
 import { router } from '../router.js';
 import { store } from '../store.js';
 import { Composer } from '../composer.js';
 import { pickFolder, fsRoots } from './folderpicker.js';
-import { pref, addRecentFolder } from '../prefs.js';
+import { pref, setPref, addRecentFolder } from '../prefs.js';
+import { allowedValue } from '../store.js';
+import { MODES, pillSelect, knownEfforts, loadNewChatOptions, applyNewChatOptions } from '../chatoptions.js';
 import { getChat } from '../chatsession.js';
 import { upsertSession, sessionsState, sessionTitle, activityTime } from '../sessions.js';
 import { setBaseTitle, herdList } from '../herd.js';
@@ -54,6 +56,43 @@ export function renderHome(ctx, query = {}) {
     folderChip.title = cwd || 'Choose working folder';
     recipeChip.replaceChildren(icon('recipe', 14), h('span', null, recipe ? recipe.title : 'Recipe'), recipe ? iconBtn('x', 'Clear recipe', (e) => { e.stopPropagation(); recipe = null; renderChips(); }, { size: 'sm' }) : icon('chevronDown', 12));
   };
+  // ----- per-chat options (spec 008): provider, model, thinking effort, approval mode -----
+  const optsRow = h('div', { class: 'home-opts', role: 'group', 'aria-label': 'Options for the new chat' });
+  let optData = null;
+  const choice = { provider: '', model: '', effort: '', mode: '', ...(pref('newChat') || {}) };
+  const saveChoice = () => setPref('newChat', { provider: choice.provider, model: choice.model, effort: choice.effort, mode: choice.mode });
+  const renderOpts = () => {
+    const nodes = [];
+    if (optData && optData.providers.length) {
+      const provs = optData.providers;
+      if (choice.provider && !provs.some((x) => x.id === choice.provider)) { choice.provider = ''; choice.model = ''; choice.effort = ''; }
+      const defP = provs.find((x) => x.id === optData.defaultProvider);
+      const effProvider = choice.provider || optData.defaultProvider;
+      const pEntry = provs.find((x) => x.id === effProvider);
+      const models = pEntry ? pEntry.models : [];
+      if (choice.model && !models.some((m) => m.id === choice.model)) { choice.model = ''; choice.effort = ''; }
+      const defModel = (!choice.provider || choice.provider === optData.defaultProvider) && optData.defaultModel ? optData.defaultModel : (pEntry ? pEntry.defaultModel : '');
+      nodes.push(pillSelect('cpu', 'Provider', [{ value: '', label: 'Default provider' + (defP ? ' (' + defP.name + ')' : '') }, ...provs.map((x) => ({ value: x.id, label: x.name }))],
+        choice.provider, (v) => { choice.provider = v; choice.model = ''; choice.effort = ''; saveChoice(); renderOpts(); }));
+      nodes.push(pillSelect('zap', 'Model', [{ value: '', label: 'Default model' + (defModel ? ' (' + defModel + ')' : '') }, ...models.map((m) => ({ value: m.id, label: m.name }))],
+        choice.model, (v) => { choice.model = v; choice.effort = ''; saveChoice(); renderOpts(); }));
+      const efforts = knownEfforts(effProvider, choice.model || defModel);
+      if (choice.effort && !efforts.some((x) => x.value === choice.effort)) choice.effort = '';
+      nodes.push(pillSelect('brain', 'Thinking effort', [{ value: '', label: 'Default effort' + (optData.defaultEffort ? ' (' + optData.defaultEffort + ')' : '') }, ...efforts], choice.effort, (v) => { choice.effort = v; saveChoice(); }));
+    }
+    const modes = MODES.filter((m) => allowedValue('allowed_modes', m.value));
+    if (choice.mode && !modes.some((m) => m.value === choice.mode)) choice.mode = '';
+    const dm = optData ? MODES.find((m) => m.value === optData.defaultMode) : null;
+    nodes.push(pillSelect('shield', 'Approval mode', [{ value: '', label: 'Default approval' + (dm ? ' (' + dm.label + ')' : '') }, ...modes], choice.mode, (v) => { choice.mode = v; saveChoice(); }));
+    optsRow.replaceChildren(...nodes);
+  };
+  // Apply the non-default choices to the new chat before its first prompt; unavailable ones only warn.
+  const applyChoice = async (chat) => {
+    if (!choice.provider && !choice.model && !choice.effort && !choice.mode) return;
+    const warn = await applyNewChatOptions(chat, { ...choice });
+    if (warn.length) toast('Some chat options were not applied:\n' + warn.join('\n'), { kind: 'warn', timeout: 10000 });
+  };
+
   folderChip.addEventListener('click', async () => { const d = await pickFolder({ initial: cwd }); if (d) { cwd = d; renderChips(); composer.focus(); } });
   recipeChip.addEventListener('click', async () => {
     let list = [];
@@ -72,6 +111,7 @@ export function renderHome(ctx, query = {}) {
       sending = true; status.hidden = false;
       try {
         const chat = await createSession({ cwd, recipeId: recipe ? recipe.id : null });
+        await applyChoice(chat);
         router.go('/chat/' + encodeURIComponent(chat.id));
         // Goose renders recipe parameters during session/new; swap an untouched template prompt for the rendered one.
         const rendered = chat.recipe && chat.recipe.prompt;
@@ -91,6 +131,7 @@ export function renderHome(ctx, query = {}) {
     try {
       status.hidden = false;
       const chat = await createSession({ cwd, recipeId: recipe ? recipe.id : null });
+      await applyChoice(chat);
       if (recipe && (chat.recipe && chat.recipe.prompt || recipe.prompt)) chat.prefill = (chat.recipe && chat.recipe.prompt) || recipe.prompt;
       router.go('/chat/' + encodeURIComponent(chat.id));
     } catch (e) { toastError(e, 'Could not start chat'); } finally { status.hidden = true; }
@@ -118,9 +159,11 @@ export function renderHome(ctx, query = {}) {
       logo(52),
       h('h1', { class: 'home-title' }, greet + (name ? ', ' + name : '')),
       h('p', { class: 'home-sub' }, 'Start a conversation. Goose keeps working even if you close this tab.'),
-      h('div', { class: 'home-composer' }, h('div', { class: 'home-chips' }, folderChip, recipeChip, h('span', { class: 'grow' }), startEmpty), composer.el, status),
+      h('div', { class: 'home-composer' }, h('div', { class: 'home-chips' }, folderChip, recipeChip, h('span', { class: 'grow' }), startEmpty), optsRow, composer.el, status),
       recents));
   renderChips();
+  renderOpts();
+  loadNewChatOptions().then((d) => { optData = d; renderOpts(); }).catch(() => {});
   renderRecents();
   if (!cwd) defaultCwd().then((d) => { if (!cwd && d) { cwd = d; renderChips(); } });
   if (query.recipe) {

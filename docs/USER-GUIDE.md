@@ -251,7 +251,8 @@ Press `Ctrl+K` (or `Cmd+K` on a Mac), or click the command button. Type to filte
 
 ## 4. Starting a chat
 
-Click **New chat** (or press `Alt+N`). The new-chat screen shows a greeting, a message box and two chips above it.
+Click **New chat** (or press `Alt+N`). The new-chat screen shows a greeting, a message box, two chips above it
+and a row of option pickers for the new chat.
 
 ### Step by step
 
@@ -259,8 +260,22 @@ Click **New chat** (or press `Alt+N`). The new-chat screen shows a greeting, a m
    used, or your default workspace. Click it to choose another folder.
 2. Optional: click the **Recipe** chip and pick a recipe to start from. Its prompt is put into the message box.
    Click the small X on the chip to clear it.
-3. Type what Goose should work on.
-4. Press `Enter` (or click the send button).
+3. Optional: choose the **options for this chat** in the picker row (version 1.4.0 and later):
+
+   | Picker | What it sets |
+   |---|---|
+   | Provider | The model provider. Only providers set up in your profile (and allowed by your policy) are listed. |
+   | Model | The model of that provider. Changing the provider resets the model to its default. |
+   | Thinking effort | How much the model reasons before answering (Off, Low, Medium, High, Max, or the values the provider offers). The list shows the values Goose offered last time for that model. |
+   | Approval mode | When Goose asks before it runs a tool: Auto, Approve, Smart approve or Chat only (see [Mode](#mode)). |
+
+   Each picker starts at **Default (...)**, which keeps the default from **Settings > Models & Providers** and
+   **Settings > Preferences**. Your choices are remembered for the next new chat. They are applied to the chat
+   before your first message is sent. If the new chat does not offer a choice (for example a thinking effort the
+   model does not support), Goose Web shows a warning and the chat starts with Goose's value instead. The pickers
+   in the chat header can still change everything later.
+4. Type what Goose should work on.
+5. Press `Enter` (or click the send button).
 
 Goose Web creates the chat, opens it and sends your message. The chat keeps running even if you close the tab.
 

@@ -18,7 +18,8 @@ it, on a desktop or a phone.
 ## Features
 
 - **Chat**: streaming responses, tool calls, and tool-permission cards (approve or deny, first answer wins across
-  all your tabs). Recipe parameters and elicitation forms. Mode and model switching. File upload into your
+  all your tabs). Recipe parameters and elicitation forms. Mode, provider, model and thinking-effort switching, also
+  on the New chat screen before the first message. File upload into your
   workspace.
 - **Live activity** (as in Goose Desktop): the model's thinking, every tool call with its input, live output
   and result, and a live bar with the current step, tool-call count and elapsed time. How much stays open is a

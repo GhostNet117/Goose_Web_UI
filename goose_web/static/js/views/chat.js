@@ -9,6 +9,7 @@ import { pickFolder } from './folderpicker.js';
 import { getSession, removeSession, patchSession, sessionTitle, upsertSession, isArchived } from '../sessions.js';
 import { policy, allowedValue } from '../store.js';
 import { isPinned, togglePin } from '../prefs.js';
+import { pillSelect, rememberEffortOptions } from '../chatoptions.js';
 import { setBaseTitle } from '../herd.js';
 import { mdElement } from '../markdown.js';
 
@@ -94,6 +95,7 @@ export function renderChat(ctx, sessionId) {
       nodes.push(pillSelect(ic, o.name || o.id, opts, o.currentValue, async (v) => { try { await chat.setConfig(o.id, v); } catch (e) { toastError(e, o.name); renderSelects(); } }));
     }
     selects.replaceChildren(...nodes);
+    rememberEffortOptions(chat.configOptions);   // the New chat screen offers the effort values seen here
   };
   const renderUsage = () => {
     const u = chat.usage;
@@ -231,14 +233,6 @@ export function renderChat(ctx, sessionId) {
     focus: () => composer.focus(),
     destroy() { offs.forEach((f) => f()); document.removeEventListener('keydown', onKey); setCurrentChat(null); chat.transcript.root.remove(); },
   };
-}
-
-function pillSelect(ic, label, options, value, onChange) {
-  const s = select(options, value ?? '', { class: 'pill-select', 'aria-label': label, title: label });
-  if (value && !options.some((o) => o.value === value)) s.prepend(h('option', { value }, value));
-  s.value = value ?? '';
-  s.addEventListener('change', () => onChange(s.value));
-  return h('label', { class: 'pill', title: label }, icon(ic, 13), s);
 }
 
 async function exportSession(chat, format) {

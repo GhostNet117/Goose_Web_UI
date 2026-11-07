@@ -25,6 +25,8 @@ export const DEFAULT_PREFS = {
   herd: { all: false },
   // Live agent activity in chat. thinking: auto|expanded|collapsed; tools: auto|detailed|concise.
   activity: { thinking: 'auto', tools: 'auto', statusBar: true },
+  // New chat screen choices (spec 008); '' = profile default.
+  newChat: { provider: '', model: '', effort: '', mode: '' },
 };
 
 export function prefs() { return { ...DEFAULT_PREFS, ...(store.get('prefs') || {}) }; }

@@ -136,7 +136,7 @@ The main ideas:
 |---|---|
 | `index.html` | Shell page: theme stylesheets, `modulepreload` of `js/app.js`, boot spinner. |
 | `manifest.webmanifest` | PWA manifest. |
-| `sw.js` | Service worker (`gw-shell-v8`): offline shell, network-first for app code, cache-first for vendor files. |
+| `sw.js` | Service worker (`gw-shell-v9`): offline shell, network-first for app code, cache-first for vendor files. |
 | `css/app.css` | All styles and themes. |
 | `icons/` | `goose.svg`, `goose-maskable.svg`. |
 | `vendor/` | Vendored libraries (marked, DOMPurify, highlight.js, qrcode-generator) with `README.md` and `SHA256SUMS`. |
@@ -146,6 +146,7 @@ The main ideas:
 | `js/rpc.js` | Reconnecting JSON-RPC client over `/ws`. |
 | `js/api.js` | `fetch` wrapper for the REST API (CSRF header, errors, uploads). |
 | `js/prefs.js` | User preferences (server-stored, cached in `localStorage`), themes. |
+| `js/chatoptions.js` | Per-chat options shared by the chat header and the New chat screen: `pillSelect`, Goose's approval `MODES`, the learned thinking-effort values (`localStorage` `gw-effort-options`), `loadNewChatOptions()` and `applyNewChatOptions()` (spec 008). |
 | `js/chatsession.js` | `ChatSession`: per-session controller. Maps ACP updates to transcript calls. Handles send, queue, steer, cancel and modes. |
 | `js/transcript.js` | `Transcript`: incremental, windowed rendering of messages, thoughts, tool cards, plans, asks and inline MCP Apps. |
 | `js/composer.js` | Message input: slash commands, @mentions, attachments, send/stop/steer/queue. |
@@ -1021,10 +1022,10 @@ Goose sends each thinking block as one `agent_thought_chunk` once the model fini
 | `herd.js` | Herd map keyed `profile:sessionId`. Status transitions raise browser notifications, toasts, or a WebAudio chime, depending on preferences. The page title gets an `(n)` prefix, and the favicon gets a dot (amber for needs-you, green for done). Sort order: needs_you, working, error, done, idle, offline. |
 | `sessions.js` | `session/list` with `_meta {types, goose {includeLastMessageSnippet}, query}` and cursor paging. Debounced refresh merges. Sessions are grouped by working folder, using the same grouping rules as Goose Desktop. |
 | `markdown.js` | marked (GFM), then DOMPurify. Forbidden tags: `style`, `form`, `input`, `button`, `textarea`, `select`, `iframe`, `object`, `embed`. The `style` attribute is forbidden. Links get `target=_blank` with `rel="noopener noreferrer nofollow"`. `javascript:` URLs are removed. Remote images are dropped (only `data:image/`, `blob:` and same-origin paths are kept). Final messages get highlight.js and copy buttons on code blocks. |
-| `prefs.js` | `DEFAULT_PREFS`: `theme`, `accent`, `density`, `fontSize`, `codeTheme`, `enterToSend`, `showTimestamps`, `pinned`, `recentFolders`, `lastCwd`, `notifications {browser, sound, events}`, `sidebar {collapsed, showArchived, includeScheduled, width}`, `herd {all}`. Stored through `PUT /api/me/prefs` (debounced 600 ms) and cached in `localStorage` (`gw.prefs`). `patchPref` merges nested objects with the defaults. `applyTheme` sets `data-theme`, `data-scheme`, `data-density`, `--accent` and `--fs`, and switches the highlight.js stylesheet. Nine themes. |
+| `prefs.js` | `DEFAULT_PREFS`: `theme`, `accent`, `density`, `fontSize`, `codeTheme`, `enterToSend`, `showTimestamps`, `pinned`, `recentFolders`, `lastCwd`, `newChat {provider, model, effort, mode}`, `notifications {browser, sound, events}`, `sidebar {collapsed, showArchived, includeScheduled, width}`, `herd {all}`. Stored through `PUT /api/me/prefs` (debounced 600 ms) and cached in `localStorage` (`gw.prefs`). `patchPref` merges nested objects with the defaults. `applyTheme` sets `data-theme`, `data-scheme`, `data-density`, `--accent` and `--fs`, and switches the highlight.js stylesheet. Nine themes. |
 | `views/chat.js` | Chat header (rename, folder chip, mode/provider/model/thought-level selectors filtered by policy, context ring, extension status, run pill), scroller with stick-to-bottom, composer, queue row, and menu (fork, session extensions, tool permissions, system prompt, diagnostics, export, archive, delete). |
 | `views/apps.js` | Apps gallery and `createAppBridge` (the MCP App host bridge). |
-| `views/home.js` | New chat: `session/new {cwd, mcpServers: [], _meta}`, from a recipe or a deeplink. A missing provider is mapped to a setup hint. |
+| `views/home.js` | New chat: `session/new {cwd, mcpServers: [], _meta}`, from a recipe or a deeplink. A missing provider is mapped to a setup hint. Option pickers (provider, model, thinking effort, approval mode; data from `_goose/unstable/providers/list`, `defaults/read`, `preferences/read`, filtered by policy, remembered in the `newChat` preference). After `session/new` and before the first `session/prompt`, `applyNewChatOptions()` sends `session/set_config_option` for `provider`, `model` and the `thought_level` option (in that order, each checked against the refreshed option list), then `session/set_mode`. These change only that session; the gateway enforces the policy on them (`policy.py`). |
 | `views/herd.js` | Herd board (`_gw/herd`, `GET /api/herd` for peers). |
 | `views/admin.js` | Users, teams, policy, team items, hints library, sign-in providers, settings, system, ownership, host tasks, audit, logs. |
 | `views/settings.js` | Providers, prompts, preferences, hints, tool permissions, advanced configuration, appearance, notifications, account (password, TOTP, API tokens, sign-ins). |
@@ -1048,7 +1049,7 @@ data:
 - **Install** pre-caches the shell list on a best-effort basis and calls
   `skipWaiting()`.
 - **Activate** deletes every cache whose name is not the current `VERSION`
-  (`gw-shell-v8`) and claims open clients.
+  (`gw-shell-v9`) and claims open clients.
 - **notificationclick** focuses an open window, or opens one, at
   `/#/chat/<sessionId>` or `/#/herd`.
 
