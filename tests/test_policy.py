@@ -5,12 +5,14 @@ import pytest
 from goose_web import policy as pol
 
 P = "_goose/unstable/"
+# a typical team member: the 1.4 defaults with Any provider / model / mode (spec 009 representation)
+MEMBER = {**pol.LEGACY_DEFAULT_POLICY, **{k: [pol.ANY] for k in pol.CHAT_LISTS}, "team": {"id": 1, "name": "t"}}
 ROOT = os.path.abspath(os.sep + "profiles" + os.sep + "alice" + os.sep + "workspace")
 
 
 def chk(method, params=None, policy=None, admin=False):
     pol.check(method, params if params is not None else {}, is_admin=admin,
-              policy=policy or dict(pol.DEFAULT_POLICY), roots=[ROOT])
+              policy=policy or dict(MEMBER), roots=[ROOT])
 
 
 def test_admin_unrestricted():
@@ -42,7 +44,7 @@ def test_unknown_method_denied():
 def test_extension_permissions():
     with pytest.raises(pol.Denied):
         chk(P + "config/extensions/add", {"extension": {"type": "platform", "name": "todo"}})
-    p = {**pol.DEFAULT_POLICY, "extensions_edit": True}
+    p = {**MEMBER, "extensions_edit": True}
     chk(P + "config/extensions/add", {"extension": {"type": "platform", "name": "todo"}}, policy=p)
     with pytest.raises(pol.Denied):  # stdio = arbitrary command
         chk(P + "config/extensions/add", {"extension": {"type": "mcp", "server": {"name": "x", "command": "cmd"}}},
@@ -52,7 +54,7 @@ def test_extension_permissions():
 
 
 def test_model_and_mode_allow_lists():
-    p = {**pol.DEFAULT_POLICY, "allowed_models": ["m1"], "allowed_modes": ["approve"]}
+    p = {**MEMBER, "allowed_models": ["m1"], "allowed_modes": ["approve"]}
     chk("session/set_config_option", {"configId": "model", "value": "m1"}, policy=p)
     with pytest.raises(pol.Denied):
         chk("session/set_config_option", {"configId": "model", "value": "m2"}, policy=p)
@@ -62,7 +64,7 @@ def test_model_and_mode_allow_lists():
 
 def test_sources_by_type():
     chk(P + "sources/create", {"type": "skill", "target": {"scope": "global"}})
-    p = {**pol.DEFAULT_POLICY, "skills_edit": False}
+    p = {**MEMBER, "skills_edit": False}
     with pytest.raises(pol.Denied):
         chk(P + "sources/create", {"type": "skill", "target": {"scope": "global"}}, policy=p)
 
@@ -73,17 +75,18 @@ def test_config_read_allow_list():
         chk(P + "config/read", {"key": "SOME_API_KEY", "isSecret": True})
 
 
-def test_effective_policy_merge():
+def test_effective_policy_one_team_and_overrides():
     user = {"role": "user", "policy_overrides": {"max_concurrent_runs": 9}}
-    teams = [{"policy": {"allow_shell": True, "allowed_models": ["a"]}},
-             {"policy": {"allowed_models": ["b"], "allowed_roots": ["D:\\x"]}}]
+    teams = [{"id": 1, "name": "a", "policy": {"allow_shell": True, "allowed_models": ["a"],
+                                                "allowed_roots": ["D:\\x"]}},
+             {"id": 2, "name": "b", "policy": {"allowed_models": ["b"], "config_edit": True}}]
     e = pol.effective_policy(user, teams)
     assert e["allow_shell"] is True
-    assert e["allowed_models"] == ["a", "b"]
+    assert e["allowed_models"] == ["a"]            # one team: no union with a second team
+    assert e["config_edit"] is False
     assert e["allowed_roots"] == ["D:\\x"]
     assert e["max_concurrent_runs"] == 9
-    teams.append({"policy": {}})  # a team with no model list = unrestricted
-    assert pol.effective_policy(user, teams)["allowed_models"] == []
+    assert e["team"] == {"id": 1, "name": "a"}
     assert pol.effective_policy({"role": "admin"}, [])["config_edit"] is True
 
 

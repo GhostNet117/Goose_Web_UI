@@ -148,7 +148,8 @@ def cmd_init(args, settings) -> int:
         import json
         import time
         db.execute("INSERT INTO teams(name, description, policy, created_at) VALUES(?,?,?,?)",
-                   ("Everyone", "Default team for new users (no shell, no extension changes).", json.dumps({}),
+                   ("Everyone", "Default team for new users. Starts with nothing allowed: choose its providers, models and "
+                    "approval modes in Admin > Teams.", json.dumps({}),
                     time.time()))
         db.set_setting("default_team_id", db.one("SELECT id FROM teams WHERE name='Everyone'")["id"])
     db.audit("system.init", target=name, detail={"native_root": native, "generated_password": generated})

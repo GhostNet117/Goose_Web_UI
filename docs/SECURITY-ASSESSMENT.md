@@ -13,6 +13,9 @@
   NEW-10 findings. **No external penetration test was done.** Nothing was attacked at runtime beyond the
   project's own unit tests. Statements about Goose internals that were not verified are marked as such.
 - **Reporting:** see [SECURITY.md](../SECURITY.md).
+- **Addendum:** [section 7](#7-addendum-goose-web-150-team-profiles-with-least-privilege) records the
+  security-relevant changes of goose-web 1.5.0 (team profiles with least privilege) and the known risk that
+  remains. Sections 1 to 6 describe v1.0.0.
 
 ## 1. Summary
 
@@ -288,7 +291,8 @@ Limits of this assessment:
    GW-14).
 7. Leave `allow_shell`, `config_edit`, `extensions_edit`, `providers_edit` and `notify_webhook` off for ordinary
    teams. Set `allowed_modes`, `allowed_providers`, `allowed_models` and `max_concurrent_runs` (GW-03, GW-08,
-   GW-20). Keep `notify.allow_private_targets: false`.
+   GW-20). Keep `notify.allow_private_targets: false`. Since 1.5.0 a new team allows nothing until you allow it;
+   keep Shell and raw config editing off for non-admin teams (section 7).
 8. Reserved usernames (`appdata`, `workspace`, ...) are refused by the gateway (GW-04). Older builds did not refuse
    them.
 9. Restrict the ACLs of the profiles root and the native profile folder to the gateway user, SYSTEM and
@@ -358,3 +362,49 @@ Get-NetFirewallRule -Name GooseWeb-Gateway-TCP-8710 | Get-NetFirewallAddressFilt
 Get-ScheduledTask -TaskName GooseWeb_Gateway | Select-Object -ExpandProperty Principal  # Interactive / Limited
 .\.venv\Scripts\python.exe -m goose_web check                                         # running as ... not elevated
 ```
+
+## 7. Addendum: goose-web 1.5.0, team profiles with least privilege
+
+This addendum lists the security-relevant changes of goose-web 1.5.0 and the known risk that remains. It is not a
+new full review: the findings above keep their v1.0.0 status unless this section says otherwise.
+
+### 7.1 Changes
+
+| Change | Effect | Evidence (file: function) |
+|---|---|---|
+| Deny by default | An empty `allowed_modes`, `allowed_providers` or `allowed_models` now allows nothing; `"*"` (Any) allows everything. New teams start with every switch off and every list empty. A user without a team can sign in and read chats but cannot chat. Admins are not restricted. | `policy.py: DEFAULT_POLICY, allows, chat_block, effective_policy, check` |
+| One team per user | The 1.4 rule merged several teams (switches OR-ed, lists unioned, an empty list made the result unrestricted), so a user got the most permissive combination. Now a user has one team (unique index), adding a user to a team moves them, and a directory sign-in sets the mapped team (the first match wins). | `db.py: set_user_team, _migrate_policy_model`; `api.py: admin_team, _team_from_body`; `auth.py: _upsert_external` |
+| Chats checked against the current policy | A prompt in an older chat is refused when the chat's provider, model or mode is no longer allowed. `config/upsert` of `GOOSE_PROVIDER`, `GOOSE_MODEL`, `GOOSE_MODE` and `defaults/save` are checked against the lists. | `policy.py: check_session_choice, check, CONFIG_LIST_KEYS`; `hub.py` |
+| Working-folder hints loophole closed | In 1.4 a member could place an `AGENTS.md` or `.goosehints` in a working folder, and Goose loaded it next to the team hints, which could override them. Isolated workers now run with `CONTEXT_FILE_NAMES=[".goose-web-hints.md"]` and load only the composed file, in which team hints come last and are marked final. Personal hints are included only when the team allows them. Non-admins cannot upload or create files with these names (`403 hint_file_refused`) or change `CONTEXT_FILE_NAMES`. The native (admin) profile is unchanged. | `workers.py: WorkerManager._env`; `profiles.py: hint_sections, compose_hints`; `api.py: _refuse_hint_name`; `policy.py: MANAGED_CONFIG_KEYS` |
+| Folder roots | Non-admin roots are the workspace, the team folder and the team's extra folders. Extra folders and `share_folder` must be absolute paths; `*` is never a folder (`400 bad_folder`). | `policy.py: user_roots`; `api.py: _clean_policy`; `profiles.py: team_folder` |
+| Upgrade migration | So that existing deployments behave as before, 1.4 teams are converted with their empty chat lists set to Any, and users in several teams keep the lowest team id (audited). Migrated teams are therefore as open as before until an admin narrows them. | `db.py: _migrate_policy_model` |
+
+GW-03 (prompt injection): the row above says the default policy does not restrict modes. In 1.5.0 a new team allows no
+modes until an admin chooses them; teams migrated from 1.4 keep Any until narrowed.
+
+### 7.2 Known risk: one Windows account for all team profiles
+
+Severity High, status Accepted risk (this extends GW-01).
+
+- All isolated workers, of every team, run under the same Windows (OS) account as the gateway. Team policies, team
+  folders and the hints rules are enforced by the gateway, over ACP and in the file endpoints. They are not Windows
+  file permissions.
+- If a team is given Shell (`allow_shell`), the `developer` extension or other command-running or stdio
+  extensions, or raw config editing (`config_edit`), its members' agents can read and change other users' profiles
+  (including chats and `secrets.yaml`), other teams' folders and the gateway's database on disk.
+- Built-in tools that read files are not confined to the roots either (GW-08).
+
+Mitigation: keep Shell and config editing off for non-admin teams (the team's Experience page warns when Shell is
+on), share only credentials that every member may hold, and give teams that need a shell their own gateway under a
+separate OS account or container. Separate Windows worker accounts per team were assessed separately and are not
+built; they are possible future work.
+
+### 7.3 Checklist additions
+
+1. Back up the database before upgrading to 1.5.0. After the upgrade, open each team's Experience page and replace
+   "Any" with explicit providers, models and approval modes where you can.
+2. Switch off "Members may add personal hints" for teams whose hints must be authoritative, and check the result
+   with Admin > Users > View effective hints.
+3. Review the audit log for `team.migrate.membership` (memberships dropped by the upgrade) and
+   `user.team.directory` (a directory user matched several teams).
+4. Keep `allow_shell` and `config_edit` off for every non-admin team (7.2).

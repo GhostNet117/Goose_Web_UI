@@ -13,7 +13,7 @@ it, on a desktop or a phone.
   `%APPDATA%\Block\goose`) with all of its chats, recipes and settings. Nothing gets copied around, and Goose
   Desktop keeps working on the same profile.
 
-`goose-web 1.1.0` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
+`goose-web 1.5.0` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
 
 ## Features
 
@@ -33,10 +33,13 @@ it, on a desktop or a phone.
   within about 2 seconds, and the session list re-sorts.
 - **Settings**: providers and models, system prompts, goose hints, tool permissions, preferences, themes,
   notifications, account security.
-- **Teams and policies**: per-team permissions (shell, extensions, providers, schedules, config...), allowed modes,
-  providers, models and folders, and concurrency limits. Team recipes, skills, extensions and providers are
-  provisioned into members' profiles.
-- **Shared goosehints library**: hints documents assigned to users or teams, combined with personal hints.
+- **Team profiles with least privilege**: each user belongs to one team, and the team decides their experience:
+  allowed providers, models and approval modes (nothing until you allow it, or Any), a default model, permissions
+  (shell, extensions, providers, schedules, config...), a shared team folder, extra folders and concurrency limits.
+  Team recipes, skills, extensions and providers are provisioned into members' profiles. Users without a team can
+  sign in but cannot chat.
+- **Shared hints library**: hints documents assigned to teams or users. Team hints come last and take precedence;
+  personal hints are used only when the team allows them, and hints files in working folders are ignored.
 - **Sign-in**: local accounts, LDAP/Active Directory, OpenID Connect, optional TOTP two-factor (admins can reset it
   when a user loses their authenticator), API tokens for automation.
 - **Audit log** of sign-ins, admin changes, impersonation and sensitive agent calls.
@@ -224,6 +227,8 @@ vulnerability, see [SECURITY.md](SECURITY.md).
 - **Profile isolation is a privacy boundary, not a hard security boundary.** All workers run as one OS user, so a
   tool that can read files or run commands can reach other profiles. That is why the shell/developer extensions are
   off for non-admins unless their policy sets `allow_shell`. Admins have the full power of that OS account.
+  Team folders and team policies are enforced by the gateway, not by OS permissions, so keep Shell and raw config
+  editing off for non-admin teams.
 - **Home-folder skill and recipe folders are shared.** `~/.agents/skills`, `~/.agents/recipes` and similar folders
   are not moved by `GOOSE_PATH_ROOT` and are visible to all profiles.
 - **On Linux an existing `~/.config/goose` profile is not imported automatically.** The admin starts fresh unless

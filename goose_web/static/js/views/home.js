@@ -1,5 +1,5 @@
 // New chat / home view: hero composer with folder chip + optional recipe; creates session/new then sends.
-import { h, btn, iconBtn, toast, toastError, shortPath, baseName, menu, relTime, spinner } from '../ui.js';
+import { h, btn, iconBtn, toast, toastError, shortPath, baseName, menu, relTime, spinner, banner } from '../ui.js';
 import { icon, logo } from '../icons.js';
 import { rpc, G } from '../rpc.js';
 import { router } from '../router.js';
@@ -7,7 +7,7 @@ import { store } from '../store.js';
 import { Composer } from '../composer.js';
 import { pickFolder, fsRoots } from './folderpicker.js';
 import { pref, setPref, addRecentFolder } from '../prefs.js';
-import { allowedValue } from '../store.js';
+import { allowedValue, chatBlocked } from '../store.js';
 import { MODES, pillSelect, knownEfforts, loadNewChatOptions, applyNewChatOptions } from '../chatoptions.js';
 import { getChat } from '../chatsession.js';
 import { upsertSession, sessionsState, sessionTitle, activityTime } from '../sessions.js';
@@ -159,6 +159,7 @@ export function renderHome(ctx, query = {}) {
       logo(52),
       h('h1', { class: 'home-title' }, greet + (name ? ', ' + name : '')),
       h('p', { class: 'home-sub' }, 'Start a conversation. Goose keeps working even if you close this tab.'),
+      chatBlocked() ? banner('warn', chatBlocked()) : null,
       h('div', { class: 'home-composer' }, h('div', { class: 'home-chips' }, folderChip, recipeChip, h('span', { class: 'grow' }), startEmpty), optsRow, composer.el, status),
       recents));
   renderChips();

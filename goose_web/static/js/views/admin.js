@@ -71,7 +71,7 @@ function usersTab(body) {
     out.replaceChildren(table([
       { label: 'User', render: (u) => h('div', { class: 'row' }, h('span', { class: 'avatar' }, (u.displayName || u.username || '?').slice(0, 1).toUpperCase()), h('div', null, h('div', { class: 'strong' }, u.displayName || u.username), h('div', { class: 'muted small' }, u.username + (u.email ? ' · ' + u.email : '')))) },
       { label: 'Role', render: (u) => u.role === 'admin' ? badge('admin', 'accent') : badge('user') },
-      { label: 'Teams', render: (u) => h('span', { class: 'small' }, (u.teams || []).map(teamName).join(', ') || h('span', { class: 'muted' }, '—')) },
+      { label: 'Team', render: (u) => u.team ? h('span', { class: 'small' }, teamName(u.team)) : u.role === 'admin' ? h('span', { class: 'muted small' }, '—') : badge('no team', 'warn') },
       { label: 'Auth', render: (u) => h('span', { class: 'row' }, badge(u.authSource || 'local'), u.totpEnabled ? badge('2FA', 'ok') : null) },
       { label: 'Profile', render: (u) => badge(u.profileMode || 'isolated') },
       { label: 'Status', render: (u) => u.disabled ? badge('disabled', 'err') : u.locked || u.lockedUntil ? badge('locked', 'warn') : u.mustChangePassword ? badge('must change pw', 'warn') : badge('active', 'ok') },
@@ -87,6 +87,7 @@ function usersTab(body) {
           if (!(await confirmDialog({ title: 'Reset two-factor for ' + u.username + '?', message: 'Use this when the user lost their authenticator. Two-factor is removed, the account is unlocked, all of their sessions end and their API tokens are revoked. They sign in with their password only and should enrol a new authenticator straight away.', confirmText: 'Reset two-factor', danger: true }))) return;
           try { const r = await POST('/api/admin/users/' + encodeURIComponent(u.id) + '/reset-totp', {}); toast('Two-factor removed for ' + u.username + (r.tokensRevoked ? ' (' + r.tokensRevoked + ' API token(s) revoked)' : ''), { kind: 'success' }); load(); } catch (e) { toastError(e); }
         } },
+        { label: 'View effective hints', icon: 'hint', onClick: () => effectiveHints(u) },
         { label: 'Re-provision profile', icon: 'refresh', onClick: async () => {
           try { const r = await POST('/api/admin/users/' + encodeURIComponent(u.id) + '/provision', {}); modal({ title: 'Provisioned ' + u.username, body: h('div', { class: 'stack' }, (r.changes || []).length ? h('ul', { class: 'plain-list small' }, ...r.changes.map((c) => h('li', null, typeof c === 'string' ? c : prettyJson(c)))) : h('div', { class: 'muted' }, 'No changes needed.'), r.restartPending ? banner('info', 'The worker restarts when the user is idle.') : null) }); } catch (e) { toastError(e); }
         } },
@@ -98,6 +99,16 @@ function usersTab(body) {
         { label: 'Delete…', icon: 'trash', danger: true, hidden: u.id === (store.get('me').user || {}).id, onClick: () => deleteUser(u) },
       ], { align: 'right' })) },
     ], rows, { empty: 'No users', rowClass: (u) => u.disabled ? 'muted-row' : '' }));
+  };
+  const effectiveHints = async (u) => {
+    try {
+      const r = await GET('/api/admin/users/' + encodeURIComponent(u.id) + '/hints');
+      modal({ title: 'Effective hints: ' + u.username, size: 'lg', body: h('div', { class: 'stack' },
+        h('div', { class: 'muted small' }, (r.team ? 'Team: ' + r.team + ' · ' : '') + (r.path || '')),
+        r.note ? banner('info', r.note) : null,
+        r.personalDropped ? banner('warn', 'This user has personal hints, but their team does not allow personal hints, so Goose does not get them.') : null,
+        h('pre', { class: 'json tall' }, r.effective || '(empty)')) });
+    } catch (e) { toastError(e); }
   };
   const deleteUser = async (u) => {
     let purge = false;
@@ -115,7 +126,8 @@ function usersTab(body) {
     const src = select([{ value: 'local', label: 'Local password' }, { value: 'ldap', label: 'LDAP / AD' }, { value: 'oidc', label: 'OIDC / SSO' }], (u && u.authSource) || 'local');
     const mode = select([{ value: 'isolated', label: 'Isolated profile (recommended)' }, { value: 'native', label: 'Native profile (the service account’s own %APPDATA% Goose)' }], (u && u.profileMode) || 'isolated');
     const pw = input({ type: 'password', autocomplete: 'new-password', placeholder: 'leave blank to generate a temporary password' });
-    const tp = multiPick(teams.map((t) => ({ value: t.id, label: t.name, sub: t.description || '' })), u ? u.teams : (store.get('adminDefaultTeam') ? [store.get('adminDefaultTeam')] : []), { empty: 'No teams yet' });
+    const defTeam = store.get('adminDefaultTeam');
+    const tp = select([{ value: '', label: 'No team (can sign in, cannot chat)' }, ...teams.map((t) => ({ value: String(t.id), label: t.name }))], u ? String(u.team || '') : String(defTeam || ''));
     const hp = multiPick(hints.map((x) => ({ value: x.id, label: x.name, sub: x.description || '' })), u ? u.hints : [], { empty: 'Hints library is empty' });
     const ov = textarea({ rows: 4, class: 'inp mono', value: u && u.policyOverrides && Object.keys(u.policyOverrides).length ? prettyJson(u.policyOverrides) : '', placeholder: '{ "allow_shell": false }' });
     const err = h('div', { class: 'field-error' });
@@ -123,11 +135,11 @@ function usersTab(body) {
       body: h('div', { class: 'stack' },
         h('div', { class: 'grid2' }, field('Username', username), field('Display name', dn), field('Email', em), field('Role', role), field('Sign-in', src), field('Profile mode', mode, 'Native maps to the Windows user’s real Goose profile – use for one admin at most.')),
         isNew ? field('Initial password', pw, 'The user must change it at the first sign-in. At least 12 characters with upper- and lower-case letters, a number and a symbol.') : null,
-        field('Teams', tp.el, 'Policy is the union of the user’s teams.'), field('Goose hints', hp.el, 'Shared .goosehints documents for this user.'),
+        field('Team', tp, 'One team per user. The team decides hints, providers, models, approval modes and folders. Administrators are not restricted.'), field('Extra hints for this user', hp.el, 'Hints documents for this user only. They come before the team hints, which take precedence.'),
         !isNew ? h('details', null, h('summary', null, 'Policy overrides (advanced)'), field(null, ov, 'JSON object merged over the team policy for this user only.')) : null, err),
       footer: [btn('Cancel', () => m.close()), btn(isNew ? 'Create user' : 'Save', async () => {
         err.textContent = '';
-        const b = { displayName: dn.value.trim() || undefined, email: em.value.trim() || undefined, role: role.value, teams: tp.get(), hints: hp.get(), profileMode: mode.value, authSource: src.value };
+        const b = { displayName: dn.value.trim() || undefined, email: em.value.trim() || undefined, role: role.value, team: tp.value ? Number(tp.value) : null, hints: hp.get(), profileMode: mode.value, authSource: src.value };
         if (!isNew && ov.value.trim()) { try { b.policyOverrides = JSON.parse(ov.value); } catch { err.textContent = 'Policy overrides must be valid JSON'; return; } } else if (!isNew) b.policyOverrides = {};
         try {
           if (isNew) {
@@ -153,25 +165,48 @@ function usersTab(body) {
 }
 
 // ===================================================================== Teams
+// Spec 009: least privilege. A switch that is off, or a list that is empty, grants nothing; "Any" (*) grants all.
 export const POLICY_FLAGS = [
   ['recipes_edit', 'Edit recipes'], ['skills_edit', 'Edit skills'], ['extensions_edit', 'Edit extensions'], ['providers_edit', 'Edit providers & models'],
-  ['schedules', 'Manage schedules'], ['apps', 'Manage apps'], ['prompts_edit', 'Edit system prompts'], ['hints_edit', 'Edit personal hints'],
+  ['schedules', 'Manage schedules'], ['apps', 'Manage apps'], ['prompts_edit', 'Edit system prompts'], ['hints_edit', 'Members may add personal hints'],
   ['tools_permissions', 'Set tool permissions'], ['config_edit', 'Edit raw config'], ['allow_shell', 'Allow shell / stdio extensions'], ['notify_webhook', 'Notification webhooks'],
 ];
-export const POLICY_LISTS = [
-  ['allowed_modes', 'Allowed modes', 'auto, approve, smart_approve, chat'], ['allowed_providers', 'Allowed providers', 'provider ids'],
-  ['allowed_models', 'Allowed models', 'model ids'], ['allowed_roots', 'Allowed folders', 'one path per line, e.g. D:\\Projects'],
+const FLAG_LABEL = Object.fromEntries(POLICY_FLAGS);
+const EXPERIENCE = [
+  { id: 'hints', title: 'Hints', flags: ['hints_edit'] },
+  { id: 'models', title: 'Providers & models', flags: ['providers_edit'], kinds: ['provider'] },
+  { id: 'modes', title: 'Approval modes', flags: [] },
+  { id: 'folders', title: 'Folders', flags: [] },
+  { id: 'ext', title: 'Extensions & tools', flags: ['allow_shell', 'extensions_edit', 'tools_permissions', 'apps'], kinds: ['extension'] },
+  { id: 'recipes', title: 'Recipes, skills & schedules', flags: ['recipes_edit', 'skills_edit', 'schedules'], kinds: ['recipe', 'skill'] },
+  { id: 'other', title: 'Other', flags: ['prompts_edit', 'config_edit', 'notify_webhook'] },
 ];
+const MODE_CHOICES = [['auto', 'Auto'], ['approve', 'Approve'], ['smart_approve', 'Smart approve'], ['chat', 'Chat only']];
+const WARN_KIND = { err: 'error', warn: 'warn', info: 'info' };
+
+// An allow-list with an explicit "Any" switch. modes = tick boxes instead of free text.
+function anyList(label, values, hint, modes) {
+  let any = (values || []).includes('*');
+  const sel = new Set(any ? [] : values || []);
+  const ta = textarea({ rows: 2, class: 'inp mono', value: any ? '' : (values || []).join(', '), placeholder: 'nothing allowed - add ids, or switch on Any' });
+  const box = modes ? h('div', { class: 'chk-list' }, ...modes.map(([v, l]) => h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked: sel.has(v), onchange: (e) => { if (e.target.checked) sel.add(v); else sel.delete(v); } }), h('span', null, l)))) : ta;
+  const sync = () => { box.hidden = any; };
+  const tg = toggle(any, (v) => { any = v; sync(); }, { text: 'Any' });
+  sync();
+  return { el: field(label, h('div', { class: 'stack-sm' }, tg, box), hint), get: () => (any ? ['*'] : modes ? [...sel] : ta.value.split(/[,\n]/).map((s) => s.trim()).filter(Boolean)) };
+}
+
 function teamsTab(body) {
   let teams = [], users = [], hints = [], selId = null;
   const listEl = h('div', { class: 'split-list' }, skeleton(4));
   const detail = h('div', { class: 'split-detail' });
-  body.replaceChildren(h('div', { class: 'row' }, h('p', { class: 'muted grow' }, 'Teams grant policy, shared hints and library items (recipes, skills, extensions, providers) to their members.'), btn('New team', () => newTeam(), { icon: 'plus', variant: 'primary', size: 'sm' })), h('div', { class: 'split' }, listEl, detail));
+  body.replaceChildren(h('div', { class: 'row' }, h('p', { class: 'muted grow' }, 'Each user belongs to one team. The team decides their experience: hints, providers and models, approval modes, folders, extensions, recipes and skills. Least privilege: nothing is allowed until you allow it.'), btn('New team', () => newTeam(), { icon: 'plus', variant: 'primary', size: 'sm' })), h('div', { class: 'split' }, listEl, detail));
+  const teamName = (id) => (teams.find((t) => t.id === id) || {}).name || '';
   const drawList = () => listEl.replaceChildren(...(teams.length ? teams.map((t) => h('button', { type: 'button', class: ['litem', t.id === selId ? 'active' : ''], onclick: () => { selId = t.id; drawList(); drawDetail(); } },
-    icon('users', 14), h('div', { class: 'litem-main' }, h('div', { class: 'litem-title' }, t.name), h('div', { class: 'litem-sub' }, ((t.members || []).length) + ' members' + (t.description ? ' · ' + t.description : ''))))) : [empty('users', 'No teams')]));
+    icon('users', 14), h('div', { class: 'litem-main' }, h('div', { class: 'litem-title' }, t.name, (t.warnings || []).some((w) => w.level === 'err') ? h('span', { class: 'muted small' }, ' · cannot chat') : null), h('div', { class: 'litem-sub' }, ((t.members || []).length) + ' members' + (t.description ? ' · ' + t.description : ''))))) : [empty('users', 'No teams')]));
   const newTeam = async () => {
-    const n = input({ placeholder: 'Engineering' }); const d = input({ placeholder: 'optional' });
-    const m = modal({ title: 'New team', size: 'sm', body: h('div', { class: 'stack' }, field('Name', n), field('Description', d)), footer: [btn('Cancel', () => m.close()), btn('Create', async () => {
+    const n = input({ placeholder: 'InfoSec Ops' }); const d = input({ placeholder: 'optional' });
+    const m = modal({ title: 'New team', size: 'sm', body: h('div', { class: 'stack' }, field('Name', n), field('Description', d), h('div', { class: 'muted small' }, 'A new team starts with everything off and nothing allowed. Then choose its providers, models, approval modes and hints.')), footer: [btn('Cancel', () => m.close()), btn('Create', async () => {
       if (!n.value.trim()) return;
       try { const r = await POST('/api/admin/teams', { name: n.value.trim(), description: d.value.trim(), policy: {} }); m.close(); selId = (r && (r.id || (r.team && r.team.id))) || null; load(); } catch (e) { toastError(e); }
     }, { variant: 'primary' })] });
@@ -181,45 +216,67 @@ function teamsTab(body) {
     if (!t) { detail.replaceChildren(empty('shield', 'Select a team')); return; }
     const pol = { ...(t.policy || {}) };
     const name = input({ value: t.name }); const desc = input({ value: t.description || '' });
-    const flags = h('div', { class: 'policy-grid' }, ...POLICY_FLAGS.map(([k, label]) => h('div', { class: 'set-row' }, h('div', { class: 'grow' }, h('div', null, label), h('div', { class: 'muted small mono' }, k)), toggle(!!pol[k], (v) => { pol[k] = v; }))));
-    const lists = POLICY_LISTS.map(([k, label, hint]) => { const ta = textarea({ rows: k === 'allowed_roots' ? 3 : 2, class: 'inp mono', value: (pol[k] || []).join(k === 'allowed_roots' ? '\n' : ', '), placeholder: 'empty = unrestricted' }); return { k, ta, el: field(label, ta, hint + ' · empty = unrestricted') }; });
-    const maxRuns = input({ type: 'number', min: '0', value: pol.max_concurrent_runs ?? '', placeholder: 'unlimited', class: 'inp inp-sm' });
-    const members = multiPick(users.map((u) => ({ value: u.id, label: u.displayName || u.username, sub: u.username })), t.members || [], { empty: 'No users' });
+    const flagRow = (k) => h('div', { class: 'set-row' }, h('div', { class: 'grow' }, h('div', null, FLAG_LABEL[k]), h('div', { class: 'muted small mono' }, k)), toggle(!!pol[k], (v) => { pol[k] = v; }));
+    const providers = anyList('Allowed providers', pol.allowed_providers, 'Provider ids, e.g. openai, anthropic, or a custom provider id.');
+    const models = anyList('Allowed models', pol.allowed_models, 'Model ids, e.g. gpt-4o-mini.');
+    const modes = anyList('Allowed approval modes', pol.allowed_modes, 'Chat only = no tool calls; Approve = ask before every tool call.', MODE_CHOICES);
+    const dProv = input({ value: pol.default_provider || '', placeholder: 'e.g. openai' });
+    const dModel = input({ value: pol.default_model || '', placeholder: 'e.g. gpt-4o-mini' });
+    const share = input({ value: pol.share_folder || '', placeholder: t.teamFolder || '' });
+    const roots = textarea({ rows: 3, class: 'inp mono', value: (pol.allowed_roots || []).join('\n'), placeholder: 'none - one absolute path per line' });
+    const maxRuns = input({ type: 'number', min: '0', value: pol.max_concurrent_runs ?? '', placeholder: '3', class: 'inp inp-sm' });
+    const members = multiPick(users.filter((u) => u.role !== 'admin' || (t.members || []).includes(u.id)).map((u) => ({ value: u.id, label: u.displayName || u.username, sub: u.username + (u.team && u.team !== t.id ? ' · now in ' + teamName(u.team) + ' (moves here)' : '') })), t.members || [], { empty: 'No users' });
     const hp = multiPick(hints.map((x) => ({ value: x.id, label: x.name, sub: x.description || '' })), t.hints || [], { empty: 'Hints library is empty' });
-    const itemsBox = h('div', null, spinner(14));
+    const itemBoxes = {};
+    const groupBody = (g) => {
+      const parts = g.flags.map(flagRow);
+      if (g.id === 'hints') parts.unshift(field('Team hints', hp.el, 'Team hints come last in every member\'s hints and take precedence over personal hints.'));
+      if (g.id === 'models') parts.unshift(h('div', { class: 'grid2' }, providers.el, models.el, field('Default provider', dProv, 'New chats start here. Must be allowed above.'), field('Default model', dModel, 'Members\' profile default follows this.')));
+      if (g.id === 'modes') parts.push(modes.el);
+      if (g.id === 'folders') parts.push(h('div', { class: 'stack-sm' }, h('div', { class: 'muted small' }, 'Members can always reach their own workspace and the team folder. Nothing else unless listed here.'), field('Team folder', share, 'Shared by all members. Leave empty for the default: ' + (t.teamFolder || '')), field('Extra folders', roots, 'Absolute paths, one per line.'), field('Max concurrent runs', maxRuns, 'Per user. Empty = the default (3). 0 = unlimited.')));
+      if (g.kinds) {
+        itemBoxes[g.id] = h('div', null, spinner(14));
+        parts.push(h('div', { class: 'row' }, h('span', { class: 'muted small grow' }, 'Library items: ' + g.kinds.join(', ') + 's copied into members\' profiles.'), btn('Add from library', () => libraryPicker(t, loadItems, g.kinds[0]), { icon: 'plus', size: 'sm' })), itemBoxes[g.id]);
+      }
+      return parts;
+    };
     detail.replaceChildren(
       h('div', { class: 'detail-head' }, h('h2', null, t.name), h('div', { class: 'row' },
         actionBtn('Save team', async () => {
-          const p = { ...pol };
-          for (const { k, ta } of lists) p[k] = ta.value.split(k === 'allowed_roots' ? /\r?\n/ : /[,\n]/).map((s) => s.trim()).filter(Boolean);
-          p.max_concurrent_runs = maxRuns.value === '' ? null : Number(maxRuns.value);
-          await PATCH('/api/admin/teams/' + encodeURIComponent(t.id), { name: name.value.trim(), description: desc.value.trim(), policy: p, members: members.get(), hints: hp.get() });
+          const p = { ...pol, allowed_providers: providers.get(), allowed_models: models.get(), allowed_modes: modes.get(),
+            allowed_roots: roots.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
+            default_provider: dProv.value.trim(), default_model: dModel.value.trim(), share_folder: share.value.trim(),
+            max_concurrent_runs: maxRuns.value === '' ? null : Number(maxRuns.value) };
+          const r = await PATCH('/api/admin/teams/' + encodeURIComponent(t.id), { name: name.value.trim(), description: desc.value.trim(), policy: p, members: members.get(), hints: hp.get() });
+          if (r && (r.moved || []).length) toast('Moved to ' + t.name + ': ' + r.moved.join(', '), { kind: 'info', timeout: 8000 });
           await load();
         }, { variant: 'primary', size: 'sm', success: 'Team saved' }),
         iconBtn('trash', 'Delete team', async () => {
-          if (!(await confirmDialog({ title: 'Delete team ' + t.name + '?', message: 'Members lose the policy and items granted by this team.', confirmText: 'Delete', danger: true }))) return;
+          if (!(await confirmDialog({ title: 'Delete team ' + t.name + '?', message: 'Members are left without a team and cannot chat until you move them to another team. The team folder is kept on disk.', confirmText: 'Delete', danger: true }))) return;
           try { await DEL('/api/admin/teams/' + encodeURIComponent(t.id)); selId = null; load(); } catch (e) { toastError(e); }
         }, { variant: 'danger-soft' }))),
       h('div', { class: 'grid2' }, field('Name', name), field('Description', desc)),
-      section('Policy', h('span', { class: 'row' }, btn('All on', () => { POLICY_FLAGS.forEach(([k]) => { pol[k] = true; }); flags.querySelectorAll('input[type=checkbox]').forEach((c) => { c.checked = true; }); }, { size: 'sm', variant: 'ghost' }), btn('All off', () => { POLICY_FLAGS.forEach(([k]) => { pol[k] = false; }); flags.querySelectorAll('input[type=checkbox]').forEach((c) => { c.checked = false; }); }, { size: 'sm', variant: 'ghost' })), flags,
-        h('div', { class: 'grid2' }, ...lists.map((l) => l.el), field('Max concurrent runs', maxRuns, 'per user · empty = unlimited'))),
-      section('Members', null, members.el),
-      section('Assigned hints', null, hp.el),
-      section('Library items', btn('Add from library', () => libraryPicker(t, loadItems), { icon: 'plus', size: 'sm' }), itemsBox));
+      (t.warnings || []).length ? h('div', { class: 'stack-sm' }, ...t.warnings.map((w) => banner(WARN_KIND[w.level] || 'info', w.text))) : null,
+      section('Members', null, members.el, h('div', { class: 'muted small' }, 'One team per user: ticking someone from another team moves them here.')),
+      h('h3', { class: 'exp-title' }, 'Experience'),
+      ...EXPERIENCE.map((g) => section(g.title, null, ...groupBody(g))));
     const loadItems = async () => {
       try {
         const items = arr(await GET('/api/admin/teams/' + encodeURIComponent(t.id) + '/items'), 'items');
-        itemsBox.replaceChildren(table([
-          { label: 'Kind', render: (i) => badge(i.kind) }, { label: 'Name', render: (i) => h('span', { class: 'strong' }, i.name) },
-          { label: 'Source', render: (i) => h('span', { class: 'muted small' }, i.fromProfile || i.source || '') },
-          { label: '', class: 'right', render: (i) => iconBtn('trash', 'Remove', async () => { try { await DEL('/api/admin/teams/' + encodeURIComponent(t.id) + '/items/' + encodeURIComponent(i.id)); loadItems(); } catch (e) { toastError(e); } }, { variant: 'danger-soft' }) },
-        ], items, { empty: 'No items – members only get their own recipes, skills, extensions and providers.' }));
-      } catch (e) { itemsBox.replaceChildren(banner('error', errMsg(e))); }
+        for (const g of EXPERIENCE.filter((x) => x.kinds)) {
+          const mine = items.filter((i) => g.kinds.includes(i.kind));
+          itemBoxes[g.id].replaceChildren(mine.length ? table([
+            { label: 'Kind', render: (i) => badge(i.kind) }, { label: 'Name', render: (i) => h('span', { class: 'strong' }, i.name) },
+            { label: 'Source', render: (i) => h('span', { class: 'muted small' }, i.fromProfile || i.source || '') },
+            { label: '', class: 'right', render: (i) => iconBtn('trash', 'Remove', async () => { try { await DEL('/api/admin/teams/' + encodeURIComponent(t.id) + '/items/' + encodeURIComponent(i.id)); loadItems(); } catch (e) { toastError(e); } }, { variant: 'danger-soft' }) },
+          ], mine) : h('div', { class: 'muted small' }, 'None.'));
+        }
+      } catch (e) { for (const b of Object.values(itemBoxes)) b.replaceChildren(banner('error', errMsg(e))); }
     };
     loadItems();
   };
-  const libraryPicker = (t, onDone) => {
-    let kind = 'recipe'; let profile = (store.get('me').user || {}).username || '';
+  const libraryPicker = (t, onDone, startKind = 'recipe') => {
+    let kind = startKind; let profile = (store.get('me').user || {}).username || '';
     const pSel = select(users.map((u) => ({ value: u.username, label: (u.displayName || u.username) + (u.role === 'admin' ? ' (admin)' : '') })), profile, { class: 'inp' });
     const res = h('div', { class: 'lib-res' });
     const kinds = h('div');

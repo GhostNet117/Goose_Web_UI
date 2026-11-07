@@ -48,7 +48,8 @@ def test_isolated_layout_and_base(tmp_path, monkeypatch):
 def test_team_items_and_secrets(tmp_path, monkeypatch):
     s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
     tid = db.execute("INSERT INTO teams(name, policy, created_at) VALUES('t', ?, 0)",
-                     (json.dumps({"default_provider": "p1", "default_model": "m1"}),))
+                     (json.dumps({"default_provider": "p1", "default_model": "m1", "allowed_providers": ["*"],
+                                 "allowed_models": ["*"], "allowed_modes": ["*"]}),))
     db.execute("INSERT INTO team_members(team_id, user_id) VALUES(?,?)", (tid, alice["id"]))
     for kind, ref in (("provider", "p1"), ("skill", "hello"), ("extension", "fetch")):
         name, payload = pr.export_item(admin, kind, ref)
@@ -64,7 +65,8 @@ def test_team_items_and_secrets(tmp_path, monkeypatch):
     assert sec == {"P1_KEY": "s1", "FETCH_KEY": "s2"}            # only referenced secrets
     assert cfg["extensions"]["fetch"]["enabled"] is False          # stdio needs allow_shell
     assert (root / "skills" / "hello" / "SKILL.md").exists()
-    assert "Be brief." in (root / ".goosehints").read_text()
+    assert "Be brief." in (root / ".goose-web-hints.md").read_text()
+    assert not (root / ".goosehints").exists()
     assert changes
     # removal cleans up only managed items
     (root / "skills" / "mine").mkdir()

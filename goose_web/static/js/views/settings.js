@@ -3,7 +3,7 @@ import { h, btn, iconBtn, pageHeader, toast, toastError, confirmDialog, promptDi
 import { icon } from '../icons.js';
 import { rpc, G } from '../rpc.js';
 import { GET, POST, PUT, PATCH, DEL } from '../api.js';
-import { store, policy, policyList } from '../store.js';
+import { store, policy, allowedValue } from '../store.js';
 import { setBaseTitle, chime } from '../herd.js';
 import { router } from '../router.js';
 import { THEMES, ACCENTS, prefs, pref, setPref, patchPref, activityPrefs } from '../prefs.js';
@@ -47,7 +47,6 @@ const ro = (key, what) => policy(key) ? null : banner('info', 'Read-only: your p
 // ===================================================================== Providers
 function providersTab(body) {
   const canEdit = policy('providers_edit');
-  const allowedP = policyList('allowed_providers');
   let entries = []; let defaults = {}; let q = ''; let showAll = false;
   const defBox = h('div', { class: 'card' }, skeleton(2));
   const list = h('div', { class: 'prov-list' }, skeleton(6));
@@ -62,7 +61,7 @@ function providersTab(body) {
       canEdit ? btn('Custom provider', () => customDialog(null), { size: 'sm', icon: 'plus', variant: 'primary' }) : null], list),
     section('Stored secrets', null, secretsBox));
 
-  const allowed = (e) => !allowedP.length || allowedP.includes(e.providerId);
+  const allowed = (e) => allowedValue('allowed_providers', e.providerId);   // "*" = any, empty = none (spec 009)
   const drawDefaults = () => {
     const configured = entries.filter((e) => e.configured && allowed(e));
     const pSel = select([{ value: '', label: '— none —' }, ...configured.map((e) => ({ value: e.providerId, label: e.providerName }))], defaults.providerId || '', { class: 'inp' });
@@ -330,8 +329,9 @@ function hintsTab(body) {
         t === 'edit' ? ta : t === 'preview' ? h('div', { class: 'md-preview' }, mdElement(ta.value || '*empty*')) : h('pre', { class: 'json tall' }, r.effective || ''));
       drawPane();
       body.replaceChildren(
-        h('p', { class: 'muted' }, '.goosehints are extra instructions added to every chat. Your administrator may assign shared hints; you can add personal ones.'),
-        section('Assigned by your team', null, (r.assigned || []).length ? h('div', { class: 'stack-sm' }, ...r.assigned.map((a) => h('div', { class: 'card row' }, icon('lock', 14), h('div', { class: 'grow' }, h('div', { class: 'strong' }, a.name), h('div', { class: 'muted small' }, a.description || ''))))) : h('div', { class: 'muted' }, 'None assigned.')),
+        h('p', { class: 'muted' }, 'Goose hints are extra instructions added to every chat. Your team\'s hints come last and take precedence: if a personal hint conflicts with a team hint, Goose follows the team hint.' + (r.team ? ' Team: ' + r.team.name + '.' : '')),
+        r.personalDropped ? banner('warn', 'Your personal hints are not used: your team does not allow personal hints. They are kept here in case that changes.') : null,
+        section('Assigned by your administrator', null, (r.assigned || []).length ? h('div', { class: 'stack-sm' }, ...r.assigned.map((a) => h('div', { class: 'card row' }, icon('lock', 14), h('div', { class: 'grow' }, h('div', { class: 'strong' }, a.name), h('div', { class: 'muted small' }, a.description || ''))))) : h('div', { class: 'muted' }, 'None assigned.')),
         section('Personal hints', editable ? actionBtn('Save', async () => { await PUT('/api/me/hints', { personal: ta.value }); r.personal = ta.value; }, { variant: 'primary', size: 'sm', success: 'Hints saved' }) : null,
           !editable ? banner('info', 'Read-only: your policy does not allow editing hints.') : null, pane));
     } catch (e) { body.replaceChildren(banner('error', errMsg(e))); }

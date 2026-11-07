@@ -33,6 +33,8 @@ IS_WINDOWS = os.name == "nt"
 # Environment variables that would let the gateway's own configuration leak into an isolated profile.
 _ISOLATION_STRIP_PREFIXES = ("GOOSE_",)
 _ISOLATION_KEEP = {"GOOSE_DISABLE_KEYRING", "GOOSE_TELEMETRY_ENABLED"}
+# Same value as profiles.GW_HINTS_FILENAME (kept here so workers.py does not import profiles).
+ISOLATED_HINTS_FILENAME = ".goose-web-hints.md"
 
 
 # ------------------------------------------------------------------ Windows job object + process scan
@@ -281,6 +283,10 @@ class WorkerManager:
             env.pop("GOOSE_PATH_ROOT", None)
         for k, v in (self.s.get("goose", "extra_env") or {}).items():
             env[str(k)] = str(v)
+        if not w.native:
+            # Spec 009: Goose loads only the gateway-written hints file (config/.goose-web-hints.md), never an
+            # AGENTS.md / .goosehints in a working folder. The env var beats config.yaml and extra_env.
+            env["CONTEXT_FILE_NAMES"] = json.dumps([ISOLATED_HINTS_FILENAME])
         env["GOOSE_SERVER__SECRET_KEY"] = w.secret
         return env
 

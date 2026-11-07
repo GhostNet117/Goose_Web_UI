@@ -279,8 +279,13 @@ class AuthService:
             if existing["profile_mode"] != "native":  # never demote the native admin from the directory
                 self.db.update_user(existing["id"], role=role, display_name=display or existing["display_name"],
                                     email=email or existing["email"])
-        for t in teams:
-            self.db.execute("INSERT OR IGNORE INTO team_members(team_id, user_id) VALUES(?,?)", (t, existing["id"]))
+        if teams:
+            # one team per user (spec 009): the directory decides; with several mapped groups the first one wins
+            if len(teams) > 1:
+                self.db.audit("user.team.directory", target=username,
+                              detail={"mapped": teams, "used": teams[0], "reason": "one team per user"})
+            if (self.db.user_team(existing["id"]) or {}).get("id") != int(teams[0]):
+                self.db.set_user_team(existing["id"], int(teams[0]))
         return self.db.user_by_id(existing["id"])
 
     # ------------------------------------------------------------ OIDC (auth code + PKCE)

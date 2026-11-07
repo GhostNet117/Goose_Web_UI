@@ -9,6 +9,8 @@ from goose_web import policy as pol
 from goose_web.hub import Client, Hub
 from goose_web.workers import Worker
 
+MEMBER = {**pol.LEGACY_DEFAULT_POLICY, **{k: [pol.ANY] for k in pol.CHAT_LISTS}, "team": {"id": 1, "name": "t"}}
+
 
 class FakeAgent:
     def __init__(self):
@@ -111,7 +113,7 @@ async def env():
 
 def mk_client(user="alice", role="user"):
     sink = Sink()
-    c = Client(sink.send, {"id": 1, "username": user, "role": role}, dict(pol.DEFAULT_POLICY),
+    c = Client(sink.send, {"id": 1, "username": user, "role": role}, dict(MEMBER),
                [__import__("os").path.abspath("/ws")])
     c.start()
     return c, sink

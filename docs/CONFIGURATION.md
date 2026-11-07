@@ -127,7 +127,7 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 | Command | Flags | What it does |
 |---|---|---|
 | `serve` | `--host`, `--port` (a `--host` value also joins the Host allow-list) | Runs the gateway. It first checks the token (`winsec.ensure_unelevated`): when elevated on Windows it relaunches itself with a normal-user, Medium-integrity token, and on POSIX it refuses to run as root (exit 3). Logs go to `<system_dir>/logs/gateway.log` (5 MB x 5) and to stderr. |
-| `init` | `--admin NAME` (default: current OS user), `--password PW`, `--password-file FILE` (first line of FILE, `-` = stdin), `--native-root auto\|fresh\|PATH` (default `auto`), `--force` | Creates the database and the first admin (local, `must_change_pw`, profile mode `native`), creates the team **Everyone** and makes it the default team. Without `--password`/`--password-file` it generates a **random 20-character initial password and prints it once**. Only its hash is stored and it is not shown again. If you lose it, run `user reset`. A given password that does not meet the password rules only triggers a warning, because it must be changed at first sign-in anyway. `auto` uses Goose's default profile folder if it has a `config` subfolder, otherwise `fresh` (`<profiles_root>/appdata` with `config/`, `data/`, `state/`). A path ending in `config` is accepted and its parent is used. Without `--force`, an existing database is left as it is. |
+| `init` | `--admin NAME` (default: current OS user), `--password PW`, `--password-file FILE` (first line of FILE, `-` = stdin), `--native-root auto\|fresh\|PATH` (default `auto`), `--force` | Creates the database and the first admin (local, `must_change_pw`, profile mode `native`), creates the team **Everyone** (with nothing allowed, like every new team) and makes it the default team. Without `--password`/`--password-file` it generates a **random 20-character initial password and prints it once**. Only its hash is stored and it is not shown again. If you lose it, run `user reset`. A given password that does not meet the password rules only triggers a warning, because it must be changed at first sign-in anyway. `auto` uses Goose's default profile folder if it has a `config` subfolder, otherwise `fresh` (`<profiles_root>/appdata` with `config/`, `data/`, `state/`). A path ending in `config` is accepted and its parent is used. Without `--force`, an existing database is left as it is. |
 | `user list` | | Lists users. |
 | `user add NAME` | `--password`, `--admin` | Creates a local user (temporary password printed if none is given, change forced). |
 | `user reset NAME` | `--password` | Sets a temporary password (printed), forces a change, unlocks the account, switches it to local auth, signs it out everywhere and revokes its API tokens. Use it if the initial admin password is lost. |
@@ -145,7 +145,7 @@ Admins change these in the UI (Admin > Settings / Sign-in). They are stored in t
 | Setting | Default | Meaning |
 |---|---|---|
 | `native_root` | set by `init` | The admin's native Goose profile folder. |
-| `default_team_id` | the Everyone team | Team for users created in the admin UI without explicit teams. Users auto-created by LDAP/OIDC join only their mapped teams. |
+| `default_team_id` | the Everyone team | The team a new user joins when none is given: users created in the admin UI or API without `team`, users created with `user add`, and users auto-created by LDAP/OIDC when no group or claim maps to a team. Empty = new users have no team (they can sign in but cannot chat). |
 | `brand` | `{name: "Goose Web", tagline: ...}` | `name`, `tagline`, `machine` (shown in Herd). |
 | `session_hours` | config `auth.session_hours` | 1 to 720. |
 | `allow_self_totp` | `true` | When false, non-admins cannot set up or enable TOTP themselves (`403 totp_self_disabled`). Admins can always enrol. |
@@ -166,52 +166,59 @@ stored value.
 | `ldap.userBase` | `""` | Search base. |
 | `ldap.userFilter` | `(&(objectClass=user)(sAMAccountName={username}))` | `{username}` is escaped with `escape_filter_chars`. |
 | `ldap.adminGroupDn` | `""` | `memberOf` value that makes the user an admin (native admins are never demoted). |
-| `ldap.groupTeamMap` | `{}` | `{groupDn: teamId}`. |
+| `ldap.groupTeamMap` | `{}` | `{groupDn: teamId}`. One team per user: the mapped team replaces the previous one, and when several groups match the first one wins (audit `user.team.directory`). |
 | `ldap.startTls` | `false` | StartTLS on `ldap://`. |
 | `ldap.caFile` | `""` | CA bundle for a private CA. TLS uses certificate checking (`CERT_REQUIRED`). |
 | `ldap.allowInsecure` | `false` | A plain `ldap://` URL without `startTls` is refused when the settings are saved (`400 bad_config`) and at sign-in (`503 ldap_insecure`, no bind is attempted), because it would send passwords in clear text. Setting this to `true` (admin UI checkbox "Allow unencrypted LDAP (not recommended)") allows it anyway. |
 | `ldap.autoCreate` | `true` | Create users at their first sign-in. |
-| `oidc[]` | `[]` | Providers: `id` (safe name), `label`, `issuer` (discovery at `<issuer>/.well-known/openid-configuration`), `clientId`, `clientSecret`, `scopes` (default `openid profile email`), `adminClaim`, `adminValue` (if empty, the claim must be `true`), `teamClaim` (matched against team names), `autoCreate` (default true), `stripDomain` (default true: `alice@x` becomes `alice`). Redirect URI: `<public_url>/api/auth/oidc/<id>/callback`. **Needs `server.public_url`.** An OIDC account is bound to the issuer + subject (`sub`) of its first sign-in. Existing unbound OIDC users are bound at their next sign-in. Another identity for the same name gets `oidc_conflict`, and local and LDAP accounts with that name are never taken over. |
+| `oidc[]` | `[]` | Providers: `id` (safe name), `label`, `issuer` (discovery at `<issuer>/.well-known/openid-configuration`), `clientId`, `clientSecret`, `scopes` (default `openid profile email`), `adminClaim`, `adminValue` (if empty, the claim must be `true`), `teamClaim` (matched against team names; the first match becomes the user's one team), `autoCreate` (default true), `stripDomain` (default true: `alice@x` becomes `alice`). Redirect URI: `<public_url>/api/auth/oidc/<id>/callback`. **Needs `server.public_url`.** An OIDC account is bound to the issuer + subject (`sub`) of its first sign-in. Existing unbound OIDC users are bound at their next sign-in. Another identity for the same name gets `oidc_conflict`, and local and LDAP accounts with that name are never taken over. |
 
 ## 5. Policies and teams
 
 Policies apply to non-admins only. Admins get every permission with no lists and no run limit (`ADMIN_POLICY`).
-Keys (`goose_web/policy.py`):
+Since 1.5.0 policies follow least privilege: a missing or false switch is off, an empty `allowed_modes`,
+`allowed_providers` or `allowed_models` list allows **nothing**, and the value `"*"` (shown as **Any** in the admin
+UI) allows everything. Keys of a team's `policy` (`goose_web/policy.py`):
 
-| Key | Type | Default | Allows |
+| Key | Type | New team | Allows |
 |---|---|---|---|
-| `recipes_edit` | bool | true | save/delete recipes, recipe and subrecipe sources |
-| `skills_edit` | bool | true | create/update/delete/import skill, agent and project sources |
+| `recipes_edit` | bool | false | save/delete recipes, recipe and subrecipe sources |
+| `skills_edit` | bool | false | create/update/delete/import skill, agent and project sources |
 | `extensions_edit` | bool | false | add/remove/enable extensions, pick extensions for a new session |
 | `providers_edit` | bool | false | custom providers, provider config and secrets, defaults, model downloads, onboarding import |
-| `schedules` | bool | true | create/update/delete/pause/run schedules |
-| `apps` | bool | true | import/delete MCP Apps, direct `tools/call` |
+| `schedules` | bool | false | create/update/delete/pause/run schedules |
+| `apps` | bool | false | import/delete MCP Apps, direct `tools/call` |
 | `prompts_edit` | bool | false | system prompts |
-| `hints_edit` | bool | true | personal goose hints |
-| `tools_permissions` | bool | true | per-tool permission settings |
-| `config_edit` | bool | false | raw config read/write (treat it like `allow_shell`) |
+| `hints_edit` | bool | false | personal goose hints ("Members may add personal hints"); when false, personal hints are left out of the composed hints |
+| `tools_permissions` | bool | false | per-tool permission settings |
+| `config_edit` | bool | false | raw config read/write (treat it like `allow_shell`); `CONTEXT_FILE_NAMES` stays locked |
 | `allow_shell` | bool | false | shell/code extensions (`developer`, `computercontroller`, `code_execution`, `orchestrator`), stdio MCP extensions, per-session MCP servers |
 | `notify_webhook` | bool | false | a personal notification webhook |
-| `allowed_modes` | list | `[]` = any | Goose modes (`session/set_mode`, `mode` option) |
-| `allowed_providers` | list | `[]` = any | providers |
-| `allowed_models` | list | `[]` = any | models |
-| `allowed_roots` | list | `[]` | folders besides the user's workspace |
-| `max_concurrent_runs` | int | 3 | running agents per profile (0 = no limit) |
-
-Teams can also set `default_provider` and `default_model`, which are written into members' profiles.
+| `allowed_modes` | list | `[]` = none | Goose modes (`session/set_mode`, `mode` option, `GOOSE_MODE`); `["*"]` = any |
+| `allowed_providers` | list | `[]` = none | providers (`provider` option, `GOOSE_PROVIDER`, `defaults/save`); `["*"]` = any |
+| `allowed_models` | list | `[]` = none | models (`model` option, `GOOSE_MODEL`, `defaults/save`); `["*"]` = any |
+| `allowed_roots` | list | `[]` | extra folders besides the user's workspace and the team folder; absolute paths only, no `"*"` (`400 bad_folder`) |
+| `max_concurrent_runs` | int | 3 | running agents per profile (0 = no limit; not set = 3) |
+| `default_provider`, `default_model` | string | not set | the team default model, written into members' profiles (new members, and members still on the previous default) |
+| `share_folder` | string | not set = `<profiles_root>/_teams/<team id>` | the team's shared folder; must be an absolute path (`400 bad_folder`) |
 
 How the effective policy is built (`effective_policy`):
 
-- **No teams**: `DEFAULT_POLICY`.
-- **One or more teams**: each team's policy is laid over `DEFAULT_POLICY` first. Then:
-  - booleans are OR-ed (any team that allows it grants it)
-  - `allowed_modes`, `allowed_providers` and `allowed_models` are unioned, but if any team leaves a list empty the
-    result is unrestricted
-  - `allowed_roots` are unioned
-  - `max_concurrent_runs` is the highest value across the teams
+- **Admins**: `ADMIN_POLICY`; teams and overrides are ignored.
+- **No team**: `DEFAULT_POLICY` (everything off, nothing allowed) and `chat_blocked` is set: the user can sign in
+  and read chats but `session/new`, `session/fork` and `session/prompt` are refused.
+- **One team** (a user has at most one): the team's policy laid over `DEFAULT_POLICY`. If the team allows no
+  providers, models or modes, `chat_blocked` is set as well.
 - **User overrides** (`policy_overrides`, Admin > Users) replace single keys last.
 
-Every ACP method a non-admin sends goes through `policy.check`. Methods that are not on the list are denied.
+Every ACP method a non-admin sends goes through `policy.check`. Methods that are not on the list are denied. A
+prompt in an existing chat is also refused when the chat's current provider, model or mode is not allowed
+(`check_session_choice`).
+
+Upgrading from 1.4 converts the stored policies once (schema version 4, `meta` key `policy_model` = 2): each team is
+completed with the 1.4 defaults, empty mode/provider/model lists in teams and user overrides become `["*"]`, and a
+user in several teams keeps the team with the lowest id (audit `team.migrate.membership`). See
+[ADMINISTRATION.md](ADMINISTRATION.md#98-upgrading-from-14-the-policy-migration).
 
 ## 6. Profile layout
 
@@ -223,8 +230,9 @@ Every ACP method a non-admin sends goes through `policy.check`. Methods that are
     logs/                       gateway.log, worker-<user>.log
     library/teams/<id>/recipes/ team recipes (on members' GOOSE_RECIPE_PATH)
     backups/native-hints/       copies of the admin's .goosehints before a save from the UI
+  _teams/<team id>/             a team's shared folder (unless the team sets share_folder)
   <user>/                       one isolated profile = GOOSE_PATH_ROOT of that user's worker
-    config/                     config.yaml, secrets.yaml, .goosehints (composed), custom_providers/, recipes/, skills/
+    config/                     config.yaml, secrets.yaml, .goose-web-hints.md (composed), custom_providers/, recipes/, skills/
     data/                       sessions/sessions.db, logs/ (written by Goose)
     state/
     workspace/                  default folder for new chats
@@ -244,12 +252,15 @@ Every ACP method a non-admin sends goes through `policy.check`. Methods that are
   created are never overwritten.
 - Isolated workers get `GOOSE_DISABLE_KEYRING=1` (secrets in the profile's `secrets.yaml`), `GOOSE_RECIPE_PATH` =
   their team recipe folders, and no inherited `GOOSE_*` variables except `GOOSE_DISABLE_KEYRING` and
-  `GOOSE_TELEMETRY_ENABLED`.
+  `GOOSE_TELEMETRY_ENABLED`. They also get `CONTEXT_FILE_NAMES=[".goose-web-hints.md"]` (set after
+  `goose.extra_env`), so Goose loads only the composed hints file and ignores `AGENTS.md` and `.goosehints` in
+  working folders. Composition order: personal hints (only with `hints_edit`), documents assigned to the user, then
+  the team's documents last, as the final word. A `config/.goosehints` written by Goose Web 1.4 is removed.
 - Not relocatable by `GOOSE_PATH_ROOT`: home-folder skill and recipe folders such as `~/.agents/skills` and
   `~/.agents/recipes` are shared by every profile on the machine.
 - Usernames: letters, digits, `.`, `_`, `-`, starting with a letter or digit, up to 64 characters, no Windows device
-  names. Reserved names are refused (case-insensitive): `appdata`, `workspace`, `_system`, `_deleted`, `library`,
-  `backups`, `logs` (see [SECURITY-ASSESSMENT.md](SECURITY-ASSESSMENT.md) GW-04).
+  names. Reserved names are refused (case-insensitive): `appdata`, `workspace`, `_system`, `_deleted`, `_teams`,
+  `library`, `backups`, `logs` (see [SECURITY-ASSESSMENT.md](SECURITY-ASSESSMENT.md) GW-04).
 - Uploaded file names are sanitised (last path component only, no Windows-invalid characters, no trailing dots or
   spaces, device names such as `CON` get a `_` prefix). An existing file is never overwritten: the upload is saved as
   `name (1).ext`, `name (2).ext` and so on.

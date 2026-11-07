@@ -8,7 +8,10 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 3   # v3 (1.3.0): ip_blocks table, created by SCHEMA on open
+from .policy import ANY, CHAT_LISTS, LEGACY_DEFAULT_POLICY
+
+SCHEMA_VERSION = 4   # v3 (1.3.0): ip_blocks table; v4 (1.5.0): one team per user, least-privilege policies
+POLICY_MODEL = 2     # meta 'policy_model': 2 = spec 009 semantics (empty list = nothing, "*" = any)
 
 # Audit rows older than this are deleted when the database is opened (GW-23).
 AUDIT_RETENTION_DAYS = 365
@@ -177,9 +180,67 @@ class Database:
                     self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")  # nosec B608
             for sql in POST_MIGRATION_SQL:
                 self._conn.execute(sql)
+            self._migrate_policy_model()
             self._conn.execute("UPDATE meta SET value=? WHERE key='schema_version' AND CAST(value AS INTEGER) < ?",
                                (str(SCHEMA_VERSION), SCHEMA_VERSION))
             self._user_columns = frozenset(self._table_columns("users"))
+
+    def _migrate_policy_model(self) -> None:
+        """One-shot move to the spec 009 policy model, so existing teams and users behave exactly as before:
+
+        - each team policy is materialised over the 1.4 defaults, and its empty mode/provider/model lists (which
+          meant "unrestricted") become ["*"];
+        - empty mode/provider/model lists in user policy_overrides become ["*"] as well;
+        - a user in several teams keeps the team with the lowest id (the dropped memberships are audited);
+        - team_members gets a unique index on user_id (one team per user from now on).
+        New databases run it too (nothing to convert) and only get the index."""
+        row = self._conn.execute("SELECT value FROM meta WHERE key='policy_model'").fetchone()
+        if row is not None and int(row[0] or 0) >= POLICY_MODEL:
+            self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_team_members_user ON team_members(user_id)")
+            return
+        now = time.time()
+        self._conn.execute("BEGIN")
+        try:
+            for tid, raw in self._conn.execute("SELECT id, policy FROM teams").fetchall():
+                try:
+                    stored = json.loads(raw or "{}")
+                except ValueError:
+                    stored = {}
+                pol = {**LEGACY_DEFAULT_POLICY, **(stored if isinstance(stored, dict) else {})}
+                for k in CHAT_LISTS:
+                    if not pol.get(k):
+                        pol[k] = [ANY]
+                self._conn.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps(pol), tid))
+            for uid, raw in self._conn.execute("SELECT id, policy_overrides FROM users").fetchall():
+                try:
+                    ov = json.loads(raw or "{}")
+                except ValueError:
+                    continue
+                if not isinstance(ov, dict):
+                    continue
+                changed = False
+                for k in CHAT_LISTS:
+                    if k in ov and isinstance(ov[k], list) and not ov[k]:
+                        ov[k] = [ANY]
+                        changed = True
+                if changed:
+                    self._conn.execute("UPDATE users SET policy_overrides=? WHERE id=?", (json.dumps(ov), uid))
+            dupes = self._conn.execute(
+                "SELECT m.user_id, m.team_id, u.username FROM team_members m JOIN users u ON u.id=m.user_id "
+                "WHERE m.team_id > (SELECT MIN(team_id) FROM team_members m2 WHERE m2.user_id=m.user_id)").fetchall()
+            for uid, tid, uname in dupes:
+                self._conn.execute("DELETE FROM team_members WHERE user_id=? AND team_id=?", (uid, tid))
+                self._conn.execute(
+                    "INSERT INTO audit(ts, user_id, username, ip, action, target, detail, ok) VALUES(?,?,?,?,?,?,?,1)",
+                    (now, None, "", "", "team.migrate.membership", uname,
+                     json.dumps({"droppedTeamId": tid, "reason": "one team per user (spec 009)"})))
+            self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_team_members_user ON team_members(user_id)")
+            self._conn.execute("INSERT INTO meta(key, value) VALUES('policy_model', ?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(POLICY_MODEL),))
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     # -- helpers -----------------------------------------------------------------
     @staticmethod
@@ -250,7 +311,8 @@ class Database:
         return self.query("SELECT * FROM users ORDER BY username")
 
     # Folder names inside the profiles root that must never become a user's profile folder.
-    RESERVED_USERNAMES = frozenset({"appdata", "workspace", "_system", "_deleted", "library", "backups", "logs"})
+    RESERVED_USERNAMES = frozenset({"appdata", "workspace", "_system", "_deleted", "_teams", "library", "backups",
+                                    "logs"})
 
     def create_user(self, **fields: Any) -> int:
         if str(fields.get("username") or "").lower() in self.RESERVED_USERNAMES:
@@ -285,7 +347,20 @@ class Database:
             raise ValueError(f"unknown or read-only user field(s): {sorted(bad)}")
 
     def user_teams(self, uid: int) -> list[dict]:
-        return self.query("SELECT t.* FROM teams t JOIN team_members m ON m.team_id=t.id WHERE m.user_id=? ORDER BY t.name", (uid,))
+        """The user's team as a list of 0 or 1 rows (one team per user since spec 009)."""
+        return self.query("SELECT t.* FROM teams t JOIN team_members m ON m.team_id=t.id WHERE m.user_id=? "
+                          "ORDER BY t.id LIMIT 1", (uid,))
+
+    def user_team(self, uid: int) -> dict | None:
+        rows = self.user_teams(uid)
+        return rows[0] if rows else None
+
+    def set_user_team(self, uid: int, team_id: int | None) -> None:
+        """Put a user in exactly one team (or none). Replaces any previous membership."""
+        stmts: list[tuple[str, Iterable[Any]]] = [("DELETE FROM team_members WHERE user_id=?", (int(uid),))]
+        if team_id:
+            stmts.append(("INSERT INTO team_members(team_id, user_id) VALUES(?,?)", (int(team_id), int(uid))))
+        self.transaction(stmts)
 
     # -- audit -----------------------------------------------------------------------
     def purge_audit(self, days: float = AUDIT_RETENTION_DAYS) -> int:

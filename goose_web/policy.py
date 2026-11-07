@@ -1,7 +1,9 @@
-"""Effective policy (teams + user overrides) and the ACP method firewall.
+"""Effective policy (the user's one team + user overrides) and the ACP method firewall.
 
-Admins are unrestricted. For everyone else, every ACP method a browser sends goes through `check()`. Unknown
-methods are denied by default, so a new Goose release cannot open a hole by itself.
+Least privilege (spec 009): a missing or false switch is off, an empty allowed_modes / allowed_providers /
+allowed_models list allows NOTHING, and the explicit value "*" (ANY) allows everything. A user without a team
+can sign in but cannot chat. Admins are unrestricted. For everyone else, every ACP method a browser sends goes
+through `check()`. Unknown methods are denied by default, so a new Goose release cannot open a hole by itself.
 """
 from __future__ import annotations
 
@@ -13,8 +15,18 @@ from typing import Any
 BOOL_KEYS = ["recipes_edit", "skills_edit", "extensions_edit", "providers_edit", "schedules", "apps",
              "prompts_edit", "hints_edit", "tools_permissions", "config_edit", "allow_shell", "notify_webhook"]
 LIST_KEYS = ["allowed_modes", "allowed_providers", "allowed_models", "allowed_roots"]
+# Lists that gate chatting. "*" = any value; empty = none. allowed_roots has no "*" (folders are explicit).
+CHAT_LISTS = ["allowed_modes", "allowed_providers", "allowed_models"]
+ANY = "*"
+# Extra keys a team policy may carry besides BOOL_KEYS / LIST_KEYS / max_concurrent_runs.
+TEAM_EXTRA_KEYS = ["default_provider", "default_model", "share_folder"]
 
-DEFAULT_POLICY: dict[str, Any] = {
+# The base every team starts from (spec 009): everything off, nothing allowed.
+DEFAULT_POLICY: dict[str, Any] = {**{k: False for k in BOOL_KEYS}, **{k: [] for k in LIST_KEYS},
+                                  "max_concurrent_runs": 3}
+
+# The defaults of Goose Web 1.4 and earlier (empty list = unrestricted). Used only to migrate old teams.
+LEGACY_DEFAULT_POLICY: dict[str, Any] = {
     "recipes_edit": True, "skills_edit": True, "extensions_edit": False, "providers_edit": False,
     "schedules": True, "apps": True, "prompts_edit": False, "hints_edit": True, "tools_permissions": True,
     "config_edit": False, "allow_shell": False, "notify_webhook": False,
@@ -22,8 +34,11 @@ DEFAULT_POLICY: dict[str, Any] = {
     "max_concurrent_runs": 3,
 }
 
-ADMIN_POLICY: dict[str, Any] = {**{k: True for k in BOOL_KEYS}, **{k: [] for k in LIST_KEYS},
-                                "max_concurrent_runs": 0}
+ADMIN_POLICY: dict[str, Any] = {**{k: True for k in BOOL_KEYS}, **{k: [ANY] for k in CHAT_LISTS},
+                                "allowed_roots": [], "max_concurrent_runs": 0, "chat_blocked": ""}
+
+NO_TEAM_REASON = "You are not in a team yet, so you cannot chat. Ask your administrator to add you to a team."
+_LIST_LABELS = {"allowed_providers": "providers", "allowed_models": "models", "allowed_modes": "approval modes"}
 
 # Extensions that give the model a shell or arbitrary code execution.
 SHELL_EXTENSIONS = {"developer", "computercontroller", "code_execution", "orchestrator"}
@@ -78,39 +93,114 @@ SOURCE_PERMISSION = {"skill": "skills_edit", "builtinSkill": "skills_edit", "age
                      "project": "skills_edit", "recipe": "recipes_edit", "subrecipe": "recipes_edit"}
 # config keys a non-config_edit user may read
 READABLE_CONFIG_KEYS = {"GOOSE_PROVIDER", "GOOSE_MODEL", "GOOSE_MODE", "GOOSE_THINKING_EFFORT", "GOOSE_MAX_TURNS"}
+# config keys Goose Web sets itself (spec 009: the hints file name); never writable by a non-admin
+MANAGED_CONFIG_KEYS = {"CONTEXT_FILE_NAMES"}
+# config/upsert values checked against the team's lists
+CONFIG_LIST_KEYS = {"GOOSE_PROVIDER": "allowed_providers", "GOOSE_MODEL": "allowed_models",
+                    "GOOSE_MODE": "allowed_modes"}
 
 
 class Denied(Exception):
     pass
 
 
+def allows(policy: dict, key: str, value: Any) -> bool:
+    """True if the list `key` contains "*" (any) or `value`. Empty or missing = nothing allowed."""
+    lst = policy.get(key) or []
+    return ANY in lst or value in lst
+
+
+def chat_block(policy: dict) -> str:
+    """Why this (non-admin) policy cannot chat, or "" if it can."""
+    if policy.get("no_team"):
+        return NO_TEAM_REASON
+    for k in ("allowed_providers", "allowed_models", "allowed_modes"):
+        if not policy.get(k):
+            return f"Your team allows no {_LIST_LABELS[k]}, so you cannot chat. Ask your administrator."
+    return ""
+
+
 def effective_policy(user: dict, teams: list[dict]) -> dict:
+    """The policy of a user. Admins: ADMIN_POLICY. Everyone else: their ONE team over the least-privilege base
+    (spec 009; a second team, which the database no longer allows, is ignored), then the user's overrides."""
     if user.get("role") == "admin":
         return dict(ADMIN_POLICY)
-    if not teams:
-        pol = dict(DEFAULT_POLICY)
+    pol: dict[str, Any] = {k: (list(v) if isinstance(v, list) else v) for k, v in DEFAULT_POLICY.items()}
+    team = teams[0] if teams else None
+    if team is None:
+        pol["no_team"] = True
+        pol["team"] = None
     else:
-        pol = {k: False for k in BOOL_KEYS}
-        lists: dict[str, set | None] = {k: set() for k in LIST_KEYS}
-        mcr = 0
-        for t in teams:
-            tp = {**DEFAULT_POLICY, **(t.get("policy") or {})}
-            for k in BOOL_KEYS:
-                pol[k] = pol[k] or bool(tp.get(k))
-            for k in LIST_KEYS:
-                v = tp.get(k) or []
-                if k != "allowed_roots" and not v:
-                    lists[k] = None  # this team is unrestricted
-                elif lists[k] is not None:
-                    lists[k].update(v)
-            mcr = max(mcr, int(tp.get("max_concurrent_runs") or 0))
+        tp = team.get("policy") or {}
+        for k in BOOL_KEYS:
+            if k in tp:
+                pol[k] = bool(tp[k])
         for k in LIST_KEYS:
-            pol[k] = sorted(lists[k]) if lists[k] is not None else []
-        pol["max_concurrent_runs"] = mcr
+            if isinstance(tp.get(k), list):
+                pol[k] = [str(x) for x in tp[k] if str(x).strip()]
+        if tp.get("max_concurrent_runs") is not None:
+            pol["max_concurrent_runs"] = int(tp.get("max_concurrent_runs") or 0)
+        for k in ("default_provider", "default_model"):
+            if tp.get(k):
+                pol[k] = str(tp[k])
+        pol["team"] = {"id": team.get("id"), "name": team.get("name")}
     for k, v in (user.get("policy_overrides") or {}).items():
         if k in DEFAULT_POLICY:
             pol[k] = v
+    pol["chat_blocked"] = chat_block(pol)
     return pol
+
+
+def check_session_choice(policy: dict, load_result: dict | None) -> None:
+    """Refuse a prompt when the chat's CURRENT provider, model or mode is not allowed (for example an old chat
+    after the team narrowed its lists). Values come from session/new, session/load and set_config_option."""
+    if not isinstance(load_result, dict):
+        return
+    names = {"allowed_providers": "provider", "allowed_models": "model", "allowed_modes": "approval mode"}
+    for o in load_result.get("configOptions") or []:
+        if not isinstance(o, dict):
+            continue
+        cur = o.get("currentValue")
+        key = {"provider": "allowed_providers", "model": "allowed_models", "mode": "allowed_modes"}.get(o.get("id"))
+        if key and cur and not allows(policy, key, cur):
+            raise Denied(f"this chat uses the {names[key]} '{cur}', which your team does not allow. "
+                         f"Pick an allowed {names[key]} for this chat first.")
+    modes = load_result.get("modes")
+    if isinstance(modes, dict) and modes.get("currentModeId") and \
+            not allows(policy, "allowed_modes", modes["currentModeId"]):
+        raise Denied(f"this chat uses the approval mode '{modes['currentModeId']}', which your team does not "
+                     "allow. Pick an allowed mode for this chat first.")
+
+
+def team_warnings(policy: dict, *, hints: int, members: int) -> list[dict]:
+    """What the admin should know about a team's experience (Experience page). level: err | warn | info."""
+    p = {**DEFAULT_POLICY, **(policy or {})}
+    out: list[dict] = []
+    for k in ("allowed_providers", "allowed_models", "allowed_modes"):
+        if not p.get(k):
+            out.append({"level": "err", "text": f"No {_LIST_LABELS[k]} allowed: members can't chat."})
+    dp, dm = p.get("default_provider"), p.get("default_model")
+    if dp and p.get("allowed_providers") and not allows(p, "allowed_providers", dp):
+        out.append({"level": "warn", "text": f"The default provider '{dp}' is not in the allowed providers."})
+    if dm and p.get("allowed_models") and not allows(p, "allowed_models", dm):
+        out.append({"level": "warn", "text": f"The default model '{dm}' is not in the allowed models."})
+    if not dp and p.get("allowed_providers"):
+        out.append({"level": "info", "text": "No default model: members keep their profile's model if it is "
+                                             "allowed, otherwise the first allowed provider."})
+    if p.get("allow_shell"):
+        out.append({"level": "warn", "text": "Shell is on: members' agents can run commands as the gateway's "
+                                             "Windows account and read other profiles (known risk)."})
+    if p.get("config_edit"):
+        out.append({"level": "warn", "text": "Raw config editing is on: members can change their Goose settings."})
+    if p.get("providers_edit"):
+        out.append({"level": "warn", "text": "Members can add providers and API keys of their own."})
+    if not hints:
+        out.append({"level": "info", "text": "No team hints assigned: members get no team instructions."})
+    if p.get("hints_edit"):
+        out.append({"level": "info", "text": "Members may add personal hints (team hints take precedence)."})
+    if not members:
+        out.append({"level": "info", "text": "No members yet."})
+    return out
 
 
 def _norm(p: str) -> str:
@@ -157,7 +247,10 @@ def path_allowed(path: str, roots: list[str]) -> bool:
 
 
 def user_roots(policy: dict, workspace: str) -> list[str]:
-    return [workspace, *[r for r in policy.get("allowed_roots") or [] if r]]
+    """Own workspace, the team's shared folder, then the team's extra folders ("*" is never a folder)."""
+    extra = [r for r in policy.get("allowed_roots") or [] if r and r != ANY]
+    team = [policy["team_folder"]] if policy.get("team_folder") else []
+    return [workspace, *team, *extra]
 
 
 def _ext_name(ext: dict | None) -> str:
@@ -210,6 +303,10 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
         check_tool_call_target(params)  # every user, admins included (NEW-01)
     if is_admin:
         return
+    if method in ("session/new", "session/fork", "session/prompt"):
+        why = chat_block(policy)
+        if why:
+            raise Denied(why)
     if method in ("session/new", "session/load", "session/fork", "session/resume"):
         cwd = params.get("cwd")
         if cwd is not None and not path_allowed(str(cwd), roots):
@@ -219,18 +316,16 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
                 raise Denied(f"folder not allowed: {d}")
     if method == P + "session/working-dir/update" and not path_allowed(str(params.get("workingDir") or ""), roots):
         raise Denied("folder not allowed")
-    if method == "session/set_mode":
-        allowed = policy.get("allowed_modes") or []
-        if allowed and params.get("modeId") not in allowed:
-            raise Denied(f"mode not allowed: {params.get('modeId')}")
+    if method == "session/set_mode" and not allows(policy, "allowed_modes", params.get("modeId")):
+        raise Denied(f"mode not allowed: {params.get('modeId')}")
     if method == "session/set_config_option":
         cid, val = params.get("configId"), params.get("value")
-        if cid == "provider" and policy.get("allowed_providers") and val not in policy["allowed_providers"]:
-            raise Denied(f"provider not allowed: {val}")
-        if cid == "model" and policy.get("allowed_models") and val not in policy["allowed_models"]:
-            raise Denied(f"model not allowed: {val}")
-        if cid == "mode" and policy.get("allowed_modes") and val not in policy["allowed_modes"]:
-            raise Denied(f"mode not allowed: {val}")
+        key = {"provider": "allowed_providers", "model": "allowed_models", "mode": "allowed_modes"}.get(cid)
+        if key and not allows(policy, key, val):
+            raise Denied(f"{cid} not allowed: {val}")
+    if method in (P + "config/upsert", P + "config/remove") and \
+            str(params.get("key") or "").upper() in MANAGED_CONFIG_KEYS:
+        raise Denied(f"{params.get('key')} is managed by Goose Web")
     if method in ALWAYS:
         return
     if method in SOURCE_METHODS:
@@ -262,8 +357,14 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
             if method == P + "tools/call" and (tool_ext in SHELL_EXTENSIONS or tool_prefix in SHELL_EXTENSIONS) \
                     and not policy.get("allow_shell"):
                 raise Denied("direct shell tool calls need the allow_shell permission")
-            if method == P + "config/upsert" and str(params.get("key")).upper() in {"GOOSE_PROVIDER"} and \
-                    policy.get("allowed_providers") and params.get("value") not in policy["allowed_providers"]:
-                raise Denied("provider not allowed")
+            if method == P + "config/upsert":
+                key = CONFIG_LIST_KEYS.get(str(params.get("key")).upper())
+                if key and params.get("value") is not None and not allows(policy, key, params.get("value")):
+                    raise Denied(f"{params.get('key')} value not allowed by your team")
+            if method == P + "defaults/save":
+                if not allows(policy, "allowed_providers", params.get("providerId")):
+                    raise Denied("provider not allowed")
+                if params.get("modelId") and not allows(policy, "allowed_models", params.get("modelId")):
+                    raise Denied("model not allowed")
             return
     raise Denied(f"method not available to your account: {method}")

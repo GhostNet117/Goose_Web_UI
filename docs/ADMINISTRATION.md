@@ -188,7 +188,7 @@ Variables read only on the first start (when `/data/_system/goose-web.db` does n
 | `GOOSE_WEB_ADMIN_PASSWORD` | not set | the password itself; visible in `docker inspect`, so prefer the `_FILE` variant |
 
 To give users access to host folders, mount them (for example `/srv/projects:/workspaces`) and add the container
-path to a team's allowed folders (section 9).
+path to a team's extra folders (section 9).
 
 Behind a reverse proxy, add to `environment:`:
 
@@ -211,7 +211,8 @@ There is no default password. `goose-web init` creates the first admin:
 - password: a random 20-character password, printed once in a framed block. Only its hash is stored.
 - the change of this password is enforced at the first sign-in (`must_change_pw`); until then the account can do
   nothing else (API calls return `403 password_change_required`, the WebSocket is refused)
-- a team called **Everyone** is created and made the default team for new users
+- a team called **Everyone** is created and made the default team for new users. Like every new team it starts
+  with nothing allowed: choose its providers, models and approval modes before its members can chat (section 9)
 
 The installers keep the output of `init` and print it at the end; Docker prints it to the container log on the
 first start only.
@@ -426,7 +427,7 @@ in **Admin > Settings**.
 | Role | Can do |
 |---|---|
 | `admin` | everything: the admin console, every ACP method without policy checks, any absolute folder on the host, all users' agents in the herd, opening another user's chats. Policy and per-user overrides do not apply to admins. |
-| `user` | what the effective policy of their teams and overrides allows (section 9), inside their workspace and allowed folders |
+| `user` | what the policy of their one team and their overrides allow (section 9), inside their workspace, their team folder and the team's extra folders. A user without a team can sign in and read old chats, but cannot chat. |
 
 Keep the number of admins low. At least one enabled admin must remain: you cannot delete the last admin, delete or
 disable your own account, or remove your own admin role. The admin with the native profile cannot be changed to
@@ -436,14 +437,14 @@ disable your own account, or remove your own admin role. The admin with the nati
 
 | Where | How |
 |---|---|
-| Admin > Users > New user | user name, display name, e-mail, role, sign-in source (Local password, LDAP / AD, OIDC / SSO), profile mode, initial password, teams, shared hints. If no password is given for a local account, a temporary password is generated and shown once. A password typed here (or generated) must always be changed by the user at the first sign-in. Without explicit teams the user joins the default team. The isolated profile is created right away. |
+| Admin > Users > New user | user name, display name, e-mail, role, sign-in source (Local password, LDAP / AD, OIDC / SSO), profile mode, initial password, team (one per user), extra hints documents. If no password is given for a local account, a temporary password is generated and shown once. A password typed here (or generated) must always be changed by the user at the first sign-in. The Team select starts at the default team; choose "No team (can sign in, cannot chat)" to create a user without one. The isolated profile is created right away. |
 | Console | `python -m goose_web --config <config> user add bob` creates a local user with a temporary password (printed) and a forced change, and adds it to the default team. `--admin` makes it an admin, `--password` sets the password. The profile is created at the first sign-in. |
 | LDAP | users are created at their first successful directory sign-in when "autoCreate" is on (section 7.4) |
 | OIDC | users are created at their first sign-in when "Create users automatically" is on (section 7.5) |
 
 User names: letters, digits, `.`, `_` and `-`, starting with a letter or digit, up to 64 characters. Windows device
-names and the reserved names `appdata`, `workspace`, `_system`, `_deleted`, `library`, `backups` and `logs` are
-refused, because the user name becomes the profile folder name.
+names and the reserved names `appdata`, `workspace`, `_system`, `_deleted`, `_teams`, `library`, `backups` and
+`logs` are refused, because the user name becomes the profile folder name (`_teams` holds the team folders).
 
 Password rules (strong passwords, enforced by the server for every new password: own change, admin create and
 edit, `init` warns):
@@ -490,10 +491,12 @@ How it works:
 - A plain `ldap://` URL without StartTLS is refused when the settings are saved (`400 bad_config`) and at sign-in
   (`503 ldap_insecure`, no bind is attempted), unless "Allow unencrypted LDAP" is on.
 - First sign-in with "autoCreate" on (the default): the account is created with sign-in source `ldap`, an isolated
-  profile, role `admin` if the user is in the admin group (otherwise `user`), and membership of the mapped teams, or
-  of the default team when no group maps.
+  profile, role `admin` if the user is in the admin group (otherwise `user`), and the team of the first mapped
+  group, or the default team when no group maps.
 - Every later sign-in updates role, display name and e-mail from the directory (the native-profile admin is never
-  demoted) and adds the user to mapped teams. Team memberships are never removed by a sign-in.
+  demoted). When a group maps to a team, that team replaces the user's previous team (one team per user). If
+  several mapped groups match, the first one wins and the audit log records `user.team.directory`. When no group
+  maps, an existing user keeps their team.
 - With autoCreate off, create the user first in Admin > Users with sign-in "LDAP / AD".
 - A local account with the same name is never checked against the directory; it keeps using its local password.
 - Resetting the password of an LDAP account (Admin reset or `user reset`) switches it to a local account.
@@ -537,8 +540,10 @@ How it works:
   that name is never taken over.
 - To pre-create a user, add it in Admin > Users with sign-in "OIDC / SSO" and the expected user name; the first
   sign-in binds it.
-- Role and team claims are applied at every sign-in (the native-profile admin is never demoted; teams are only
-  added). New users without a matching team join the default team.
+- Role and team claims are applied at every sign-in (the native-profile admin is never demoted). A matching team
+  replaces the user's previous team; if several team names match, the first one wins (audit
+  `user.team.directory`). Without a match an existing user keeps their team, and a new user joins the default
+  team.
 
 ### 7.6 Disabling, unlocking, resetting and deleting
 
@@ -549,7 +554,7 @@ How it works:
 | Reset password | "Reset password" (local accounts only): shows a temporary password once, forces a change, ends all sessions, revokes all API tokens, unlocks | `user reset NAME [--password PW]`: same effect, prints the temporary password, also re-enables a disabled account and switches the account to local sign-in |
 | Reset two-factor (lost authenticator) | "Reset two-factor" (only for users with the "2FA" badge, never your own account): removes the two-factor enrolment, unlocks, ends all sessions, revokes all API tokens. The user signs in with the password and enrols again (section 7.8) | `user reset-totp NAME`: same effect |
 | Set a password | Edit > password field (admin API `PATCH`): the user must always change it at the next sign-in; ends sessions and revokes tokens | none |
-| Re-provision the profile | "Re-provision profile": applies teams, hints and policy again and lists the changes | none |
+| Re-provision the profile | "Re-provision profile": applies the team, hints and policy again and lists the changes | none |
 | Delete | "Delete...": stops the worker and removes the account. The isolated profile folder is moved to `<profiles_root>/_deleted/<user>-<timestamp>`, or deleted permanently if you tick the box. The native profile is never moved or deleted. | none |
 
 Console commands work on the database directly. Run them on the gateway host, as the same OS account as the
@@ -668,40 +673,98 @@ curl -H "Authorization: Bearer gwt_xxxxxxxx" https://goose.example.org/api/me
 
 ## 9. Teams and policies
 
-Teams are managed in **Admin > Teams & policy**. A team has a name, a description, a policy, members, assigned
-shared hints and library items.
+Teams are managed in **Admin > Teams & policy**. A team has a name, a description, members, a policy, team hints, a
+team folder and library items. Since version 1.5.0 the team decides a member's whole experience, and policies follow
+least privilege: nothing is allowed until you allow it.
 
-### 9.1 The default team
+### 9.1 One team per user
 
-`init` creates the team **Everyone** with an empty policy (that is, the default policy: no shell, no extension
-changes) and makes it the default team. Users created in the admin UI without explicit teams, users created with
-`user add`, and LDAP/OIDC users without a mapped team join the default team. Change it in Admin > Settings >
-"Default team for new users". If you delete the default team, choose another default (or none) in Admin > Settings.
+- Each user belongs to one team at most (the database enforces this with a unique index on
+  `team_members(user_id)`).
+- Ticking a user in a team's **Members** list moves them out of their previous team. The list shows "now in ... (moves here)" next to such
+  users; after saving, a message lists who moved, and the `team.update` audit
+  entry records them under `moved`.
+- In **Admin > Users** the **Team** column shows each user's team, or a "no team" badge. The edit dialog has a
+  single **Team** select; "No team (can sign in, cannot chat)" removes the membership.
+- A user without a team can sign in, browse and read their old chats, but cannot chat: new chats, forks and
+  prompts are refused with "You are not in a team yet, so you cannot chat. Ask your administrator to add you to a
+  team." The home page shows the same text as a banner.
+- Directory sign-ins set the team from the group or claim mapping (sections 7.4 and 7.5).
+- Admins are never restricted, whatever their team.
 
-### 9.2 Policy settings
+### 9.2 The default team
 
-Policies apply to non-admins only. The admin UI shows the flags as switches and the lists as text fields
-(comma-separated, or one folder per line); an empty list means "unrestricted" (for folders: only the workspace).
+`init` creates the team **Everyone** and makes it the default team. Users created in the admin UI (the Team select
+starts at the default team), users created with `user add`, and new LDAP/OIDC users without a mapped team join it.
+Change it in Admin > Settings > "Default team for new users". If you delete the default team, choose another
+default (or none) in Admin > Settings.
 
-| Key | UI label | Default | When on (or set), the user may |
+On a new install **Everyone**, like every new team, starts with every switch off and nothing allowed. Allow its
+providers, models and approval modes before its members can chat.
+
+### 9.3 The team's Experience page
+
+Selecting a team shows its name and description, its warnings, the **Members** list, and an **Experience** section
+grouped by topic:
+
+| Group | What you set there |
+|---|---|
+| Hints | **Team hints** (documents from the Hints library) and "Members may add personal hints" (`hints_edit`) |
+| Providers & models | **Allowed providers** and **Allowed models** (each with an **Any** switch), **Default provider**, **Default model**, "Edit providers & models" (`providers_edit`), provider library items |
+| Approval modes | **Allowed approval modes**: Auto, Approve, Smart approve, Chat only, or **Any** |
+| Folders | **Team folder**, **Extra folders**, **Max concurrent runs** |
+| Extensions & tools | `allow_shell`, `extensions_edit`, `tools_permissions`, `apps`, extension library items |
+| Recipes, skills & schedules | `recipes_edit`, `skills_edit`, `schedules`, recipe and skill library items |
+| Other | `prompts_edit`, `config_edit`, `notify_webhook` |
+
+The warnings at the top of the team (also returned by `GET /api/admin/teams` as `warnings`) tell you what members
+will experience:
+
+| Level | Examples |
+|---|---|
+| error | "No models allowed: members can't chat." (the same for providers and approval modes). The team list marks such a team "cannot chat". |
+| warning | the default provider or model is not in the allowed list; "Shell is on: members' agents can run commands as the gateway's Windows account and read other profiles (known risk)."; raw config editing is on; members can add providers and API keys of their own |
+| info | no default model; "No team hints assigned: members get no team instructions."; members may add personal hints; "No members yet." |
+
+### 9.4 Policy settings
+
+Policies apply to non-admins only. A switch that is off grants nothing. For the three chat lists (approval modes,
+providers, models) an empty list allows **nothing**, and the **Any** switch stores `"*"`, which allows every value.
+A new team starts with every switch off and every list empty.
+
+| Key | UI label | New team | When on (or set), members may |
 |---|---|---|---|
-| `recipes_edit` | Edit recipes | on | save and delete recipes, create recipe and subrecipe sources. Team recipes cannot be deleted by members. |
-| `skills_edit` | Edit skills | on | create, update, delete and import skills, agents and project sources |
+| `recipes_edit` | Edit recipes | off | save and delete recipes, create recipe and subrecipe sources. Team recipes cannot be deleted by members. |
+| `skills_edit` | Edit skills | off | create, update, delete and import skills, agents and project sources |
 | `extensions_edit` | Edit extensions | off | add, remove, enable and disable extensions, and choose extensions for a new session |
 | `providers_edit` | Edit providers & models | off | manage custom providers, provider configuration and secrets, default provider/model, local model downloads, onboarding import |
-| `schedules` | Manage schedules | on | create, update, delete, pause, resume and run schedules |
-| `apps` | Manage apps | on | import and delete MCP Apps, and call tools directly from an app (`tools/call`) |
+| `schedules` | Manage schedules | off | create, update, delete, pause, resume and run schedules |
+| `apps` | Manage apps | off | import and delete MCP Apps, and call tools directly from an app (`tools/call`) |
 | `prompts_edit` | Edit system prompts | off | change system prompts |
-| `hints_edit` | Edit personal hints | on | edit their personal goose hints |
-| `tools_permissions` | Set tool permissions | on | change per-tool permission settings |
+| `hints_edit` | Members may add personal hints | off | write personal goose hints, which are then included before the team hints (section 10) |
+| `tools_permissions` | Set tool permissions | off | change per-tool permission settings |
 | `config_edit` | Edit raw config | off | read and write the raw Goose configuration (treat like `allow_shell`) |
-| `allow_shell` | Allow shell / stdio extensions | off | use command-running extensions (`developer`, `computercontroller`, `code_execution`, `orchestrator`), stdio MCP extensions, per-session MCP servers and direct shell tool calls |
+| `allow_shell` | Allow shell / stdio extensions | off | use command-running extensions (`developer`, `computercontroller`, `code_execution`, `orchestrator`), stdio MCP extensions, per-session MCP servers and direct shell tool calls. See the known risk in section 11.3. |
 | `notify_webhook` | Notification webhooks | off | set a personal notification webhook |
-| `allowed_modes` | Allowed modes | any | only these Goose modes (`auto`, `approve`, `smart_approve`, `chat`) |
-| `allowed_providers` | Allowed providers | any | only these provider ids |
-| `allowed_models` | Allowed models | any | only these model ids |
-| `allowed_roots` | Allowed folders | workspace only | use these folders in addition to their workspace (chat folders, file browser, uploads, downloads). Symlinks and junctions are resolved, so a link inside an allowed folder cannot lead outside. |
-| `max_concurrent_runs` | Max concurrent runs | 3 | have at most this many agents running at once (0 or empty = no limit) |
+| `allowed_modes` | Allowed approval modes | nothing | only these Goose modes (`auto`, `approve`, `smart_approve`, `chat`); `*` = any. Empty = members cannot chat. |
+| `allowed_providers` | Allowed providers | nothing | only these provider ids; `*` = any. Empty = members cannot chat. |
+| `allowed_models` | Allowed models | nothing | only these model ids; `*` = any. Empty = members cannot chat. |
+| `allowed_roots` | Extra folders | none | use these folders in addition to their workspace and the team folder (chat folders, file browser, uploads, downloads). Every entry must be an absolute path and `*` is not accepted (`400 bad_folder`). Symlinks and junctions are resolved, so a link inside an allowed folder cannot lead outside. |
+| `max_concurrent_runs` | Max concurrent runs | 3 | have at most this many agents running at once. Empty = the default (3), `0` = unlimited. |
+| `default_provider`, `default_model` | Default provider, Default model | not set | the provider and model new members start with (section 9.6). Both should be in the allowed lists; the page warns if they are not. |
+| `share_folder` | Team folder | empty = `<profiles_root>\_teams\<team id>` | the team's shared folder (section 9.7). Must be an absolute path (`400 bad_folder`). |
+
+Chat checks for non-admins:
+
+- A user whose team allows no providers, no models or no approval modes cannot chat ("Your team allows no models,
+  so you cannot chat. Ask your administrator.").
+- A prompt in an existing chat is refused when that chat's current provider, model or approval mode is not allowed,
+  for example after the team narrowed its lists: "this chat uses the model 'example-model', which your team does
+  not allow. Pick an allowed model for this chat first." The user picks an allowed value in the chat header.
+- Choosing a mode, provider or model in a chat, `config/upsert` of `GOOSE_PROVIDER`, `GOOSE_MODEL` or `GOOSE_MODE`
+  (with `config_edit`), and `defaults/save` (with `providers_edit`) are checked against the lists.
+- `config/upsert` and `config/remove` of `CONTEXT_FILE_NAMES` are refused for every non-admin, with or without
+  `config_edit`, because Goose Web manages that key (section 10).
 
 Every ACP method that is not explicitly allowed is denied for non-admins, so a new Goose release cannot open new
 functions by itself. Denials are returned as `forbidden: <reason>` and recorded in the audit log as `acp.denied`.
@@ -709,18 +772,16 @@ functions by itself. Denials are returned as `forbidden: <reason>` and recorded 
 Two rules apply to everyone, admins included: an MCP App's direct tool call may only use tools of the extension it
 names, and `session/new` is always tagged with the client name `goose-web`.
 
-Teams can also carry `default_provider` and `default_model`, which are written into members' profiles when they
-have no provider yet. These two keys are not shown in the admin UI; set them through the admin API
-(`PATCH /api/admin/teams/{id}` with `policy.default_provider` and `policy.default_model`, see [API.md](API.md)).
-
-### 9.3 How team policies combine
+### 9.5 How the effective policy is built
 
 | Situation | Effective policy |
 |---|---|
-| user is an admin | everything allowed, no lists, no run limit; overrides are ignored |
-| user in no team | the default policy (table above) |
-| user in one or more teams | each team's policy is first laid over the default policy, then: switches are OR-ed (any team that allows it grants it); `allowed_modes`, `allowed_providers` and `allowed_models` are unioned, but if any team leaves a list empty the result is unrestricted; `allowed_roots` are unioned; `max_concurrent_runs` is the highest number of all teams (0 = unlimited results only when every team says 0) |
-| per-user overrides | applied last; each key in the override replaces the combined value |
+| user is an admin | everything allowed, no lists, no run limit; the team and overrides are ignored |
+| user without a team | nothing allowed, and chatting is blocked |
+| user in a team | the team's policy laid over the least-privilege base (every switch off, every list empty, 3 runs) |
+| per-user overrides | applied last; each key in the override replaces the team's value |
+
+There is no merging of several teams any more: a user has one team, and that team's policy applies.
 
 Per-user overrides are set in Admin > Users > Edit > "Policy overrides (advanced)" as a JSON object, for example:
 
@@ -728,25 +789,62 @@ Per-user overrides are set in Admin > Users > Edit > "Policy overrides (advanced
 { "allow_shell": false, "allowed_modes": ["approve"], "max_concurrent_runs": 1 }
 ```
 
-Only known policy keys are kept. An empty field removes all overrides.
+In overrides too, an empty list allows nothing and `["*"]` allows everything. Only known policy keys are kept. An
+empty field removes all overrides.
 
-### 9.4 What a policy change does to a profile
+### 9.6 The team default model, and what a policy change does to a profile
 
-Saving a team (policy, members or hints), changing a user's teams, hints or overrides, or adding or removing a team
-item re-provisions the affected isolated profiles:
+Saving a team (policy, members or hints), changing a user's team, hints or overrides, or adding or removing a team
+item re-provisions the affected isolated profiles, including users who were moved out of another team:
 
 - shell extensions are disabled in the profile's `config.yaml` when `allow_shell` is off
 - team items are written, updated or removed
-- if `allowed_providers` is set and the profile's provider is not allowed, the provider is reset to the team default
-  or the first allowed provider
-- if `allowed_modes` is set and the profile's mode is not allowed, the mode is set to the first allowed mode
-- the composed `.goosehints` is rewritten
+- the team folder is created if it does not exist yet
+- the team default model: a new member's profile gets the team's `default_provider` and `default_model` (when they
+  are allowed). When you change the team default, members whose profile still uses the previous default follow
+  the new one; members who picked another model keep their choice
+- if the profile's provider is no longer allowed, it is reset to the team default, or else to the first provider
+  listed explicitly in `allowed_providers`; a model that is no longer allowed is reset to the default model, or
+  removed so that the provider's default applies
+- if the profile's mode is not allowed, it is set to `approve` when that is allowed, otherwise to the first allowed
+  mode
+- the composed hints file `config/.goose-web-hints.md` is rewritten (section 10)
 
 When something changed while the user's worker is running, the worker is marked "restart pending" and restarts
 when it has no active runs and no open questions. Policy checks on ACP calls use the new policy at the next
 WebSocket connection of the user.
 
-### 9.5 Team library items
+### 9.7 The team folder
+
+- Every team has a shared folder: by default `<profiles_root>\_teams\<team id>` (for example
+  `C:\Goose_Web_Profiles\_teams\3`), or the absolute path in the team's **Team folder** field, for example a share
+  such as `D:\Shares\Risk`. A relative path is refused (`400 bad_folder`).
+- The folder is created when a member's profile is provisioned or when a member connects.
+- Members can use it as a chat folder and in the file browser, where it is labelled **Team:** and the team name, next to their
+  own Workspace and the team's extra folders.
+- `_teams` is a reserved user name, so no profile folder can take its place.
+- Deleting a team keeps its folder on disk. The team's members are left without a team (and cannot chat) until you
+  add them to another team.
+- The folder is protected by the gateway's checks, not by Windows permissions: see the known risk in section 11.3.
+
+### 9.8 Upgrading from 1.4: the policy migration
+
+The first start of 1.5.0 converts the database once (schema version 4, `meta` key `policy_model` = 2), so that
+existing teams keep behaving as before:
+
+- every team's stored policy is completed with the 1.4 defaults (recipes, skills, schedules, apps, personal hints
+  and tool permissions on; everything else off), and its empty approval mode, provider and model lists, which meant
+  "unrestricted" in 1.4, become `["*"]` (Any);
+- empty approval mode, provider and model lists in per-user overrides become `["*"]` as well;
+- a user who was in several teams keeps only the team with the lowest id; each dropped membership is recorded in the
+  audit log as `team.migrate.membership`;
+- the unique index that allows one team per user is created.
+
+Back up the database before the upgrade (section 19). Afterwards, review every team on its Experience page: replace
+"Any" with explicit lists where you can, switch off "Members may add personal hints" where team hints must be
+final, and check the users whose membership was dropped.
+
+### 9.9 Team library items
 
 A team can hand recipes, skills, extensions and providers to its members. In the team's "Library items" section,
 choose "Add from library", pick a profile (any user, including your own native profile) and a kind, then add an
@@ -767,21 +865,43 @@ from the team, removes what was provisioned (but never items the user created).
 
 ## 10. Shared goose hints
 
-The **Admin > Hints library** holds shared `.goosehints` documents. Assign a document to teams (team > Assigned hints)
-or to individual users (Admin > Users > Edit > Goose hints).
+The **Admin > Hints library** holds shared hints documents. Assign a document to a team (on the team's Experience page,
+Hints > Team hints) or to a single user (Admin > Users > Edit > "Extra hints for this user").
 
-For each isolated profile the gateway composes `config/.goosehints` from:
+For each isolated profile the gateway composes `config/.goose-web-hints.md`. Its parts are listed from lowest to
+highest precedence:
 
-1. a header saying the file is managed by Goose Web
-2. every assigned document (directly or through a team), sorted by name
-3. the user's personal hints (editable by the user when `hints_edit` is on)
+1. a header saying the file is managed by Goose Web, and a note telling the model that the hints are listed from
+   lowest to highest precedence and that team hints are final
+2. the user's personal hints, under "personal hints (lowest precedence)", but only if the team allows "Members may
+   add personal hints" (`hints_edit`, off for new teams). Otherwise they are left out (they stay saved), and the
+   user sees a warning in Settings > Goose hints
+3. the documents assigned to the user directly, sorted by name (a document that is also a team hint appears once,
+   in the team part)
+4. the team's documents last, under the heading `Team: <name> (final: these take precedence)`
+
+Isolated workers run with `CONTEXT_FILE_NAMES=[".goose-web-hints.md"]`, so Goose loads only this file. `AGENTS.md`
+and `.goosehints` files in a chat's working folder, and the `AGENTS.md` in the shared agents home folder, are
+ignored for isolated profiles. A member therefore cannot override the team hints by placing a hints file in a
+folder. In addition:
+
+- non-admins cannot upload, or create with "New folder", anything named `AGENTS.md`, `.goosehints` or
+  `.goose-web-hints.md`, in any folder (`403 hint_file_refused`);
+- non-admins cannot change or remove `CONTEXT_FILE_NAMES` through the Goose configuration, even with `config_edit`.
+  The worker's environment value is set after `goose.extra_env`, so it also wins over the configuration file;
+- the `config/.goosehints` file that Goose Web 1.4 composed is removed at the next provisioning if it still starts
+  with the Goose Web header. A `.goosehints` that the user wrote is left in place (Goose no longer loads it).
+
+**Admin > Users > actions > View effective hints** shows what the user's Goose loads: the composed text, the file
+path, the team, and a warning when the user's personal hints are dropped.
 
 Saving, renaming or deleting a document rewrites the hints of every user it is assigned to immediately; this is
-safe while Goose runs. Edits made directly in an isolated profile's `.goosehints` file are overwritten.
+safe while Goose runs. Edits made directly in an isolated profile's `.goose-web-hints.md` file are overwritten.
 
-The native profile is different: its `.goosehints` belongs to the admin and is never composed. The admin edits it in
-their own settings, and the previous file is copied to `<system_dir>/backups/native-hints/` before each save.
-Shared documents assigned to a native-profile admin are listed but not written into that file.
+The native profile is different: its `.goosehints` belongs to the admin and is never composed, and Goose still
+loads `AGENTS.md` and `.goosehints` from the working folder as usual. The admin edits the file in their own
+settings, and the previous file is copied to `<system_dir>/backups/native-hints/` before each save. Shared documents
+assigned to a native-profile admin are listed but not written into that file.
 
 ## 11. Profiles
 
@@ -791,7 +911,7 @@ Every non-native user gets `<profiles_root>/<username>/`, which is the `GOOSE_PA
 
 ```
 <profiles_root>/<username>/
-  config/        config.yaml, secrets.yaml, .goosehints (composed), custom_providers/, recipes/, skills/
+  config/        config.yaml, secrets.yaml, .goose-web-hints.md (composed), custom_providers/, recipes/, skills/
   data/          sessions/sessions.db, logs/        (written by Goose)
   state/                                            (written by Goose)
   workspace/     default folder for new chats
@@ -807,7 +927,8 @@ Every non-native user gets `<profiles_root>/<username>/`, which is the `GOOSE_PA
 - Isolated workers get `GOOSE_DISABLE_KEYRING=1` (secrets stay in the profile's `secrets.yaml`), a
   `GOOSE_RECIPE_PATH` with only their team recipe folders, and none of the gateway's `GOOSE_*` environment variables
   (except `GOOSE_DISABLE_KEYRING` and `GOOSE_TELEMETRY_ENABLED`). Values in `goose.extra_env` are passed to every
-  worker, isolated ones included.
+  worker, isolated ones included. Isolated workers also get `CONTEXT_FILE_NAMES=[".goose-web-hints.md"]`
+  (section 10), which `extra_env` cannot override.
 
 ### 11.2 The native profile
 
@@ -838,6 +959,14 @@ unless `allow_shell` is on; grant it only to people you would trust with that OS
 recipe folders such as `~/.agents/skills` and `~/.agents/recipes` are not moved by `GOOSE_PATH_ROOT` and are visible to
 all profiles. Admins always have the full power of the OS account.
 
+**Known risk with teams.** Team policies, team folders and the hints rules are enforced by the gateway (over ACP
+and in the file endpoints), not by Windows permissions: every isolated worker, of every team, runs under the same
+Windows account as the gateway. If a team is given Shell (`allow_shell`), the `developer` extension or stdio
+extensions, its members' agents can read other users' profiles and other teams' folders on disk. Keep Shell and
+raw config editing (`config_edit`) off for non-admin teams; the Experience page warns when Shell is on. Separate
+Windows accounts per team would close this gap; they are not built (possible future work). See
+[SECURITY-ASSESSMENT.md](SECURITY-ASSESSMENT.md#7-addendum-goose-web-150-team-profiles-with-least-privilege).
+
 ## 12. Workers
 
 Admin > System lists every worker with its state (`stopped`, `starting`, `ready`, `crashed`), PID and port, uptime,
@@ -852,7 +981,7 @@ running.
 | Ready check | the gateway polls `http://127.0.0.1:<port>/status` until it answers, for at most `goose.start_timeout_seconds` (45) |
 | Idle shutdown | the monitor (every 15 seconds) stops a worker after `goose.idle_minutes` (30) without browser clients, active runs, open questions or scheduler duty |
 | Crash restart | a crashed worker is restarted with exponential backoff (2, 4, 8 ... seconds, at most 5 minutes) while browsers are connected or it owns a scheduler with jobs; otherwise it starts again on next use |
-| Pending restart | after a profile change (section 9.4) or a scheduler hand-over (section 13), when no run is active |
+| Pending restart | after a profile change (section 9.6) or a scheduler hand-over (section 13), when no run is active |
 | Stop by admin | Admin > System > Stop: in-flight calls fail with "stopped by an administrator"; the worker starts again when the user connects |
 | Restart by admin | Admin > System > Restart: active runs are interrupted (the UI asks for confirmation) |
 | Process tree | stopping a worker also stops its MCP server processes (Windows: `taskkill /T`; Linux/macOS: the worker's process group) |
@@ -947,8 +1076,8 @@ Recorded actions:
 | System | `system.init`, `system.start`, `system.stop` |
 | Sign-in | `auth.login` (success and failure), `auth.logout`, `auth.totp` (wrong code), `auth.ldap` (insecure LDAP refused), `auth.oidc` (OIDC failure), `user.oidc.bind`, `auth.password.weak` (existing password below the policy, change forced), `auth.ip.blocked`, `auth.ip.unblocked` (`"via": "cli"` from the console) |
 | Own account | `user.password`, `user.totp.enable`, `user.totp.disable`, `user.token.create`, `user.token.delete`, `hints.personal.save`, `hints.native.save` |
-| User admin | `user.create`, `user.update` (changed field names, never the password), `user.delete`, `user.reset_password`, `user.totp.reset` (two-factor reset, `"via": "cli"` from the console), `user.unlock`, `user.provision` |
-| Teams and hints | `team.create`, `team.update`, `team.delete`, `team.item.add`, `team.item.remove`, `hints.create`, `hints.update`, `hints.delete` |
+| User admin | `user.create`, `user.update` (changed field names, never the password), `user.delete`, `user.reset_password`, `user.totp.reset` (two-factor reset, `"via": "cli"` from the console), `user.unlock`, `user.provision`, `user.team.directory` (directory sign-in matched several teams; the first was used) |
+| Teams and hints | `team.create`, `team.update` (with `moved`: users moved here from another team), `team.delete`, `team.migrate.membership` (1.5.0 upgrade: a second team membership was dropped), `team.item.add`, `team.item.remove`, `hints.create`, `hints.update`, `hints.delete` |
 | Settings | `settings.auth`, `settings.update` |
 | Operations | `worker.restart`, `worker.stop`, `hosttask.<action>`, `fs.upload` |
 | Agent calls | `acp.denied` (policy denials, with the reason), `acp.<method>` for sensitive methods (configuration, providers and secrets, recipes save/delete, schedules create/delete, apps import/delete, sources, tool permissions, direct tool calls, adding session extensions, defaults, session delete) and for every call on another user's profile, `acp.answer` (answers to permission prompts and forms, with the choice) |
@@ -1088,9 +1217,10 @@ docker compose -f docker/compose.yaml start goose-web
 5. Start the gateway and run `goose-web check`.
 6. Ask users to reload the page (a hard refresh if the old UI still shows, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)).
 
-Database schema changes are applied automatically when the gateway (or a console command) opens the database. The
-migrations only add nullable columns and indexes and never rename or drop anything; the version is kept in the
-`meta` table (`schema_version`, currently 2). Keep the pre-upgrade database backup as your rollback path.
+Database schema changes are applied automatically when the gateway (or a console command) opens the database; the
+version is kept in the `meta` table (`schema_version`, currently 4). Column migrations only add nullable columns
+and indexes. The upgrade to 1.5.0 also converts team policies and memberships once (section 9.8), so back up the
+database first. Keep the pre-upgrade database backup as your rollback path.
 
 ### 20.2 Updating Goose (native)
 
@@ -1152,8 +1282,9 @@ docker compose -f docker/compose.yaml down -v     # also deletes the volume and 
 6. Enrol two-factor for your admin account, then switch on "Require two-factor for administrators".
 7. Configure sign-in methods: LDAP (`ldaps://` or StartTLS, CA file, least-privilege bind account) and/or OIDC
    (`public_url` set, exact redirect URI registered). Keep one local admin as break-glass.
-8. Review the **Everyone** team policy and create teams with the permissions, allowed modes, providers, models,
-   folders and run limits each group needs.
+8. Set up each team on its Experience page, starting with **Everyone** (which allows nothing on a new install):
+   allowed providers, models and approval modes, a default model, team hints, folders and run limits. Clear every
+   warning marked as an error.
 9. Set the default team, the sign-in lifetime and the branding in Admin > Settings. Consider lowering
    `auth.remember_days`.
 10. Add shared providers, extensions, skills and recipes as team items, and shared hints documents.
@@ -1179,7 +1310,7 @@ This list follows the code's behaviour; the full reasoning is in
 | Sessions | Lower `auth.remember_days` and the sign-in lifetime if devices are shared. Users can revoke sessions in their settings. |
 | Failed sign-ins | Keep the address block on (`auth.ip_block_threshold` 10). Check Admin > Blocked addresses now and then; exempt only networks you control. |
 | Directory sign-in | LDAP over `ldaps://` or StartTLS with `caFile` for a private CA, least-privilege bind account, `allowInsecure` off. OIDC with an `https://` issuer, exact redirect URI, and `stripDomain: false` if the identity provider has more than one domain. |
-| Policies | Leave `allow_shell`, `config_edit`, `extensions_edit`, `providers_edit` and `notify_webhook` off for ordinary teams. Set `allowed_modes`, `allowed_providers`, `allowed_models`, `allowed_roots` and `max_concurrent_runs`. |
+| Policies | Leave `allow_shell`, `config_edit`, `extensions_edit`, `providers_edit` and `notify_webhook` off for ordinary teams. Set `allowed_modes`, `allowed_providers`, `allowed_models`, `allowed_roots` and `max_concurrent_runs`, with explicit values rather than Any where you can. Keep personal hints off where team hints must be final. Remember that all teams share one Windows account (section 11.3). |
 | Shared items | Share extensions and providers only when every member may hold the copied credentials. Import MCP Apps and extensions only from trusted sources. |
 | Webhooks | Keep `notify.allow_private_targets: false`. |
 | Native profile | Bind at most one admin to it. Restrict its folder's permissions to the gateway user (plus SYSTEM and Administrators on Windows). |
@@ -1214,7 +1345,7 @@ tasks, Blocked addresses, Audit log, Logs.
 
 Admin REST endpoints (all under `/api/admin/`, admin session or admin API token; details in [API.md](API.md)):
 `users`, `users/{id}`, `users/{id}/reset-password`, `users/{id}/reset-totp`, `users/{id}/unlock`,
-`users/{id}/provision`, `ip-blocks`, `ip-blocks/unblock`, `teams`, `teams/{id}`, `teams/{id}/items`, `teams/{id}/items/{item}`, `library`, `hints`, `hints/{id}`, `auth`, `settings`,
+`users/{id}/provision`, `users/{id}/hints`, `ip-blocks`, `ip-blocks/unblock`, `teams`, `teams/{id}`, `teams/{id}/items`, `teams/{id}/items/{item}`, `library`, `hints`, `hints/{id}`, `auth`, `settings`,
 `audit`, `system`, `system/workers/{key}/{restart|stop}`, `ownership`, `hosttasks`, `hosttasks/action`, `logs`.
 
 Health check: `GET /healthz` returns `ok` (exempt from the Host allow-list). It shows that the gateway process

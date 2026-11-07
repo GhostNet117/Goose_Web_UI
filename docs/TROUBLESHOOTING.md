@@ -244,7 +244,7 @@ Directory (LDAP) and SSO (OIDC) accounts have their passwords managed elsewhere;
 | Log `LDAP error: ...` with a TLS or certificate message | The server certificate is not trusted. Certificates are always verified. | Set the CA file (`caFile`) to the CA that issued the directory server certificate. |
 | Log `LDAP error: ...` with a timeout | Server unreachable. Connect timeout is 8 s, receive timeout 10 s. | Check DNS, firewall and port (636 for LDAPS, 389 for StartTLS). |
 | One user gets `Invalid username or password` while others work | The user search returned zero or more than one entry (it must match exactly one), the user's password is wrong, or the user has no Goose Web account yet and automatic creation (`autoCreate`) is off. | Check the search base and filter for that user name; create the account or turn on `autoCreate`. |
-| A directory user signs in but has the wrong role or teams | Role and teams come from the user's `memberOf` groups: `adminGroupDn` gives the admin role, `groupTeamMap` maps groups to teams. | Check the group DNs (compared without regard to case) in the LDAP settings. |
+| A directory user signs in but has the wrong role or team | Role and team come from the user's `memberOf` groups: `adminGroupDn` gives the admin role, `groupTeamMap` maps groups to teams. A user has one team: the mapped team replaces the previous one, and when several groups match the first one wins (audit `user.team.directory`). | Check the group DNs (compared without regard to case) in the LDAP settings. |
 | Log `ldap3 is not installed` | The optional dependency is missing from the virtual environment. | Install `ldap3` into the gateway's environment (it is in the locked requirements; re-run the installer or `pip install --require-hashes -r requirements.lock`). |
 
 ### 3.5 OIDC single sign-on
@@ -550,7 +550,7 @@ button and **Back to herd**.
 | Error text | Cause | Fix |
 | --- | --- | --- |
 | Goose's own "session not found" style error | The session was deleted (in Goose Web, Goose Desktop or the CLI), or the link points at a session in another profile. Sessions belong to one profile. | Go back to the herd and pick an existing chat. Administrators open other users' chats through the herd or with `?profile=<user>`. |
-| `forbidden: folder not allowed: <folder>` | The session's working folder is outside the user's allowed folders (the policy changed after the chat was created). | An administrator adds the folder to the user's or team's allowed roots, or the user starts a new chat in an allowed folder. |
+| `forbidden: folder not allowed: <folder>` | The session's working folder is outside the user's allowed folders (the policy changed after the chat was created). | An administrator adds the folder to the team's extra folders, or the user starts a new chat in an allowed folder. |
 | `Goose is not available: <error>` | The worker cannot start (section 7.2). | Section 7.2. |
 | `the Goose worker restarted` / `the Goose worker connection closed` | The worker restarted while the chat was loading. | Click Retry. |
 | `Goose is not connected` | The worker connection is down. | Wait for the yellow bar to clear, then Retry. |
@@ -609,7 +609,7 @@ For users who are not administrators, extension changes go through the policy. R
 | `forbidden: method not available to your account: <method>` | The method is reserved for administrators. |
 
 When `allow_shell` is off, provisioning switches the shell extensions off in the user's profile; the developer
-extension shows the description `Shell and file editing (disabled by policy)`. Saving a user's teams, hints or
+extension shows the description `Shell and file editing (disabled by policy)`. Saving a user's team, hints or
 policy overrides, or a team's policy, provisions the affected profiles again; Admin > Users also has a provision
 action for one user. After granting `allow_shell`, turn the extension on in the user's settings.
 
@@ -692,7 +692,7 @@ chat link) and `Priority` (`high` for "needs you", otherwise `default`). Other U
 
 ## 14. Old user interface after an upgrade
 
-The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v9`). The
+The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v10`). The
 page, scripts and styles are fetched from the network first, and the cache is used only when the gateway cannot
 be reached; `/api/` and `/ws` are never cached. Third-party libraries and icons are served from the cache first.
 The gateway sends these files with `Cache-Control: no-cache`.
@@ -712,20 +712,29 @@ The gateway sends these files with `Cache-Control: no-cache`.
 | Message | Cause | Fix |
 | --- | --- | --- |
 | `Uploads are limited to N MB` (413 `too_large`) | File larger than `server.max_upload_mb` (default 25), or more than 20 files at once. | Raise `server.max_upload_mb` (and the proxy body limit), or upload fewer/smaller files. |
-| `That folder is outside your allowed folders` (403 `path_forbidden`) | The user's policy limits folders. | Add the folder to the allowed roots. |
+| `That folder is outside your allowed folders` (403 `path_forbidden`) | Non-admins can use only their workspace, the team folder and the team's extra folders. | Add the folder to the team's extra folders (Experience > Folders), or use the team folder. |
 | `Access denied by the file system` (403 `denied`) | The operating system refused access to the account the gateway runs as. | Fix file permissions/ownership (section 7.4). |
 | `Folder not found` / `File not found` (404) | The path does not exist. | Check the path. |
 | `name_taken` (409) | A file or folder with that name already exists. | Choose another name. |
 | `forbidden: you already have N agents running (limit M)` | `max_concurrent_runs` in the policy (default 3). | Wait for a run to finish, or raise the limit. |
-| `forbidden: folder not allowed: <folder>` / `forbidden: project folder not allowed` | Working folder outside allowed roots. | Add the folder, then the user reloads. |
+| `forbidden: folder not allowed: <folder>` / `forbidden: project folder not allowed` | Working folder outside the workspace, the team folder and the team's extra folders. | Add the folder to the team's extra folders, then the user reloads. |
 | `forbidden: provider not allowed: <provider>` / `model not allowed: <model>` | Not in `allowed_providers` / `allowed_models`. | Adjust the policy. |
 | `forbidden: mode not allowed: <mode>` | Not in `allowed_modes`. | Adjust the policy. |
+| `forbidden: You are not in a team yet, so you cannot chat. ...` (also a banner on the home page) | The user has no team: created without one, removed from a team, or the team was deleted. They can still sign in and read old chats. | Add the user to a team (Admin > Users > Edit > Team, or the team's Members list). |
+| `forbidden: Your team allows no models, so you cannot chat. ...` (or providers, or approval modes) | Since 1.5.0 an empty allowed list allows nothing. The team shows an error warning in Admin > Teams & policy. | Allow values on the team's Experience page, or switch on Any. |
+| `forbidden: this chat uses the model '<model>', which your team does not allow. ...` | The chat's provider, model or mode was allowed when the chat started, but not any more. | The user picks an allowed value in the chat header, or an administrator allows it. |
+| `forbidden: GOOSE_MODEL value not allowed by your team` / `provider not allowed` / `model not allowed` | A change of the profile default (`defaults/save`) or of the raw config outside the team's lists. | Pick an allowed value. |
+| `forbidden: CONTEXT_FILE_NAMES is managed by Goose Web` | Non-admins cannot change which hints files Goose loads. | Nothing to fix: team hints are set by an administrator. |
+| `'AGENTS.md' is a Goose hints file name. ...` (403 `hint_file_refused`) | Non-admins cannot upload or create anything named `AGENTS.md`, `.goosehints` or `.goose-web-hints.md`. | Rename the file (for example `AGENTS.txt`), or ask an administrator to put the content in the Hints library. |
+| Goose ignores an `AGENTS.md` or `.goosehints` in the project folder (isolated profiles) | Since 1.5.0 isolated workers load only the composed `config/.goose-web-hints.md` (`CONTEXT_FILE_NAMES`). | Put shared instructions in the Hints library and assign them to the team. Check the result with Admin > Users > View effective hints. |
+| Personal hints are not used (warning in Settings > Goose hints) | The team does not allow personal hints (`hints_edit` off, the default for new teams). | An administrator switches on "Members may add personal hints", or moves the content into team hints. |
+| A user is in a different team, or in none, after the upgrade to 1.5.0 | Users who were in several teams keep only the team with the lowest id (audit `team.migrate.membership`). | Move the user to the right team. |
 | `team recipes are managed by your administrator` | A user tried to delete a recipe that comes from the team library. | An administrator removes it from the team library. |
 | `Administrators only` (403 `forbidden`) | Admin endpoint used by a normal user. | Use an administrator account. |
 | `Your administrator has turned off self-service two-factor enrolment` | `allowSelfTotp` is off. | An administrator turns it on. |
 | `Turn on two-factor for your own account before requiring it for administrators` (409) | Prevents an administrator from locking themselves out. | Enrol two-factor first. |
 | `Two-factor is required for administrators` (403) | An administrator tried to turn off their own two-factor while it is required. | Turn the requirement off first, or keep two-factor. |
-| `names may contain letters, digits, '.', '_' and '-' and must start with a letter or digit` / `reserved name` | Invalid user, team or item name. Reserved: `appdata`, `workspace`, `_system`, `_deleted`, `library`, `backups`, `logs`. | Choose another name. |
+| `names may contain letters, digits, '.', '_' and '-' and must start with a letter or digit` / `reserved name` | Invalid user, team or item name. Reserved: `appdata`, `workspace`, `_system`, `_deleted`, `_teams`, `library`, `backups`, `logs`. | Choose another name. |
 | `Internal error (see the gateway log)` (500 `server_error`) | Unexpected error. | Read `gateway.log` for `unhandled error on <path>` and the traceback. |
 | A policy change has no effect | Policies are captured when the WebSocket connects. | The user reloads the page. |
 | An API token stopped working | Tokens are refused once expired, for disabled accounts, and while a password change is required; `user reset`, a two-factor reset and account deletion remove them. | Create a new token. |

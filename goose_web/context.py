@@ -113,7 +113,12 @@ class Ctx:
 
     # ---------------------------------------------------------- users / profiles / policy
     def policy_for(self, user: dict) -> dict:
-        return pol.effective_policy(user, self.db.user_teams(user["id"]))
+        teams = self.db.user_teams(user["id"])
+        p = pol.effective_policy(user, teams)
+        if teams and user.get("role") != "admin":
+            folder = self.profiles.ensure_team_folder(teams[0])
+            p["team_folder"] = str(folder or self.profiles.team_folder(teams[0]))
+        return p
 
     def roots_for(self, user: dict, policy: dict | None = None) -> list[str]:
         policy = policy or self.policy_for(user)

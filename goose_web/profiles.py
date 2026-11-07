@@ -1,11 +1,15 @@
 """Profile layout, provisioning (teams -> profile files) and the cross-profile library.
 
 Layout of an isolated profile (GOOSE_PATH_ROOT=<profiles_root>/<username>):
-    config/  config.yaml, secrets.yaml, .goosehints, custom_providers/, recipes/, skills/
+    config/  config.yaml, secrets.yaml, .goose-web-hints.md (composed hints), custom_providers/, recipes/, skills/
     data/    sessions/sessions.db, logs/        (written by Goose)
     state/                                       (written by Goose)
     workspace/                                   default folder for new chats
     .goose-web/managed.json                      what the gateway provisioned (so it never touches user items)
+
+Team shared folders: <profiles_root>/_teams/<team id> (or the team's share_folder), reachable by the members.
+Isolated workers run with CONTEXT_FILE_NAMES=[".goose-web-hints.md"] (workers.py), so Goose loads only the
+gateway-written hints file, never an AGENTS.md / .goosehints planted in a working folder (spec 009).
 
 The admin's native profile (profile_mode = native) is NEVER provisioned. The gateway only reads it, except
 when the admin saves their own goose hints in the UI (the previous file is backed up first).
@@ -25,12 +29,19 @@ import yaml
 
 from .config import Settings, default_native_goose_root
 from .db import Database
-from .policy import SHELL_EXTENSIONS, effective_policy
+from .policy import ANY, SHELL_EXTENSIONS, allows, effective_policy
 from .security import safe_name
 
 MANAGED_MARK = ".goose-web-managed"
 HINTS_HEADER = ("# Managed by Goose Web. Edit your personal hints in the web UI (Settings > Goose hints);\n"
                 "# changes made directly in this file are overwritten.\n")
+PRECEDENCE_NOTE = ("\n# How to use these hints: they are listed from lowest to highest precedence. Team hints come\n"
+                   "# last and are final: if a personal hint conflicts with a team hint, follow the team hint.\n")
+# The only hints file name Goose loads for isolated profiles (CONTEXT_FILE_NAMES, set by workers.py).
+GW_HINTS_FILENAME = ".goose-web-hints.md"
+LEGACY_HINTS_FILENAME = ".goosehints"
+# File names a non-admin may not upload or create: Goose's default context files and ours (lower case).
+HINT_FILE_NAMES = frozenset({".goosehints", "agents.md", GW_HINTS_FILENAME.lower()})
 # Platform extensions every new profile starts with (copied from the admin profile when present there).
 BASE_EXTENSIONS = ["todo", "skills", "apps", "chatrecall", "summarize", "extensionmanager", "analyze", "memory",
                    "summon", "tom"]
@@ -92,6 +103,22 @@ class Profiles:
             return Path(self.s.get("goose", "default_workdir_native") or os.path.expanduser("~"))
         return self.root_for(user) / "workspace"
 
+    # ------------------------------------------------------------ team shared folder
+    def team_folder(self, team: dict) -> Path:
+        """The team's shared folder: its share_folder (absolute) or <profiles_root>/_teams/<team id>."""
+        sf = str((team.get("policy") or {}).get("share_folder") or "").strip()
+        if sf and os.path.isabs(sf):
+            return Path(sf)
+        return self.root / "_teams" / str(int(team["id"]))
+
+    def ensure_team_folder(self, team: dict) -> Path | None:
+        p = self.team_folder(team)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        return p
+
     def team_recipe_dirs(self, user: dict) -> list[str]:
         out = []
         for t in self.db.user_teams(user["id"]):
@@ -116,13 +143,40 @@ class Profiles:
             " UNION SELECT th.hints_id FROM team_hints th JOIN team_members m ON m.team_id=th.team_id"
             " WHERE m.user_id=?) ORDER BY h.name", (user["id"], user["id"]))
 
+    def hint_sections(self, user: dict) -> dict:
+        """The parts of a user's composed hints, lowest precedence first (spec 009)."""
+        team = self.db.user_team(user["id"])
+        pol = effective_policy(user, [team] if team else [])
+        personal = (user.get("personal_hints") or "").strip()
+        use_personal = bool(personal) and (user.get("role") == "admin" or bool(pol.get("hints_edit")))
+        mine = self.db.query("SELECT h.* FROM hints_docs h JOIN user_hints uh ON uh.hints_id=h.id "
+                             "WHERE uh.user_id=? ORDER BY h.name", (user["id"],))
+        team_docs = self.db.query("SELECT h.* FROM hints_docs h JOIN team_hints th ON th.hints_id=h.id "
+                                  "WHERE th.team_id=? ORDER BY h.name", (team["id"],)) if team else []
+        team_ids = {d["id"] for d in team_docs}
+        return {"team": team, "personal": personal if use_personal else "",
+                "personalDropped": bool(personal) and not use_personal,
+                "user": [h for h in mine if h["id"] not in team_ids],   # a doc on both lists appears once, as team
+                "teamDocs": team_docs}
+
     def compose_hints(self, user: dict) -> str:
-        parts = [HINTS_HEADER]
-        for h in self.assigned_hints(user):
-            parts.append(f"\n# ---- {h['name']} ----\n{h['content'].rstrip()}\n")
-        if (user.get("personal_hints") or "").strip():
-            parts.append(f"\n# ---- personal ----\n{user['personal_hints'].rstrip()}\n")
+        """Header, precedence rule, personal hints (if the team allows them), documents an admin assigned to
+        this user, then the team's documents LAST, so team hints are final (spec 009)."""
+        s = self.hint_sections(user)
+        parts = [HINTS_HEADER, PRECEDENCE_NOTE]
+        if s["personal"]:
+            parts.append(f"\n# ---- personal hints (lowest precedence) ----\n{s['personal'].rstrip()}\n")
+        for h in s["user"]:
+            parts.append(f"\n# ---- {h['name']} (assigned to you) ----\n{h['content'].rstrip()}\n")
+        if s["teamDocs"]:
+            parts.append(f"\n# ==== Team: {s['team']['name']} (final: these take precedence) ====\n")
+            for h in s["teamDocs"]:
+                parts.append(f"\n# ---- {h['name']} ----\n{h['content'].rstrip()}\n")
         return "".join(parts)
+
+    def hints_path(self, user: dict) -> Path:
+        """The file Goose loads the composed hints from (isolated profiles)."""
+        return self.config_dir(user) / GW_HINTS_FILENAME
 
     def native_hints_path(self, user: dict) -> Path:
         return self.config_dir(user) / ".goosehints"
@@ -145,12 +199,24 @@ class Profiles:
         _atomic_write(p, content)
         return backup
 
+    def _drop_legacy_hints(self, user: dict) -> bool:
+        """Remove the config/.goosehints that Goose Web 1.4 wrote (only if it is ours: it starts with the header)."""
+        p = self.config_dir(user) / LEGACY_HINTS_FILENAME
+        try:
+            if p.is_file() and p.read_text(encoding="utf-8", errors="replace").startswith(HINTS_HEADER[:40]):
+                p.unlink()
+                return True
+        except OSError:
+            pass
+        return False
+
     def write_hints(self, user: dict) -> None:
-        """Rewrite only the composed .goosehints of an isolated profile (safe while Goose runs)."""
+        """Rewrite only the composed hints file of an isolated profile (safe while Goose runs)."""
         if self.is_native(user):
             return
         self.ensure_layout(user)
-        _atomic_write(self.config_dir(user) / ".goosehints", self.compose_hints(user))
+        _atomic_write(self.hints_path(user), self.compose_hints(user))
+        self._drop_legacy_hints(user)
 
     # ------------------------------------------------------------ provisioning
     def _manifest_path(self, user: dict) -> Path:
@@ -229,11 +295,12 @@ class Profiles:
                     secrets[k] = src_secrets[k]
                     new_manifest["secrets"].append(k)
 
-        default_provider = default_model = None
-        for t in teams:
-            tp = t.get("policy") or {}
-            default_provider = default_provider or tp.get("default_provider")
-            default_model = default_model or tp.get("default_model")
+        team = teams[0] if teams else None
+        tp = (team or {}).get("policy") or {}
+        default_provider = tp.get("default_provider") or None
+        default_model = tp.get("default_model") or None
+        if team is not None:
+            self.ensure_team_folder(team)
 
         for it in items:
             kind, name, payload = it["kind"], it["name"], it.get("payload") or {}
@@ -302,37 +369,61 @@ class Profiles:
                 shutil.rmtree(sdir, ignore_errors=True)
                 changes.append(f"skill {sk} removed")
 
-        # provider / model / mode defaults and allow-lists
-        allowed_p = pol.get("allowed_providers") or []
-        if default_provider and (first_time or not cfg.get("GOOSE_PROVIDER")):
-            cfg["GOOSE_PROVIDER"] = default_provider
-            if default_model:
-                cfg["GOOSE_MODEL"] = default_model
-            changes.append(f"default model {default_provider}/{default_model}")
+        # provider / model / mode defaults and allow-lists (spec 009: the team default model)
+        allowed_p = [p for p in pol.get("allowed_providers") or [] if p != ANY]
+        team_default = [default_provider, default_model] if default_provider else None
+        default_ok = bool(team_default) and allows(pol, "allowed_providers", default_provider) and \
+            (not default_model or allows(pol, "allowed_models", default_model))
+        prev_default = old.get("teamDefault")
+        current = [cfg.get("GOOSE_PROVIDER"), cfg.get("GOOSE_MODEL")]
+        if team_default:
+            new_manifest["teamDefault"] = team_default
+        if default_ok and (first_time or not cfg.get("GOOSE_PROVIDER") or
+                           (team_default != prev_default and (prev_default is None or current == prev_default))):
+            if current != team_default:
+                cfg["GOOSE_PROVIDER"] = default_provider
+                if default_model:
+                    cfg["GOOSE_MODEL"] = default_model
+                else:
+                    cfg.pop("GOOSE_MODEL", None)
+                changes.append(f"default model {default_provider}/{default_model or '(provider default)'}")
         elif first_time and admin_cfg.get("GOOSE_PROVIDER") and \
-                (not allowed_p or admin_cfg.get("GOOSE_PROVIDER") in allowed_p) and \
+                allows(pol, "allowed_providers", admin_cfg.get("GOOSE_PROVIDER")) and \
                 admin_cfg.get("GOOSE_PROVIDER") in new_manifest["providers"]:
             cfg["GOOSE_PROVIDER"] = admin_cfg["GOOSE_PROVIDER"]
             cfg["GOOSE_MODEL"] = admin_cfg.get("GOOSE_MODEL")
-        if allowed_p and cfg.get("GOOSE_PROVIDER") and cfg["GOOSE_PROVIDER"] not in allowed_p:
-            cfg["GOOSE_PROVIDER"] = default_provider or allowed_p[0]
+        if cfg.get("GOOSE_PROVIDER") and not allows(pol, "allowed_providers", cfg["GOOSE_PROVIDER"]):
             cfg.pop("GOOSE_MODEL", None)
-            if default_model:
-                cfg["GOOSE_MODEL"] = default_model
+            if default_ok:
+                cfg["GOOSE_PROVIDER"] = default_provider
+                if default_model:
+                    cfg["GOOSE_MODEL"] = default_model
+            elif allowed_p:
+                cfg["GOOSE_PROVIDER"] = allowed_p[0]
+            else:
+                cfg.pop("GOOSE_PROVIDER", None)
             changes.append("provider reset to an allowed one")
+        if cfg.get("GOOSE_MODEL") and not allows(pol, "allowed_models", cfg["GOOSE_MODEL"]):
+            if default_ok and default_model and cfg.get("GOOSE_PROVIDER") == default_provider:
+                cfg["GOOSE_MODEL"] = default_model
+            else:
+                cfg.pop("GOOSE_MODEL", None)
+            changes.append("model reset to an allowed one")
         modes = pol.get("allowed_modes") or []
-        if modes and cfg.get("GOOSE_MODE") not in modes:
-            cfg["GOOSE_MODE"] = modes[0]
-            changes.append(f"mode {modes[0]}")
+        if modes and not allows(pol, "allowed_modes", cfg.get("GOOSE_MODE")):
+            cfg["GOOSE_MODE"] = "approve" if allows(pol, "allowed_modes", "approve") else modes[0]
+            changes.append(f"mode {cfg['GOOSE_MODE']}")
 
         _write_yaml(cfg_path, cfg)
         if secrets or secrets_path.exists():
             _write_yaml(secrets_path, secrets)
         hints = self.compose_hints(user)
-        hp = cfg_dir / ".goosehints"
+        hp = self.hints_path(user)
         if not hp.exists() or hp.read_text(encoding="utf-8") != hints:
             _atomic_write(hp, hints)
             changes.append("goose hints")
+        if self._drop_legacy_hints(user):
+            changes.append("old .goosehints removed (Goose Web now uses .goose-web-hints.md)")
         _atomic_write(self._manifest_path(user), json.dumps(new_manifest, indent=1))
         return changes
 

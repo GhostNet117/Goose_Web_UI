@@ -23,6 +23,7 @@ from goose_web.config import DEFAULTS, Settings
 from goose_web.context import Ctx, HTTPError, url_origin
 from goose_web.db import Database
 
+MEMBER = {**pol.LEGACY_DEFAULT_POLICY, **{k: [pol.ANY] for k in pol.CHAT_LISTS}, "team": {"id": 1, "name": "t"}}
 REPO = Path(__file__).resolve().parent.parent
 PW = "Blue-Kettle-42"
 P = "_goose/unstable/"
@@ -283,12 +284,12 @@ def test_oidc_refused_without_public_url(stack):
 
 # ---------------------------------------------------------------- NEW-01: tools/call extension prefix
 def _chk(params, admin=False, policy=None):
-    pol.check(P + "tools/call", params, is_admin=admin, policy=policy or dict(pol.DEFAULT_POLICY), roots=["/x"])
+    pol.check(P + "tools/call", params, is_admin=admin, policy=policy or dict(MEMBER), roots=["/x"])
 
 
 @pytest.mark.parametrize("admin", [False, True])
 def test_tools_call_prefix_must_match_extension(admin):
-    policy = dict(pol.ADMIN_POLICY if admin else pol.DEFAULT_POLICY)
+    policy = dict(pol.ADMIN_POLICY if admin else MEMBER)
     with pytest.raises(pol.Denied, match="does not belong to extension"):
         _chk({"sessionId": "s", "extensionName": "todo", "name": "developer__shell"}, admin, policy)
     with pytest.raises(pol.Denied, match="does not belong to extension"):

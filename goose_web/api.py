@@ -22,7 +22,8 @@ from . import policy as acp_policy
 from .auth import AuthError
 from .context import Ctx, HTTPError, body_json
 from .hub import RpcError
-from .policy import BOOL_KEYS, DEFAULT_POLICY, LIST_KEYS
+from .policy import ANY, BOOL_KEYS, CHAT_LISTS, DEFAULT_POLICY, LIST_KEYS
+from .profiles import HINT_FILE_NAMES
 
 MAX_PREFS = 64 * 1024
 log = logging.getLogger("goose_web")
@@ -175,6 +176,8 @@ async def me(request: Request):
                "policy": policy, "isAdmin": u["role"] == "admin",
                "totpEnrolmentRequired": c.auth.totp_enrolment_required(u),
                "teams": [{"id": t["id"], "name": t["name"]} for t in c.db.user_teams(u["id"])],
+               "team": (policy.get("team") if u["role"] != "admin" else
+                        next(({"id": t["id"], "name": t["name"]} for t in c.db.user_teams(u["id"])), None)),
                "scheduler": {"enabled": sched_on, "owner": "gateway" if sched_on else "desktop", "reason": reason},
                "workspace": str(c.profiles.workspace(u)), "version": c.version, "gooseVersion": c.goose_version})
 
@@ -319,8 +322,11 @@ async def me_hints(request: Request):
             text = await asyncio.to_thread(c.profiles.read_native_hints, u)
             return ok({"personal": text, "assigned": assigned, "effective": text, "editable": True, "native": True,
                        "path": str(c.profiles.native_hints_path(u))})
+        sec = c.profiles.hint_sections(u)
         return ok({"personal": u["personal_hints"], "assigned": assigned, "effective": c.profiles.compose_hints(u),
-                   "editable": bool(pol.get("hints_edit")), "native": False})
+                   "editable": bool(pol.get("hints_edit")), "native": False,
+                   "personalDropped": sec["personalDropped"],
+                   "team": {"id": sec["team"]["id"], "name": sec["team"]["name"]} if sec["team"] else None})
     if not pol.get("hints_edit"):
         raise HTTPError(403, "forbidden", "Your administrator manages your goose hints")
     b = await body_json(request, 512 * 1024)
@@ -382,8 +388,12 @@ async def fs_roots(request: Request):
             roots.append({"path": "/", "label": "/"})
     else:
         c.profiles.ensure_layout(u)
-        roots = [{"path": r, "label": "Workspace" if i == 0 else os.path.basename(r.rstrip("\\/")) or r}
-                 for i, r in enumerate(c.roots_for(u))]
+        p = c.policy_for(u)
+        team_folder = p.get("team_folder")
+        team_label = "Team: " + str((p.get("team") or {}).get("name") or "")
+        roots = [{"path": r, "label": "Workspace" if i == 0 else team_label if r == team_folder else
+                  os.path.basename(r.rstrip("\\/")) or r}
+                 for i, r in enumerate(c.roots_for(u, p))]
     return ok({"roots": roots, "home": str(ws), "defaultCwd": str(ws)})
 
 
@@ -428,8 +438,17 @@ async def fs_mkdir(request: Request):
     u = c.require(request).user
     b = await body_json(request)
     p = _check_path(c, u, os.path.abspath(str(b.get("path") or "")))
+    _refuse_hint_name(u, p.name)
     p.mkdir(parents=True, exist_ok=True)
     return ok({"path": str(p)})
+
+
+def _refuse_hint_name(u: dict, name: str) -> None:
+    """Spec 009: a non-admin may not place a Goose context file (AGENTS.md, .goosehints, .goose-web-hints.md) in
+    any folder: it would sit beside the team hints that the administrator controls."""
+    if u["role"] != "admin" and str(name or "").strip().rstrip(". ").lower() in HINT_FILE_NAMES:
+        raise HTTPError(403, "hint_file_refused",
+                        f"'{name}' is a Goose hints file name. Your team's hints are managed by your administrator.")
 
 
 # Windows device names: "CON", "con.txt", "COM1.tar.gz" all open the device instead of a file. Same list as
@@ -493,6 +512,7 @@ async def fs_upload(request: Request):
             if not hasattr(f, "filename") or not f.filename:
                 continue
             name = safe_upload_name(f.filename)
+            _refuse_hint_name(u, name)
             target, out = _create_exclusive(d, name)
             size = 0
             with out:
@@ -672,6 +692,7 @@ def _set_links(c: Ctx, table: str, col: str, owner_col: str, owner_id: int, ids:
 def _admin_user_view(c: Ctx, u: dict) -> dict:
     d = c.public_user(u)
     d["teams"] = [t["id"] for t in c.db.user_teams(u["id"])]
+    d["team"] = d["teams"][0] if d["teams"] else None
     d["hints"] = [r["hints_id"] for r in c.db.query("SELECT hints_id FROM user_hints WHERE user_id=?", (u["id"],))]
     d["policyOverrides"] = u.get("policy_overrides") or {}
     d["profilePath"] = str(c.profiles.root_for(u))
@@ -730,16 +751,61 @@ async def admin_users(request: Request):
                            # spec 007: a password set by an administrator is always changed at first sign-in
                            must_change_pw=1 if source == "local" else 0,
                            profile_mode=mode, profile_path=native_path)
-    teams = b.get("teams")
-    if teams is None and c.db.get_setting("default_team_id"):
-        teams = [c.db.get_setting("default_team_id")]
-    _set_links(c, "team_members", "team_id", "user_id", uid, teams or [])
+    team = _team_from_body(c, b)
+    if team is _UNSET:
+        team = c.db.get_setting("default_team_id") or None
+    c.db.set_user_team(uid, team)
     _set_links(c, "user_hints", "hints_id", "user_id", uid, b.get("hints") or [])
     user = c.db.user_by_id(uid)
     if mode == "isolated":
         await asyncio.to_thread(c.profiles.provision, user)
     c.audit(request, "user.create", admin, target=username, detail={"role": role, "mode": mode, "source": source})
     return ok({"user": _admin_user_view(c, user), "tempPassword": temp})
+
+
+_UNSET = object()
+
+
+def _team_from_body(c: Ctx, b: dict):
+    """The one team in a user create/update body: "team": id|null, or the older "teams": [id] (at most one).
+    Returns _UNSET when the body names no team."""
+    if "team" in b:
+        raw = b["team"]
+    elif "teams" in b:
+        lst = b["teams"] or []
+        if not isinstance(lst, list) or len(lst) > 1:
+            raise HTTPError(400, "one_team", "A user belongs to one team at most")
+        raw = lst[0] if lst else None
+    else:
+        return _UNSET
+    if raw in (None, "", 0):
+        return None
+    try:
+        tid = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPError(400, "bad_team", "team must be a team id or null")
+    if not c.db.one("SELECT id FROM teams WHERE id=?", (tid,)):
+        raise HTTPError(400, "bad_team", "Team not found")
+    return tid
+
+
+async def admin_user_hints(request: Request):
+    """What a user's Goose loads as hints (spec 009 'View effective hints')."""
+    c = ctx(request)
+    c.require(request, admin=True)
+    u = _get_user(c, request)
+    if c.profiles.is_native(u):
+        text = await asyncio.to_thread(c.profiles.read_native_hints, u)
+        return ok({"username": u["username"], "native": True, "effective": text,
+                   "path": str(c.profiles.native_hints_path(u)),
+                   "note": "Native profile: Goose also loads AGENTS.md and .goosehints from the chat's working "
+                           "folder up to its git root."})
+    sec = c.profiles.hint_sections(u)
+    return ok({"username": u["username"], "native": False, "effective": c.profiles.compose_hints(u),
+               "path": str(c.profiles.hints_path(u)), "team": sec["team"]["name"] if sec["team"] else None,
+               "personalDropped": sec["personalDropped"],
+               "note": "Isolated profile: Goose loads only this file (CONTEXT_FILE_NAMES); hints files in "
+                       "working folders are ignored."})
 
 
 def _get_user(c: Ctx, request: Request) -> dict:
@@ -796,9 +862,10 @@ async def admin_user(request: Request):
             raise _weak(probs)
         fields["password_hash"] = await asyncio.to_thread(security.hash_password, b["password"])
         fields["must_change_pw"] = 1  # spec 007: always; "mustChangePassword" in the request is ignored
+    team = _team_from_body(c, b)
     c.db.update_user(u["id"], **fields)
-    if "teams" in b:
-        _set_links(c, "team_members", "team_id", "user_id", u["id"], b["teams"])
+    if team is not _UNSET:
+        c.db.set_user_team(u["id"], team)
     if "hints" in b:
         _set_links(c, "user_hints", "hints_id", "user_id", u["id"], b["hints"])
     if fields.get("disabled") or "password_hash" in fields:
@@ -806,7 +873,7 @@ async def admin_user(request: Request):
         c.auth.revoke_user_sessions(u["id"])
         c.auth.revoke_user_tokens(u["id"])
     u2 = c.db.user_by_id(u["id"])
-    changes = await _reprovision(c, [u2]) if {"teams", "hints", "policyOverrides"} & b.keys() else {}
+    changes = await _reprovision(c, [u2]) if {"team", "teams", "hints", "policyOverrides"} & b.keys() else {}
     c.audit(request, "user.update", admin, target=u["username"], detail={"fields": sorted(b.keys() - {"password"})})
     return ok({"user": _admin_user_view(c, u2), "changes": changes.get(u["username"], [])})
 
@@ -900,12 +967,24 @@ def _clean_policy(p: dict) -> dict:
             v = p[k]
             if isinstance(v, str):
                 v = [x.strip() for x in v.replace("\n", ",").split(",")]
-            out[k] = [str(x).strip() for x in (v or []) if str(x).strip()][:200]
-    if "max_concurrent_runs" in p:
+            v = [str(x).strip() for x in (v or []) if str(x).strip()][:200]
+            if k in CHAT_LISTS and ANY in v:
+                v = [ANY]                     # "Any" makes the rest of the list meaningless
+            if k == "allowed_roots":
+                bad = [r for r in v if r == ANY or not os.path.isabs(r)]
+                if bad:
+                    raise HTTPError(400, "bad_folder", f"Extra folders must be absolute paths: {bad[0]}")
+            out[k] = v
+    if p.get("max_concurrent_runs") not in (None, ""):
         out["max_concurrent_runs"] = max(0, min(100, int(p.get("max_concurrent_runs") or 0)))
     for k in ("default_provider", "default_model"):
         if p.get(k):
-            out[k] = str(p[k])[:200]
+            out[k] = str(p[k]).strip()[:200]
+    if str(p.get("share_folder") or "").strip():
+        sf = str(p["share_folder"]).strip()[:500]
+        if not os.path.isabs(sf):
+            raise HTTPError(400, "bad_folder", "The team folder must be an absolute path")
+        out["share_folder"] = sf
     return out
 
 
@@ -913,9 +992,11 @@ def _team_view(c: Ctx, t: dict) -> dict:
     members = [r["user_id"] for r in c.db.query("SELECT user_id FROM team_members WHERE team_id=?", (t["id"],))]
     hints = [r["hints_id"] for r in c.db.query("SELECT hints_id FROM team_hints WHERE team_id=?", (t["id"],))]
     n = c.db.one("SELECT COUNT(*) AS n FROM team_items WHERE team_id=?", (t["id"],))["n"]
+    pol = {**DEFAULT_POLICY, **(t.get("policy") or {})}
     return {"id": t["id"], "name": t["name"], "description": t["description"],
-            "policy": {**DEFAULT_POLICY, **(t.get("policy") or {})}, "members": members, "hints": hints,
-            "itemCount": n, "createdAt": t["created_at"]}
+            "policy": pol, "members": members, "hints": hints,
+            "itemCount": n, "createdAt": t["created_at"], "teamFolder": str(c.profiles.team_folder(t)),
+            "warnings": acp_policy.team_warnings(pol, hints=len(hints), members=len(members))}
 
 
 def _team_members(c: Ctx, team_id: int) -> list[dict]:
@@ -963,17 +1044,26 @@ async def admin_team(request: Request):
         c.db.execute("UPDATE teams SET name=?, description=?, policy=? WHERE id=?",
                      (str(b.get("name", t["name"]))[:80], str(b.get("description", t["description"]))[:500],
                       _json.dumps(_clean_policy(b["policy"]) if "policy" in b else (t.get("policy") or {})), tid))
+    moved: list[str] = []
     if "members" in b:
+        ids = sorted({int(m) for m in b["members"] or []})
+        # one team per user (spec 009): a new member leaves their previous team
+        for r in c.db.query("SELECT m.user_id, u.username, t.name AS team FROM team_members m JOIN users u "
+                            "ON u.id=m.user_id JOIN teams t ON t.id=m.team_id WHERE m.team_id<>?", (tid,)):
+            if r["user_id"] in ids:
+                moved.append(f"{r['username']} (from {r['team']})")
+                before.append(c.db.user_by_id(r["user_id"]))
         c.db.transaction([("DELETE FROM team_members WHERE team_id=?", (tid,))] +
-                         [("INSERT OR IGNORE INTO team_members(team_id, user_id) VALUES(?,?)", (tid, int(m)))
-                          for m in b["members"] or []])
+                         [("DELETE FROM team_members WHERE user_id=?", (m,)) for m in ids] +
+                         [("INSERT INTO team_members(team_id, user_id) VALUES(?,?)", (tid, m)) for m in ids])
     if "hints" in b:
         _set_links(c, "team_hints", "hints_id", "team_id", tid, b["hints"])
     after = _team_members(c, tid)
     seen = {u["id"]: u for u in before + after}
     changes = await _reprovision(c, [c.db.user_by_id(i) for i in seen])
-    c.audit(request, "team.update", admin, target=t["name"], detail={"fields": sorted(b.keys())})
-    return ok({"team": _team_view(c, c.db.one("SELECT * FROM teams WHERE id=?", (tid,))), "changes": changes})
+    c.audit(request, "team.update", admin, target=t["name"], detail={"fields": sorted(b.keys()), "moved": moved})
+    return ok({"team": _team_view(c, c.db.one("SELECT * FROM teams WHERE id=?", (tid,))), "changes": changes,
+               "moved": moved})
 
 
 async def admin_team_items(request: Request):
@@ -1313,6 +1403,7 @@ routes = [
     Route("/api/admin/users/{uid:int}/unlock", admin_user_unlock, methods=["POST"]),
     Route("/api/admin/users/{uid:int}/reset-totp", admin_user_reset_totp, methods=["POST"]),
     Route("/api/admin/users/{uid:int}/provision", admin_user_provision, methods=["POST"]),
+    Route("/api/admin/users/{uid:int}/hints", admin_user_hints, methods=["GET"]),
     Route("/api/admin/ip-blocks", admin_ip_blocks),
     Route("/api/admin/ip-blocks/unblock", admin_ip_unblock, methods=["POST"]),
     Route("/api/admin/teams", admin_teams, methods=["GET", "POST"]),

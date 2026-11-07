@@ -50,7 +50,16 @@ export function policyList(key) {
   const v = (me.policy || {})[key];
   return Array.isArray(v) ? v : [];
 }
+// Spec 009: "*" = any value; an empty list allows nothing. Admins are never restricted.
 export function allowedValue(listKey, value) {
+  const me = store.get('me');
+  if (!me || me.isAdmin) return true;
   const l = policyList(listKey);
-  return !l.length || l.includes(value);
+  return l.includes('*') || l.includes(value);
+}
+// Why this user cannot start or continue chats ('' = they can). Set by the gateway (policy.chat_block).
+export function chatBlocked() {
+  const me = store.get('me');
+  if (!me || me.isAdmin) return '';
+  return String((me.policy || {}).chat_blocked || '');
 }

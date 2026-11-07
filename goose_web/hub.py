@@ -312,6 +312,9 @@ class Upstream:
                 await self._guard_recipe_delete(params)
             if method == "session/prompt":
                 self._check_concurrency(client, params)
+                if not client.is_admin:
+                    s0 = self.sessions.get(str(params.get("sessionId") or ""))
+                    pol.check_session_choice(client.policy, s0.load_result if s0 else None)
             await self.ensure()
             if method == "session/load":
                 sid = str(params.get("sessionId") or "")
@@ -658,10 +661,18 @@ class Upstream:
             s = self.sessions.get(str(params.get("sessionId") or ""))
             if s and s.load_result and isinstance(s.load_result.get("modes"), dict):
                 s.load_result["modes"] = {**s.load_result["modes"], "currentModeId": params.get("modeId")}
+            if s and s.load_result and isinstance(s.load_result.get("configOptions"), list):
+                # keep the "mode" config option in step (the prompt policy check reads both)
+                s.load_result["configOptions"] = [
+                    {**o, "currentValue": params.get("modeId")} if isinstance(o, dict) and o.get("id") == "mode" else o
+                    for o in s.load_result["configOptions"]]
         elif method == "session/set_config_option" and ok:
             s = self.sessions.get(str(params.get("sessionId") or ""))
             if s and s.load_result is not None and result.get("configOptions") is not None:
                 s.load_result["configOptions"] = result["configOptions"]
+            if s and s.load_result and params.get("configId") == "mode" and \
+                    isinstance(s.load_result.get("modes"), dict):
+                s.load_result["modes"] = {**s.load_result["modes"], "currentModeId": params.get("value")}
         elif method in ("session/delete", "session/close") and ok:
             s = self.sessions.pop(str(params.get("sessionId") or ""), None)
             if s:
@@ -686,6 +697,17 @@ class Upstream:
             elif isinstance(u.get("status"), dict) and not replaying:
                 s.last_text = str(u["status"].get("message") or "")[:300]
                 self._herd_dirty.add(s.sid)
+            return
+        if kind == "config_option_update" and isinstance(u.get("configOptions"), list) and s.load_result is not None:
+            s.load_result["configOptions"] = u["configOptions"]   # the prompt policy check reads these (spec 009)
+            return
+        if kind == "current_mode_update" and s.load_result is not None and u.get("currentModeId"):
+            if isinstance(s.load_result.get("modes"), dict):
+                s.load_result["modes"] = {**s.load_result["modes"], "currentModeId": u["currentModeId"]}
+            if isinstance(s.load_result.get("configOptions"), list):
+                s.load_result["configOptions"] = [
+                    {**o, "currentValue": u["currentModeId"]} if isinstance(o, dict) and o.get("id") == "mode" else o
+                    for o in s.load_result["configOptions"]]
             return
         if kind == "session_info_update":
             if u.get("title"):

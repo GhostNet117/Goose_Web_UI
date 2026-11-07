@@ -43,9 +43,12 @@ Things to know before you start:
   the chat replays and shows what happened.
 - **Several tabs and devices stay in sync.** If Goose asks for permission, every open tab shows the question.
   The first answer wins.
-- **Your administrator decides what you may do.** A policy controls, for example, which folders you can use,
-  which models you can pick and whether you can add extensions. Pages show a "Read-only" note when your policy
-  does not allow a change. See [section 15](#15-what-your-policy-can-restrict).
+- **Your team decides what you may do.** You belong to one team. Its policy, set by your administrator, decides
+  which providers, models and approval modes you can use, which folders you can reach, which hints Goose gets and
+  whether you can add extensions. Pages show a "Read-only" note when your policy does not allow a change. See
+  [section 15](#15-what-your-policy-can-restrict).
+- **No team, no chat.** If you are not in a team yet, you can sign in, look around and read your old chats, but
+  you cannot start or continue a chat until your administrator adds you to a team.
 
 ## 2. Signing in and out
 
@@ -115,7 +118,15 @@ Directory and single sign-on accounts do not have a password in Goose Web. Your 
 
 On your first chat, Goose may say that no model provider is set up. Open **Settings > Models & Providers** and
 configure one, or ask your administrator to assign one to your team. Many administrators provision providers,
-recipes, skills and extensions for teams, so they may already be there.
+recipes, skills and extensions for teams, so they may already be there. Your team may also set a default model,
+which new chats start with.
+
+If the home page shows a yellow banner instead, you cannot chat yet:
+
+| Banner | Meaning |
+|---|---|
+| You are not in a team yet, so you cannot chat. Ask your administrator to add you to a team. | Your account has no team. You can still browse and read your old chats. |
+| Your team allows no providers (or models, or approval modes), so you cannot chat. Ask your administrator. | Your team is not set up yet. |
 
 ### Signing out
 
@@ -292,8 +303,9 @@ Below the message box you may see:
 
 The folder picker opens when you click a folder chip.
 
-- **Locations** on the left lists the folders you may use: your **Workspace** and any extra folders your
-  administrator allowed. Administrators also see **Home** and the drives or `/`.
+- **Locations** on the left lists the folders you may use: your **Workspace**, your team's shared folder (shown
+  as **Team:** and the team name), and any extra folders your team allows. Administrators also see **Home** and
+  the drives or `/`.
 - **Recent** lists folders you used recently.
 - Type or paste a path in the box at the top and press `Enter`, for example `C:\work\project` or `~/project`.
 - Click a folder to open it. Use the breadcrumbs or `..` to go up.
@@ -302,6 +314,9 @@ The folder picker opens when you click a folder chip.
 - Click **Use this folder** to confirm.
 
 You can only pick folders inside your allowed folders. Goose cannot be started in other folders.
+
+**The team folder** is shared by everyone in your team: what you put there, your teammates can see and change.
+Keep private work in your Workspace.
 
 ## 5. The chat screen
 
@@ -336,7 +351,7 @@ usually are:
 | `smart_approve` (smart approval) | Goose asks only for tools it considers risky. |
 | `chat` (chat only) | Goose does not use tools. |
 
-Your policy can limit which modes you may choose. Only allowed modes appear in the list. Accounts created by
+Your team decides which modes you may choose. Only allowed modes appear in the list. Accounts created by
 the gateway normally start in `approve` mode. Apps that call tools need `auto` mode (see [Apps](#12-apps)).
 
 ### Provider, model and thinking level
@@ -345,7 +360,10 @@ The pickers next to the mode list come from Goose. Typically there is a provider
 for models that support it, a thinking level picker.
 
 - Changes apply to this chat only. The default for new chats is set in **Settings > Models & Providers**.
-- Your policy can limit the providers and models. Only allowed values appear.
+- Your team decides which providers and models you can use. Only allowed values appear.
+- If your team stops allowing the provider, model or mode that an older chat uses, Goose Web refuses new messages
+  in that chat ("this chat uses the model ..., which your team does not allow"). Pick an allowed one in the chat
+  header first, then send again.
 - The thinking level controls how much the model reasons before answering. A higher level can be slower and
   cost more.
 
@@ -414,6 +432,10 @@ message box.
   becomes `report (1).pdf`.
 - You need a working folder before you can upload a file.
 - The administrator sets the maximum file size. Up to 20 files can be uploaded at once.
+- Files named `AGENTS.md`, `.goosehints` or `.goose-web-hints.md` cannot be uploaded, and you cannot create a
+  folder with those names ("... is a Goose hints file name"). Your team's hints are managed by your
+  administrator, and Goose ignores such files in your folders anyway. Rename the file (for example
+  `AGENTS.txt`) if you only want to share its text.
 - Click the X on an attachment to remove it before sending. Goose Web waits for uploads to finish before it
   sends.
 
@@ -955,10 +977,21 @@ The list comes from Goose, so your version may show other settings.
 
 Goose hints are extra instructions added to every chat.
 
-- **Assigned by your team**: hints documents your administrator assigned to you. They are read-only.
+- **Assigned by your administrator**: hints documents assigned to you or to your team. They are read-only.
 - **Personal hints**: your own hints. Write them in the **Personal** tab, check them in **Preview**, and click
   **Save**.
 - **Effective (what Goose sees)**: the combined text Goose receives.
+
+The parts are combined from lowest to highest precedence: your personal hints first, then documents assigned to
+you, then your team's hints last. **Team hints win**: if one of your hints conflicts with a team hint, Goose follows
+the team hint.
+
+Your team decides whether you may have personal hints ("Members may add personal hints", off unless your
+administrator turns it on). If it is off, the editor is read-only, and any personal hints you saved earlier are kept
+but not used: a warning says "Your personal hints are not used: your team does not allow personal hints."
+
+Goose loads only these combined hints. `AGENTS.md` or `.goosehints` files in your working folders are ignored, and
+you cannot upload or create files with those names.
 
 Example personal hints:
 
@@ -968,8 +1001,6 @@ Example personal hints:
 - Our repositories are in C:\work.
 - Answer in short paragraphs.
 ```
-
-Editing needs the `hints_edit` permission (on by default).
 
 ### Tool permissions
 
@@ -1025,7 +1056,7 @@ unless your administrator allows internal ones. Clear the field and save to remo
 
 ### Account
 
-**Profile**: shows your username, role, sign-in source and teams. Change your **Display name** and **Email**
+**Profile**: shows your username, role, sign-in source and team. Change your **Display name** and **Email**
 and click **Save profile**.
 
 **Password** (local accounts only): enter your current password and the new one twice, then click **Change
@@ -1060,21 +1091,23 @@ are revoked when your password changes or is reset.
 
 ## 15. What your policy can restrict
 
-Administrators assign policies through teams. Administrators themselves have no restrictions. If a button is
-missing or a page says "Read-only", your policy is the likely reason. Ask your administrator, and see
+You belong to one team, and your administrator sets that team's policy (and sometimes a few settings for you
+alone). Administrators themselves have no restrictions. Since version 1.5.0 policies follow least privilege: a
+new team allows nothing until the administrator turns things on. If a button is missing or a page says
+"Read-only", your policy is the likely reason. Ask your administrator, and see
 [ADMINISTRATION.md](ADMINISTRATION.md) and [CONFIGURATION.md](CONFIGURATION.md).
 
-| Permission | What it allows | Default for users |
+| Permission | What it allows | On a new team |
 |---|---|---|
-| `recipes_edit` | Create, change and delete recipes | Allowed |
-| `skills_edit` | Create, change, import and delete skills | Allowed |
+| `recipes_edit` | Create, change and delete recipes | Not allowed |
+| `skills_edit` | Create, change, import and delete skills | Not allowed |
 | `extensions_edit` | Add, remove, enable and disable extensions | Not allowed |
 | `providers_edit` | Set up providers, defaults, custom providers and secrets | Not allowed |
-| `schedules` | Create, change, pause, run and delete schedules | Allowed |
-| `apps` | Import and delete apps, app tool calls | Allowed |
+| `schedules` | Create, change, pause, run and delete schedules | Not allowed |
+| `apps` | Import and delete apps, app tool calls | Not allowed |
 | `prompts_edit` | Change system prompts, including per-chat prompts | Not allowed |
-| `hints_edit` | Edit personal Goose hints | Allowed |
-| `tools_permissions` | Set per-tool permissions | Allowed |
+| `hints_edit` | Personal Goose hints ("Members may add personal hints"); without it your personal hints are not used | Not allowed |
+| `tools_permissions` | Set per-tool permissions | Not allowed |
 | `config_edit` | Raw Goose configuration (Advanced config tab) | Not allowed |
 | `allow_shell` | Shell and command extensions, command (stdio) MCP extensions | Not allowed |
 | `notify_webhook` | A personal notification webhook | Not allowed |
@@ -1083,12 +1116,14 @@ Lists and limits:
 
 | Setting | Effect |
 |---|---|
-| Allowed modes | Only these modes appear in the mode picker. |
-| Allowed providers / models | Only these appear in the pickers and in Models & Providers. |
-| Allowed folders | You can use your workspace plus these folders. |
+| Allowed approval modes | Only these modes appear in the mode picker. None allowed = you cannot chat. |
+| Allowed providers / models | Only these appear in the pickers and in Models & Providers. None allowed = you cannot chat. |
+| Default provider / model | What new chats start with. |
+| Team folder | A folder shared by your team, shown as **Team:** and the team name. |
+| Extra folders | Folders you can use besides your workspace and the team folder. |
 | Concurrent runs | How many agents can run at the same time (default 3). |
 
-Your team's policy may differ from these defaults.
+Teams that existed before version 1.5.0 kept their earlier settings, so your team may allow more than a new team.
 
 ## 16. FAQ
 
@@ -1101,7 +1136,18 @@ The chat is in `approve` mode. Choose **Always allow** for tools you trust, set 
 **Settings > Tool permissions**, or switch to another mode if your policy allows it.
 
 **Why can't I pick a folder?**
-You can only use your workspace and the folders your administrator allowed. Ask for access to other folders.
+You can only use your workspace, your team folder and the extra folders your team allows. Ask for access to
+other folders.
+
+**Why can't I chat?**
+The home page says why. Either you are not in a team yet, or your team allows no providers, models or approval
+modes. Ask your administrator. In an older chat, the reason can also be that the chat uses a model, provider or
+mode your team no longer allows: pick an allowed one in the chat header.
+
+**Why does Goose ignore the AGENTS.md in my project?**
+Goose Web gives Goose only the hints your team and you set (Settings > Goose hints). Hints files in working
+folders are ignored, and you cannot upload files with those names. Ask your administrator to add shared
+instructions to your team's hints.
 
 **Why don't I see the Thinking block?**
 Not every model produces thinking. Check the thinking level picker in the chat header and the **Default

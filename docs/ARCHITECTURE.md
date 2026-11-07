@@ -105,7 +105,7 @@ The main ideas:
 | Client | `hub.py` | One browser tab connected to `/ws`. |
 | Herd | `hub.py`, `static/js/herd.js` | The list of agents (sessions) that are working, need the user, finished, or failed. The gateway derives it from the ACP stream. |
 | Ask | `hub.py`, `static/js/asks.js` | An agent-to-client request (permission, elicitation, recipe parameters). It is fanned out to every tab, and the first answer wins. |
-| Policy | `policy.py` | Per-user effective permissions, merged from teams and overrides. Enforced by a default-deny ACP method firewall. |
+| Policy | `policy.py` | Per-user effective permissions: the user's one team over a least-privilege base, then per-user overrides. Enforced by a default-deny ACP method firewall. |
 
 ## 2. File-by-file map
 
@@ -121,12 +121,12 @@ The main ideas:
 | `api.py` | All REST handlers and the `routes` list: auth, current user, preferences, TOTP, API tokens, hints, notifications, file system, MCP App frames, herd, and every `/api/admin/*` endpoint. |
 | `hub.py` | `Hub`, `Upstream`, `Client`, `SessionState`: relays ACP, rewrites ids, buffers and replays session updates, fans out asks, derives herd status, watches for external changes, audits calls. |
 | `workers.py` | `WorkerManager` and `Worker`: spawns, health-checks, restarts and idles out `goose serve`; scheduler ownership; worker logs; Windows Job Object; Goose Desktop detection. |
-| `policy.py` | Default and admin policies, team merge (`effective_policy`), path containment (`path_allowed`), and the ACP method firewall (`check`). |
+| `policy.py` | Least-privilege default, legacy (1.4) and admin policies, `effective_policy` (one team + overrides), chat gating (`chat_block`, `check_session_choice`), team warnings (`team_warnings`), roots (`user_roots`), path containment (`path_allowed`), and the ACP method firewall (`check`). |
 | `auth.py` | `AuthService`: local passwords, LDAP/Active Directory, OIDC (authorization code with PKCE), TOTP, lockout and rate limits, cookie sessions, API tokens. |
 | `ipblock.py` | `IPBlocker`: counts failed sign-ins per client address (IPv4, or IPv6 /64) in the `ip_blocks` table, blocks after `auth.ip_block_threshold` in a row within the window, expiry, unblock, listing; in-memory cache of blocked keys refreshed every 15 s. |
 | `security.py` | Stdlib-only primitives: scrypt password hashing, strong-password rules, `ip_in`, tokens, constant-time compare, TOTP, `RateLimiter`, `safe_name`. |
 | `db.py` | SQLite storage (WAL), schema, additive migrations, JSON column decoding, audit log and retention purge. |
-| `profiles.py` | Profile layout, provisioning of isolated profiles from team items, `.goosehints` composition, cross-profile library and item export, profile archiving. |
+| `profiles.py` | Profile layout, provisioning of isolated profiles from team items, team folders, hints composition (`.goose-web-hints.md`), cross-profile library and item export, profile archiving. |
 | `winsec.py` | Windows token helpers: elevation and integrity checks, un-elevated relaunch (SAFER), file ownership reports. Safe no-ops on other platforms. |
 | `hosttasks.py` | Admin view of Windows scheduled tasks with an elevation-risk flag; run/end/enable/disable actions. Returns nothing on other platforms. |
 
@@ -136,7 +136,7 @@ The main ideas:
 |---|---|
 | `index.html` | Shell page: theme stylesheets, `modulepreload` of `js/app.js`, boot spinner. |
 | `manifest.webmanifest` | PWA manifest. |
-| `sw.js` | Service worker (`gw-shell-v9`): offline shell, network-first for app code, cache-first for vendor files. |
+| `sw.js` | Service worker (`gw-shell-v10`): offline shell, network-first for app code, cache-first for vendor files. |
 | `css/app.css` | All styles and themes. |
 | `icons/` | `goose.svg`, `goose-maskable.svg`. |
 | `vendor/` | Vendored libraries (marked, DOMPurify, highlight.js, qrcode-generator) with `README.md` and `SHA256SUMS`. |
@@ -228,7 +228,11 @@ if scheduler:
   `secrets.yaml` and not to the shared OS keyring, and `GOOSE_RECIPE_PATH` is
   set to the team recipe folders. `GOOSE_PATH_ROOT` is set to the profile root,
   or removed for the default native root. `goose.extra_env` from the
-  configuration is applied last.
+  configuration is applied next. Finally, for isolated profiles,
+  `CONTEXT_FILE_NAMES` is set to `[".goose-web-hints.md"]`, so Goose loads
+  only the composed hints file and ignores `AGENTS.md` and `.goosehints` in
+  working folders and the agents home folder (`extra_env` cannot override
+  it).
 - **Working directory.** The profile root, or the home directory.
 - **Process group.** On Windows the worker gets
   `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` and is added to a kill-on-close
@@ -1049,7 +1053,7 @@ data:
 - **Install** pre-caches the shell list on a best-effort basis and calls
   `skipWaiting()`.
 - **Activate** deletes every cache whose name is not the current `VERSION`
-  (`gw-shell-v9`) and claims open clients.
+  (`gw-shell-v10`) and claims open clients.
 - **notificationclick** focuses an open window, or opens one, at
   `/#/chat/<sessionId>` or `/#/herd`.
 
@@ -1077,10 +1081,10 @@ secrets, schedules) stays in each profile and is never copied into it.
 
 | Table | Purpose and notable columns |
 |---|---|
-| `meta` | `key`, `value`. Holds `schema_version`. |
+| `meta` | `key`, `value`. Holds `schema_version` and `policy_model` (2 = least-privilege policies, written by the 1.5.0 migration). |
 | `users` | `username` (unique, case-insensitive), `display_name`, `email`, `role` (`user`/`admin`), `auth_source` (`local`, `ldap`, `oidc`), `password_hash`, `must_change_pw`, `totp_secret`, `totp_enabled`, `totp_last_counter`, `disabled`, `profile_mode` (`isolated`/`native`), `profile_path`, `personal_hints`, `prefs` (JSON), `policy_overrides` (JSON), `has_schedules`, `failed_logins`, `locked_until`, `created_at`, `last_login_at`, `oidc_issuer`, `oidc_subject` |
-| `teams` | `name` (unique, case-insensitive), `description`, `policy` (JSON) |
-| `team_members` | `(team_id, user_id)`, cascades on delete |
+| `teams` | `name` (unique, case-insensitive), `description`, `policy` (JSON: the policy keys plus `default_provider`, `default_model`, `share_folder`) |
+| `team_members` | `(team_id, user_id)`, cascades on delete. Unique index `ux_team_members_user` on `user_id`: one team per user (schema version 4). `Database.set_user_team` replaces a membership. |
 | `hints_docs` | Shared hints documents: `name`, `description`, `content` |
 | `user_hints`, `team_hints` | Hints documents assigned to users or teams |
 | `team_items` | Items provisioned into members' profiles: `kind` (`recipe`, `skill`, `extension`, `provider`), `name`, `payload` (JSON), `source`. Unique per `(team_id, kind, name)`. |
@@ -1098,7 +1102,7 @@ objects.
 **Guards.**
 
 - `create_user` rejects the reserved names `appdata`, `workspace`, `_system`,
-  `_deleted`, `library`, `backups` and `logs`, because user names become
+  `_deleted`, `_teams`, `library`, `backups` and `logs`, because user names become
   folder names under `<profiles_root>`.
 - Dynamic user updates check column names against `PRAGMA table_info`
   (`_check_user_columns`). Link-table updates use a fixed allow-list
@@ -1106,7 +1110,9 @@ objects.
 
 ### 10.3 Schema version and migrations
 
-`SCHEMA_VERSION = 2`. Migrations are additive and idempotent:
+`SCHEMA_VERSION = 4` (3: the `ip_blocks` table, 1.3.0; 4: one team per user and
+least-privilege policies, 1.5.0). Column migrations are additive and
+idempotent:
 
 ```python
 MIGRATIONS = [
@@ -1125,11 +1131,30 @@ On open:
 1. `CREATE TABLE IF NOT EXISTS` runs for every table.
 2. Each migration column is added if it is missing.
 3. The post-migration SQL runs.
-4. `meta.schema_version` is raised if it is lower than `SCHEMA_VERSION`.
+4. `_migrate_policy_model` runs (one-shot, see below).
+5. `meta.schema_version` is raised if it is lower than `SCHEMA_VERSION`.
 
 Columns are never dropped or renamed, so an older gateway can still open a
 newer database. To change the schema, append to `MIGRATIONS` and bump
 `SCHEMA_VERSION`.
+
+**Policy model migration** (`_migrate_policy_model`, `POLICY_MODEL = 2`). It
+runs in one transaction when `meta.policy_model` is missing or lower than 2,
+so existing teams keep their 1.4 behaviour under the new least-privilege
+rules:
+
+- each team policy is laid over `LEGACY_DEFAULT_POLICY` (the 1.4 defaults),
+  and its empty `allowed_modes`, `allowed_providers` and `allowed_models`
+  (which meant unrestricted) become `["*"]`;
+- the same three lists become `["*"]` where they are empty in a user's
+  `policy_overrides`;
+- a user in several teams keeps the lowest team id; every dropped membership
+  is audited as `team.migrate.membership`;
+- the unique index `ux_team_members_user` is created and `meta.policy_model`
+  is set to 2.
+
+New databases run it too (there is nothing to convert) and only get the
+index.
 
 ### 10.4 Audit retention
 
@@ -1148,6 +1173,7 @@ database is opened. Admins read the log through
 | `<profiles_root>` | `paths.profiles_root`. One folder per isolated user. |
 | `<system_dir>` | `paths.system_dir`, default `<profiles_root>/_system`: the database, `logs/`, `library/`, `backups/`, and (by default) `config.yaml`. |
 | `<profiles_root>/_deleted/<name>-<timestamp>` | Archived profiles of deleted users, unless the profile was purged. |
+| `<profiles_root>/_teams/<team id>` | A team's shared folder (`Profiles.team_folder`), unless the team sets an absolute `share_folder`. Created by `ensure_team_folder`; kept when the team is deleted. |
 | `<profiles_root>/appdata` | Fresh native Goose root created by `init --native-root fresh` (contains `config/`, `data/`, `state/`). |
 
 ### 11.2 Isolated profile layout
@@ -1159,7 +1185,7 @@ The worker runs with `GOOSE_PATH_ROOT=<profiles_root>/<username>`:
   config/
     config.yaml          provider, model, mode, extensions
     secrets.yaml         API keys (keyring disabled)
-    .goosehints          composed: header + assigned hints documents + personal hints
+    .goose-web-hints.md  composed hints, the only context file Goose loads
     custom_providers/    provider definitions provisioned from teams
     recipes/             the user's own recipes
     skills/              user skills and team skills (marked .goose-web-managed)
@@ -1200,14 +1226,34 @@ or memberships change (`_reprovision`).
      `GOOSE_RECIPE_PATH`.
 4. Managed items that are no longer assigned are removed. Only items the
    gateway created are touched.
-5. It applies the team's `default_provider` and `default_model`, and enforces
-   `allowed_providers` and `allowed_modes`.
-6. It writes `config.yaml`, `secrets.yaml`, `.goosehints` and the manifest
+5. It creates the team folder (`ensure_team_folder`).
+6. **Team default model.** If the team's `default_provider` (and
+   `default_model`) are allowed, they are written on first provisioning,
+   when the profile has no provider, or when the team default changed and
+   the profile still used the previous one (stored as `teamDefault` in the
+   manifest). A provider that is not allowed is reset to the team default
+   or the first explicitly allowed provider; a model that is not allowed is
+   reset to the default model or removed; a mode that is not allowed becomes
+   `approve` if allowed, otherwise the first allowed mode.
+7. It writes `config.yaml`, `secrets.yaml`, `config/.goose-web-hints.md` and the manifest
    atomically: a temporary file followed by `os.replace`, with LF line endings.
 
 If provisioning changes anything while the worker is running,
 `restart_pending` is set and the worker restarts once it has no running
 sessions.
+
+It also removes the `config/.goosehints` that 1.4 composed, if the file
+starts with the Goose Web header (`_drop_legacy_hints`).
+
+**Hints composition** (`hint_sections`, `compose_hints`). The file lists its
+parts from lowest to highest precedence: the header and a precedence note,
+the personal hints (only for admins or when the policy has `hints_edit`;
+otherwise `personalDropped` is reported), the documents assigned to the user
+(minus any that are also team documents), and the team's documents last
+under `Team: <name> (final: these take precedence)`. `write_hints` rewrites
+only this file, which is safe while Goose runs. Non-admins cannot create a
+file or folder named `AGENTS.md`, `.goosehints` or `.goose-web-hints.md`
+through the file endpoints (`api._refuse_hint_name`, `HINT_FILE_NAMES`).
 
 ### 11.4 Native profile
 
@@ -1217,7 +1263,8 @@ sessions and configuration. The gateway **never provisions** a native profile.
 The one exception is that an admin saving their own hints through the web UI
 writes `.goosehints`. The previous file is first backed up to
 `<system_dir>/backups/native-hints/.goosehints.<timestamp>`. A native profile
-must belong to an admin.
+must belong to an admin. Its worker gets no `CONTEXT_FILE_NAMES`, so Goose
+loads `AGENTS.md` and `.goosehints` as usual.
 
 ### 11.5 Library and export
 
@@ -1343,8 +1390,10 @@ lists the mechanisms.
 **LDAP / Active Directory** (`ldap3`):
 
 - service bind, then search with escaped filters, then user bind;
-- the admin role comes from `adminGroupDn` membership, and teams from
-  `groupTeamMap`;
+- the admin role comes from `adminGroupDn` membership, and the team from
+  `groupTeamMap`: the mapped team replaces the previous one, and when
+  several groups match the first wins (audited as `user.team.directory`);
+  OIDC team claims follow the same rule (`_upsert_external`);
 - users are created automatically as isolated profiles;
 - plain `ldap://` without StartTLS is refused at save time and at login
   (`503 ldap_insecure`) unless `allowInsecure` is set.
@@ -1365,34 +1414,44 @@ sign-in.
 
 ### 12.6 Policy enforcement
 
-**Merging** (`effective_policy`):
+**Building the policy** (`effective_policy`, spec 009 "least privilege"):
 
-- Admins get `ADMIN_POLICY` (everything, no limits). Users without teams get
-  `DEFAULT_POLICY`.
-- Otherwise the user's teams are merged:
-  - boolean permissions are OR-ed;
-  - allow-lists are combined, and an empty list in any team means
-    unrestricted (except `allowed_roots`);
-  - `max_concurrent_runs` takes the maximum.
+- Admins get `ADMIN_POLICY` (everything, `"*"` lists, no limits).
+- Everyone else starts from `DEFAULT_POLICY`: every switch off, every list
+  empty, `max_concurrent_runs` 3. An empty `allowed_modes`,
+  `allowed_providers` or `allowed_models` allows nothing; `"*"` (`ANY`)
+  allows every value (`allows`).
+- A user without a team gets `no_team` and stays at the base.
+- A user's one team (`teams[0]`; the database allows only one) is laid over
+  the base: switches, lists, `max_concurrent_runs`, `default_provider`,
+  `default_model`, plus `team: {id, name}`. `Ctx.policy_for` adds
+  `team_folder`.
 - The user's `policy_overrides` are applied last.
+- `chat_blocked` is the reason text from `chat_block` when the user has no
+  team or the team allows no providers, models or modes, otherwise empty.
 
-| Permission | Default | Allows |
+| Permission | New team | Allows |
 |---|---|---|
-| `recipes_edit` | on | Saving and deleting recipes, recipe sources |
-| `skills_edit` | on | Skill, agent and project sources |
+| `recipes_edit` | off | Saving and deleting recipes, recipe sources |
+| `skills_edit` | off | Skill, agent and project sources |
 | `extensions_edit` | off | Adding, removing and configuring extensions |
 | `providers_edit` | off | Provider configuration, custom providers, secrets |
-| `schedules` | on | Creating and changing schedules |
-| `apps` | on | Importing and deleting apps, `tools/call` from apps |
+| `schedules` | off | Creating and changing schedules |
+| `apps` | off | Importing and deleting apps, `tools/call` from apps |
 | `prompts_edit` | off | Editing system prompt templates |
-| `hints_edit` | on | Editing personal hints |
-| `tools_permissions` | on | Per-tool permission settings |
-| `config_edit` | off | Writing Goose configuration keys |
+| `hints_edit` | off | Personal hints (included in the composed hints only when on) |
+| `tools_permissions` | off | Per-tool permission settings |
+| `config_edit` | off | Writing Goose configuration keys (never `CONTEXT_FILE_NAMES`) |
 | `allow_shell` | off | Shell-capable extensions (`developer`, `computercontroller`, `code_execution`, `orchestrator`), stdio extensions, inline `mcpServers` |
 | `notify_webhook` | off | Personal webhook notifications |
-| `allowed_modes`, `allowed_providers`, `allowed_models` | `[]` (any) | Allow-lists for session mode and model selection |
-| `allowed_roots` | `[]` | Extra folders beyond the profile `workspace` |
+| `allowed_modes`, `allowed_providers`, `allowed_models` | `[]` (none) | Allow-lists for session mode and model selection; `["*"]` = any |
+| `allowed_roots` | `[]` | Extra absolute folders beyond the workspace and the team folder (no `"*"`) |
 | `max_concurrent_runs` | 3 | Running sessions per user (0 = unlimited) |
+
+`team_warnings(policy, hints, members)` returns the Experience page warnings
+(`err`: a chat list is empty; `warn`: default not allowed, Shell on, raw
+config on, members can add providers; `info`: no default model, no team
+hints, personal hints allowed, no members).
 
 **Firewall** (`check`). Any ACP method that is not in `ALWAYS`, in
 `SOURCE_METHODS` (checked by source type), in the readable configuration keys
@@ -1401,7 +1460,18 @@ sign-in.
 denied with "method not available to your account". Extra argument checks:
 
 - enabling, adding or calling a shell extension needs `allow_shell`;
-- `config/upsert` of `GOOSE_PROVIDER` is checked against `allowed_providers`;
+- `session/new`, `session/fork` and `session/prompt` are refused while
+  `chat_block` returns a reason (no team, or an empty chat list);
+- `session/prompt` is refused when the chat's current provider, model or
+  mode is no longer allowed (`check_session_choice`, called by the hub with
+  the cached `session/load` / `session/new` result);
+- `session/set_mode` and `session/set_config_option` (`provider`, `model`,
+  `mode`) are checked against the lists;
+- `config/upsert` of `GOOSE_PROVIDER`, `GOOSE_MODEL` and `GOOSE_MODE` is
+  checked against the matching list, and `defaults/save` against
+  `allowed_providers` and `allowed_models`;
+- `config/upsert` and `config/remove` of `CONTEXT_FILE_NAMES`
+  (`MANAGED_CONFIG_KEYS`) are refused for every non-admin;
 - project directories for sources must be inside the roots.
 
 **Path checks** (`path_allowed(path, roots)`):
@@ -1410,8 +1480,8 @@ denied with "method not available to your account". Extra argument checks:
 - It must be inside a root both lexically (`normpath`/`abspath`) and after
   resolving symlinks and junctions (`realpath`).
 - Comparison is case-insensitive on Windows.
-- A user's roots are `[workspace, *allowed_roots]`. Admins may use any
-  absolute path.
+- A user's roots are `[workspace, team folder, *allowed_roots]`
+  (`user_roots`). Admins may use any absolute path.
 
 The REST file endpoints (`/api/fs/*`) use the same check through
 `Ctx.path_ok`.
@@ -1421,6 +1491,8 @@ The REST file endpoints (`/api/fs/*`) use the same check through
 **Uploads** (`POST /api/fs/upload?dir=`):
 
 - the directory must pass the path check;
+- non-admins cannot upload a file named `AGENTS.md`, `.goosehints` or
+  `.goose-web-hints.md` (`403 hint_file_refused`);
 - size is limited to `server.max_upload_mb` (25), checked against
   `Content-Length` first and again while streaming in 1 MB chunks;
 - at most 20 files and 20 fields per request.
@@ -1694,8 +1766,9 @@ location) and disables the cache plugin.
 | File | Covers |
 |---|---|
 | `tests/test_security.py` | Password hashing round trip, password rules, tokens, TOTP (RFC 6238 test vector), rate limiter, `safe_name`, `winsec` reports. |
-| `tests/test_policy.py` | Admin bypass, forced `session/new` client metadata, cwd outside roots, unknown method denied, extension permissions, mode/model allow-lists, sources by type, config read allow-list, team merge, shell tool calls by name prefix, reserved usernames. |
+| `tests/test_policy.py` | Admin bypass, forced `session/new` client metadata, cwd outside roots, unknown method denied, extension permissions, mode/model allow-lists, sources by type, config read allow-list, one-team policy, shell tool calls by name prefix, reserved usernames. |
 | `tests/test_profiles.py` | Isolated layout and base extensions, team items and secrets, library listing, native scheduler yielding to Goose Desktop. |
+| `tests/test_team_profiles.py` | Spec 009: new teams allow nothing, no team cannot chat, Any and explicit lists, config writes and the locked `CONTEXT_FILE_NAMES`, prompts refused in chats with a disallowed model, team warnings, roots, the 1.4 migration, hints order and dropped personal hints, the hints file and worker environment, team folder and default model, one team per user (moves), effective hints view and upload refusal. |
 | `tests/test_hub.py` | A `FakeAgent` WebSocket server (`initialize`, `session/new`, `session/load`, `session/prompt`). Tests: a run survives a tab disconnect and is replayed, policy denial, the second answer to an ask loses, idle replay only while unchanged elsewhere, the watcher announces external changes. |
 | `tests/test_auth_hardening.py` | TOTP replay and lockout, TOTP settings, OIDC subject binding and takeover protection, LDAP plaintext refusal, token revocation on reset, disable and password change, admin and CLI two-factor reset, column and link-table allow-lists, audit purge, additive migration of a legacy database. |
 | `tests/test_platform_hardening.py` | Generated admin password and one-time printing, `init` password options, path containment including symlink escapes, `address_blocked`, webhook pinning and no redirects, log rotation, vendored file checksums, hashed lock file covering `pyproject.toml`, Dockerfile download verification, SHA-pinned actions. |
