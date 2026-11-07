@@ -16,6 +16,7 @@ const TABS = [
   { id: 'system', label: 'System', icon: 'cpu' },
   { id: 'ownership', label: 'Ownership check', icon: 'lock' },
   { id: 'hosttasks', label: 'Host tasks', icon: 'schedule' },
+  { id: 'ipblocks', label: 'Blocked addresses', icon: 'shield' },
   { id: 'audit', label: 'Audit log', icon: 'scroll' },
   { id: 'logs', label: 'Logs', icon: 'terminal' },
 ];
@@ -36,7 +37,7 @@ export function renderAdmin(ctx, tab) {
   const el = h('div', { class: 'view view-page view-settings' },
     pageHeader(h('span', { class: 'row' }, iconBtn('menu', 'Toggle sidebar', () => ctx.toggleSidebar(), { class: 'only-mobile' }), 'Admin'), null, [mob]),
     h('div', { class: 'page-body settings-layout' }, nav, body));
-  const R = { users: usersTab, teams: teamsTab, hints: hintsLibTab, auth: authTab, settings: settingsTab, system: systemTab, ownership: ownershipTab, hosttasks: hostTasksTab, audit: auditTab, logs: logsTab };
+  const R = { users: usersTab, teams: teamsTab, hints: hintsLibTab, auth: authTab, settings: settingsTab, system: systemTab, ownership: ownershipTab, hosttasks: hostTasksTab, ipblocks: ipBlocksTab, audit: auditTab, logs: logsTab };
   let inner = null;
   try { inner = R[cur.id](body) || null; } catch (e) { console.error(e); body.replaceChildren(banner('error', errMsg(e))); }
   return { el, destroy() { if (inner && inner.destroy) inner.destroy(); } };
@@ -114,7 +115,6 @@ function usersTab(body) {
     const src = select([{ value: 'local', label: 'Local password' }, { value: 'ldap', label: 'LDAP / AD' }, { value: 'oidc', label: 'OIDC / SSO' }], (u && u.authSource) || 'local');
     const mode = select([{ value: 'isolated', label: 'Isolated profile (recommended)' }, { value: 'native', label: 'Native profile (the service account’s own %APPDATA% Goose)' }], (u && u.profileMode) || 'isolated');
     const pw = input({ type: 'password', autocomplete: 'new-password', placeholder: 'leave blank to generate a temporary password' });
-    let mustChange = true;
     const tp = multiPick(teams.map((t) => ({ value: t.id, label: t.name, sub: t.description || '' })), u ? u.teams : (store.get('adminDefaultTeam') ? [store.get('adminDefaultTeam')] : []), { empty: 'No teams yet' });
     const hp = multiPick(hints.map((x) => ({ value: x.id, label: x.name, sub: x.description || '' })), u ? u.hints : [], { empty: 'Hints library is empty' });
     const ov = textarea({ rows: 4, class: 'inp mono', value: u && u.policyOverrides && Object.keys(u.policyOverrides).length ? prettyJson(u.policyOverrides) : '', placeholder: '{ "allow_shell": false }' });
@@ -122,7 +122,7 @@ function usersTab(body) {
     const m = modal({ title: isNew ? 'New user' : 'Edit ' + u.username, size: 'lg',
       body: h('div', { class: 'stack' },
         h('div', { class: 'grid2' }, field('Username', username), field('Display name', dn), field('Email', em), field('Role', role), field('Sign-in', src), field('Profile mode', mode, 'Native maps to the Windows user’s real Goose profile – use for one admin at most.')),
-        isNew ? h('div', { class: 'grid2' }, field('Initial password', pw), h('div', { class: 'field' }, h('div', { class: 'field-label' }, ' '), checkbox(true, 'Must change at first sign-in', (v) => { mustChange = v; }))) : null,
+        isNew ? field('Initial password', pw, 'The user must change it at the first sign-in. At least 12 characters with upper- and lower-case letters, a number and a symbol.') : null,
         field('Teams', tp.el, 'Policy is the union of the user’s teams.'), field('Goose hints', hp.el, 'Shared .goosehints documents for this user.'),
         !isNew ? h('details', null, h('summary', null, 'Policy overrides (advanced)'), field(null, ov, 'JSON object merged over the team policy for this user only.')) : null, err),
       footer: [btn('Cancel', () => m.close()), btn(isNew ? 'Create user' : 'Save', async () => {
@@ -134,7 +134,6 @@ function usersTab(body) {
             if (!/^[A-Za-z0-9._-]{2,64}$/.test(username.value.trim())) { err.textContent = 'Username: 2–64 letters, digits, . _ -'; return; }
             b.username = username.value.trim();
             if (pw.value && src.value === 'local') b.password = pw.value;
-            b.mustChangePassword = mustChange;
             const r = await POST('/api/admin/users', b, { quiet: true });
             m.close(); toast('User created', { kind: 'success' });
             if (r && r.tempPassword) showSecretOnce('Temporary password for ' + b.username, 'password', r.tempPassword);
@@ -446,6 +445,42 @@ function hostTasksTab(body) {
 }
 
 // ===================================================================== Audit
+// ===================================================================== Blocked addresses (spec 007)
+function ipBlocksTab(body) {
+  const out = h('div', null, skeleton(4));
+  const unblock = async (b, label) => {
+    try { await POST('/api/admin/ip-blocks/unblock', b); toast(label, { kind: 'success' }); load(); } catch (e) { toastError(e); }
+  };
+  const days = (d) => (Math.round(d * 100) / 100) + (d === 1 ? ' day' : ' days');
+  async function load() {
+    let r;
+    try { r = await GET('/api/admin/ip-blocks'); } catch (e) { out.replaceChildren(banner('error', errMsg(e))); return; }
+    const items = r.items || [];
+    const rule = r.threshold > 0
+      ? 'An address is blocked after ' + r.threshold + ' failed sign-ins in a row within ' + days(r.windowDays) + ' (a successful sign-in resets the count). Blocks last ' + (r.blockDays > 0 ? days(r.blockDays) : 'until unblocked here') + '. IPv6 addresses are grouped by /64. Trusted proxies' + ((r.exempt || []).length ? ' and ' + r.exempt.join(', ') : '') + ' are never blocked.'
+      : 'Address blocking is turned off (auth.ip_block_threshold is 0).';
+    out.replaceChildren(
+      banner('info', rule),
+      h('div', { class: 'row' }, h('span', { class: 'grow muted small' }, items.filter((x) => x.blocked).length + ' blocked, ' + items.filter((x) => !x.blocked).length + ' counting'),
+        btn('Refresh', () => load(), { icon: 'refresh', size: 'sm' }),
+        items.length ? btn('Unblock all', async () => {
+          if (!(await confirmDialog({ title: 'Unblock every address?', message: 'All blocks end and every failure count is cleared.', confirmText: 'Unblock all', danger: true }))) return;
+          unblock({ all: true }, 'All addresses unblocked');
+        }, { icon: 'check', size: 'sm' }) : null),
+      table([
+        { label: 'Address', render: (x) => h('code', null, x.ip) },
+        { label: 'Status', render: (x) => x.blocked ? badge('blocked', 'err') : badge('counting', 'warn') },
+        { label: 'Failures', render: (x) => String(x.failures) },
+        { label: 'Last user name tried', render: (x) => x.lastUsername ? h('span', { class: 'mono small' }, x.lastUsername) : h('span', { class: 'muted' }, '—') },
+        { label: 'Last failure', render: (x) => x.lastFailureAt ? h('span', { title: fmtDateTime(x.lastFailureAt * 1000) }, relTime(x.lastFailureAt * 1000)) : h('span', { class: 'muted' }, '—') },
+        { label: 'Blocked until', render: (x) => !x.blocked ? h('span', { class: 'muted' }, '—') : x.blockedUntil ? h('span', { title: fmtDateTime(x.blockedUntil * 1000) }, fmtDateTime(x.blockedUntil * 1000)) : 'until unblocked' },
+        { label: '', class: 'right', render: (x) => btn(x.blocked ? 'Unblock' : 'Clear', () => unblock({ ip: x.ip }, (x.blocked ? 'Unblocked ' : 'Cleared ') + x.ip), { size: 'sm' }) },
+      ], items, { empty: 'No blocked addresses and no failed sign-ins being counted.' }));
+  }
+  body.replaceChildren(out);
+  load();
+}
+
 function auditTab(body) {
   let rows = [], loading = false, done = false;
   const user = input({ placeholder: 'user', class: 'inp inp-sm' });

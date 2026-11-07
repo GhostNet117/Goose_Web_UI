@@ -67,20 +67,80 @@ def needs_rehash(stored: str | None) -> bool:
         return True
 
 
-def password_problems(password: str, min_length: int = 10, username: str = "") -> list[str]:
+# Strong-password policy (spec 007). auth.min_password_length may raise the minimum, never lower it.
+PASSWORD_MIN_LENGTH = 12
+
+# Common passwords and the words they are built from. A password is refused when it is one of these, or when
+# it is one of these words with digits/symbols added at the start or end and simple letter swaps
+# (P@ssw0rd123!, Summer2026!, !Qwerty2026).
+_COMMON_WORDS = frozenset("""
+password passwd passw0rd pass changeme letmein welcome welcomeback admin administrator root guest user login
+default secret temp temporary test tester qwerty qwertyuiop qwertz azerty asdf asdfgh asdfghjkl zxcvbn
+zxcvbnm iloveyou loveyou monkey dragon sunshine princess football baseball soccer hockey master shadow
+superman batman trustno trustnoone abc abcd abcdef abcdefg abcdefgh abc123 goose gooseweb goosegoose
+summer winter spring autumn fall january february march april may june july august september october
+november december monday friday hello hellothere freedom whatever starwars pokemon computer internet
+mypassword yourpassword company letmeinnow access accessgranted
+""".split())
+_COMMON_EXACT = frozenset({"123456789012", "1234567890ab", "qwerty123456", "password1234", "1q2w3e4r5t6y",
+                           "1qaz2wsx3edc", "zaq12wsxcde3"})
+_LEET = str.maketrans({"@": "a", "4": "a", "0": "o", "1": "i", "!": "i", "3": "e", "$": "s", "5": "s",
+                       "7": "t", "+": "t", "8": "b", "9": "g"})
+
+
+def _common_base(password: str) -> bool:
+    low = password.lower()
+    if low in _COMMON_EXACT or low in _COMMON_WORDS:
+        return True
+    # strip what people append/prepend (digits, symbols, spaces), then undo letter swaps in the middle
+    core = low.strip("0123456789!@#$%^&*()_+-=[]{};:'\",.<>/?\\|`~ ")
+    for cand in (core, core.translate(_LEET)):
+        letters = "".join(ch for ch in cand if ch.isalpha())
+        if letters and (letters in _COMMON_WORDS or letters.rstrip("s") in _COMMON_WORDS):
+            return True
+    return False
+
+
+def password_problems(password: str, min_length: int = PASSWORD_MIN_LENGTH, username: str = "") -> list[str]:
+    """Return what is wrong with `password` under the strong-password policy ([] = acceptable)."""
+    pw = password or ""
+    need = max(int(min_length or 0), PASSWORD_MIN_LENGTH)
     problems = []
-    if len(password or "") < min_length:
-        problems.append(f"must be at least {min_length} characters")
-    if password and username and password.lower() == username.lower():
-        problems.append("must not equal the username")
-    if password and password.lower() in {"changeme", "password", "temp123", "goose", "letmein",
-                                         "password123", "changeme123", "1234567890"}:
-        problems.append("is too common")
-    classes = sum([any(c.islower() for c in password or ""), any(c.isupper() for c in password or ""),
-                   any(c.isdigit() for c in password or ""), any(not c.isalnum() for c in password or "")])
-    if password and len(password) < 16 and classes < 3:
-        problems.append("needs 3 of: lower, upper, digit, symbol (or be 16+ characters)")
+    if len(pw) < need:
+        problems.append(f"must be at least {need} characters")
+    if not any(c.islower() for c in pw):
+        problems.append("needs a lowercase letter")
+    if not any(c.isupper() for c in pw):
+        problems.append("needs an uppercase letter")
+    if not any(c.isdigit() for c in pw):
+        problems.append("needs a number")
+    if not any(not c.isalnum() for c in pw):
+        problems.append("needs a symbol")
+    name = (username or "").strip().lower()
+    if pw and name and len(name) >= 3 and name in pw.lower():
+        problems.append("must not contain the username")
+    if pw and _common_base(pw):
+        problems.append("is too common or built from a common word")
+    low = pw.lower()
+    if any(low[i] == low[i + 1] == low[i + 2] == low[i + 3] for i in range(len(low) - 3)):
+        problems.append("must not repeat a character 4 or more times in a row")
     return problems
+
+
+def ip_in(ip: str, nets: list[str]) -> bool:
+    """True when `ip` is inside any of the networks/addresses in `nets` (invalid entries are ignored)."""
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address((ip or "").strip())
+    except ValueError:
+        return False
+    for n in nets or []:
+        try:
+            if addr in ipaddress.ip_network(str(n).strip(), strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 # ---------------------------------------------------------------- tokens

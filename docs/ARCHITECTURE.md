@@ -71,7 +71,7 @@ Web never calls a model itself.
  +--------------------------------------------------------------------------+
  |  goose-web gateway  (Starlette app under uvicorn, default port 8710)     |
  |                                                                          |
- |  SecurityHeaders > GZip > HostGuard > routes                              |
+ |  SecurityHeaders > GZip > HostGuard > IPBlockGuard > routes               |
  |  REST API (api.py)        /ws endpoint (app.py)                          |
  |  auth.py  policy.py  profiles.py                                         |
  |  db.py (SQLite: <system_dir>/goose-web.db)                              |
@@ -116,14 +116,15 @@ The main ideas:
 | `__init__.py` | Package version. |
 | `__main__.py` | CLI: `python -m goose_web [--config FILE] serve|init|user|check|version`. Logging setup, first-run initialisation (database, native root, first admin, `Everyone` team), user management, environment checks, `uvicorn.run`. |
 | `config.py` | `Settings`: built-in defaults, then `config.yaml`, then `GOOSE_WEB__SECTION__KEY` environment variables. Goose binary auto-detection, default native Goose root. |
-| `app.py` | ASGI app factory `create_app`: middleware (`SecurityHeaders`, `GZipMiddleware`, `HostGuard`), static and SPA routes, `/ws` endpoint, lifespan, webhook SSRF guard and sender, event/audit handlers wired into the hub. |
+| `app.py` | ASGI app factory `create_app`: middleware (`SecurityHeaders`, `GZipMiddleware`, `HostGuard`, `IPBlockGuard`), static and SPA routes, `/ws` endpoint, lifespan, webhook SSRF guard and sender, event/audit handlers wired into the hub. |
 | `context.py` | `Ctx` (shared services), `HTTPError`, request helpers: identity resolution, `require()` (auth, CSRF, origin, role), allowed origins, client IP, policy and roots for a user, `upstream_for(user)`, `body_json`. |
 | `api.py` | All REST handlers and the `routes` list: auth, current user, preferences, TOTP, API tokens, hints, notifications, file system, MCP App frames, herd, and every `/api/admin/*` endpoint. |
 | `hub.py` | `Hub`, `Upstream`, `Client`, `SessionState`: relays ACP, rewrites ids, buffers and replays session updates, fans out asks, derives herd status, watches for external changes, audits calls. |
 | `workers.py` | `WorkerManager` and `Worker`: spawns, health-checks, restarts and idles out `goose serve`; scheduler ownership; worker logs; Windows Job Object; Goose Desktop detection. |
 | `policy.py` | Default and admin policies, team merge (`effective_policy`), path containment (`path_allowed`), and the ACP method firewall (`check`). |
 | `auth.py` | `AuthService`: local passwords, LDAP/Active Directory, OIDC (authorization code with PKCE), TOTP, lockout and rate limits, cookie sessions, API tokens. |
-| `security.py` | Stdlib-only primitives: scrypt password hashing, password rules, tokens, constant-time compare, TOTP, `RateLimiter`, `safe_name`. |
+| `ipblock.py` | `IPBlocker`: counts failed sign-ins per client address (IPv4, or IPv6 /64) in the `ip_blocks` table, blocks after `auth.ip_block_threshold` in a row within the window, expiry, unblock, listing; in-memory cache of blocked keys refreshed every 15 s. |
+| `security.py` | Stdlib-only primitives: scrypt password hashing, strong-password rules, `ip_in`, tokens, constant-time compare, TOTP, `RateLimiter`, `safe_name`. |
 | `db.py` | SQLite storage (WAL), schema, additive migrations, JSON column decoding, audit log and retention purge. |
 | `profiles.py` | Profile layout, provisioning of isolated profiles from team items, `.goosehints` composition, cross-profile library and item export, profile archiving. |
 | `winsec.py` | Windows token helpers: elevation and integrity checks, un-elevated relaunch (SAFER), file ownership reports. Safe no-ops on other platforms. |
@@ -135,7 +136,7 @@ The main ideas:
 |---|---|
 | `index.html` | Shell page: theme stylesheets, `modulepreload` of `js/app.js`, boot spinner. |
 | `manifest.webmanifest` | PWA manifest. |
-| `sw.js` | Service worker (`gw-shell-v7`): offline shell, network-first for app code, cache-first for vendor files. |
+| `sw.js` | Service worker (`gw-shell-v8`): offline shell, network-first for app code, cache-first for vendor files. |
 | `css/app.css` | All styles and themes. |
 | `icons/` | `goose.svg`, `goose-maskable.svg`. |
 | `vendor/` | Vendored libraries (marked, DOMPurify, highlight.js, qrcode-generator) with `README.md` and `SHA256SUMS`. |
@@ -366,11 +367,17 @@ headers are handled by the gateway's own trusted-proxy logic),
 ### 5.1 Middleware order
 
 ```
-request -> SecurityHeaders -> GZipMiddleware(min 1024 B, level 5) -> HostGuard -> router
+request -> SecurityHeaders -> GZipMiddleware(min 1024 B, level 5) -> HostGuard -> IPBlockGuard -> router
 ```
 
-`HostGuard` is the innermost middleware, so its `400 invalid host` responses
-still pass through `SecurityHeaders`.
+`HostGuard` and `IPBlockGuard` are the innermost middleware, so their `400 invalid host` and
+`403 ip_blocked` responses still pass through `SecurityHeaders`.
+
+**IPBlockGuard.** For HTTP and WebSocket scopes (except `GET`/`HEAD /healthz`) it takes the context from
+`scope["app"].state.ctx`, computes `Ctx.client_ip` on an `HTTPConnection` and asks
+`AuthService.ipblock.is_blocked`. A blocked address gets `403` (JSON `{"error":"ip_blocked"}` under `/api/`,
+plain text otherwise) or a WebSocket denial response. Before the lifespan has created the context, it passes
+everything through.
 
 **HostGuard.** It normalises the `Host` header (`host_only()`: strips the port
 and IPv6 brackets, lower-cases, removes a trailing dot) and refuses any host
@@ -1041,7 +1048,7 @@ data:
 - **Install** pre-caches the shell list on a best-effort basis and calls
   `skipWaiting()`.
 - **Activate** deletes every cache whose name is not the current `VERSION`
-  (`gw-shell-v7`) and claims open clients.
+  (`gw-shell-v8`) and claims open clients.
 - **notificationclick** focuses an open window, or opens one, at
   `/#/chat/<sessionId>` or `/#/herd`.
 
@@ -1081,6 +1088,7 @@ secrets, schedules) stays in each profile and is never copied into it.
 | `audit` | `ts`, `user_id`, `username`, `ip`, `action`, `target`, `detail` (JSON), `ok`. Indexed on `ts`. |
 | `settings` | `key`, `value` (JSON): `auth`, `brand`, `default_team_id`, `session_hours`, `allow_self_totp`, `require_totp_admins`, `peers`, `native_root` |
 | `oidc_states` | `state`, `verifier`, `nonce`, `created_at` (10-minute login handshakes) |
+| `ip_blocks` | `ip` (address key: IPv4 or IPv6 /64), `failures` (JSON list of timestamps of the current run), `last_username`, `blocked_at` (0 = not blocked), `blocked_until` (0 = until unblocked), `updated_at` (schema version 3) |
 
 **JSON columns.** `prefs`, `policy_overrides`, `policy`, `payload`, `detail` and
 `value` are decoded automatically in `_row()`, so callers always get Python
@@ -1250,16 +1258,32 @@ lists the mechanisms.
   salt, stored as `scrypt$N$r$p$salt$hash`. Hashes are upgraded on login when
   the parameters change (`needs_rehash`). Unknown users are verified against a
   dummy hash, so response timing does not reveal which accounts exist.
-- **Password rules** (`password_problems`). Minimum length
-  (`auth.min_password_length`, default 10). The password must not equal the
-  username and must not be on a common-password list. Passwords shorter than
-  16 characters need three of the four character classes.
+- **Password rules** (`password_problems`, version 1.3.0). Minimum length
+  `max(auth.min_password_length, PASSWORD_MIN_LENGTH)` = 12 by default; a
+  lower-case letter, an upper-case letter, a digit and a symbol; must not
+  contain the username (3+ characters); not a common password and not a common
+  word once leading/trailing digits and symbols are stripped and leet swaps
+  undone (`_common_base`); no character 4 times in a row (case-insensitive).
+  `temp_password()` and `generate_admin_password()` loop until they comply.
+  At a successful local sign-in, a password that fails the rules sets
+  `must_change_pw` (audit `auth.password.weak`). Passwords set by an admin
+  (create, PATCH, reset) always set `must_change_pw`.
 - **Rate limits.**
   - 40 attempts per 300 s per IP and 10 per 300 s per IP and user, returning
     `429`.
   - `auth.lockout_threshold` (8) failures lock the account for
     `auth.lockout_minutes` (15), returning `423`.
   - The sliding-window `RateLimiter` holds at most 50,000 keys.
+  - **Address block** (`ipblock.py`). Failed sign-ins (wrong password,
+    unknown user, disabled, local sign-in off, locked, wrong TOTP) append a
+    timestamp to the address's row in `ip_blocks` (`AuthService._fail`);
+    timestamps older than `auth.ip_block_window_days` (30) are dropped and
+    at most `auth.ip_block_threshold` (10) kept. When that many remain, the
+    row gets `blocked_at` and `blocked_until` (`ip_block_days`, 30; 0 = no
+    expiry), the response becomes `403 ip_blocked` and `auth.ip.blocked` is
+    audited. A successful sign-in deletes the row (failures must be
+    consecutive). Trusted proxies and `auth.ip_block_exempt` are never
+    counted. IPv6 is keyed by /64, IPv4-mapped IPv6 by the IPv4 address.
 - **Initial admin password.** `init` generates a random 20-character password
   (or accepts one from `--password-file` or stdin) and prints it once.
 
@@ -1675,6 +1699,7 @@ location) and disables the cache plugin.
 | `tests/test_auth_hardening.py` | TOTP replay and lockout, TOTP settings, OIDC subject binding and takeover protection, LDAP plaintext refusal, token revocation on reset, disable and password change, admin and CLI two-factor reset, column and link-table allow-lists, audit purge, additive migration of a legacy database. |
 | `tests/test_platform_hardening.py` | Generated admin password and one-time printing, `init` password options, path containment including symlink escapes, `address_blocked`, webhook pinning and no redirects, log rotation, vendored file checksums, hashed lock file covering `pyproject.toml`, Dockerfile download verification, SHA-pinned actions. |
 | `tests/test_release_fixes.py` | Regression tests for the `NEW-nn` findings: WebSocket token only in the header and never with `Origin`, Host allow-list and `HostGuard` (including WebSockets and forwarded hosts), allowed origins with and without `public_url`, OIDC requires `public_url`, `tools/call` prefix matching, upload name sanitising and exclusive create, download headers, app frame CSP and policy check, webhook validation at save time, `trust_env=False`, CLI reset revokes tokens, vendored files not EOL-converted. |
+| `tests/test_signin_hardening.py` | Strong-password rules and generated passwords, address keys, the address block (threshold, reset on success, 30-day window, expiry, permanent block, threshold 0, trusted proxies and exempt networks, IPv6 /64, restart), `IPBlockGuard` for HTTP and WebSocket and forwarded addresses, admin list/unblock API, login `403 ip_blocked`, forced change of admin-set passwords, weak existing password forces a change, `ip` CLI. |
 | `tests/test_api.py` | Helpers of the apps frame endpoint (HTML extraction from resource contents). |
 
 Run the suite with:

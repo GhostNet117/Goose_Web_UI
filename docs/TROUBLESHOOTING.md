@@ -203,6 +203,9 @@ Useful gateway log lines:
 | `Directory sign-in is not configured securely. Ask an administrator to check the LDAP settings.` (503 `ldap_insecure`) | LDAP uses plain `ldap://` without StartTLS. | Section 3.4. |
 | `/#/login?error=oidc_...` after single sign-on | See section 3.5. | Section 3.5. |
 | `Gateway unreachable` with a Retry button | The app could not load `/api/me` (network error, proxy error, gateway down). | Section 1.1. |
+| `Sign-in from your network address is blocked after too many failed attempts. Ask an administrator to unblock it.` (403 `ip_blocked`; every other page shows the same text as plain text) | 10 failed sign-ins in a row from this client address within 30 days (`auth.ip_block_*`), from any user names. | Section 3.7. |
+| After signing in: `Choose a new password` although the password is not temporary | The password does not meet the strong-password rules of version 1.3.0 and later, or an administrator set it. | Choose a password with at least 12 characters, upper- and lower-case letters, a number and a symbol, not containing the user name. |
+| `Rejected: ...` when choosing a password (400 `weak_password`) | The server's password rules: 12+ characters, lower case, upper case, number, symbol, not containing the user name, not a common password or a common word with digits/symbols added, no character 4 times in a row. | Choose a longer, less predictable password. |
 | The initial admin password was lost | It is printed only once. | `user reset admin` (section 3.6). |
 | `no such user` from `user reset` although the user exists in the UI | The command used a different database because `--config` was missing or wrong. | Pass the service's `--config` (section 3.6). |
 
@@ -213,9 +216,11 @@ The gateway takes the client IP from the rightmost `X-Forwarded-For` value only 
 `192.168.1.2`) and is not listed, every user appears to come from the proxy's address, so one user's failed
 attempts can rate-limit everyone. Add the proxy address to `server.trusted_proxies` and restart.
 
-Lockout is per account, not per IP. An account locked by someone guessing passwords stays locked for
+The account lockout is per account. An account locked by someone guessing passwords stays locked for
 `auth.lockout_minutes` after the last failure; the Audit log shows the attempts (`auth.login` failures and the
-lockout) with client IPs.
+lockout) with client IPs. The address block (section 3.7) is per client IP, so with an untrusted proxy one bad
+actor would block the proxy's address for everyone - except that trusted proxies are never blocked, which is one more
+reason to list the proxy in `server.trusted_proxies`.
 
 ### 3.3 Unlocking or resetting from the admin console
 
@@ -290,6 +295,27 @@ The command works while the gateway is running; the user's open browser sessions
 sessions were deleted.
 
 ---
+
+### 3.7 A blocked address (`ip_blocked`)
+
+After `auth.ip_block_threshold` (10) failed sign-ins in a row from one client address within
+`auth.ip_block_window_days` (30), the gateway refuses every request from that address for `auth.ip_block_days` (30)
+with HTTP 403 and the text `Sign-in from your network address is blocked after too many failed attempts. Ask an
+administrator to unblock it.` IPv6 addresses are blocked per /64.
+
+1. See who and what: Admin > **Blocked addresses** (address, failures, last user name tried, blocked until), or the
+   Audit log entry `auth.ip.blocked`, or on the gateway machine:
+
+   ```powershell
+   C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles\_system\config.yaml ip list
+   ```
+
+2. If it was a legitimate user (for example someone with an old saved password), click **Unblock** in Admin >
+   Blocked addresses, or run `... ip unblock <address>` on the gateway machine. The console command also works when
+   your own address is blocked and the gateway is running; the gateway picks it up within 15 seconds.
+3. If many people share one address (office NAT, VPN), consider putting that network in `auth.ip_block_exempt`.
+4. If every user is blocked at once, the gateway probably sees the proxy's address instead of the client's: add the
+   proxy to `server.trusted_proxies` (section 3.2), restart, and run `ip unblock --all`.
 
 ## Lost authenticator
 
@@ -666,7 +692,7 @@ chat link) and `Priority` (`high` for "needs you", otherwise `default`). Other U
 
 ## 14. Old user interface after an upgrade
 
-The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v7`). The
+The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v8`). The
 page, scripts and styles are fetched from the network first, and the cache is used only when the gateway cannot
 be reached; `/api/` and `/ws` are never cached. Third-party libraries and icons are served from the cache first.
 The gateway sends these files with `Cache-Control: no-cache`.

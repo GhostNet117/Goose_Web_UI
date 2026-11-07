@@ -88,11 +88,14 @@ A code can be used only once. If it is rejected, wait for the next code.
 | Invalid code, try again. | The two-factor code is wrong or was already used. |
 | This account is temporarily locked. | Too many failed attempts. Wait, or ask an administrator to unlock you. |
 | Too many attempts. Please wait a minute. | Sign-in is rate limited. Wait a minute and retry. |
+| Sign-in from your network address is blocked after too many failed attempts. | 10 failed sign-ins in a row came from your network address. Ask an administrator to unblock it. |
 | Gateway unreachable | The browser cannot reach the server. Click **Retry**, or see [TROUBLESHOOTING.md](TROUBLESHOOTING.md). |
 
 ### First-time setup
 
-When an administrator creates your account, you get a temporary password.
+When an administrator creates your account or sets your password, you get a temporary password. You always have to
+change it at your first sign-in. The same screen appears if your current password does not meet the rules below
+(for example a password chosen before the rules were tightened).
 
 1. Sign in with the temporary password.
 2. The **Choose a new password** screen opens. You cannot use the app until you change it.
@@ -103,8 +106,10 @@ When an administrator creates your account, you get a temporary password.
 Password rules (local accounts):
 
 - at least 12 characters
-- a lowercase letter, an uppercase letter, a number and a symbol
+- a lowercase letter, an uppercase letter, a number and a symbol (a space counts as a symbol)
 - it must not contain your username
+- it must not be a common password, or a common word with numbers or symbols added (`Summer2026!` is refused)
+- no character four or more times in a row
 
 Directory and single sign-on accounts do not have a password in Goose Web. Your organisation manages it.
 

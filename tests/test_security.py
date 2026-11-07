@@ -19,7 +19,10 @@ def test_password_policy():
     assert security.password_problems("ChangeMe", 10)
     assert security.password_problems("alice2xxxx", 10, "alice2xxxx")
     assert not security.password_problems("Blue-Kettle-42", 10)
-    assert not security.password_problems("a very long passphrase here", 10)
+    # spec 007: 12+ characters (never lower), all four character classes
+    assert "must be at least 12 characters" in security.password_problems("Blue-Kettl4", 10)
+    assert security.password_problems("a very long passphrase here", 10)
+    assert not security.password_problems("A very long passphrase 4 here", 10)
 
 
 def test_tokens():

@@ -132,8 +132,8 @@ def cmd_init(args, settings) -> int:
     else:
         password, generated = generate_admin_password(), True
     if not generated:
-        problems = security.password_problems(password, int(settings.get("auth", "min_password_length") or 10),
-                                              name)
+        problems = security.password_problems(password, int(settings.get("auth", "min_password_length")
+                                                            or security.PASSWORD_MIN_LENGTH), name)
         if problems:
             print(f"warning: the given admin password {'; '.join(problems)} (it must be changed at first "
                   "sign-in anyway)", file=sys.stderr)
@@ -211,6 +211,44 @@ def cmd_user(args, settings) -> int:
     return 1
 
 
+def cmd_ip(args, settings) -> int:
+    """Break-glass for the sign-in IP block (spec 007); works while the gateway runs (it re-reads within 15 s)."""
+    import datetime
+
+    from .db import Database
+    from .ipblock import IPBlocker
+    db = Database(settings.system_dir / "goose-web.db")
+    blocker = IPBlocker(db, settings)
+
+    def when(ts):
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"
+    if args.action == "list":
+        d = blocker.describe()
+        print(f"Block after {d['threshold']} consecutive failed sign-ins within {d['windowDays']:g} days; "
+              f"blocks last {(str(round(d['blockDays'], 2)) + ' days') if d['blockDays'] else 'until unblocked'}.")
+        rows = blocker.list()
+        if not rows:
+            print("No blocked or counted addresses.")
+        for r in rows:
+            state = f"BLOCKED until {when(r['blockedUntil']) if r['blockedUntil'] else 'unblocked'}" if r["blocked"] \
+                else "counting"
+            print(f"{r['ip']:<40} {state:<30} failures={r['failures']:<3} last={when(r['lastFailureAt'])} "
+                  f"user={r['lastUsername'] or '-'}")
+        return 0
+    if args.all:
+        n = blocker.unblock_all()
+        db.audit("auth.ip.unblocked", target="*", detail={"via": "cli", "removed": n})
+        print(f"Removed {n} address record(s); nothing is blocked now.")
+        return 0
+    if not args.address:
+        raise SystemExit("give an address, or --all")
+    if not blocker.unblock(args.address):
+        raise SystemExit(f"{args.address} is not blocked or counted (see: goose-web ip list)")
+    db.audit("auth.ip.unblocked", target=args.address, detail={"via": "cli"})
+    print(f"Unblocked {args.address} (the gateway picks this up within 15 seconds).")
+    return 0
+
+
 def cmd_check(args, settings) -> int:
     from . import winsec
     from .workers import desktop_running, goose_version
@@ -276,6 +314,10 @@ def main(argv: list[str] | None = None) -> int:
     u.add_argument("name", nargs="?")
     u.add_argument("--password")
     u.add_argument("--admin", action="store_true")
+    ipc = sub.add_parser("ip", help="list or unblock addresses blocked after failed sign-ins")
+    ipc.add_argument("action", choices=["list", "unblock"])
+    ipc.add_argument("address", nargs="?", help="address to unblock (an IPv6 address unblocks its /64)")
+    ipc.add_argument("--all", action="store_true", help="unblock every address and clear all counters")
     sub.add_parser("check", help="diagnostics")
     sub.add_parser("version")
     args = p.parse_args(argv)
@@ -286,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if cmd == "serve" and not hasattr(args, "host"):
         args.host, args.port = None, None
-    return {"serve": cmd_serve, "init": cmd_init, "user": cmd_user, "check": cmd_check}[cmd](args, settings)
+    return {"serve": cmd_serve, "init": cmd_init, "user": cmd_user, "ip": cmd_ip, "check": cmd_check}[cmd](args, settings)
 
 
 if __name__ == "__main__":

@@ -68,7 +68,11 @@ auth:
   remember_days: 30
   lockout_threshold: 8
   lockout_minutes: 15
-  min_password_length: 10
+  min_password_length: 12                   # never below 12
+  ip_block_threshold: 10                    # failed sign-ins in a row that block an address; 0 = off
+  ip_block_window_days: 30
+  ip_block_days: 30                         # 0 = until an admin unblocks it
+  ip_block_exempt: []                       # addresses/CIDR networks never blocked
 notify:
   allow_private_targets: false
 host_tasks:
@@ -98,14 +102,18 @@ host_tasks:
 | `auth.remember_days` | `30` | Session length with "remember me". |
 | `auth.lockout_threshold` | `8` | Failed passwords before a lockout. |
 | `auth.lockout_minutes` | `15` | Lockout duration. |
-| `auth.min_password_length` | `10` | Minimum length for new passwords. |
+| `auth.min_password_length` | `12` | Minimum length for new passwords. Values below 12 are raised to 12. New passwords also need a lower-case letter, an upper-case letter, a number and a symbol, must not contain the user name, must not be (or be built from) a common password and must not repeat a character 4 times in a row ([ADMINISTRATION.md](ADMINISTRATION.md#72-creating-accounts)). |
+| `auth.ip_block_threshold` | `10` | Failed sign-ins in a row from one client address (IPv6: per /64) that block it. A successful sign-in from the address resets the count. `0` turns address blocking off. |
+| `auth.ip_block_window_days` | `30` | Only failures from the last N days count toward `ip_block_threshold`. |
+| `auth.ip_block_days` | `30` | How long a block lasts. `0` = until an administrator unblocks it (Admin > Blocked addresses or `ip unblock`). |
+| `auth.ip_block_exempt` | `[]` | Addresses or CIDR networks that are never counted or blocked. `server.trusted_proxies` are always exempt. |
 | `notify.allow_private_targets` | `false` | Personal notification webhooks may only reach public internet addresses. Every resolved address is checked. Loopback, private, link-local, CGNAT, reserved, multicast and unspecified targets (including IPv4 embedded in IPv6) are refused, both when the webhook is saved (`400 webhook_blocked`) and when it is sent. Requests go to the checked IP, never follow redirects and ignore proxy environment variables. Set `true` only if users really need internal targets, such as a self-hosted ntfy on the LAN. |
 | `host_tasks.enabled` | `true` | Turns the admin host-task view on or off (Windows only). |
 | `host_tasks.path_filter` | `\*` | Task Scheduler folder filter. `\Microsoft\*` is always excluded. |
 
 Fixed limits (not configurable): 2 MiB JSON bodies, 64 MiB WebSocket frames, 12 MiB live buffer per session,
 256 MiB total, login limits of 40 attempts per 5 minutes per IP and 10 per 5 minutes per IP+username (wrong TOTP
-codes count toward the account lockout like wrong passwords), worker logs rotated at 10 MiB with 3 backups (checked
+codes count toward the account lockout and the address block like wrong passwords), worker logs rotated at 10 MiB with 3 backups (checked
 before each worker start), audit rows kept for 365 days (older rows are deleted at startup).
 
 API tokens (Settings > Account > API tokens) are sent as `Authorization: Bearer gwt_...`, for REST calls and for
@@ -119,11 +127,13 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 | Command | Flags | What it does |
 |---|---|---|
 | `serve` | `--host`, `--port` (a `--host` value also joins the Host allow-list) | Runs the gateway. It first checks the token (`winsec.ensure_unelevated`): when elevated on Windows it relaunches itself with a normal-user, Medium-integrity token, and on POSIX it refuses to run as root (exit 3). Logs go to `<system_dir>/logs/gateway.log` (5 MB x 5) and to stderr. |
-| `init` | `--admin NAME` (default: current OS user), `--password PW`, `--password-file FILE` (first line of FILE, `-` = stdin), `--native-root auto\|fresh\|PATH` (default `auto`), `--force` | Creates the database and the first admin (local, `must_change_pw`, profile mode `native`), creates the team **Everyone** and makes it the default team. Without `--password`/`--password-file` it generates a **random 20-character initial password and prints it once**. Only its hash is stored and it is not shown again. If you lose it, run `user reset`. A given password that is weak only triggers a warning, because it must be changed at first sign-in anyway. `auto` uses Goose's default profile folder if it has a `config` subfolder, otherwise `fresh` (`<profiles_root>/appdata` with `config/`, `data/`, `state/`). A path ending in `config` is accepted and its parent is used. Without `--force`, an existing database is left as it is. |
+| `init` | `--admin NAME` (default: current OS user), `--password PW`, `--password-file FILE` (first line of FILE, `-` = stdin), `--native-root auto\|fresh\|PATH` (default `auto`), `--force` | Creates the database and the first admin (local, `must_change_pw`, profile mode `native`), creates the team **Everyone** and makes it the default team. Without `--password`/`--password-file` it generates a **random 20-character initial password and prints it once**. Only its hash is stored and it is not shown again. If you lose it, run `user reset`. A given password that does not meet the password rules only triggers a warning, because it must be changed at first sign-in anyway. `auto` uses Goose's default profile folder if it has a `config` subfolder, otherwise `fresh` (`<profiles_root>/appdata` with `config/`, `data/`, `state/`). A path ending in `config` is accepted and its parent is used. Without `--force`, an existing database is left as it is. |
 | `user list` | | Lists users. |
 | `user add NAME` | `--password`, `--admin` | Creates a local user (temporary password printed if none is given, change forced). |
 | `user reset NAME` | `--password` | Sets a temporary password (printed), forces a change, unlocks the account, switches it to local auth, signs it out everywhere and revokes its API tokens. Use it if the initial admin password is lost. |
 | `user reset-totp NAME` | | Removes the user's two-factor (lost authenticator), unlocks the account, signs it out everywhere and revokes its API tokens; audited as `user.totp.reset`. Same as Admin > Users > Reset two-factor, and the way back in when the only admin lost their authenticator. |
+| `ip list` | | Lists client addresses blocked after failed sign-ins and addresses that are collecting failures (count, last user name tried, end of the block). |
+| `ip unblock ADDRESS` | `--all` | Ends the block of ADDRESS (an IPv6 address unblocks its /64) and clears its count, or with `--all` every block and count; audited as `auth.ip.unblocked`. Works while the gateway runs (it re-reads the blocks within 15 seconds), so it is the way back in when the admin's own address is blocked. |
 | `check` | | Diagnostics: version, config file, goose binary and version, OS user and integrity (fails if elevated), profiles root, Goose Desktop running (Windows), whether the port is free. Exit code 1 if something is wrong. |
 | `version` | | Prints the version. |
 

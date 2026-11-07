@@ -204,7 +204,9 @@ Every key, the CLI, policies, profile layout, scheduler rules and scripts are de
   allow-listed (DNS-rebinding guard). The CSP is strict.
 - No default password: the first admin gets a random password that is shown once, and must change it at first
   sign-in.
-- Sign-in is rate limited with a lockout. TOTP (with replay protection), LDAP/AD (TLS required by default) and OIDC
+- Strong passwords are enforced (12+ characters, all four character classes, no common passwords); passwords set by
+  an admin must be changed at the next sign-in. Sign-in is rate limited with an account lockout, and a client address
+  is blocked after 10 failed sign-ins in a row within 30 days (Admin > Blocked addresses, `goose-web ip unblock`). TOTP (with replay protection), LDAP/AD (TLS required by default) and OIDC
   (accounts bound to issuer + subject) are supported. API tokens are sent only in the `Authorization` header.
 - Non-admins go through a default-deny ACP firewall with folder confinement (symlinks resolved). Shell extensions
   are off unless `allow_shell` is set. MCP Apps can only call tools of their own extension.

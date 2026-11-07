@@ -31,7 +31,7 @@ is a number.
 |---|---|---|
 | GET | `/healthz` | `ok` (text) |
 | GET | `/api/auth/config` | `{ brand:{name, tagline}, version, local:true, ldap:{enabled, label}, oidc:[{id,label}] }` |
-| POST | `/api/auth/login` | `{username, password, totp?, remember?}` → `{user, csrf, mustChangePassword, totpEnrolmentRequired}`. Errors: `401 invalid_credentials`, `401 totp_required` (ask for the code and resend), `401 totp_invalid` (wrong or already used code; counts toward the lockout), `423 locked`, `429 rate_limited`, `503 ldap_insecure` (LDAP configured without TLS, see `ldap.allowInsecure`), `403 bad_origin` |
+| POST | `/api/auth/login` | `{username, password, totp?, remember?}` → `{user, csrf, mustChangePassword, totpEnrolmentRequired}`. Errors: `401 invalid_credentials`, `401 totp_required` (ask for the code and resend), `401 totp_invalid` (wrong or already used code; counts toward the lockout), `423 locked`, `429 rate_limited`, `403 ip_blocked` (too many failed sign-ins from this address; while blocked, every request from it gets this 403), `503 ldap_insecure` (LDAP configured without TLS, see `ldap.allowInsecure`), `403 bad_origin` |
 | POST | `/api/auth/logout` | `{}` → `{ok:true}` |
 | GET | `/api/auth/oidc/{id}/start` | 302 to the IdP. On an error, 302 to `/#/login?error=<code>`, for example `oidc_needs_public_url` (OIDC needs `server.public_url`) |
 | GET | `/api/auth/oidc/{id}/callback` | 302 to `/` (or to `/#/login?error=...`, for example `oidc_conflict` when the name belongs to a local/LDAP account or is bound to another issuer + subject) |
@@ -94,9 +94,11 @@ is a number.
 
 | Method | Path | Notes |
 |---|---|---|
-| GET/POST | `/api/admin/users` | POST `{username, displayName?, email?, role:"user"\|"admin", password?, mustChangePassword?:true, teams:[id], hints:[id], profileMode:"isolated"\|"native", authSource:"local"\|"ldap"\|"oidc"}` → `{user, tempPassword?}` |
-| GET/PATCH/DELETE | `/api/admin/users/{id}` | PATCH accepts any of the POST fields plus `disabled`, `policyOverrides`. Disabling a user or setting a password revokes the user's sessions and API tokens. DELETE `?purgeProfile=1` deletes the profile folder; otherwise the folder is renamed to `_deleted/<name>-<ts>` |
+| GET/POST | `/api/admin/users` | POST `{username, displayName?, email?, role:"user"\|"admin", password?, teams:[id], hints:[id], profileMode:"isolated"\|"native", authSource:"local"\|"ldap"\|"oidc"}` → `{user, tempPassword?}` |
+| GET/PATCH/DELETE | `/api/admin/users/{id}` | PATCH accepts any of the POST fields plus `disabled`, `policyOverrides`. A password set here (or in POST) must meet the password rules (`400 weak_password {problems}`) and must always be changed at the user's next sign-in (`mustChangePassword` is ignored since 1.3.0). Disabling a user or setting a password revokes the user's sessions and API tokens. DELETE `?purgeProfile=1` deletes the profile folder; otherwise the folder is renamed to `_deleted/<name>-<ts>` |
 | POST | `/api/admin/users/{id}/reset-password` | → `{tempPassword}` (the user must change it at next login). Revokes the user's sessions and API tokens |
+| GET | `/api/admin/ip-blocks` | → `{items:[{ip, blocked, failures, lastFailureAt, lastUsername, blockedAt, blockedUntil}], threshold, windowDays, blockDays, exempt}`. Blocked addresses and addresses collecting failed sign-ins (IPv6 as a /64), blocked first. `blockedUntil: null` while blocked = until unblocked |
+| POST | `/api/admin/ip-blocks/unblock` | `{ip}` or `{all:true}` → `{removed:n}`. Ends the block and clears the count. `404 not_found` if the address is not listed. Audit `auth.ip.unblocked` |
 | POST | `/api/admin/users/{id}/reset-totp` | removes the user's two-factor (lost authenticator): clears the secret, unlocks, ends the user's sessions and revokes their API tokens → `{user, sessionsEnded:true, tokensRevoked:n}`. `409 totp_not_enabled` if the user has no two-factor, `400 self` for your own account. Audit `user.totp.reset` |
 | POST | `/api/admin/users/{id}/unlock` | |
 | POST | `/api/admin/users/{id}/provision` | re-applies teams, hints and policy to the profile → `{changes:[...], restartPending}` |

@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3   # v3 (1.3.0): ip_blocks table, created by SCHEMA on open
 
 # Audit rows older than this are deleted when the database is opened (GW-23).
 AUDIT_RETENTION_DAYS = 365
@@ -131,9 +131,18 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS oidc_states (
   state TEXT PRIMARY KEY, verifier TEXT NOT NULL, nonce TEXT NOT NULL, created_at REAL NOT NULL
 );
+-- failed sign-ins per client address (IPv4, or IPv6 /64) and blocks (ipblock.py, spec 007)
+CREATE TABLE IF NOT EXISTS ip_blocks (
+  ip TEXT PRIMARY KEY,
+  failures TEXT NOT NULL DEFAULT '[]',      -- JSON list of failure timestamps in the current run, newest last
+  last_username TEXT NOT NULL DEFAULT '',
+  blocked_at REAL NOT NULL DEFAULT 0,       -- 0 = not blocked
+  blocked_until REAL NOT NULL DEFAULT 0,    -- 0 while blocked = until an administrator unblocks it
+  updated_at REAL NOT NULL
+);
 """
 
-JSON_COLUMNS = {"prefs", "policy_overrides", "policy", "payload", "detail", "value"}
+JSON_COLUMNS = {"prefs", "policy_overrides", "policy", "payload", "detail", "value", "failures"}
 
 
 class Database:

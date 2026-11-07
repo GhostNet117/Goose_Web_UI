@@ -17,6 +17,7 @@ import httpx
 from . import security
 from .config import Settings
 from .db import Database
+from .ipblock import BLOCKED_MESSAGE, IPBlocker
 
 log = logging.getLogger("goose_web.auth")
 
@@ -64,6 +65,7 @@ class AuthService:
         self.s = settings
         self.ip_limiter = security.RateLimiter(40, 300)
         self.user_limiter = security.RateLimiter(10, 300)
+        self.ipblock = IPBlocker(db, settings)
         self._oidc_meta: dict[str, tuple[float, dict]] = {}
 
     # ------------------------------------------------------------ config
@@ -112,16 +114,27 @@ class AuthService:
         self._oidc_meta.clear()
 
     # ------------------------------------------------------------ password login
+    def _fail(self, ip: str, username: str, code: str, message: str, status: int = 401) -> AuthError:
+        """Count a failed sign-in against the client address (spec 007) and return the error to raise."""
+        if self.ipblock.record_failure(ip, username):
+            return AuthError("ip_blocked", BLOCKED_MESSAGE, 403)
+        return AuthError(code, message, status)
+
     def login(self, username: str, password: str, totp: str | None, ip: str) -> dict:
         username = (username or "").strip()
+        if self.ipblock.is_blocked(ip):
+            raise AuthError("ip_blocked", BLOCKED_MESSAGE, 403)
         if not self.ip_limiter.hit(ip) or not self.user_limiter.hit(f"{ip}|{username.lower()}"):
             raise AuthError("rate_limited", "Too many attempts. Wait a few minutes.", 429)
-        if not username or not password or len(password) > 1024:
+        if not username or not password:
             raise AuthError("invalid_credentials", "Invalid username or password")
+        if len(password) > 1024:
+            raise self._fail(ip, username, "invalid_credentials", "Invalid username or password")
         user = self.db.user_by_name(username)
         cfg = self.auth_config()
         if user and user["locked_until"] > time.time():
-            raise AuthError("locked", "Account temporarily locked after failed attempts. Try again later.", 423)
+            raise self._fail(ip, username, "locked",
+                             "Account temporarily locked after failed attempts. Try again later.", 423)
         ok = False
         if user is None or user["auth_source"] == "ldap":
             if cfg["ldap"].get("enabled") and ldap_transport_insecure(cfg["ldap"]):
@@ -139,7 +152,7 @@ class AuthService:
                 security.verify_password(password, None)  # constant-ish time
         elif user["auth_source"] == "local":
             if not cfg["localEnabled"] and user["role"] != "admin":
-                raise AuthError("invalid_credentials", "Local sign-in is disabled")
+                raise self._fail(ip, username, "invalid_credentials", "Local sign-in is disabled")
             ok = security.verify_password(password, user["password_hash"])
             if ok and security.needs_rehash(user["password_hash"]):
                 self.db.update_user(user["id"], password_hash=security.hash_password(password))
@@ -147,10 +160,10 @@ class AuthService:
             if user:
                 self._record_failure(user)
             self.db.audit("auth.login", user=user, ip=ip, target=username, ok=False)
-            raise AuthError("invalid_credentials", "Invalid username or password")
+            raise self._fail(ip, username, "invalid_credentials", "Invalid username or password")
         if user["disabled"]:
             self.db.audit("auth.login", user=user, ip=ip, target=username, detail={"reason": "disabled"}, ok=False)
-            raise AuthError("invalid_credentials", "Invalid username or password")
+            raise self._fail(ip, username, "invalid_credentials", "Invalid username or password")
         if user["totp_enabled"]:
             if not totp:
                 raise AuthError("totp_required", "Enter the code from your authenticator app")
@@ -158,9 +171,19 @@ class AuthService:
             if not self.accept_totp(user, str(totp)):
                 self._record_failure(user)
                 self.db.audit("auth.totp", user=user, ip=ip, ok=False)
-                raise AuthError("totp_invalid", "That code is not valid")
-        self.db.update_user(user["id"], failed_logins=0, locked_until=0, last_login_at=time.time())
+                raise self._fail(ip, username, "totp_invalid", "That code is not valid")
+        fields: dict[str, Any] = {"failed_logins": 0, "locked_until": 0, "last_login_at": time.time()}
+        if user["auth_source"] == "local" and not user["must_change_pw"]:
+            # Passwords set before the strong-password policy (spec 007) must be replaced: the plain text is
+            # only available here, so a weak one is flagged now and the user changes it before going further.
+            min_len = int(self.s.get("auth", "min_password_length") or security.PASSWORD_MIN_LENGTH)
+            if security.password_problems(password, min_len, user["username"]):
+                fields["must_change_pw"] = 1
+                self.db.audit("auth.password.weak", user=user, ip=ip, target=user["username"],
+                              detail={"forcedChange": True})
+        self.db.update_user(user["id"], **fields)
         self.user_limiter.reset(f"{ip}|{username.lower()}")
+        self.ipblock.record_success(ip)
         return self.db.user_by_id(user["id"])
 
     def _record_failure(self, user: dict) -> None:

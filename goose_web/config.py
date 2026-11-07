@@ -74,7 +74,12 @@ DEFAULTS: dict[str, Any] = {
         "remember_days": 30,
         "lockout_threshold": 8,
         "lockout_minutes": 15,
-        "min_password_length": 10,
+        "min_password_length": 12,        # never below 12 (strong-password floor, security.PASSWORD_MIN_LENGTH)
+        # Block a client address after this many consecutive failed sign-ins within the window (0 = off).
+        "ip_block_threshold": 10,
+        "ip_block_window_days": 30,
+        "ip_block_days": 30,              # how long a block lasts; 0 = until an administrator unblocks it
+        "ip_block_exempt": [],            # addresses/networks never blocked (trusted proxies always are)
     },
     "notify": {
         # Personal notification webhooks may only reach public internet addresses: loopback, private (RFC 1918,

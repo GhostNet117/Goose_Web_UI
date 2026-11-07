@@ -200,7 +200,7 @@ Behind a reverse proxy, add to `environment:`:
 ```
 
 Trust only the proxy's own address. Every host in a trusted range can forge the client IP that rate limiting, the
-lockout and the audit log rely on, so do not trust a whole Docker network range unless you must.
+lockout, the address block and the audit log rely on, so do not trust a whole Docker network range unless you must.
 
 ## 4. First start and the initial admin password
 
@@ -436,7 +436,7 @@ disable your own account, or remove your own admin role. The admin with the nati
 
 | Where | How |
 |---|---|
-| Admin > Users > New user | user name, display name, e-mail, role, sign-in source (Local password, LDAP / AD, OIDC / SSO), profile mode, initial password, "Must change at first sign-in", teams, shared hints. If no password is given for a local account, a temporary password is generated and shown once. Without explicit teams the user joins the default team. The isolated profile is created right away. |
+| Admin > Users > New user | user name, display name, e-mail, role, sign-in source (Local password, LDAP / AD, OIDC / SSO), profile mode, initial password, teams, shared hints. If no password is given for a local account, a temporary password is generated and shown once. A password typed here (or generated) must always be changed by the user at the first sign-in. Without explicit teams the user joins the default team. The isolated profile is created right away. |
 | Console | `python -m goose_web --config <config> user add bob` creates a local user with a temporary password (printed) and a forced change, and adds it to the default team. `--admin` makes it an admin, `--password` sets the password. The profile is created at the first sign-in. |
 | LDAP | users are created at their first successful directory sign-in when "autoCreate" is on (section 7.4) |
 | OIDC | users are created at their first sign-in when "Create users automatically" is on (section 7.5) |
@@ -445,9 +445,19 @@ User names: letters, digits, `.`, `_` and `-`, starting with a letter or digit, 
 names and the reserved names `appdata`, `workspace`, `_system`, `_deleted`, `library`, `backups` and `logs` are
 refused, because the user name becomes the profile folder name.
 
-Password rules (`auth.min_password_length`, default 10): at least that many characters, not equal to the user name,
-not a common password, and 3 of lower case, upper case, digit and symbol unless the password has 16 or more
-characters. Passwords are stored as scrypt hashes.
+Password rules (strong passwords, enforced by the server for every new password: own change, admin create and
+edit, `init` warns):
+
+- at least 12 characters (`auth.min_password_length`, default 12, can raise this but never lower it below 12);
+- at least one lower-case letter, one upper-case letter, one number and one symbol (a space counts as a symbol);
+- must not contain the user name (user names of 3 or more characters);
+- not a common password, and not a common word with digits or symbols added at the start or end or simple letter
+  swaps (for example `P@ssw0rd123!`, `Summer2026!`, `Welcome-2026#` are refused);
+- no character repeated 4 or more times in a row.
+
+Passwords are stored as scrypt hashes. A local account whose existing password does not meet these rules (set before
+version 1.3.0) is asked to change it at its next successful sign-in (audit `auth.password.weak`). Changing the
+password ends the user's other sessions and revokes their API tokens, as every password change does.
 
 ### 7.3 Local accounts
 
@@ -538,7 +548,7 @@ How it works:
 | Unlock after failed sign-ins | "Unlock" (clears the failure counter and the lock) | `user reset NAME` also unlocks |
 | Reset password | "Reset password" (local accounts only): shows a temporary password once, forces a change, ends all sessions, revokes all API tokens, unlocks | `user reset NAME [--password PW]`: same effect, prints the temporary password, also re-enables a disabled account and switches the account to local sign-in |
 | Reset two-factor (lost authenticator) | "Reset two-factor" (only for users with the "2FA" badge, never your own account): removes the two-factor enrolment, unlocks, ends all sessions, revokes all API tokens. The user signs in with the password and enrols again (section 7.8) | `user reset-totp NAME`: same effect |
-| Set a password | Edit > password field (admin API `PATCH`), with "must change" on by default; ends sessions and revokes tokens | none |
+| Set a password | Edit > password field (admin API `PATCH`): the user must always change it at the next sign-in; ends sessions and revokes tokens | none |
 | Re-provision the profile | "Re-provision profile": applies teams, hints and policy again and lists the changes | none |
 | Delete | "Delete...": stops the worker and removes the account. The isolated profile folder is moved to `<profiles_root>/_deleted/<user>-<timestamp>`, or deleted permanently if you tick the box. The native profile is never moved or deleted. | none |
 
@@ -560,6 +570,7 @@ docker compose -f docker/compose.yaml exec goose-web python -m goose_web user re
 |---|---|
 | Rate limit | at most 40 sign-in attempts per 5 minutes per client IP and 10 per 5 minutes per IP and user name (`429`, in memory, cleared by a gateway restart) |
 | Lockout | after `auth.lockout_threshold` (8) failed factors - wrong passwords and wrong or replayed TOTP codes both count - the account is locked for `auth.lockout_minutes` (15) (`423`, also with the right password) |
+| Address block | after `auth.ip_block_threshold` (10) failed sign-ins in a row from one client address within `auth.ip_block_window_days` (30), that address is blocked for `auth.ip_block_days` (30; `0` = until an admin unblocks it). Stored in the database, so it survives restarts. See section 7.9. |
 | Session length | fixed from sign-in, never extended. Without "Keep me signed in": `session_hours` (Admin > Settings > Sign-in lifetime, 1 to 720 hours, default `auth.session_hours` = 12). With "Keep me signed in" (ticked by default on the sign-in page): `auth.remember_days` (30 days, config only) |
 | Cookie | `HttpOnly`, `SameSite=Strict`; `__Host-gw` with `Secure` when `public_url` is `https://`, otherwise `gw` |
 | Writes | need the CSRF header and an allowed Origin |
@@ -586,6 +597,41 @@ docker compose -f docker/compose.yaml exec goose-web python -m goose_web user re
   (`400 self`): turn your own two-factor off in your account settings, or have another admin reset it. Resetting
   another admin while "Require two-factor for administrators" is on is allowed; that admin is then reported as
   `totpEnrolmentRequired` until they enrol again. Step by step: [TROUBLESHOOTING.md](TROUBLESHOOTING.md#lost-authenticator).
+
+### 7.9 Blocked addresses (failed sign-ins)
+
+Every failed password sign-in counts against the client address: wrong password, unknown user name, disabled
+account, local sign-in turned off, locked account, wrong or replayed two-factor code. Not counted: the "enter your
+code" step, rate-limited attempts, empty forms and the LDAP-misconfiguration refusal. A successful sign-in from the
+address clears its count, so only failures in a row count.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `auth.ip_block_threshold` | `10` | failures in a row that block the address; `0` turns blocking off |
+| `auth.ip_block_window_days` | `30` | only failures from the last N days count |
+| `auth.ip_block_days` | `30` | how long a block lasts; `0` = until an administrator unblocks it |
+| `auth.ip_block_exempt` | `[]` | addresses or networks (CIDR) that are never counted or blocked |
+
+- A blocked address gets `403` on every page and API call (`{"error": "ip_blocked"}` under `/api/`) and its
+  WebSocket is refused, also for users who are already signed in from it. `GET /healthz` stays open. The sign-in that
+  reaches the limit already answers `403 ip_blocked`, and the sign-in page explains it.
+- The address is the client IP the gateway sees: the rightmost `X-Forwarded-For` entry when the request comes from a
+  trusted proxy, otherwise the peer address. IPv6 addresses are counted and blocked per /64 network. The trusted
+  proxies themselves (`server.trusted_proxies`) are never blocked, because that would lock out every user behind
+  the proxy.
+- Several users behind one NAT share an address: one person's failures count for all of them. Put such an office
+  network in `auth.ip_block_exempt` if that is a problem (the per-account lockout still applies).
+- **Admin > Blocked addresses** lists blocked addresses and addresses that are collecting failures (count, last user
+  name tried, last failure, blocked until), with **Unblock** / **Clear** per row and **Unblock all**.
+- Console (works while the gateway runs; it picks up the change within 15 seconds):
+
+```powershell
+C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles\_system\config.yaml ip list
+C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles\_system\config.yaml ip unblock 203.0.113.7
+C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles\_system\config.yaml ip unblock --all
+```
+
+- Audit: `auth.ip.blocked` (address, last user name tried, count, end of the block) and `auth.ip.unblocked`.
 
 ## 8. API tokens
 
@@ -899,7 +945,7 @@ Recorded actions:
 | Area | Actions |
 |---|---|
 | System | `system.init`, `system.start`, `system.stop` |
-| Sign-in | `auth.login` (success and failure), `auth.logout`, `auth.totp` (wrong code), `auth.ldap` (insecure LDAP refused), `auth.oidc` (OIDC failure), `user.oidc.bind` |
+| Sign-in | `auth.login` (success and failure), `auth.logout`, `auth.totp` (wrong code), `auth.ldap` (insecure LDAP refused), `auth.oidc` (OIDC failure), `user.oidc.bind`, `auth.password.weak` (existing password below the policy, change forced), `auth.ip.blocked`, `auth.ip.unblocked` (`"via": "cli"` from the console) |
 | Own account | `user.password`, `user.totp.enable`, `user.totp.disable`, `user.token.create`, `user.token.delete`, `hints.personal.save`, `hints.native.save` |
 | User admin | `user.create`, `user.update` (changed field names, never the password), `user.delete`, `user.reset_password`, `user.totp.reset` (two-factor reset, `"via": "cli"` from the console), `user.unlock`, `user.provision` |
 | Teams and hints | `team.create`, `team.update`, `team.delete`, `team.item.add`, `team.item.remove`, `hints.create`, `hints.update`, `hints.delete` |
@@ -1131,6 +1177,7 @@ This list follows the code's behaviour; the full reasoning is in
 | Host and Origin | Keep `server.allowed_hosts` and `server.allowed_origins` empty unless users really use another name or a direct address. |
 | Admin accounts | Few admins. Two-factor for all of them, then "Require two-factor for administrators". One local break-glass admin with a strong password stored safely. |
 | Sessions | Lower `auth.remember_days` and the sign-in lifetime if devices are shared. Users can revoke sessions in their settings. |
+| Failed sign-ins | Keep the address block on (`auth.ip_block_threshold` 10). Check Admin > Blocked addresses now and then; exempt only networks you control. |
 | Directory sign-in | LDAP over `ldaps://` or StartTLS with `caFile` for a private CA, least-privilege bind account, `allowInsecure` off. OIDC with an `https://` issuer, exact redirect URI, and `stripDomain: false` if the identity provider has more than one domain. |
 | Policies | Leave `allow_shell`, `config_edit`, `extensions_edit`, `providers_edit` and `notify_webhook` off for ordinary teams. Set `allowed_modes`, `allowed_providers`, `allowed_models`, `allowed_roots` and `max_concurrent_runs`. |
 | Shared items | Share extensions and providers only when every member may hold the copied credentials. Import MCP Apps and extensions only from trusted sources. |
@@ -1157,15 +1204,17 @@ the command):
 | `user add NAME [--password PW] [--admin]` | create a local user |
 | `user reset NAME [--password PW]` | temporary password, forced change, unlock, re-enable, switch to local sign-in, sign out everywhere, revoke API tokens |
 | `user reset-totp NAME` | remove the user's two-factor (lost authenticator), unlock, sign out everywhere, revoke API tokens |
+| `ip list` | addresses blocked after failed sign-ins, and addresses collecting failures |
+| `ip unblock ADDRESS` / `ip unblock --all` | end a block and clear the count (an IPv6 address unblocks its /64) |
 | `check` | diagnostics; exit code 1 if something is wrong |
 | `version` | print the version |
 
 Admin console tabs: Users, Teams & policy, Hints library, Auth providers, Settings, System, Ownership check, Host
-tasks, Audit log, Logs.
+tasks, Blocked addresses, Audit log, Logs.
 
 Admin REST endpoints (all under `/api/admin/`, admin session or admin API token; details in [API.md](API.md)):
 `users`, `users/{id}`, `users/{id}/reset-password`, `users/{id}/reset-totp`, `users/{id}/unlock`,
-`users/{id}/provision`, `teams`, `teams/{id}`, `teams/{id}/items`, `teams/{id}/items/{item}`, `library`, `hints`, `hints/{id}`, `auth`, `settings`,
+`users/{id}/provision`, `ip-blocks`, `ip-blocks/unblock`, `teams`, `teams/{id}`, `teams/{id}/items`, `teams/{id}/items/{item}`, `library`, `hints`, `hints/{id}`, `auth`, `settings`,
 `audit`, `system`, `system/workers/{key}/{restart|stop}`, `ownership`, `hosttasks`, `hosttasks/action`, `logs`.
 
 Health check: `GET /healthz` returns `ok` (exempt from the Host allow-list). It shows that the gateway process

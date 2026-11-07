@@ -44,6 +44,7 @@ export function renderLogin(root, { authConfig, onLoggedIn }) {
       } else if (code === 'invalid_credentials') { err.textContent = 'Invalid username or password.'; pass.select(); }
       else if (code === 'locked' || ex.status === 423) err.textContent = 'This account is temporarily locked. Try again later or ask an administrator.';
       else if (code === 'rate_limited' || ex.status === 429) err.textContent = 'Too many attempts. Please wait a minute.';
+      else if (code === 'ip_blocked') err.textContent = 'Sign-in from your network address is blocked after too many failed attempts. Ask an administrator to unblock it.';
       else err.textContent = ex.message || 'Sign-in failed.';
     } finally { submit.disabled = false; submit.classList.remove('is-busy'); }
   });
@@ -69,7 +70,8 @@ export function strengthProblems(pw, username = '') {
   if (!/[A-Z]/.test(pw)) p.push('An uppercase letter');
   if (!/[0-9]/.test(pw)) p.push('A number');
   if (!/[^A-Za-z0-9]/.test(pw)) p.push('A symbol');
-  if (username && pw.toLowerCase().includes(username.toLowerCase())) p.push('Must not contain your username');
+  // same rules as the server (security.password_problems): user names of 3+ characters only
+  if (username && username.length >= 3 && pw.toLowerCase().includes(username.toLowerCase())) p.push('Must not contain your username');
   return p;
 }
 export function strengthScore(pw) {

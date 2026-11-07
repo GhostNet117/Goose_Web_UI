@@ -14,7 +14,7 @@ import httpx
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
 from starlette.middleware.gzip import GZipMiddleware
-from starlette.requests import Request
+from starlette.requests import HTTPConnection, Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
@@ -27,6 +27,7 @@ from .config import Settings
 from .context import Ctx, HTTPError, _ip_in
 from .db import Database
 from .hub import Client, Hub
+from .ipblock import BLOCKED_MESSAGE
 from .profiles import Profiles
 from .workers import WorkerManager, goose_version
 
@@ -157,6 +158,37 @@ class HostGuard:
         if "websocket.http.response" in (scope.get("extensions") or {}):
             return await WebSocket(scope, receive, send).send_denial_response(bad)
         await send({"type": "websocket.close", "code": 1008, "reason": "invalid host"})
+
+
+class IPBlockGuard:
+    """Refuses every HTTP request and WebSocket handshake from a blocked client address (spec 007).
+
+    The address is `Ctx.client_ip` (X-Forwarded-For only from trusted proxies). GET/HEAD /healthz stays open.
+    Before the lifespan has created the context, everything passes.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        if scope["type"] == "http" and scope.get("path") == "/healthz" and scope.get("method") in ("GET", "HEAD"):
+            return await self.app(scope, receive, send)
+        app = scope.get("app")
+        c = getattr(getattr(app, "state", None), "ctx", None)
+        if c is None or not c.auth.ipblock.is_blocked(c.client_ip(HTTPConnection(scope))):
+            return await self.app(scope, receive, send)
+        if str(scope.get("path") or "").startswith("/api/"):
+            deny: Response = JSONResponse({"error": "ip_blocked", "message": BLOCKED_MESSAGE}, status_code=403,
+                                          headers={"Cache-Control": "no-store"})
+        else:
+            deny = PlainTextResponse(BLOCKED_MESSAGE, status_code=403, headers={"Cache-Control": "no-store"})
+        if scope["type"] == "http":
+            return await deny(scope, receive, send)
+        if "websocket.http.response" in (scope.get("extensions") or {}):
+            return await WebSocket(scope, receive, send).send_denial_response(deny)
+        await send({"type": "websocket.close", "code": 1008, "reason": "address blocked"})
 
 
 async def index(request: Request):
@@ -431,7 +463,8 @@ def create_app(settings: Settings) -> Starlette:
     app = Starlette(routes=routes, lifespan=lifespan,
                     exception_handlers={HTTPError: http_error, 404: not_found, 500: server_error,
                                         ValueError: _bad_request})
-    app.add_middleware(HostGuard, settings=settings)   # innermost: its 400 still gets the security headers
+    app.add_middleware(IPBlockGuard)                   # innermost: blocked addresses (spec 007), after the Host check
+    app.add_middleware(HostGuard, settings=settings)   # inner: its 400 still gets the security headers
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     app.add_middleware(SecurityHeaders, hsts=settings.public_url.startswith("https://"))
     return app

@@ -38,9 +38,22 @@ def ok(data: Any = None, status: int = 200) -> JSONResponse:
 
 
 def temp_password() -> str:
+    """A random temporary password (XXXX-XXXX-XXXX!d) that always meets the password policy."""
     alphabet = string.ascii_letters + string.digits
-    core = "".join(secrets.choice(alphabet) for _ in range(12))
-    return f"{core[:4]}-{core[4:8]}-{core[8:]}!7"
+    while True:
+        core = "".join(secrets.choice(alphabet) for _ in range(12))
+        pw = f"{core[:4]}-{core[4:8]}-{core[8:]}!{secrets.randbelow(10)}"
+        if not security.password_problems(pw):
+            return pw
+
+
+def _min_pw(c: Ctx) -> int:
+    return int(c.settings.get("auth", "min_password_length") or security.PASSWORD_MIN_LENGTH)
+
+
+def _weak(problems: list[str]) -> HTTPError:
+    # the UI shows message + ": " + problems, so the message itself does not repeat them
+    return HTTPError(400, "weak_password", "The password does not meet the rules", problems=problems)
 
 
 # ====================================================================== auth
@@ -177,12 +190,11 @@ async def me_password(request: Request):
         c.audit(request, "user.password", u, ok=False)
         raise HTTPError(400, "wrong_password", "Your current password is not correct")
     new = str(b.get("new") or "")
-    problems = security.password_problems(new, int(c.settings.get("auth", "min_password_length") or 10),
-                                          u["username"])
+    problems = security.password_problems(new, _min_pw(c), u["username"])
     if new == b.get("current"):
         problems.append("must differ from the current password")
     if problems:
-        raise HTTPError(400, "weak_password", "Password " + "; ".join(problems), problems=problems)
+        raise _weak(problems)
     c.db.update_user(u["id"], password_hash=await asyncio.to_thread(security.hash_password, new), must_change_pw=0)
     c.auth.revoke_user_sessions(u["id"], keep_hash=ident.session["token_hash"] if ident.session else None)
     revoked = c.auth.revoke_user_tokens(u["id"])  # a password change also ends API-token access (GW-21)
@@ -704,9 +716,9 @@ async def admin_users(request: Request):
     pw = b.get("password")
     if source == "local":
         if pw:
-            probs = security.password_problems(pw, int(c.settings.get("auth", "min_password_length") or 10), username)
+            probs = security.password_problems(pw, _min_pw(c), username)
             if probs:
-                raise HTTPError(400, "weak_password", "Password " + "; ".join(probs), problems=probs)
+                raise _weak(probs)
         else:
             temp = pw = temp_password()
     native_path = ""
@@ -715,7 +727,8 @@ async def admin_users(request: Request):
     uid = c.db.create_user(username=username, display_name=str(b.get("displayName") or username)[:120],
                            email=str(b.get("email") or "")[:200], role=role, auth_source=source,
                            password_hash=await asyncio.to_thread(security.hash_password, pw) if pw else None,
-                           must_change_pw=1 if (temp or b.get("mustChangePassword", True)) else 0,
+                           # spec 007: a password set by an administrator is always changed at first sign-in
+                           must_change_pw=1 if source == "local" else 0,
                            profile_mode=mode, profile_path=native_path)
     teams = b.get("teams")
     if teams is None and c.db.get_setting("default_team_id"):
@@ -778,12 +791,11 @@ async def admin_user(request: Request):
     if "policyOverrides" in b and isinstance(b["policyOverrides"], dict):
         fields["policy_overrides"] = {k: v for k, v in b["policyOverrides"].items() if k in DEFAULT_POLICY}
     if b.get("password"):
-        probs = security.password_problems(b["password"], int(c.settings.get("auth", "min_password_length") or 10),
-                                           u["username"])
+        probs = security.password_problems(b["password"], _min_pw(c), u["username"])
         if probs:
-            raise HTTPError(400, "weak_password", "Password " + "; ".join(probs), problems=probs)
+            raise _weak(probs)
         fields["password_hash"] = await asyncio.to_thread(security.hash_password, b["password"])
-        fields["must_change_pw"] = 1 if b.get("mustChangePassword", True) else 0
+        fields["must_change_pw"] = 1  # spec 007: always; "mustChangePassword" in the request is ignored
     c.db.update_user(u["id"], **fields)
     if "teams" in b:
         _set_links(c, "team_members", "team_id", "user_id", u["id"], b["teams"])
@@ -819,6 +831,30 @@ async def admin_user_unlock(request: Request):
     c.db.update_user(u["id"], failed_logins=0, locked_until=0)
     c.audit(request, "user.unlock", admin, target=u["username"])
     return ok()
+
+
+async def admin_ip_blocks(request: Request):
+    """Addresses blocked after repeated failed sign-ins, and addresses collecting failures (spec 007)."""
+    c = ctx(request)
+    c.require(request, admin=True)
+    return ok({"items": c.auth.ipblock.list(), **c.auth.ipblock.describe()})
+
+
+async def admin_ip_unblock(request: Request):
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    b = await body_json(request, 16 * 1024)
+    if b.get("all") is True:
+        n = c.auth.ipblock.unblock_all()
+        c.audit(request, "auth.ip.unblocked", admin, target="*", detail={"removed": n})
+        return ok({"removed": n})
+    ip = str(b.get("ip") or "").strip()[:64]
+    if not ip:
+        raise HTTPError(400, "bad_request", "ip is required")
+    if not c.auth.ipblock.unblock(ip):
+        raise HTTPError(404, "not_found", "That address is not blocked or counted")
+    c.audit(request, "auth.ip.unblocked", admin, target=ip)
+    return ok({"removed": 1})
 
 
 async def admin_user_reset_totp(request: Request):
@@ -1277,6 +1313,8 @@ routes = [
     Route("/api/admin/users/{uid:int}/unlock", admin_user_unlock, methods=["POST"]),
     Route("/api/admin/users/{uid:int}/reset-totp", admin_user_reset_totp, methods=["POST"]),
     Route("/api/admin/users/{uid:int}/provision", admin_user_provision, methods=["POST"]),
+    Route("/api/admin/ip-blocks", admin_ip_blocks),
+    Route("/api/admin/ip-blocks/unblock", admin_ip_unblock, methods=["POST"]),
     Route("/api/admin/teams", admin_teams, methods=["GET", "POST"]),
     Route("/api/admin/teams/{tid:int}", admin_team, methods=["GET", "PATCH", "DELETE"]),
     Route("/api/admin/teams/{tid:int}/items", admin_team_items, methods=["GET", "POST"]),

@@ -1,7 +1,6 @@
 """Shared runtime context and request helpers (auth, CSRF, client IP, JSON errors)."""
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
 import time
@@ -170,18 +169,7 @@ def url_origin(url: str) -> str:
     return f"{u.scheme}://{host}"
 
 
-def _ip_in(ip: str, nets: list[str]) -> bool:
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return False
-    for n in nets:
-        try:
-            if addr in ipaddress.ip_network(n, strict=False):
-                return True
-        except ValueError:
-            continue
-    return False
+_ip_in = security.ip_in  # one implementation, shared with the IP block (ipblock.py)
 
 
 async def body_json(request: Request, limit: int = 2 * 1024 * 1024) -> dict:
