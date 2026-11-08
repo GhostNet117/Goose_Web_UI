@@ -465,6 +465,6 @@ all Windows apps stay readable.
   127.0.0.1 to the same service, the gateway's port and another user's forwarder address were refused; another
   container could not open the pipe. Anything the relayed service accepts is reachable by every sandboxed user, so
   list only services meant for them (for example a model proxy) and keep their own authentication.
-- **Goose 1.50 `tools/call`** ignores `extensionName` and resolves a tool by name across the chat, so a policy that
+- **Goose 1.50.x `tools/call`** ignores `extensionName` (fixed in Goose 1.51) and resolves a tool by name across the chat, so a policy that
   allows direct calls for one extension could reach another extension's tool. The gateway now checks every direct
   tool call against `tools/list` of the named extension and refuses a mismatch (on all Goose versions).

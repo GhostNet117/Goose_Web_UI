@@ -35,16 +35,31 @@ for line in sys.stdin:
 """
 
 
-def test_parse_version_and_caps():
+def test_parse_version():
     assert parse_version("1.57.0") == (1, 57, 0) and parse_version("v1.50.1") == (1, 50, 1)
     assert parse_version("goose 1.50.1") == (1, 50, 1) and parse_version("") == ()
-    old = goose_caps({"agentInfo": {"version": "1.50.1"}})
-    assert old["supported"] and not old["liveVoice"] and not old["persistentSystemPrompt"] and not old["toolshim"]
-    assert old["importNeedsSource"]
-    new = goose_caps({"agentInfo": {"version": "1.57.0"}})
-    assert new["liveVoice"] and new["persistentSystemPrompt"] and new["toolshim"] and not new["importNeedsSource"]
-    assert goose_caps(None)["liveVoice"]                          # unknown version: assume the current feature set
-    assert not goose_caps({"agentInfo": {"version": "1.40.0"}})["supported"]
+
+
+# Measured against every release binary 1.50.0 - 1.57.0 (`goose acp` probes, 2026-11-08):
+# (toolCallScoped, toolshim, liveVoice, importWithoutSource, persistentSystemPrompt, compactTokenLimit)
+MEASURED = {
+    "1.50.0": (0, 0, 0, 0, 0, 0), "1.50.1": (0, 0, 0, 0, 0, 0), "1.51.0": (1, 1, 0, 0, 0, 0),
+    "1.52.0": (1, 1, 1, 0, 0, 0), "1.53.0": (1, 1, 1, 0, 0, 0), "1.54.0": (1, 1, 1, 1, 0, 0),
+    "1.55.0": (1, 1, 1, 1, 1, 1), "1.56.0": (1, 1, 1, 1, 1, 1), "1.57.0": (1, 1, 1, 1, 1, 1),
+}
+
+
+@pytest.mark.parametrize("ver", sorted(MEASURED))
+def test_caps_match_measured_goose_behaviour(ver):
+    c = goose_caps({"agentInfo": {"name": "goose", "version": ver}})
+    keys = ("toolCallScoped", "toolshim", "liveVoice", "importWithoutSource", "persistentSystemPrompt", "compactTokenLimit")
+    assert tuple(int(c[k]) for k in keys) == MEASURED[ver]
+    assert c["supported"] and c["importNeedsSource"] == (not c["importWithoutSource"]) and c["version"] == ver
+
+
+def test_caps_unknown_and_too_old():
+    assert all(v for k, v in goose_caps(None).items() if k not in ("version", "importNeedsSource"))  # assume current
+    assert not goose_caps({"agentInfo": {"version": "1.49.2"}})["supported"]
 
 
 class _OldGooseWorkers:
@@ -95,19 +110,22 @@ async def test_hub_adapts_to_goose_150(tmp_path):
         assert len(sent("_goose/unstable/tools/call")) == 1                         # the second never reached Goose
         # live voice does not exist before 1.57
         r = await call(3, "_goose/unstable/session/live-voice/availability", {"sessionId": "s1"})
-        assert r["error"]["code"] == -32601 and "1.57" in r["error"]["message"]
+        assert r["error"]["code"] == -32601 and "1.52" in r["error"]["message"]
         # session/import needs `source` on 1.50
         await call(4, "_goose/unstable/session/import", {"json": "{}"})
         assert sent("_goose/unstable/session/import")[-1]["params"]["source"] == "json"
-        # the per-chat system prompt is re-applied after a load (1.50 keeps it in memory only)
-        await call(5, "_goose/unstable/session/system-prompt/set", {"sessionId": "s1", "mode": "append", "text": "Be brief."})
+        # per-chat system prompts are re-applied after a load (1.50-1.54 keep them in memory only); one per mode/key
+        sp = "_goose/unstable/session/system-prompt/set"
+        await call(5, sp, {"sessionId": "s1", "mode": "append", "key": "goose-web", "text": "Be brief."})
+        await call(51, sp, {"sessionId": "s1", "mode": "set", "text": "Base."})
+        await call(52, sp, {"sessionId": "s1", "mode": "set", "text": ""})                  # cleared again
         await call(6, "session/load", {"sessionId": "s1", "cwd": os.path.abspath("/ws"), "mcpServers": []})
         for _ in range(100):
-            if len(sent("_goose/unstable/session/system-prompt/set")) == 2:
+            if len(sent(sp)) == 4:
                 break
             await asyncio.sleep(0.02)
-        again = sent("_goose/unstable/session/system-prompt/set")
-        assert len(again) == 2 and again[1]["params"] == {"sessionId": "s1", "mode": "append", "text": "Be brief."}
+        again = sent(sp)
+        assert len(again) == 4 and again[3]["params"] == {"sessionId": "s1", "mode": "append", "key": "goose-web", "text": "Be brief."}
     finally:
         await workers.stop("alice")
 

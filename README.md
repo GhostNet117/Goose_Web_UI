@@ -13,7 +13,7 @@ it, on a desktop or a phone.
   `%APPDATA%\Block\goose`) with all of its chats, recipes and settings. Nothing gets copied around, and Goose
   Desktop keeps working on the same profile.
 
-`goose-web 1.10.0` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
+`goose-web 1.10.1` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
 
 ## Features
 
@@ -98,8 +98,8 @@ and then goose-web itself with `--no-deps`.
 
 ## Quick start
 
-You need Goose 1.50 or later (the `goose` CLI, or Goose Desktop, which bundles it; a few features need 1.57, see
-[ADMINISTRATION 11.7](docs/ADMINISTRATION.md)) and Python 3.11+ or [uv](https://docs.astral.sh/uv/).
+You need Goose 1.50 or later (the `goose` CLI, or Goose Desktop, which bundles it; every release since 1.50.0 is tested; a few
+features need 1.51-1.55, see [ADMINISTRATION 11.7](docs/ADMINISTRATION.md)) and Python 3.11+ or [uv](https://docs.astral.sh/uv/).
 
 There is no default password. `goose-web init` creates the first admin with a **random initial password and prints
 it once**. The installers show it at the end of their output, and the Docker container prints it to its log on the

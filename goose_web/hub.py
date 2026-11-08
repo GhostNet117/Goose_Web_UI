@@ -46,8 +46,18 @@ WATCH_MAX_CHECKS = 40         # idle buffered sessions re-checked per change
 _READ_ONLY_SESSION_METHODS = {"session/load", "session/list", SESSION_INFO, "session/prompt", "session/cancel"}
 TRUNCATE = "_goose/unstable/session/conversation/truncate"
 SYSTEM_PROMPT_SET = "_goose/unstable/session/system-prompt/set"
-MIN_GOOSE = (1, 50)        # oldest Goose version goose-web is tested with
-MODERN_GOOSE = (1, 57)     # live voice, persisted system-prompt override, toolshim, tools/call scoped to extensionName
+MIN_GOOSE = (1, 50)        # oldest Goose version goose-web is tested with (every release 1.50.0 - 1.57.0)
+# First Goose version with each feature Goose Web adapts to, measured against every release binary 1.50.0-1.57.0
+# (`goose acp` probes; ADMINISTRATION 11.7). Everything else Goose Web uses behaves the same in all of them.
+FEATURE_SINCE = {
+    "toolCallScoped": (1, 51),           # tools/call honours extensionName (1.50 resolves the name across the chat)
+    "toolshim": (1, 51),                 # custom provider "toolshim" field
+    "liveVoice": (1, 52),                # _goose/unstable/session/live-voice/*
+    "importWithoutSource": (1, 54),      # session/import without "source" (1.50-1.53 require it)
+    "persistentSystemPrompt": (1, 55),   # session/system-prompt/set survives a worker restart
+    "compactTokenLimit": (1, 55),        # GOOSE_AUTO_COMPACT_TOKEN_LIMIT and the 225k default cap
+}
+MODERN_GOOSE = max(FEATURE_SINCE.values())   # every feature above
 
 
 def parse_version(v: Any) -> tuple[int, ...]:
@@ -63,13 +73,13 @@ def parse_version(v: Any) -> tuple[int, ...]:
 
 
 def goose_caps(init_result: dict | None) -> dict:
-    """Feature flags of the connected Goose, from initialize.agentInfo.version (Goose 1.50 and 1.57 report the same
-    capabilities otherwise). Unknown version = assume the current feature set."""
+    """Feature flags of the connected Goose, from initialize.agentInfo.version (FEATURE_SINCE). Unknown version =
+    assume the current feature set."""
     ver = ((init_result or {}).get("agentInfo") or {}).get("version") or ""
     v = parse_version(ver)
-    modern = not v or v >= MODERN_GOOSE
-    return {"version": ver, "supported": not v or v >= MIN_GOOSE, "liveVoice": modern,
-            "persistentSystemPrompt": modern, "toolshim": modern, "importNeedsSource": not modern}
+    caps = {k: (not v or v >= since) for k, since in FEATURE_SINCE.items()}
+    caps.update(version=ver, supported=not v or v >= MIN_GOOSE, importNeedsSource=not caps["importWithoutSource"])
+    return caps
 
 
 EXT_ADD = "_goose/unstable/session/extensions/add"
@@ -187,7 +197,7 @@ class SessionState:
     # process (Goose Desktop, the CLI, a schedule) writing the same session changes it -> the buffer is stale.
     fp: tuple | None = None
     fp_pending: bool = False
-    sys_prompt: dict | None = None   # last system-prompt override (re-sent after a load on Goose < 1.57)
+    sys_prompts: dict = field(default_factory=dict)   # (mode, key) -> override; re-sent after a load on Goose < 1.55
 
     def running(self) -> bool:
         return self.prompts > 0 or bool(self.run_id) or self.status in ("working", "needs_you")
@@ -415,7 +425,7 @@ class Upstream:
             if method == pol.TOOLS_CALL and params.get("extensionName"):
                 await self._check_tool_owner(params)
             if method.startswith("_goose/unstable/session/live-voice/") and not self.caps()["liveVoice"]:
-                raise RpcError(-32601, f"live voice needs Goose 1.57 or later (this worker runs Goose "
+                raise RpcError(-32601, f"live voice needs Goose 1.52 or later (this worker runs Goose "
                                        f"{self.caps()['version'] or '?'})")
             if method == "_goose/unstable/session/import" and self.caps()["importNeedsSource"] and "source" not in params:
                 params["source"] = "json"
@@ -509,11 +519,12 @@ class Upstream:
             raise pol.Denied(f"tool '{name[:200]}' does not belong to extension '{ext[:200]}'")
 
     async def _resend_sys_prompt(self, s: SessionState) -> None:
-        """Goose < 1.57 does not persist a session's system-prompt override: apply it again after a load."""
-        try:
-            await self.request(SYSTEM_PROMPT_SET, dict(s.sys_prompt or {}, sessionId=s.sid), timeout=30)
-        except Exception as e:  # the chat still works, only without the override
-            log.warning("re-applying the system prompt of %s failed: %s", s.sid, e)
+        """Goose < 1.55 does not persist a session's system-prompt overrides: apply them again after a load."""
+        for p in list(s.sys_prompts.values()):
+            try:
+                await self.request(SYSTEM_PROMPT_SET, dict(p, sessionId=s.sid), timeout=30)
+            except Exception as e:  # the chat still works, only without the override
+                log.warning("re-applying the system prompt of %s failed: %s", s.sid, e)
 
     def _check_concurrency(self, client: Client, params: dict) -> None:
         limit = int(client.policy.get("max_concurrent_runs") or 0)
@@ -769,8 +780,13 @@ class Upstream:
                 self._refresh_fp_soon(s)
         elif method == SYSTEM_PROMPT_SET and ok:
             s = self.sess(sid0)
-            # Goose < 1.57 keeps the override only in the in-memory agent: remember it to re-send after a load.
-            s.sys_prompt = dict(params) if str(params.get("text") or "").strip() else None
+            # Goose < 1.55 keeps overrides only in the in-memory agent: remember them (one per mode and key, as
+            # Goose does; empty text clears) to re-send after a load.
+            slot = (str(params.get("mode") or "append"), str(params.get("key") or ""))
+            if str(params.get("text") or "").strip():
+                s.sys_prompts[slot] = {k: v for k, v in params.items() if k != "sessionId"}
+            else:
+                s.sys_prompts.pop(slot, None)
         elif method == "session/load":
             s = self.sess(str(params.get("sessionId") or ""))
             s.loading_client = None
@@ -779,7 +795,7 @@ class Upstream:
                 if client is not None:
                     client.watch.add(s.sid)
                 self._refresh_fp_soon(s)
-                if s.sys_prompt and not self.caps()["persistentSystemPrompt"]:
+                if s.sys_prompts and not self.caps()["persistentSystemPrompt"]:
                     self._spawn(self._resend_sys_prompt(s))
         elif method == "session/prompt":
             s = self.sess(str(params.get("sessionId") or ""))

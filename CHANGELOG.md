@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.10.1 - 2026-11-08
+
+- **Every Goose release from 1.50.0 to 1.57.0 tested end to end** (administrator on `goose serve`, sandboxed member on
+  `goose acp` with a relay). Goose Web now adapts per feature at the version that introduced it instead of treating
+  everything before 1.57 like 1.50: scoped tool calls and the tool-shim option 1.51, live voice 1.52, import without
+  `source` 1.54, saved per-chat system prompt and `GOOSE_AUTO_COMPACT_TOKEN_LIMIT` 1.55 (ADMINISTRATION 11.7).
+  `goose-web check` lists what a version lacks.
+- **Fix:** the chat's System prompt dialog failed with "Invalid params" in *Append* mode on every Goose version (Goose
+  needs a key for appended prompts). Appended prompts now use the key `goose-web`; the gateway re-applies both the
+  appended and the replaced prompt after a worker restart on Goose before 1.55.
+
 ## 1.10.0 - 2026-11-08
 
 - **Goose 1.50 support:** Goose Web now works with Goose 1.50 and later (tested with 1.50.1 and 1.57.0). It reads the

@@ -433,14 +433,21 @@ def cmd_check(args, settings) -> int:
     gv = goose_version(gb)
     line("goose binary", f"{gb} ({gv or 'not runnable'})", bool(gv))
     if gv:
-        from .hub import MIN_GOOSE, MODERN_GOOSE, parse_version
+        from .hub import FEATURE_SINCE, MIN_GOOSE, parse_version
         v = parse_version(gv)
         if v and v < MIN_GOOSE:
             line("goose version", f"{gv} is older than {'.'.join(map(str, MIN_GOOSE))}, the oldest supported version", False)
-        elif v and v < MODERN_GOOSE:
-            print(f"[OK] goose version: {gv} is supported. Goose {'.'.join(map(str, MODERN_GOOSE))} or later adds live "
-                  "voice, a saved per-chat system prompt, the tool-shim option and the 225k compaction cap setting "
-                  "(GOOSE_AUTO_COMPACT_TOKEN_LIMIT); see docs/ADMINISTRATION.md 'Goose versions'.")
+        elif v:
+            later = {k: since for k, since in FEATURE_SINCE.items() if v < since}
+            if later:
+                names = {"toolCallScoped": "tool calls scoped to their extension (checked by Goose Web instead)",
+                         "toolshim": "tool-shim option", "liveVoice": "live voice",
+                         "importWithoutSource": "chat import without a source (added by Goose Web)",
+                         "persistentSystemPrompt": "saved per-chat system prompt (re-applied by Goose Web)",
+                         "compactTokenLimit": "GOOSE_AUTO_COMPACT_TOKEN_LIMIT / the 225k cap"}
+                print(f"[OK] goose version: {gv} is supported; added in later Goose versions: " + "; ".join(
+                    f"{names[k]} ({'.'.join(map(str, s))})" for k, s in later.items()) +
+                    ". See docs/ADMINISTRATION.md 11.7.")
     line("running as", f"{winsec.current_user()} integrity={winsec.integrity_level()}", not winsec.is_elevated())
     line("profiles root", settings.profiles_root, settings.profiles_root.exists())
     if os.name == "nt":

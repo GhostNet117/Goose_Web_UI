@@ -396,7 +396,7 @@ export function systemPromptDialog(chat) {
     title: 'Session system prompt', size: 'lg',
     body: h('div', { class: 'stack' }, (store.get('gooseCaps') || {}).persistentSystemPrompt === false ? banner('info', 'This Goose version keeps the override only while the chat is open in this worker. Goose Web applies it again when you reopen the chat, as long as the gateway has not restarted.') : null, h('p', { class: 'muted' }, 'Applies only to this chat. Use Settings → System prompts to change the defaults.'), field('Mode', modeSel), field('Text', ta)),
     footer: [btn('Cancel', () => m.close()), btn('Apply', async () => {
-      try { await rpc.call(G('session/system-prompt/set'), { sessionId: chat.id, mode, text: ta.value }); toast('System prompt updated', { kind: 'success' }); m.close(); } catch (e) { toastError(e, 'System prompt'); }
+      try { await rpc.call(G('session/system-prompt/set'), { sessionId: chat.id, mode, text: ta.value, ...(mode === 'append' ? { key: 'goose-web' } : {}) }); toast('System prompt updated', { kind: 'success' }); m.close(); } catch (e) { toastError(e, 'System prompt'); }
     }, { variant: 'primary' })],
   });
 }

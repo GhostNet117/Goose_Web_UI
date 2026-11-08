@@ -1117,17 +1117,17 @@ account at a different set of chats.
 
 Moving the native Goose folder itself (for example to `C:\AI\Goose_appdata`): section 3.4 (`goose-web native-root`).
 
-### 11.5 Goose settings that matter for long chats and slow extensions (Goose 1.57)
+### 11.5 Goose settings that matter for long chats and slow extensions (Goose 1.55 and later)
 
 Administrators can change any Goose configuration key in **Settings > Advanced config** (written through Goose itself,
 in the profile you are signed in to; for isolated profiles each user's own `config.yaml`).
 
-- **Chats compact at about 225k tokens even on 1M-token models.** Goose 1.57 compacts at
+- **Chats compact at about 225k tokens even on 1M-token models.** Goose 1.55 and later compact at
   `min(GOOSE_AUTO_COMPACT_THRESHOLD (0.8), GOOSE_AUTO_COMPACT_TOKEN_LIMIT / context_limit)` of the model's context
   window, and `GOOSE_AUTO_COMPACT_TOKEN_LIMIT` defaults to 225000. Set it to your largest model window (for example
   `1000000`) so every model compacts at 80% of its own window. The value is read at the start of each turn. Do not
   use `GOOSE_CONTEXT_LIMIT` for this: it overrides the window of every model.
-- **Extensions missing from new chats ("process quit before initialization").** Goose 1.57 gives a command (stdio)
+- **Extensions missing from new chats ("process quit before initialization").** Goose (every version since 1.50) gives a command (stdio)
   extension 10 seconds to answer its first handshake; slow starters (Python/uv/node servers, several chats starting
   at once) are dropped silently. Make the server start faster, give it a launcher that answers the handshake at once,
   or use a remote (HTTP) extension. Each chat stores the extension commands it was created with, so a changed
@@ -1140,7 +1140,7 @@ in the profile you are signed in to; for isolated profiles each user's own `conf
 - **Older chats keep their extension commands.** A chat started before you changed an extension's command keeps the
   old one. Goose Web marks such extensions **outdated** and offers **Refresh extensions** (chat menu or the Session
   extensions dialog): it removes them from the chat and adds the current definition, through Goose.
-- **Goose 1.50 to 1.56** have no `GOOSE_AUTO_COMPACT_TOKEN_LIMIT` (11.7).
+- **Goose 1.50 to 1.54** have no `GOOSE_AUTO_COMPACT_TOKEN_LIMIT` (11.7).
 
 ### 11.6 Sandboxing users' agents (Windows AppContainer)
 
@@ -1225,20 +1225,22 @@ own Python (its base installation is granted Read & execute). Relays take effect
 ### 11.7 Goose versions (1.50 and later)
 
 Goose Web works with Goose **1.50 or later** and detects the version of each worker when it connects (the
-`initialize` answer; `goose-web check` and `install.ps1` report it too). It was tested against 1.50.1 and 1.57.0.
-Versions from 1.51 to 1.56 are treated like 1.50. Differences on Goose older than 1.57:
+`initialize` answer; `goose-web check` and `install.ps1` report it too). Every release from 1.50.0 to 1.57.0 was
+tested end to end (an administrator on `goose serve` and a sandboxed member on `goose acp`: chatting, reopening a chat
+after a worker restart, fork, edit and rerun, extensions, tool calls, delete). They behave the same except for the
+features below, which arrived in these versions:
 
-| Feature | Goose 1.50 | What Goose Web does |
+| Feature | First Goose version | On older Goose, Goose Web ... |
 |---|---|---|
-| Direct tool calls (`tools/call` with `extensionName`) | Goose ignores `extensionName` and runs any tool of the chat with that name | The gateway checks the tool against the named extension (`tools/list`) and refuses a mismatch, on every Goose version |
-| Live voice (`session/live-voice/*`) | Not available | Refused with a clear message |
-| Per-chat system prompt (chat menu > System prompt) | Kept only in the running worker | Re-applied when the chat is opened again; lost after a gateway restart (the dialog says so) |
-| Custom provider "Tool shim" option | Unknown to Goose | The checkbox is hidden |
-| Importing a chat (`session/import`) | Needs a `source` | Sent as `source: json` |
-| The 225k compaction cap (`GOOSE_AUTO_COMPACT_TOKEN_LIMIT`, 11.5) | Does not exist: Goose compacts at `GOOSE_AUTO_COMPACT_THRESHOLD` (0.8) x the model's window | Nothing to do; lower `GOOSE_AUTO_COMPACT_THRESHOLD` to compact earlier |
+| Direct tool calls (`tools/call`) honour `extensionName` | 1.51 | checks the tool against the named extension (`tools/list`) and refuses a mismatch; it does this on every version |
+| Custom provider "Tool shim" option | 1.51 | hides the checkbox |
+| Live voice (`session/live-voice/*`) | 1.52 | refuses it with a clear message |
+| Importing a chat (`session/import`) without `source` | 1.54 | sends `source: json` |
+| Per-chat system prompt (chat menu > System prompt) kept when the worker restarts | 1.55 | re-applies it when the chat is opened again (kept by the gateway; lost when the gateway itself restarts - the dialog says so) |
+| `GOOSE_AUTO_COMPACT_TOKEN_LIMIT` and its 225k default cap (11.5) | 1.55 | nothing to do: older Goose compacts at `GOOSE_AUTO_COMPACT_THRESHOLD` (0.8) x the model's window |
 
-Extension start-up (the 10-second handshake limit in 11.5) behaves the same on 1.50 and 1.57. Install and upgrade
-are the same for both: point `goose.binary` (or `install.ps1 -GooseBinary`) at the goose CLI you use.
+Extension start-up (the 10-second handshake limit in 11.5) behaves the same in all of them. Install and upgrade are
+the same for every version: point `goose.binary` (or `install.ps1 -GooseBinary`) at the goose CLI you use.
 
 After upgrading Goose, run `goose-web check`, open a chat and check that its extensions load. If an upgrade changes
 Goose's compaction or extension start-up behaviour, revisit the settings in 11.5.
