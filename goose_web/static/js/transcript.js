@@ -1,6 +1,7 @@
 // Transcript: incremental, windowed rendering of a session's update stream.
 // Items are built lazily; only the last WINDOW items are attached to the DOM until "show earlier".
-import { h, prettyJson, copyBtn, iconBtn, toDate, fmtNum, fmtCost, btn } from './ui.js';
+import { h, prettyJson, copyBtn, iconBtn, toDate, fmtNum, fmtCost, btn, confirmDialog, toast, toastError } from './ui.js';
+import { router } from './router.js';
 import { icon, logo } from './icons.js';
 import { setMarkdown } from './markdown.js';
 import { askCard } from './asks.js';
@@ -15,6 +16,11 @@ const KIND_ICON = { read: 'file', edit: 'edit', delete: 'trash', move: 'file', s
 function timeOf(meta) {
   const c = meta && meta.goose && meta.goose.created;
   return c ? toDate(c) : null;
+}
+// Server time in whole seconds (Goose's message.created), used to cut the conversation when a prompt is edited.
+function createdOf(meta) {
+  const c = meta && meta.goose && meta.goose.created;
+  return Number.isInteger(c) ? c : null;
 }
 
 export class Transcript {
@@ -193,8 +199,52 @@ export class Transcript {
       h('div', { class: 'tr-user-meta' }, item.steer ? h('span', { class: 'badge badge-accent' }, 'steer') : null,
         prefs().showTimestamps && t ? h('span', { class: 'tr-time' }, t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })) : null),
       body,
-      h('div', { class: 'tr-actions' }, copyBtn(() => item.blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n'))));
+      item.actions = h('div', { class: 'tr-actions' }, copyBtn(() => item.blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n')),
+        item.steer ? null : iconBtn('edit', 'Edit and rerun from here', () => this.openEditor(item))));
     return el;
+  }
+
+  // Inline editor for a sent prompt (spec 010): Rerun here (replace the rest of this chat) or Branch (new chat).
+  openEditor(item) {
+    if (item.editing || !item.el) return;
+    if (this.chat.running || this.chat.promptPending) { toast('Stop the current run before editing a message.', { kind: 'warn' }); return; }
+    item.editing = true;
+    const text = item.blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+    const ta = h('textarea', { class: 'inp tr-edit-text', rows: String(Math.min(16, Math.max(3, text.split('\n').length + 1))), 'aria-label': 'Edit message' });
+    ta.value = text;
+    const others = item.blocks.length - item.blocks.filter((b) => b.type === 'text').length;
+    let buttons;
+    const close = () => { item.editing = false; ed.remove(); if (item.body) item.body.hidden = false; if (item.actions) item.actions.hidden = false; };
+    const run = async (mode) => {
+      const t = ta.value.trim();
+      if (!t) { ta.focus(); return; }
+      if (mode === 'replace' && !(await confirmDialog({ title: 'Rerun from here?', message: 'This message and everything after it are removed from this chat, then the edited message is sent. This cannot be undone. Choose Branch instead to keep the original conversation.', confirmText: 'Rerun here', danger: true }))) return;
+      buttons.forEach((b) => { b.disabled = true; });
+      try {
+        const id = await this.chat.editAndRerun(item, t, mode);
+        if (mode === 'branch') { close(); router.go('/chat/' + encodeURIComponent(id)); }
+      } catch (e) {
+        toastError(e, mode === 'branch' ? 'Branch' : 'Edit');
+        buttons.forEach((b) => { b.disabled = false; });
+      }
+    };
+    buttons = [
+      btn('Rerun here', () => run('replace'), { variant: 'primary', size: 'sm', icon: 'refresh' }),
+      btn('Branch', () => run('branch'), { size: 'sm', icon: 'fork' }),
+      btn('Cancel', close, { size: 'sm' }),
+    ];
+    const ed = h('div', { class: 'tr-edit' }, ta,
+      others ? h('div', { class: 'muted small' }, others + ' attachment(s) of the original message are sent again.') : null,
+      h('div', { class: 'tr-edit-actions' }, ...buttons,
+        h('span', { class: 'muted small' }, 'Rerun here replaces the rest of this chat; Branch starts a new chat and keeps this one.')));
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); close(); }
+      else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); run(e.shiftKey ? 'branch' : 'replace'); }
+    });
+    if (item.body) item.body.hidden = true;
+    if (item.actions) item.actions.hidden = true;
+    item.el.appendChild(ed);
+    ta.focus();
   }
   renderUserBlocks(item) {
     const body = item.body; if (!body) return;
@@ -379,7 +429,7 @@ export class Transcript {
   }
 
   // ---------- public API used by ChatSession ----------
-  addUser(blocks, { messageId = null, time = null, steer = false, pending = false } = {}) {
+  addUser(blocks, { messageId = null, time = null, created = null, steer = false, pending = false } = {}) {
     if (messageId && this.users.has(messageId)) {
       const it = this.users.get(messageId);
       it.blocks.push(...blocks);
@@ -397,7 +447,7 @@ export class Transcript {
         }
       }
     }
-    const item = { kind: 'user', blocks: [...blocks], messageId, time: time || new Date(), steer, local: !messageId, pending };
+    const item = { kind: 'user', blocks: [...blocks], messageId, time: time || new Date(), created: Number.isInteger(created) ? created : null, steer, local: !messageId, pending };
     if (messageId) this.users.set(messageId, item);
     this.finalizeAll();
     this.lastPlan = null;
@@ -417,7 +467,7 @@ export class Transcript {
     let item = null;
     if (last && last.kind === 'agent' && (!messageId || last.messageId === messageId)) item = last;
     if (!item) {
-      item = { kind: 'agent', text: '', messageId, time: timeOf(meta) || new Date(), final: false };
+      item = { kind: 'agent', text: '', messageId, time: timeOf(meta) || new Date(), created: createdOf(meta), final: false };
       this.push(item);
       if (messageId) this.byMsg.set(messageId, item);
     }
@@ -431,7 +481,7 @@ export class Transcript {
     const last = this.items[this.items.length - 1];
     let item = last && last.kind === 'thought' && (!messageId || last.messageId === messageId) ? last : null;
     if (!item) {
-      item = { kind: 'thought', text: '', messageId, time: timeOf(meta) || new Date(), live: !this.bulk && !!this.turn };
+      item = { kind: 'thought', text: '', messageId, time: timeOf(meta) || new Date(), created: createdOf(meta), live: !this.bulk && !!this.turn };
       if (item.live) this.turn.thoughts.add(item);
       this.push(item);
     }
@@ -446,7 +496,7 @@ export class Transcript {
     const st = item && item.data && item.data.status;
     if (item && (st === 'completed' || st === 'failed')) item = null;
     if (item) { item.data = { ...item.data, ...strip(u) }; takeApp(item, u); if (!this.bulk) { this.renderTool(item); this.toolPhase(item); } return item; }
-    item = { kind: 'tool', data: strip(u), id: u.toolCallId, live: '', time: timeOf(u._meta) || new Date(), liveTurn: !this.bulk && !!this.turn };
+    item = { kind: 'tool', data: strip(u), id: u.toolCallId, live: '', time: timeOf(u._meta) || new Date(), created: createdOf(u._meta), liveTurn: !this.bulk && !!this.turn };
     takeApp(item, u);
     this.tools.set(u.toolCallId, item);
     if (item.liveTurn) this.turn.tools++;

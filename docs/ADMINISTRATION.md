@@ -83,16 +83,34 @@ Run the installer as the normal Windows user that uses Goose, from a normal (not
 repository folder. It refuses to run elevated (exit code 3), because files created by an elevated process become
 owned by Administrators and Goose can then no longer manage them.
 
+Get the code with git, so that later upgrades are one command (section 20). The folder you clone into **is** the
+installation (the package is installed in editable mode), so pick its final place:
+
 ```powershell
+git clone https://github.com/GhostNet117/Goose_Web_UI.git C:\GooseWeb
 cd C:\GooseWeb
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 
+Without git, download the release ZIP from GitHub and unpack it to the final folder; upgrades then use
+`upgrade.ps1 -NoGit` after you replace the files.
+
+Goose installed somewhere else, or its appdata folder moved (for example Goose in `C:\AI\Goose` and its data in
+`C:\AI\Goose_appdata`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -GooseBinary C:\AI\Goose\resources\bin\goose.exe `
+  -GooseAppData C:\AI\Goose_appdata -ProfilesRoot C:\AI\Goose_Web_Profiles
+```
+
+See section 3.4 for what these folders are and how to change them later.
+
 What it does:
 
 1. Creates `.venv` in the install folder and installs the locked dependencies, then the package (editable, `-e .`).
-2. Finds the Goose profile: `-GooseAppData` if given, otherwise `%APPDATA%\Block\goose` if it has a `config`
-   subfolder, otherwise it asks. An empty answer (or `-GooseAppData fresh`) creates a fresh profile in
+2. Finds the Goose profile: `-GooseAppData` if given, otherwise the folder in the `GOOSE_PATH_ROOT` environment
+   variable if it has a `config` subfolder, otherwise `%APPDATA%\Block\goose` if it has a `config` subfolder,
+   otherwise it asks. An empty answer (or `-GooseAppData fresh`) creates a fresh profile in
    `<ProfilesRoot>\appdata`.
 3. Creates `<ProfilesRoot>\_system`, restricts the profiles root ACL to the installing user, SYSTEM and
    Administrators (`icacls ... /inheritance:r`), and writes `<ProfilesRoot>\_system\config.yaml` if it does not
@@ -202,6 +220,30 @@ Behind a reverse proxy, add to `environment:`:
 Trust only the proxy's own address. Every host in a trusted range can forge the client IP that rate limiting, the
 lockout, the address block and the audit log rely on, so do not trust a whole Docker network range unless you must.
 
+### 3.4 Custom Goose folders (program and appdata)
+
+Two Goose folders matter, and both can live anywhere:
+
+| Folder | What it is | Default | How to point goose-web at it |
+|---|---|---|---|
+| Goose program | the `goose` CLI (`goose.exe`; Goose Desktop ships it in `resources\bin\`) | auto-detected: `goose` on `PATH`, `%LOCALAPPDATA%\Programs\Goose\resources\bin`, `%ProgramFiles%\Goose\resources\bin`, `%USERPROFILE%\.local\bin` | `install.ps1 -GooseBinary <path>` (also on a re-run: it sets `goose.binary` and keeps the rest of `config.yaml`), or edit `goose.binary` in `config.yaml` and restart |
+| Goose appdata ("native profile") | Goose's `config\`, `data\`, `state\`: settings, providers, extensions, secrets, chats | `%APPDATA%\Block\goose` | `install.ps1 -GooseAppData <folder>` (or set `GOOSE_PATH_ROOT` before installing); later: `goose-web native-root <folder>` and restart the gateway |
+
+`goose-web native-root` (no argument) shows the current folder. With a folder it checks that `<folder>\config`
+exists, stores it, moves every native user that used the old folder to the new one and writes an audit entry
+(`system.native_root`). It does not copy any files: move or copy the Goose appdata yourself first, with Goose
+Desktop and the gateway stopped.
+
+Goose itself finds a moved appdata folder through the user environment variable `GOOSE_PATH_ROOT`. Set it for the
+Windows account so that Goose Desktop and the goose CLI use the same folder as the gateway:
+
+```powershell
+[Environment]::SetEnvironmentVariable('GOOSE_PATH_ROOT', 'C:\AI\Goose_appdata', 'User')   # then sign out and in
+```
+
+The gateway passes `GOOSE_PATH_ROOT` to the native worker itself, so it works even without that variable. Isolated
+web users never use the native profile; their profiles are below the profiles root.
+
 ## 4. First start and the initial admin password
 
 There is no default password. `goose-web init` creates the first admin:
@@ -255,7 +297,14 @@ installer) creates:
   `-FirewallRemoteAddress` (default `LocalSubnet`).
 
 Because the task is a logon task, the gateway runs while that user is signed in to Windows (a locked screen is
-fine). It stops when the user signs out.
+fine). It stops when the user signs out. `goose-web check` shows the task (`[OK] autostart task: ...`), or
+`[--] ... none registered` when it is missing; the installer registers it, a re-run of the installer keeps an
+existing one (`-Reregister` registers it again), and `upgrade.ps1` never changes it.
+
+Start at boot without anyone signing in is not part of the default setup: it needs a task that stores the account's
+password ("Run whether user is logged on or not"); an S4U task or a SYSTEM service cannot read the account's Windows
+Credential Manager secrets that the native profile's providers use, and every program the agents depend on (for
+example a local model proxy that starts at logon) must then start at boot as well.
 
 ```powershell
 # start, stop and inspect the task
@@ -1193,18 +1242,42 @@ docker compose -f docker/compose.yaml start goose-web
 
 ## 20. Upgrades
 
-### 20.1 Native installs
+### 20.1 Windows: `scripts\upgrade.ps1`
+
+One command, run as the gateway's normal (non-elevated) Windows user in the install folder:
+
+```powershell
+cd C:\GooseWeb
+powershell -ExecutionPolicy Bypass -File scripts\upgrade.ps1            # newest commit of the current branch
+powershell -ExecutionPolicy Bypass -File scripts\upgrade.ps1 -Ref v1.6.0   # a specific tag or commit
+```
+
+It finds the gateway task and its `config.yaml`, refuses while an agent is running (`-Force` overrides), backs up the
+database (online SQLite backup) and `config.yaml` to `<profiles_root>\backups\upgrade-<time>\` **before** anything
+changes, updates the code (`git pull --ff-only`, or `git checkout <Ref>`), installs the locked dependencies (with
+`uv` when available - Goose ships it in `%LOCALAPPDATA%\Goose\bin` - otherwise pip), runs `goose-web check`, and only
+then restarts the task and waits for `/healthz`. It prints the version before and after. Settings are never
+touched: the task, the firewall rule, `config.yaml`, the database content (schema migrations run when the new
+version opens it, after the backup), user profiles and Goose's own folders stay as they are. If any step fails it
+stops; up to the restart, the gateway keeps running the old version. The log is in `%TEMP%` (`-Log FILE` to
+choose).
+
+- ZIP install (no git): unpack the new release over the install folder, then `upgrade.ps1 -NoGit`.
+- From 1.5.x or older (no `upgrade.ps1` yet): `git -C C:\GooseWeb pull --ff-only`, then
+  `scripts\upgrade.ps1 -NoGit`.
+- 1.6.0 no longer looks for goose in `C:\Goose\dist-windows\resources\bin`. If `check` reports
+  `[!!] goose binary: goose (not runnable)`, run `scripts\install.ps1 -GooseBinary <path to goose.exe>` (keeps
+  everything else, does not register a second task) and then `upgrade.ps1 -NoGit`.
+- Upgrading from a chat that runs through this goose-web (an agent doing it for you): add `-Detached`. The script
+  starts itself outside the chat's process tree after `-DelaySeconds` (60) and returns; otherwise the restart would
+  end the chat's shell before the gateway is started again. Read the log afterwards.
+
+### 20.2 Linux and macOS
 
 1. Read the release notes and back up (section 19).
-2. Stop the gateway (`Stop-ScheduledTask ...` or `systemctl --user stop goose-web`).
-3. Replace the install folder's contents with the new release (for example update your clone of the repository).
+2. Stop the gateway (`systemctl --user stop goose-web`).
+3. Update your clone of the repository (`git pull --ff-only`).
 4. Reinstall the dependencies from the lock file and the package:
-
-   ```powershell
-   cd C:\GooseWeb
-   .venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock
-   .venv\Scripts\python.exe -m pip install --no-deps -e .
-   ```
 
    ```bash
    cd /opt/goose-web
@@ -1212,8 +1285,7 @@ docker compose -f docker/compose.yaml start goose-web
    .venv/bin/python -m pip install --no-deps -e .
    ```
 
-   Alternatively, run the installer again: it keeps `config.yaml`, the database and the admin password, and
-   registers the task again (use `-NoService` on Windows to skip that step).
+   Alternatively, run the installer again: it keeps `config.yaml`, the database and the admin password.
 5. Start the gateway and run `goose-web check`.
 6. Ask users to reload the page (a hard refresh if the old UI still shows, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)).
 
@@ -1222,14 +1294,14 @@ version is kept in the `meta` table (`schema_version`, currently 4). Column migr
 and indexes. The upgrade to 1.5.0 also converts team policies and memberships once (section 9.8), so back up the
 database first. Keep the pre-upgrade database backup as your rollback path.
 
-### 20.2 Updating Goose (native)
+### 20.3 Updating Goose (native)
 
 Update the goose CLI or Goose Desktop as usual. Workers use the new binary the next time they start: restart them in
 Admin > System, or restart the gateway (the goose version shown in Admin > System is read at gateway start).
 `goose.binary` pins a specific binary; when it is empty the gateway uses `goose` on `PATH`, then the usual install
 locations.
 
-### 20.3 Docker
+### 20.4 Docker
 
 The image is built locally from the repository. To upgrade goose-web, update the repository and rebuild:
 

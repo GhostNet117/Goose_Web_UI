@@ -50,9 +50,10 @@ def cmd_serve(args, settings) -> int:
 def _resolve_native_root(value: str | None, settings) -> str:
     from .config import default_native_goose_root
     if not value or value == "auto":
-        cand = default_native_goose_root()
-        if Path(cand, "config").is_dir():
-            return cand
+        # Goose's own GOOSE_PATH_ROOT (a custom appdata folder such as C:\AI\Goose_appdata) wins over the default.
+        for cand in (os.environ.get("GOOSE_PATH_ROOT") or "", default_native_goose_root()):
+            if cand and Path(cand, "config").is_dir():
+                return cand
         value = "fresh"
     if value == "fresh":
         p = settings.profiles_root / "appdata"
@@ -157,6 +158,60 @@ def cmd_init(args, settings) -> int:
     if generated:
         _print_initial_password(name, password)
     return 0
+
+
+def cmd_native_root(args, settings) -> int:
+    """Show or move the native Goose profile (the Goose appdata folder: <root>\\config, <root>\\data) after install."""
+    from .db import Database
+    db = Database(settings.system_dir / "goose-web.db")
+    old = db.get_setting("native_root") or ""
+    if not args.path:
+        print(f"Native Goose profile: {old or '(not set)'}")
+        return 0
+    p = Path(args.path)
+    if p.name.lower() == "config" and (p / "config.yaml").exists():
+        p = p.parent
+    if not (p / "config").is_dir():
+        print(f"error: {p} has no config folder; point to the Goose appdata folder that contains config\\ and data\\",
+              file=sys.stderr)
+        return 2
+    new = str(p)
+    norm = lambda s: os.path.normcase(os.path.normpath(s)) if s else ""  # noqa: E731
+    users = [u for u in db.users() if u["profile_mode"] == "native"
+             and (not u["profile_path"] or norm(u["profile_path"]) == norm(old))]
+    db.set_setting("native_root", new)
+    for u in users:
+        db.update_user(u["id"], profile_path=new)
+    db.audit("system.native_root", target=new, detail={"old": old, "users": [u["username"] for u in users]})
+    print(f"Native Goose profile: {old or '(not set)'} -> {new}; updated {len(users)} native user(s): "
+          f"{', '.join(u['username'] for u in users) or '-'}. Restart the gateway to apply.")
+    print("Goose Desktop on this account must use the same folder: set the user environment variable "
+          f"GOOSE_PATH_ROOT={new} (leave it unset for the default %APPDATA%\\Block\\goose).")
+    return 0
+
+
+def _gateway_tasks() -> list[str]:
+    """Windows: scheduled tasks that run this install's gateway (empty list if none or not Windows)."""
+    if os.name != "nt":
+        return []
+    import subprocess
+    venv = os.path.normcase(os.path.dirname(sys.executable))
+    ps = ("Get-ScheduledTask | Where-Object { $_.Actions | Where-Object { $_.Arguments -match 'goose_web' -and "
+          "$_.Arguments -match 'serve' } } | ForEach-Object { $_.TaskPath + $_.TaskName + '|' + $_.State + '|' + "
+          "(($_.Actions | ForEach-Object { $_.Execute }) -join ';') }")
+    exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0",
+                       "powershell.exe")
+    try:  # fixed command, no user input
+        out = subprocess.run([exe, "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=60,  # nosec B603
+                             stdin=subprocess.DEVNULL).stdout
+    except Exception:
+        return []
+    rows = []
+    for ln in out.splitlines():
+        parts = ln.strip().split("|")
+        if len(parts) == 3 and os.path.normcase(os.path.dirname(parts[2].strip('"'))) == venv:
+            rows.append(f"{parts[0]} ({parts[1]})")
+    return rows
 
 
 def cmd_user(args, settings) -> int:
@@ -272,6 +327,12 @@ def cmd_check(args, settings) -> int:
     with socket.socket() as s:
         free = s.connect_ex(("127.0.0.1", port)) != 0
     line(f"port {port}", "free" if free else "in use (gateway already running?)")
+    if os.name == "nt":
+        # Information only (a fresh install runs check before it registers the task): autostart at logon.
+        tasks = _gateway_tasks()
+        enabled = [t for t in tasks if not t.endswith("(Disabled)")]
+        print(f"[{'OK' if enabled else '--'}] autostart task: "
+              f"{', '.join(tasks) if tasks else 'none registered for this install (scripts/register-service.ps1)'}")
     return 0 if ok else 1
 
 
@@ -319,6 +380,8 @@ def main(argv: list[str] | None = None) -> int:
     ipc.add_argument("action", choices=["list", "unblock"])
     ipc.add_argument("address", nargs="?", help="address to unblock (an IPv6 address unblocks its /64)")
     ipc.add_argument("--all", action="store_true", help="unblock every address and clear all counters")
+    nr = sub.add_parser("native-root", help="show or move the native Goose profile (Goose appdata folder)")
+    nr.add_argument("path", nargs="?", help="new folder that contains config\\ (e.g. C:\\AI\\Goose_appdata)")
     sub.add_parser("check", help="diagnostics")
     sub.add_parser("version")
     args = p.parse_args(argv)
@@ -329,7 +392,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if cmd == "serve" and not hasattr(args, "host"):
         args.host, args.port = None, None
-    return {"serve": cmd_serve, "init": cmd_init, "user": cmd_user, "ip": cmd_ip, "check": cmd_check}[cmd](args, settings)
+    return {"serve": cmd_serve, "init": cmd_init, "user": cmd_user, "ip": cmd_ip, "check": cmd_check,
+            "native-root": cmd_native_root}[cmd](args, settings)
 
 
 if __name__ == "__main__":

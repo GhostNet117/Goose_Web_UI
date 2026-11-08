@@ -13,7 +13,7 @@ it, on a desktop or a phone.
   `%APPDATA%\Block\goose`) with all of its chats, recipes and settings. Nothing gets copied around, and Goose
   Desktop keeps working on the same profile.
 
-`goose-web 1.5.1` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
+`goose-web 1.6.0` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
 
 ## Features
 

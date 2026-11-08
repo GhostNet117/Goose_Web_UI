@@ -31,7 +31,8 @@
 [CmdletBinding()]
 param(
     [string]$ProfilesRoot = 'C:\Goose_Web_Profiles',
-    [string]$GooseAppData = '',              # existing Goose profile folder; '' = auto-detect, 'fresh' = new
+    [string]$GooseAppData = '',              # Goose appdata folder (contains config\); '' = auto-detect (GOOSE_PATH_ROOT, then %APPDATA%\Block\goose), 'fresh' = new
+    [string]$GooseBinary = '',               # path to the goose CLI (e.g. C:\AI\Goose\resources\bin\goose.exe); '' = auto-detect
     [string]$BindHost = '127.0.0.1',         # use the LAN IP (or 0.0.0.0) when a reverse proxy on another host connects
     [int]$Port = 8710,
     [string]$PublicUrl = '',                 # e.g. https://goose.example.org (enables Secure cookies + HSTS)
@@ -41,7 +42,8 @@ param(
     [string]$Admin = $env:USERNAME,
     [switch]$NoService,                      # skip task + firewall registration
     [switch]$NonInteractive,
-    [switch]$AllowElevated
+    [switch]$AllowElevated,
+    [switch]$Reregister                      # register the logon task again although one exists for this install
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,10 +60,29 @@ if ($elevated -and -not $AllowElevated) {
     exit 3
 }
 Say "Installing goose-web for $($id.Name) in $InstallDir"
+if ($GooseBinary) {
+    if (-not (Test-Path $GooseBinary -PathType Leaf)) { throw "Goose CLI not found: $GooseBinary" }
+    $gv = & $GooseBinary --version 2>&1 | Select-Object -First 1
+    if ($LASTEXITCODE) { throw "The Goose CLI did not run: $GooseBinary ($gv)" }
+    Say "Goose CLI: $GooseBinary ($gv)"
+}
+# An existing gateway task for THIS install means this is a re-run: keep the task (use scripts\upgrade.ps1 to upgrade).
+$venvPyw = Join-Path $InstallDir '.venv\Scripts\pythonw.exe'
+$existingTask = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
+    $_.Actions | Where-Object { $_.Execute -and ($_.Execute.Trim('"') -ieq $venvPyw) } })
+if ($existingTask.Count) {
+    Warn ("This install already has a gateway task: " + (($existingTask | ForEach-Object { $_.TaskPath + $_.TaskName }) -join ', ') +
+        ". To upgrade, stop here and run scripts\upgrade.ps1 (keeps every setting, backs up first).")
+}
 
 # --- 1. virtualenv -------------------------------------------------------------
 $venvPy = Join-Path $InstallDir '.venv\Scripts\python.exe'
 $uv = (Get-Command uv -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+if (-not $uv) {   # Goose ships uv; use it when uv is not on PATH
+    foreach ($c in @((Join-Path $env:LOCALAPPDATA 'Goose\bin\uv.exe'), $(if ($GooseBinary) { Join-Path (Split-Path $GooseBinary) 'uv.exe' }))) {
+        if ($c -and (Test-Path $c)) { $uv = $c; break }
+    }
+}
 Push-Location $InstallDir
 try {
     if (-not (Test-Path $venvPy)) {
@@ -72,6 +93,8 @@ try {
         }
         if (-not (Test-Path $venvPy)) { throw "Could not create the virtualenv (install Python 3.11+ or uv)." }
     }
+    & $venvPy -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"
+    if ($LASTEXITCODE) { throw "The virtualenv's Python is older than 3.11 ($(& $venvPy --version)). Delete .venv and install Python 3.11+ or uv." }
     Say "Installing dependencies (hash-locked, requirements.lock)"
     if ($uv) {
         & $uv pip install --python $venvPy --require-hashes -r requirements.lock
@@ -90,7 +113,10 @@ try {
 $native = $GooseAppData
 if (-not $native) {
     $default = Join-Path $env:APPDATA 'Block\goose'
-    if (Test-Path (Join-Path $default 'config')) {
+    if ($env:GOOSE_PATH_ROOT -and (Test-Path (Join-Path $env:GOOSE_PATH_ROOT 'config'))) {
+        $native = $env:GOOSE_PATH_ROOT
+        Say "Found the Goose profile from GOOSE_PATH_ROOT: $native"
+    } elseif (Test-Path (Join-Path $default 'config')) {
         $native = $default
         Say "Found the existing Goose profile: $native"
     } elseif (-not $NonInteractive) {
@@ -120,13 +146,29 @@ if (-not (Test-Path $cfg)) {
     ) + ($proxies | ForEach-Object { "    - `"$_`"" }) + @(
         'paths:',
         "  profiles_root: `"$($ProfilesRoot -replace '\\','\\')`"",
-        'goose:',
+        'goose:'
+    ) + $(if ($GooseBinary) { @("  binary: `"$($GooseBinary -replace '\\','\\')`"") } else { @() }) + @(
         '  idle_minutes: 30',
         '  native_scheduler: auto   # auto = only while Goose Desktop is closed (prevents double-firing)'
     )
     [IO.File]::WriteAllLines($cfg, $yaml, (New-Object Text.UTF8Encoding $false))
     Say "Wrote $cfg"
-} else { Say "Keeping existing $cfg" }
+} else {
+    Say "Keeping existing $cfg"
+    if ($GooseBinary) {   # set or replace goose.binary, leave everything else (and comments) as it is
+        $lines = [Collections.Generic.List[string]]([IO.File]::ReadAllLines($cfg))
+        $bin = "  binary: `"$($GooseBinary -replace '\\','\\')`""
+        $g = $lines.FindIndex([Predicate[string]]{ param($l) $l -match '^goose:\s*$' })
+        if ($g -lt 0) { $lines.Add('goose:'); $lines.Add($bin) }
+        else {
+            $b = -1
+            for ($i = $g + 1; $i -lt $lines.Count -and ($lines[$i] -match '^\s' -or $lines[$i] -eq ''); $i++) { if ($lines[$i] -match '^\s+binary:') { $b = $i } }
+            if ($b -ge 0) { $lines[$b] = $bin } else { $lines.Insert($g + 1, $bin) }
+        }
+        [IO.File]::WriteAllLines($cfg, $lines, (New-Object Text.UTF8Encoding $false))
+        Say "Set goose.binary in $cfg"
+    }
+}
 
 # --- 4. database + admin ---------------------------------------------------------------
 Say "Initialising (admin '$Admin'; a random initial password is generated and shown at the end)"
@@ -134,9 +176,14 @@ Say "Initialising (admin '$Admin'; a random initial password is generated and sh
 $initOut = @(& $venvPy -m goose_web --config $cfg init --admin $Admin --native-root $native)
 if ($LASTEXITCODE) { $initOut | ForEach-Object { Write-Host $_ }; throw "goose-web init failed." }
 & $venvPy -m goose_web --config $cfg check
+if ($LASTEXITCODE) {
+    throw "goose-web check failed (see the [!!] lines above). If the goose CLI was not found, re-run with -GooseBinary <path to goose.exe>."
+}
 
 # --- 5. service ----------------------------------------------------------------------------
-if (-not $NoService) {
+if ($existingTask.Count -and -not $Reregister) {
+    Say "Keeping the existing gateway task (pass -Reregister to register it again)."
+} elseif (-not $NoService) {
     $reg = Join-Path $PSScriptRoot 'register-service.ps1'
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$reg`"",
         '-User', "`"$($id.Name)`"", '-InstallDir', "`"$InstallDir`"", '-ConfigPath', "`"$cfg`"",

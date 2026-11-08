@@ -25,8 +25,9 @@ def _find_goose() -> str:
         return found
     candidates = []
     if IS_WINDOWS:
-        candidates += [r"C:\Goose\dist-windows\resources\bin\goose.exe",
-                       os.path.expandvars(r"%LOCALAPPDATA%\Programs\Goose\resources\bin\goose.exe"),
+        # Standard install locations only; a Goose installed anywhere else (e.g. C:\AI\Goose) is set with goose.binary.
+        candidates += [os.path.expandvars(r"%LOCALAPPDATA%\Programs\Goose\resources\bin\goose.exe"),
+                       os.path.expandvars(r"%ProgramFiles%\Goose\resources\bin\goose.exe"),
                        os.path.expandvars(r"%USERPROFILE%\.local\bin\goose.exe")]
     else:
         candidates += ["/usr/local/bin/goose", os.path.expanduser("~/.local/bin/goose")]

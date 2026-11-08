@@ -53,6 +53,12 @@ export function routeNotification(method, params) {
 }
 
 // Another Goose process (Desktop, CLI, a schedule) wrote this session: the gateway dropped its buffer.
+// The gateway stamps each live prompt with the server time (spec 010); Edit needs it to cut the conversation there.
+export function promptCreated(p) {
+  const c = p && p.sessionId && chats.get(p.sessionId);
+  if (c && c.lastSent && !c.lastSent.created && Number.isInteger(p.created)) c.lastSent.created = p.created;
+}
+
 export function sessionChangedElsewhere(p) {
   const sid = p && p.sessionId;
   if (!sid) return;
@@ -175,7 +181,7 @@ export class ChatSession extends Emitter {
     const meta = u._meta;
     switch (u.sessionUpdate) {
       case 'user_message_chunk':
-        t.addUser([u.content], { messageId: u.messageId || (meta && meta.goose && meta.goose.messageId) || null, time: meta && meta.goose && meta.goose.created ? new Date(meta.goose.created * 1000) : null });
+        t.addUser([u.content], { messageId: u.messageId || (meta && meta.goose && meta.goose.messageId) || null, time: meta && meta.goose && meta.goose.created ? new Date(meta.goose.created * 1000) : null, created: (meta && meta.goose && meta.goose.created) || null });
         break;
       case 'agent_message_chunk':
         t.agentChunk(u.content, u.messageId || (meta && meta.goose && meta.goose.messageId), meta);
@@ -254,6 +260,7 @@ export class ChatSession extends Emitter {
   async send(blocks) {
     if (this.running) { this.queue.push(blocks); this.emit('queue'); return; }
     const item = this.transcript.addUser(blocks, { pending: true });
+    this.lastSent = item;
     this.promptPending = true;
     this.setRunning(true);
     this.emit('sent');
@@ -280,6 +287,38 @@ export class ChatSession extends Emitter {
       if (!this.activeRunId) this.setRunning(false);
       else this.emit('state');
     }
+  }
+
+  // Edit a sent prompt (spec 010), like Goose Desktop. mode 'replace': delete this message and everything after it
+  // in this chat (conversation/truncate), then send the edited text here. mode 'branch': a new chat with the history
+  // before this message (session/fork + conversationBefore), then the edited text there; this chat is untouched.
+  // Both cut at "created >= item.created" (whole seconds, Goose's clock). Returns the chat id the prompt went to.
+  async editAndRerun(item, text, mode) {
+    if (this.running || this.promptPending) throw new Error('Stop the current run before editing a message.');
+    const created = item && item.created;
+    if (!Number.isInteger(created)) throw new Error('This message has no server time yet. Use Reload transcript in the chat menu, then try again.');
+    const items = this.transcript.items;
+    const idx = items.indexOf(item);
+    if (idx < 0) throw new Error('This message is no longer in the transcript. Reload it and try again.');
+    let prev = 0;
+    for (let i = 0; i < idx; i++) if (Number.isInteger(items[i].created) && items[i].created > prev) prev = items[i].created;
+    if (prev >= created) throw new Error('The reply before this message was saved in the same second, so the chat cannot be cut exactly here. Edit an earlier message, or use Fork conversation.');
+    const blocks = [{ type: 'text', text }, ...item.blocks.filter((b) => b.type !== 'text')];
+    if (mode === 'branch') {
+      const res = await rpc.call('session/fork', { sessionId: this.id, cwd: this.cwd, _meta: { conversationBefore: created } });
+      const id = res && res.sessionId;
+      if (!id) throw new Error('Goose did not return the new chat');
+      const title = (this.title || 'Chat') + ' (edited)';
+      upsertSession({ sessionId: id, cwd: this.cwd, title, updatedAt: new Date().toISOString() });
+      const c = getChat(id, { cwd: this.cwd, title });
+      await c.ensureLoaded();
+      c.send(blocks);
+      return id;
+    }
+    await rpc.call(G('session/conversation/truncate'), { sessionId: this.id, truncateFrom: created });
+    await this.reload();
+    this.send(blocks);
+    return this.id;
   }
 
   drainQueue() {

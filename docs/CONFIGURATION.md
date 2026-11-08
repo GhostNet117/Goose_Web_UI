@@ -92,7 +92,7 @@ host_tasks:
 | `server.allow_elevated` | `false` | If true, the gateway runs with an elevated token (Windows) or as root (POSIX) instead of refusing. Leave it false. |
 | `paths.profiles_root` | `C:\Goose_Web_Profiles` (Windows), `$GOOSE_WEB_PROFILES` or `/var/lib/goose-web/profiles` | Parent of all isolated profiles and of `_system`. |
 | `paths.system_dir` | `""` (= `<profiles_root>/_system`) | Database, logs, team library, backups. |
-| `goose.binary` | `""` | Path to `goose`. When empty: `goose` on `PATH`, then `C:\Goose\dist-windows\resources\bin\goose.exe`, `%LOCALAPPDATA%\Programs\Goose\resources\bin\goose.exe`, `%USERPROFILE%\.local\bin\goose.exe` (Windows) or `/usr/local/bin/goose`, `~/.local/bin/goose`. |
+| `goose.binary` | `""` | Path to `goose`. When empty: `goose` on `PATH`, then `%LOCALAPPDATA%\Programs\Goose\resources\bin\goose.exe`, `%ProgramFiles%\Goose\resources\bin\goose.exe`, `%USERPROFILE%\.local\bin\goose.exe` (Windows) or `/usr/local/bin/goose`, `~/.local/bin/goose`. Set it for any other location (for example `C:\AI\Goose\resources\bin\goose.exe`); `install.ps1 -GooseBinary` writes it. |
 | `goose.idle_minutes` | `30` | A worker is stopped after this long with no browser clients, no active runs and no scheduler duty. |
 | `goose.start_timeout_seconds` | `45` | How long `goose serve` may take to answer `/status`. |
 | `goose.native_scheduler` | `auto` | Who runs the scheduler for the admin's native profile (section 7). |
@@ -134,7 +134,8 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 | `user reset-totp NAME` | | Removes the user's two-factor (lost authenticator), unlocks the account, signs it out everywhere and revokes its API tokens; audited as `user.totp.reset`. Same as Admin > Users > Reset two-factor, and the way back in when the only admin lost their authenticator. |
 | `ip list` | | Lists client addresses blocked after failed sign-ins and addresses that are collecting failures (count, last user name tried, end of the block). |
 | `ip unblock ADDRESS` | `--all` | Ends the block of ADDRESS (an IPv6 address unblocks its /64) and clears its count, or with `--all` every block and count; audited as `auth.ip.unblocked`. Works while the gateway runs (it re-reads the blocks within 15 seconds), so it is the way back in when the admin's own address is blocked. |
-| `check` | | Diagnostics: version, config file, goose binary and version, OS user and integrity (fails if elevated), profiles root, Goose Desktop running (Windows), whether the port is free. Exit code 1 if something is wrong. |
+| `check` | | Diagnostics: version, config file, goose binary and version, OS user and integrity (fails if elevated), profiles root, Goose Desktop running (Windows), whether the port is free, and (Windows, information only) the logon task that autostarts this install. Exit code 1 if something is wrong. |
+| `native-root` | `[PATH]` | Without PATH: show the native Goose profile (Goose appdata folder). With PATH: move the native profile to that folder (must contain `config\`), update every native user that used the old one, audit `system.native_root`. Files are not copied. Restart the gateway afterwards. |
 | `version` | | Prints the version. |
 
 ## 4. Settings stored in the database

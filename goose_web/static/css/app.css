@@ -703,6 +703,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .agent-msg { position: relative; min-width: 0; }
 .tr-actions { display: flex; gap: 2px; height: 24px; opacity: 0; transition: opacity var(--t); }
 .tr-actions .btn-icon { width: 24px; height: 24px; }
+.tr-edit { display: flex; flex-direction: column; gap: 8px; width: min(100%, 760px); margin-left: auto; }
+.tr-edit-text { width: 100%; resize: vertical; font: inherit; line-height: 1.5; }
+.tr-edit-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .md > .codeblock:last-child { margin-bottom: 0; }
 .tr-item:hover .tr-actions, .tr-actions:focus-within { opacity: 1; }
 .tr-foot { font-size: .78em; color: var(--fg-3); }

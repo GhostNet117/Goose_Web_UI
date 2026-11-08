@@ -43,6 +43,7 @@ WATCH_FALLBACK_INTERVAL = 15.0  # no sessions.db found: fingerprint-check watche
 WATCH_MAX_CHECKS = 40         # idle buffered sessions re-checked per change
 # Methods that never change the stored session (no fingerprint refresh needed afterwards).
 _READ_ONLY_SESSION_METHODS = {"session/load", "session/list", SESSION_INFO, "session/prompt", "session/cancel"}
+TRUNCATE = "_goose/unstable/session/conversation/truncate"
 EXT_ADD = "_goose/unstable/session/extensions/add"
 EXT_REMOVE = "_goose/unstable/session/extensions/remove"
 
@@ -364,6 +365,13 @@ class Upstream:
                 return self._reply(client, mid, self.init_result)
             if method == "_goose/unstable/recipes/delete" and not client.is_admin:
                 await self._guard_recipe_delete(params)
+            if method == TRUNCATE:
+                # Goose deletes every message with created >= truncateFrom and does not check for an active run.
+                s0 = self.sessions.get(str(params.get("sessionId") or ""))
+                if s0 is not None and (s0.running() or s0.prompts):
+                    raise RpcError(-32002, "this chat is running: stop it before editing a message")
+                if not isinstance(params.get("truncateFrom"), int) or params["truncateFrom"] <= 0:
+                    raise RpcError(-32602, "truncateFrom must be a positive unix time in seconds")
             if method == "session/prompt":
                 self._check_concurrency(client, params)
                 if not client.is_admin:
@@ -407,11 +415,17 @@ class Upstream:
             s.last_text = ""
             self._set_status(s, "working")
             # Goose does not echo live prompts back, so record them for other tabs and for later replays.
+            # Stamp them with this machine's clock (Goose stamps the stored message a moment later with the same
+            # clock), so a tab can later edit the prompt: conversation/truncate cuts at created >= truncateFrom.
+            created = int(time.time())
+            client.send({"jsonrpc": "2.0", "method": "_gw/prompt_created",
+                         "params": {"sessionId": s.sid, "created": created}})
             for block in params.get("prompt") or []:
                 echo = json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {
                     "sessionId": s.sid, "update": {"sessionUpdate": "user_message_chunk", "content": block,
                                                    "_meta": {"gw": {"synthetic": True,
-                                                                    "by": client.user.get("username")}}}}},
+                                                                    "by": client.user.get("username")},
+                                                             "goose": {"created": created}}}}},
                                   separators=(",", ":"))
                 self._buffer(s, echo)
                 for c in list(self.clients):
@@ -727,6 +741,17 @@ class Upstream:
             if s and s.load_result and params.get("configId") == "mode" and \
                     isinstance(s.load_result.get("modes"), dict):
                 s.load_result["modes"] = {**s.load_result["modes"], "currentModeId": params.get("value")}
+        elif method == TRUNCATE and ok:
+            # Edit + rerun: the buffered transcript now shows messages Goose has deleted. Drop it so the next load
+            # comes from Goose, and tell the other tabs showing this chat to reload (the editing tab reloads itself).
+            s = self.sessions.get(sid0)
+            if s is not None:
+                self._invalidate(s)
+                note = {"jsonrpc": "2.0", "method": "_gw/session_changed",
+                        "params": {"sessionId": sid0, "reason": "truncated"}}
+                for c in list(self.clients):
+                    if c is not client:
+                        c.send(note)
         elif method in (EXT_ADD, EXT_REMOVE):
             # Retry / add / remove in the extension panel: the cached load result is what reconnecting tabs are
             # replayed, so its start-up extension status must follow (bug 2026-11-08, stale "failed").

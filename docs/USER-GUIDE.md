@@ -464,6 +464,25 @@ While a turn runs, the header shows "Working", and the composer changes:
 If you try to leave the page while messages are still queued, the browser asks you to confirm, because queued
 messages are kept in the page.
 
+### Editing a message you sent
+
+Hover over one of your messages and click the pencil (**Edit and rerun from here**). The text opens in place; change
+it and choose:
+
+- **Rerun here** replaces the rest of this chat: your message and everything after it are removed, and the edited
+  message is sent in the same chat. You are asked to confirm, because this cannot be undone. Shortcut: `Ctrl+Enter`.
+- **Branch** starts a new chat that contains the conversation up to (not including) this message and sends the
+  edited message there. The original chat stays as it was. The new chat is named "<title> (edited)".
+  Shortcut: `Ctrl+Shift+Enter`.
+- **Cancel** (or `Esc`) closes the editor.
+
+Pictures and other attachments of the original message are sent again with the edited text. Editing is not possible
+while the chat is running (stop it first) or for steered messages. Goose cuts the conversation by the time a message
+was saved, in whole seconds; in the rare case that the reply before your message was saved in the same second
+(typically a queued message that was sent the moment the previous run ended), the edit is refused: edit the message
+before it instead, or use **Fork conversation** in the chat menu. Other open tabs of the same chat reload
+automatically after **Rerun here**.
+
 Your policy can limit how many agents you run at the same time (the default for non-administrators is 3). When
 you reach the limit, sending fails with a message such as "you already have 3 agents running (limit 3)". Wait
 for one to finish or stop one in the Herd.

@@ -9,7 +9,7 @@ import { loadPrefs, applyTheme, setPref, prefs, resolvedTheme } from './prefs.js
 import { addAsk, resetAsks, resolvedElsewhere, ASK_METHODS, gotoAsk } from './asks.js';
 import { setHerd, upsertAgent, setMyProfile, refreshBadges, browserNotify, chime, setBaseTitle } from './herd.js';
 import { loadSessions, sessionsState, sessionTitle, activityTime, isArchived, refreshSessionsSoon } from './sessions.js';
-import { routeNotification, allChats, currentChat, sessionChangedElsewhere } from './chatsession.js';
+import { routeNotification, allChats, currentChat, sessionChangedElsewhere, promptCreated } from './chatsession.js';
 import { renderLogin, renderChangePassword } from './views/login.js';
 import { renderSidebar, NAV } from './views/sidebar.js';
 import { renderHome } from './views/home.js';
@@ -233,6 +233,7 @@ rpc.on('session/update', (p) => routeNotification('session/update', p));
 rpc.on(G('session/update'), (p) => routeNotification(G('session/update'), p));
 rpc.on('_gw/ask_resolved', (p) => resolvedElsewhere(p || {}));
 rpc.on('_gw/session_changed', (p) => sessionChangedElsewhere(p || {}));
+rpc.on('_gw/prompt_created', (p) => promptCreated(p || {}));
 rpc.on('_gw/sessions_changed', () => refreshSessionsSoon());
 rpc.on('_gw/herd_update', (p) => { const a = p && (p.agent || p); if (a && a.sessionId) upsertAgent(a); });
 rpc.on('_gw/upstream', (p) => {
