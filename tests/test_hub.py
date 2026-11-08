@@ -18,6 +18,8 @@ class FakeAgent:
         self.sessions = 0
         self.loads = 0
         self.counts = {}   # sessionId -> messageCount reported by session/info
+        self.ext_results = None   # _meta.extensionResults returned by session/load
+        self.fail_add = None      # error message for _goose/unstable/session/extensions/add
 
     async def handler(self, ws):
         async for raw in ws:
@@ -37,7 +39,10 @@ class FakeAgent:
                 await ws.send(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {
                     "sessionId": p["sessionId"], "update": {"sessionUpdate": "agent_message_chunk",
                                                             "content": {"type": "text", "text": "old"}}}}))
-                await ws.send(json.dumps({"jsonrpc": "2.0", "id": mid, "result": {}}))
+                res = {"_meta": {"extensionResults": self.ext_results}} if self.ext_results is not None else {}
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": mid, "result": res}))
+            elif meth == "_goose/unstable/session/extensions/add" and self.fail_add:
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": mid, "error": {"code": -32603, "message": self.fail_add}}))
             elif meth == "session/prompt":
                 asyncio.create_task(self.run(ws, mid, p["sessionId"]))
             elif meth == "_goose/unstable/session/info":
@@ -258,3 +263,57 @@ async def test_watcher_announces_external_change(env, tmp_path, monkeypatch):
     assert up.sessions["x9"].loaded is False and not up.sessions["x9"].buffer
     await _load(up, c1, s1, "x9", 2)
     assert agent.loads == 2
+
+
+async def test_retry_updates_replayed_extension_status(env):
+    """Bug 2026-11-08: an extension that failed at start and was started later with Retry must not show as
+    failed again when a tab reconnects (the reconnect is answered from the cached load result)."""
+    agent, hub = env
+    up = hub.upstream("alice", "alice")
+    c1, s1 = mk_client(role="admin")
+    hub.attach(up, c1)
+    agent.counts["e1"] = 3
+    agent.ext_results = [{"name": "developer", "success": True},
+                         {"name": "graphify", "success": False, "error": "process quit before initialization"}]
+    r = await _load(up, c1, s1, "e1", 1)
+    assert r["result"]["_meta"]["extensionResults"][1]["success"] is False
+    await _fp_settled(up, "e1")
+    # Retry in the extension panel: remove the dead entry, then add it again (MCP: name in server.name)
+    await up.from_client(c1, {"jsonrpc": "2.0", "id": 2, "method": "_goose/unstable/session/extensions/remove",
+                              "params": {"sessionId": "e1", "extensionKey": "graphify"}})
+    await s1.wait_for(lambda m: m.get("id") == 2)
+    await up.from_client(c1, {"jsonrpc": "2.0", "id": 3, "method": "_goose/unstable/session/extensions/add",
+                              "params": {"sessionId": "e1", "extension": {"type": "mcp", "server": {"name": "graphify"}}}})
+    await s1.wait_for(lambda m: m.get("id") == 3)
+    await _fp_settled(up, "e1")
+    # a second tab (reload) is served from the cache: graphify must now be loaded
+    c2, s2 = mk_client(role="admin")
+    hub.attach(up, c2)
+    r = await _load(up, c2, s2, "e1", 4)
+    assert agent.loads == 1 and r["result"]["_meta"]["gw"]["replayed"] is True
+    assert r["result"]["_meta"]["extensionResults"] == [{"name": "developer", "success": True},
+                                                        {"name": "graphify", "success": True}]
+    # a failed add records Goose's error; a remove drops the entry
+    agent.fail_add = "spawn failed"
+    await up.from_client(c2, {"jsonrpc": "2.0", "id": 5, "method": "_goose/unstable/session/extensions/add",
+                              "params": {"sessionId": "e1", "extension": {"type": "builtin", "name": "Developer"}}})
+    assert "error" in await s2.wait_for(lambda m: m.get("id") == 5)
+    assert up.sessions["e1"].load_result["_meta"]["extensionResults"][0] == {
+        "name": "developer", "success": False, "error": "spawn failed"}
+    await up.from_client(c2, {"jsonrpc": "2.0", "id": 6, "method": "_goose/unstable/session/extensions/remove",
+                              "params": {"sessionId": "e1", "extensionKey": "developer"}})
+    await s2.wait_for(lambda m: m.get("id") == 6)
+    assert up.sessions["e1"].load_result["_meta"]["extensionResults"] == [{"name": "graphify", "success": True}]
+
+
+def test_apply_extension_change_edge_cases():
+    from goose_web.hub import EXT_ADD, EXT_REMOVE, apply_extension_change
+    assert apply_extension_change(None, EXT_ADD, {"extension": {"name": "x"}}, {}) is False
+    assert apply_extension_change({}, EXT_ADD, {"extension": {"name": "x"}}, {}) is False      # no start-up results
+    lr = {"_meta": {"extensionResults": [], "other": 1}}
+    assert apply_extension_change(lr, EXT_ADD, {"extension": {"name": "Web Search"}}, {"result": {}}) is True
+    assert lr["_meta"] == {"extensionResults": [{"name": "Web Search", "success": True}], "other": 1}
+    assert apply_extension_change(lr, EXT_REMOVE, {"extensionKey": "web_search"}, {"error": {}}) is False  # failed remove
+    assert apply_extension_change(lr, EXT_REMOVE, {"extensionKey": "websearch"}, {"result": {}}) is True
+    assert lr["_meta"]["extensionResults"] == []
+    assert apply_extension_change(lr, EXT_ADD, {"extension": "bogus"}, {}) is False

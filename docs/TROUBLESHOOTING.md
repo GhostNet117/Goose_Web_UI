@@ -624,6 +624,7 @@ the page** (or reconnect) before it applies to chats.
 | An extension fails in Docker when writing files or caches | The container's root file system is read-only and the home folder is a temporary file system; only `/data` persists. | Point the extension's data and cache paths into `/data`, or adjust the compose file. |
 | An extension cannot find its API key | Isolated workers do not use the OS keyring and do not inherit the gateway's `GOOSE_*` variables (section 7.5). | Enter the secret in the user's settings, or pass non-secret variables via `goose.extra_env`. |
 | An extension works in Goose Desktop but not in Goose Web | Different profile (isolated vs native) or different environment/`PATH` of the service. | Compare the profile used, and the `PATH` of the service account. |
+| An extension that failed at the chat's start still shows "failed" after a successful Retry, once the page reloads or reconnects, although its tools work (before 1.5.1) | The gateway replayed the chat's cached start-up status. Fixed in 1.5.1: Retry, add and remove now update it. | Upgrade. Retry on an extension that is already running is a harmless no-op: Goose keeps the running process and does not restart it. |
 | Any other failure | | Read `worker-<user>.log` and `<profile>/data/logs`. Goose prints the extension's start-up error there. |
 
 ---

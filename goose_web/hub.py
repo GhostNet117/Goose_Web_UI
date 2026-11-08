@@ -43,6 +43,60 @@ WATCH_FALLBACK_INTERVAL = 15.0  # no sessions.db found: fingerprint-check watche
 WATCH_MAX_CHECKS = 40         # idle buffered sessions re-checked per change
 # Methods that never change the stored session (no fingerprint refresh needed afterwards).
 _READ_ONLY_SESSION_METHODS = {"session/load", "session/list", SESSION_INFO, "session/prompt", "session/cancel"}
+EXT_ADD = "_goose/unstable/session/extensions/add"
+EXT_REMOVE = "_goose/unstable/session/extensions/remove"
+
+
+def _ext_norm(name: Any) -> str:
+    return "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+
+
+def _ext_names(ext: Any) -> list[str]:
+    """Every name Goose may report an extension config under (builtin: name; MCP: server name / config key)."""
+    if not isinstance(ext, dict):
+        return []
+    cands = [ext.get("name"), ext.get("key"), ext.get("configKey")]
+    if isinstance(ext.get("server"), dict):
+        cands.append(ext["server"].get("name"))
+    return [str(c) for c in cands if c]
+
+
+def apply_extension_change(load_result: dict | None, method: str, params: dict, msg: dict) -> bool:
+    """Keep the cached start-up `_meta.extensionResults` in step with a later add/remove in the same chat.
+
+    The cached load result is replayed to every tab that reconnects (7.3). Without this, an extension that failed
+    at start and was started later with Retry showed as failed again after every reload. Returns True if changed."""
+    meta = (load_result or {}).get("_meta")
+    if not isinstance(meta, dict) or not isinstance(meta.get("extensionResults"), list):
+        return False
+    ok = "error" not in msg
+    if method == EXT_REMOVE:
+        raw = [str(params.get("extensionKey") or "")] if ok else []
+    else:
+        raw = _ext_names(params.get("extension"))
+    keys = {_ext_norm(n) for n in raw} - {""}
+    if not keys:
+        return False
+    results = list(meta["extensionResults"])
+    hit = next((i for i, r in enumerate(results) if isinstance(r, dict) and _ext_norm(r.get("name")) in keys), None)
+    if method == EXT_REMOVE:
+        if hit is None:
+            return False
+        results.pop(hit)
+    else:
+        name = results[hit].get("name") if hit is not None else raw[0]
+        if ok:
+            entry = {"name": name, "success": True}
+        else:
+            entry = {"name": name, "success": False,
+                     "error": str((msg.get("error") or {}).get("message") or "failed to start")}
+        if hit is None:
+            results.append(entry)
+        else:
+            results[hit] = entry
+    load_result["_meta"] = {**meta, "extensionResults": results}
+    return True
+
 
 INIT_PARAMS = {
     "protocolVersion": 1,
@@ -673,6 +727,12 @@ class Upstream:
             if s and s.load_result and params.get("configId") == "mode" and \
                     isinstance(s.load_result.get("modes"), dict):
                 s.load_result["modes"] = {**s.load_result["modes"], "currentModeId": params.get("value")}
+        elif method in (EXT_ADD, EXT_REMOVE):
+            # Retry / add / remove in the extension panel: the cached load result is what reconnecting tabs are
+            # replayed, so its start-up extension status must follow (bug 2026-11-08, stale "failed").
+            s = self.sessions.get(sid0)
+            if s is not None and s.load_result is not None:
+                apply_extension_change(s.load_result, method, params, msg)
         elif method in ("session/delete", "session/close") and ok:
             s = self.sessions.pop(str(params.get("sessionId") or ""), None)
             if s:
