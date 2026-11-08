@@ -26,9 +26,12 @@ for line in sys.stdin:
 
 
 def test_container_name_is_deterministic_and_valid():
-    a = sb.container_name(r"C:\Goose_Web_Profiles", "Alice.Smith")
-    assert a == sb.container_name(r"c:\goose_web_profiles", "alice.smith")      # same root/user -> same SID
-    assert a != sb.container_name(r"D:\Other", "alice.smith")                    # two gateways stay apart
+    root = os.path.abspath("Goose_Web_Profiles")
+    a = sb.container_name(root, "Alice.Smith")
+    assert a == sb.container_name(root, "alice.smith")                            # same root/user -> same SID
+    if sys.platform == "win32":                                                   # Windows paths are case-insensitive
+        assert a == sb.container_name(root.lower(), "alice.smith")
+    assert a != sb.container_name(os.path.abspath("Other"), "alice.smith")         # two gateways stay apart
     assert len(a) <= 64 and a.startswith("GooseWeb.") and all(ch.isalnum() or ch in "._-" for ch in a)
 
 
