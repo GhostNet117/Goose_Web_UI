@@ -456,3 +456,15 @@ container ACE was left. `tests/test_sandbox.py` runs the kernel check on every W
 Still accepted: administrators and the native profile run unsandboxed (they are trusted); without `sandbox.enabled`,
 or on Linux/macOS, 7.2 applies unchanged; SMB shares cannot be restricted per container; system folders readable by
 all Windows apps stay readable.
+
+### 8.3 1.10.0: relays and Goose 1.50
+
+- **Relays** (`sandbox.relays`): a sandboxed agent reaches an allow-listed local service only through a forwarder in
+  its own container and a named pipe whose DACL admits that container's SID (plus SYSTEM and the gateway's account)
+  with a low mandatory label. Verified: the user's agent reached the listed service through its forwarder; direct
+  127.0.0.1 to the same service, the gateway's port and another user's forwarder address were refused; another
+  container could not open the pipe. Anything the relayed service accepts is reachable by every sandboxed user, so
+  list only services meant for them (for example a model proxy) and keep their own authentication.
+- **Goose 1.50 `tools/call`** ignores `extensionName` and resolves a tool by name across the chat, so a policy that
+  allows direct calls for one extension could reach another extension's tool. The gateway now checks every direct
+  tool call against `tools/list` of the named extension and refuses a mismatch (on all Goose versions).

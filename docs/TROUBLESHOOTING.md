@@ -625,6 +625,8 @@ the page** (or reconnect) before it applies to chats.
 | An extension cannot find its API key | Isolated workers do not use the OS keyring and do not inherit the gateway's `GOOSE_*` variables (section 7.5). | Enter the secret in the user's settings, or pass non-secret variables via `goose.extra_env`. |
 | An extension works in Goose Desktop but not in Goose Web | Different profile (isolated vs native) or different environment/`PATH` of the service. | Compare the profile used, and the `PATH` of the service account. |
 | An extension that failed at the chat's start still shows "failed" after a successful Retry, once the page reloads or reconnects, although its tools work (before 1.5.1) | The gateway replayed the chat's cached start-up status. Fixed in 1.5.1: Retry, add and remove now update it. | Upgrade. Retry on an extension that is already running is a harmless no-op: Goose keeps the running process and does not restart it. |
+| An older chat still starts an extension the old way (slow start, "process quit before initialization", old command) although the extension was changed | Goose stores each chat's extension definitions when the chat is created. | Open the chat and use **Refresh extensions** (chat menu or Session extensions). New chats use the current settings. |
+| A sandboxed user's chats cannot reach a model proxy or service on this machine (connection refused) | The sandbox closes loopback. | Add the service to `sandbox.relays` (ADMINISTRATION 11.6) and restart the user's worker. Check `goose-web sandbox status` and the user's `worker-<user>.log`. |
 | Any other failure | | Read `worker-<user>.log` and `<profile>/data/logs`. Goose prints the extension's start-up error there. |
 
 ---

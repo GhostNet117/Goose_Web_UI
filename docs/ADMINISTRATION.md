@@ -1133,8 +1133,14 @@ in the profile you are signed in to; for isolated profiles each user's own `conf
   or use a remote (HTTP) extension. Each chat stores the extension commands it was created with, so a changed
   extension command reaches older chats only after removing and re-adding the extension in that chat.
 - **"It compacts every few messages" in the browser:** check first whether Goose compacted at all (Goose's log line
-  "Performing message compaction"). The transcript shows the last 80 items and hides older ones behind "Show earlier
-  messages", which in tool-heavy chats can look like lost history.
+  "Performing message compaction"). Before 1.10.0 the transcript showed only the last 80 items and hid older ones
+  behind "Show earlier messages", which in tool-heavy chats looked like lost history. Since 1.10.0 it shows the
+  last 300 by default (Settings > Preferences > Chat > Messages shown in a chat) and loads earlier ones when you
+  scroll to the top.
+- **Older chats keep their extension commands.** A chat started before you changed an extension's command keeps the
+  old one. Goose Web marks such extensions **outdated** and offers **Refresh extensions** (chat menu or the Session
+  extensions dialog): it removes them from the chat and adds the current definition, through Goose.
+- **Goose 1.50 to 1.56** have no `GOOSE_AUTO_COMPACT_TOKEN_LIMIT` (11.7).
 
 ### 11.6 Sandboxing users' agents (Windows AppContainer)
 
@@ -1149,6 +1155,7 @@ sandbox:
   enabled: auto              # default: on for Windows, off elsewhere; true | false
   network: internet          # none | internet | internet+lan
   read_dirs: []              # extra program folders agents may run, e.g. C:\Program Files\nodejs, a Python install
+  relays: []                 # local services sandboxed agents may use, e.g. ["127.0.0.1:8317"] (a local model proxy)
 ```
 
 What it does, for every **isolated, non-admin** user (administrators and the native profile are never sandboxed):
@@ -1176,7 +1183,8 @@ Requirements and limits:
 - Windows 10/11 or Server 2019+. On other systems `sandbox.enabled: true` makes isolated non-admin workers refuse to
   start (fail closed); use one OS account or container per team there.
 - **Model providers must be reachable over the network** (cloud APIs, or a server elsewhere on the LAN with
-  `internet+lan`). A provider that only listens on 127.0.0.1 of the same machine cannot be used by sandboxed users.
+  `internet+lan`), or be listed in `sandbox.relays` (below). A container cannot reach this machine's own LAN
+  address either, so a service on this machine is reachable only through a relay.
 - Programs the agents run must be readable by the container: tools under `C:\Program Files` usually are; per-user
   installs (Python, node, uv in the user profile) must be added to `sandbox.read_dirs`. The workers' temp, uv, pip and
   npm caches live in the user's profile (`tmp\`, `cache\`).
@@ -1190,6 +1198,50 @@ Requirements and limits:
 Check: `goose-web check` (`[OK] sandbox`), `goose-web sandbox status` (every container, its SID and grants),
 Admin > System (the Sandbox column shows **AppContainer** for sandboxed workers). Remove one user's container by hand:
 `goose-web sandbox remove <username>` (stop the worker first).
+
+#### Local services for sandboxed users (relays)
+
+A model proxy or another service that listens only on 127.0.0.1 of this machine is out of reach of sandboxed
+agents. List the ones they may use:
+
+```yaml
+sandbox:
+  relays: ["127.0.0.1:8317"]
+```
+
+For each sandboxed user and listed service, the gateway starts a small forwarder **inside the user's own
+container**. It listens on a loopback address of that user's own (`127.64.x.y`, from the user id) and the same
+port, and passes each connection over a named pipe to the gateway, which connects to the real service. The pipe's
+ACL admits only that user's container, so another user's agent cannot use it. Only the listed services become
+reachable; the rest of 127.0.0.1 stays closed (no loopback exemption).
+
+The user's Goose configuration (`config/config.yaml` and `config/custom_providers/*.json` in their profile) is
+rewritten so URLs to the service (`//127.0.0.1:8317`, `//localhost:8317`) point at the forwarder
+(`//127.64.x.y:8317`). The rewrite is undone when the service is removed from `sandbox.relays`, when the user stops
+being sandboxed (administrator, sandbox off) and by `goose-web sandbox remove`. The forwarder runs on the gateway's
+own Python (its base installation is granted Read & execute). Relays take effect at the worker's next start.
+`goose-web sandbox status` lists them.
+
+### 11.7 Goose versions (1.50 and later)
+
+Goose Web works with Goose **1.50 or later** and detects the version of each worker when it connects (the
+`initialize` answer; `goose-web check` and `install.ps1` report it too). It was tested against 1.50.1 and 1.57.0.
+Versions from 1.51 to 1.56 are treated like 1.50. Differences on Goose older than 1.57:
+
+| Feature | Goose 1.50 | What Goose Web does |
+|---|---|---|
+| Direct tool calls (`tools/call` with `extensionName`) | Goose ignores `extensionName` and runs any tool of the chat with that name | The gateway checks the tool against the named extension (`tools/list`) and refuses a mismatch, on every Goose version |
+| Live voice (`session/live-voice/*`) | Not available | Refused with a clear message |
+| Per-chat system prompt (chat menu > System prompt) | Kept only in the running worker | Re-applied when the chat is opened again; lost after a gateway restart (the dialog says so) |
+| Custom provider "Tool shim" option | Unknown to Goose | The checkbox is hidden |
+| Importing a chat (`session/import`) | Needs a `source` | Sent as `source: json` |
+| The 225k compaction cap (`GOOSE_AUTO_COMPACT_TOKEN_LIMIT`, 11.5) | Does not exist: Goose compacts at `GOOSE_AUTO_COMPACT_THRESHOLD` (0.8) x the model's window | Nothing to do; lower `GOOSE_AUTO_COMPACT_THRESHOLD` to compact earlier |
+
+Extension start-up (the 10-second handshake limit in 11.5) behaves the same on 1.50 and 1.57. Install and upgrade
+are the same for both: point `goose.binary` (or `install.ps1 -GooseBinary`) at the goose CLI you use.
+
+After upgrading Goose, run `goose-web check`, open a chat and check that its extensions load. If an upgrade changes
+Goose's compaction or extension start-up behaviour, revisit the settings in 11.5.
 
 ## 12. Workers
 

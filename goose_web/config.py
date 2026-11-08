@@ -86,6 +86,7 @@ DEFAULTS: dict[str, Any] = {
         "enabled": "auto",                # auto = on for Windows, off elsewhere; true | false
         "network": "internet",            # none | internet | internet+lan (loopback is never reachable)
         "read_dirs": [],                  # extra program folders the workers may read and run (Python, node, uv, git)
+        "relays": [],                     # local services sandboxed workers may reach, e.g. ["127.0.0.1:8317"] (relay.py)
     },
     "auth": {
         "session_hours": 12,

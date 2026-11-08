@@ -60,6 +60,7 @@ class Rpc extends Emitter {
       store.set('conn', 'open');
       if (hello && hello.upstream) store.set('upstream', hello.upstream.state || 'ready');
       if (hello && hello.agent) store.set('agentInfo', hello.agent);
+      if (hello && hello.gooseCaps) store.set('gooseCaps', hello.gooseCaps);
       this.emit('hello', hello);
       if (this.watched.size) this._send('_gw/watch', { sessionIds: [...this.watched] }, 15000, true).catch(() => {});
       const w = this.waiters; this.waiters = [];

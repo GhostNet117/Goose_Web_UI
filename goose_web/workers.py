@@ -204,6 +204,8 @@ class Worker:
     sandbox: dict | None = None      # {name, profile_root, grants, caps} -> AppContainer + stdio transport
     sandbox_sid: str = ""
     channel: Any = None              # sandbox.StdioChannel of the running stdio worker
+    relay_procs: list = field(default_factory=list)     # forwarders inside the container (relay.py)
+    relay_servers: list = field(default_factory=list)   # gateway-side pipe servers
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
@@ -324,6 +326,16 @@ class WorkerManager:
     async def _start(self, w: Worker) -> None:
         if w.sandbox:
             return await self._start_sandboxed(w)
+        if w.path_root and not w.native and IS_WINDOWS:
+            # Sandboxed before (sandbox switched off since)? Point relayed provider URLs back at the real services.
+            from . import relay as rl
+            from . import sandbox as sb
+            try:
+                name = sb.container_name(str(self.s.profiles_root), w.username)
+                if rl.undo_relays(str(self.s.system_dir / "sandbox"), name, w.path_root):
+                    log.info("worker %s: restored relayed URLs (no longer sandboxed)", w.key)
+            except Exception as e:
+                log.warning("worker %s: could not restore relayed URLs: %s", w.key, e)
         binary = self.s.goose_binary
         w.port = _free_port()
         w.secret = secrets.token_urlsafe(32)
@@ -399,9 +411,16 @@ class WorkerManager:
         cwd = os.path.join(spec["profile_root"], "workspace")
         if not os.path.isdir(cwd):
             cwd = spec["profile_root"]
+        # Relays first, so goose reads the rewritten provider URLs when it starts.
+        try:
+            await asyncio.to_thread(self._start_relays, w, state["sid"])
+        except Exception as e:   # the worker still runs; only the relayed services are unavailable
+            self._stop_relays(w)
+            log.warning("worker %s: relays not started: %s", w.key, e)
         try:
             w.proc = sb.spawn(args, self._env(w), cwd, state["sid"], spec.get("caps") or [], logf, job=self.job)
         except Exception as e:
+            self._stop_relays(w)
             w.state, w.last_error = "crashed", f"cannot start goose in the sandbox: {e}"
             raise RuntimeError(w.last_error) from e
         finally:
@@ -409,6 +428,7 @@ class WorkerManager:
         w.channel = sb.StdioChannel(w.proc, asyncio.get_running_loop())
         await asyncio.sleep(0.3)
         if w.proc.poll() is not None:
+            self._stop_relays(w)
             w.state = "crashed"
             w.last_error = f"goose acp exited with code {w.proc.returncode} (see worker-{w.key}.log)"
             raise RuntimeError(w.last_error)
@@ -416,7 +436,58 @@ class WorkerManager:
         w.state, w.started_at, w.restart_pending, w.last_error = "ready", time.time(), False, ""
         log.info("worker %s ready in sandbox %s (pid %s, scheduler=%s)", w.key, spec["name"], w.proc.pid, w.scheduler)
 
+    def _start_relays(self, w: Worker, sid: str) -> None:
+        """Spec 014: pipe server (gateway) + forwarder (inside the container) per allow-listed local service, and
+        the user's provider URLs pointed at the forwarder. Targets removed from the config are restored."""
+        from . import relay as rl
+        from . import sandbox as sb
+        spec = w.sandbox or {}
+        root = spec["profile_root"]
+        state_file = self.s.system_dir / "sandbox" / f"{spec['name']}.relays.json"
+        try:
+            old = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            old = {}
+        new = {r["target"]: r["listen"] for r in spec.get("relays") or []}
+        gone = {t: lst for t, lst in old.items() if new.get(t) != lst}
+        if gone:
+            rl.restore_profile_urls(root, gone)
+        if not new:
+            state_file.unlink(missing_ok=True)
+            return
+        py, _ = rl.python_for_container()
+        fwd = rl.write_forwarder(root)
+        logf = open(self.log_dir / f"worker-{w.key}.log", "ab", buffering=0)
+        try:
+            for r in spec["relays"]:
+                w.relay_servers.append(rl.PipeRelayServer(r["pipe"], sid, r["target"]).start())
+                p = sb.spawn([py, "-I", fwd, r["listen"], r["pipe"]], self._env(w), root, sid, [], logf, job=self.job)
+                w.relay_procs.append(p)
+                line = p.stdout.readline().decode("utf-8", "replace").strip()
+                if line != "listening":
+                    raise RuntimeError(f"forwarder for {r['target']} did not start (see worker-{w.key}.log)")
+        finally:
+            logf.close()
+        changed = rl.rewrite_profile_urls(root, new)
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps(new), encoding="utf-8")
+        log.info("worker %s: relays %s (rewrote %d file(s))", w.key, new, len(changed))
+
+    def _stop_relays(self, w: Worker) -> None:
+        for p in w.relay_procs:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        for s in w.relay_servers:
+            try:
+                s.stop()
+            except Exception:
+                pass
+        w.relay_procs, w.relay_servers = [], []
+
     def _kill(self, w: Worker) -> None:
+        self._stop_relays(w)
         p = w.proc
         if p and p.poll() is None:
             try:

@@ -135,6 +135,14 @@ if (-not $gooseExe) { throw "Goose CLI not found. Pass -GooseBinary <Goose folde
 $gv = & $gooseExe --version 2>&1 | Select-Object -First 1
 if ($LASTEXITCODE) { throw "The Goose CLI did not run: $gooseExe ($gv)" }
 Say "Goose CLI: $gooseExe ($("$gv".Trim()))"
+# Goose Web supports Goose 1.50 and later; 1.57+ adds live voice, a saved per-chat system prompt, the tool-shim
+# option and the GOOSE_AUTO_COMPACT_TOKEN_LIMIT cap (see docs/ADMINISTRATION.md, "Goose versions").
+$gvm = [regex]::Match("$gv", '(\d+)\.(\d+)')
+if ($gvm.Success) {
+    $gvt = [version]("{0}.{1}" -f $gvm.Groups[1].Value, $gvm.Groups[2].Value)
+    if ($gvt -lt [version]'1.50') { throw "Goose $gvt is too old for Goose Web (1.50 or later is needed). Upgrade Goose first." }
+    if ($gvt -lt [version]'1.57') { Warn "Goose $gvt works with Goose Web. A few features need 1.57 or later (live voice, saved per-chat system prompt, tool shim, the 225k compaction cap setting)." }
+}
 
 $detected = ''
 if ($env:GOOSE_PATH_ROOT -and (Test-Path (Join-Path $env:GOOSE_PATH_ROOT 'config'))) { $detected = $env:GOOSE_PATH_ROOT }

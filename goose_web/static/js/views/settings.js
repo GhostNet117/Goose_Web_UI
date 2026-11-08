@@ -164,7 +164,7 @@ function providersTab(body) {
     const m = modal({ title: cur ? 'Edit ' + cur.displayName : 'New custom provider', size: 'lg',
       body: h('div', { class: 'stack' }, h('div', { class: 'grid2' }, field('Engine', engine), field('Display name', name)), field('API URL', url), field('Base path', basePath), field('API key', key),
         field('Models', models, 'Comma separated'), field('Extra headers', headers, 'One per line'),
-        h('div', { class: 'row wrap' }, checkbox(requiresAuth, 'Requires API key', (v) => { requiresAuth = v; }), checkbox(streaming, 'Supports streaming', (v) => { streaming = v; }), checkbox(toolshim, 'Tool shim', (v) => { toolshim = v; }), checkbox(thinking, 'Preserve thinking', (v) => { thinking = v; })), err),
+        h('div', { class: 'row wrap' }, checkbox(requiresAuth, 'Requires API key', (v) => { requiresAuth = v; }), checkbox(streaming, 'Supports streaming', (v) => { streaming = v; }), (store.get('gooseCaps') || {}).toolshim === false ? null : checkbox(toolshim, 'Tool shim', (v) => { toolshim = v; }), checkbox(thinking, 'Preserve thinking', (v) => { thinking = v; })), err),
       footer: [btn('Cancel', () => m.close()), btn(cur ? 'Save' : 'Create', async () => {
         err.textContent = '';
         const hdr = {}; for (const line of headers.value.split('\n')) { const i = line.indexOf(':'); if (i > 0) hdr[line.slice(0, i).trim()] = line.slice(i + 1).trim(); }
@@ -276,6 +276,9 @@ function preferencesTab(body) {
     section('Chat', null, h('div', { class: 'card stack' },
       settingRow('Enter sends the message', 'When off, use Ctrl+Enter to send and Enter for a new line.', toggle(p.enterToSend !== false, (v) => setPref('enterToSend', v))),
       settingRow('Show message timestamps', null, toggle(!!p.showTimestamps, (v) => setPref('showTimestamps', v))),
+      settingRow('Messages shown in a chat', 'How much of a long chat is on screen when you open it. Older messages stay in the chat; this only limits what the page draws at once. Applies when you next open a chat.',
+        select([{ value: '100', label: 'Last 100' }, { value: '300', label: 'Last 300' }, { value: '1000', label: 'Last 1000' }, { value: '0', label: 'All (can be slow)' }], String(p.historyWindow ?? 300), { class: 'inp inp-sm', onchange: (e) => setPref('historyWindow', Number(e.target.value)) })),
+      settingRow('Load earlier messages when scrolling up', 'When off, use the "Show earlier messages" button at the top of the chat.', toggle(p.autoLoadEarlier !== false, (v) => setPref('autoLoadEarlier', v))),
       settingRow('Thinking', 'Goose\'s reasoning before each step. Auto keeps it open while Goose works and folds it when the turn ends.',
         select([{ value: 'auto', label: 'Auto' }, { value: 'expanded', label: 'Always expanded' }, { value: 'collapsed', label: 'Collapsed' }], ap.thinking, { class: 'inp inp-sm', 'aria-label': 'Thinking', onchange: (e) => patchPref('activity', { thinking: e.target.value }) })),
       settingRow('Tool details', 'Auto opens a tool call while it runs (input, live output, approval) and folds it when done. Detailed keeps every call open; Concise shows headers only.',

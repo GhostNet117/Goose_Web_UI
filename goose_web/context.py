@@ -158,8 +158,13 @@ class Ctx:
         root = str(self.profiles.root_for(user))
         read_dirs = [str(d) for d in (self.settings.get("sandbox", "read_dirs") or []) if d]
         net = str(self.settings.get("sandbox", "network") or "internet").lower()
-        return {"name": sb.container_name(str(self.settings.profiles_root), user["username"]),
-                "profile_root": root,
+        from . import relay as rl
+        name = sb.container_name(str(self.settings.profiles_root), user["username"])
+        targets = [str(t) for t in (self.settings.get("sandbox", "relays") or []) if t]
+        relays = rl.relay_specs(name, int(user["id"]), targets) if targets else []
+        if relays:   # the forwarder inside the container runs on the gateway's base Python
+            read_dirs = read_dirs + [rl.python_for_container()[1]]
+        return {"name": name, "profile_root": root, "relays": relays,
                 "grants": sb.desired_grants(root, self.roots_for(user), read_dirs, self.settings.goose_binary),
                 "caps": sb.NETWORK_CAPS.get(net, sb.NETWORK_CAPS["internet"])}
 

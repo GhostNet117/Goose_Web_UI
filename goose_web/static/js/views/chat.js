@@ -7,7 +7,7 @@ import { getChat, setCurrentChat, dropChat } from '../chatsession.js';
 import { Composer } from '../composer.js';
 import { pickFolder } from './folderpicker.js';
 import { getSession, removeSession, patchSession, sessionTitle, upsertSession, isArchived } from '../sessions.js';
-import { policy, allowedValue } from '../store.js';
+import { store, policy, allowedValue } from '../store.js';
 import { isPinned, togglePin } from '../prefs.js';
 import { pillSelect, rememberEffortOptions } from '../chatoptions.js';
 import { setBaseTitle } from '../herd.js';
@@ -170,6 +170,17 @@ export function renderChat(ctx, sessionId) {
   const el = h('div', { class: 'view view-chat' }, header, h('div', { class: 'chat-body' }, scroller, jumpBtn), h('div', { class: 'chat-composer-wrap' }, composer.el));
 
   renderState();
+  // Once per chat and page: offer to refresh extensions whose stored definition is older than the config.
+  const offerRefresh = async () => {
+    if (checkedExt.has(chat.id) || !policy('extensions_edit')) return;
+    checkedExt.add(chat.id);
+    try {
+      const [sess, cfg] = await Promise.all([rpc.call(G('session/extensions/list'), { sessionId: chat.id }), rpc.call(G('config/extensions/list'), {})]);
+      const todo = outdatedExtensions(sess.extensions, cfg.extensions);
+      if (todo.length) toast('This chat uses older definitions of ' + todo.map((t) => t.name).join(', ') + ' than your configuration.', { kind: 'warn', timeout: 12000, actions: [{ label: 'Refresh extensions', variant: 'primary', onClick: () => refreshExtensions(chat) }] });
+    } catch { /* not important enough to report */ }
+  };
+  if (chat.loaded) offerRefresh(); else offs.push(chat.on('loaded', offerRefresh));
   if (!chat.loaded && !chat.loading) chat.load();
   requestAnimationFrame(() => { scrollBottom(true); composer.focus(); });
 
@@ -183,6 +194,7 @@ export function renderChat(ctx, sessionId) {
       { label: 'Fork conversation', icon: 'fork', onClick: fork },
       '-',
       { label: 'Session extensions…', icon: 'ext', onClick: () => extensionsDialog(chat) },
+      ...(policy('extensions_edit') ? [{ label: 'Refresh extensions', icon: 'refresh', onClick: () => refreshExtensions(chat) }] : []),
       { label: 'Tools…', icon: 'tool', onClick: () => toolsDialog(chat) },
       { label: 'System prompt…', icon: 'scroll', onClick: () => systemPromptDialog(chat) },
       { label: 'Diagnostics', icon: 'activity', onClick: () => diagnosticsDialog(chat) },
@@ -243,6 +255,46 @@ async function exportSession(chat, format) {
   } catch (e) { toastError(e, 'Export'); }
 }
 
+// ----- refresh extensions -----
+const checkedExt = new Set();
+// Goose stores a chat's extension definitions when the chat is created and a reopened chat starts those, not
+// the current configuration. A chat is "outdated" when one of its extensions is defined differently in the
+// config now (for example a new command or wrapper). Refreshing removes the stored entry and adds the
+// current definition, which Goose then stores for the chat. Goose's own database is never edited directly.
+const extSig = (x) => JSON.stringify(['type', 'cmd', 'args', 'uri', 'envs', 'env_keys', 'headers', 'timeout', 'bundled']
+  .map((k) => (x && x[k] !== undefined ? x[k] : null)));
+
+export function outdatedExtensions(listed, cfgExtensions) {
+  const cfgBy = new Map((cfgExtensions || []).flatMap((e) => [[e.configKey, e], [e.extension && e.extension.name, e]].filter((x) => x[0])));
+  const out = [];
+  for (const e of listed || []) {
+    const c = cfgBy.get(e.extension && e.extension.name) || cfgBy.get(e.extensionKey);
+    if (c && c.extension && extSig(c.extension) !== extSig(e.extension)) out.push({ key: e.extensionKey, name: (e.extension && e.extension.name) || e.extensionKey, extension: c.extension });
+  }
+  return out;
+}
+
+export async function refreshExtensions(chat, { quiet = false } = {}) {
+  if (chat.running || chat.promptPending) { toast('Stop the current run before refreshing extensions.', { kind: 'warn' }); return null; }
+  try {
+    const [sess, cfg] = await Promise.all([rpc.call(G('session/extensions/list'), { sessionId: chat.id }), rpc.call(G('config/extensions/list'), {})]);
+    const todo = outdatedExtensions(sess.extensions, cfg.extensions);
+    if (!todo.length) { if (!quiet) toast('Extensions are up to date', { kind: 'success', timeout: 2000 }); return { refreshed: [], failed: [] }; }
+    const refreshed = [], failed = [];
+    for (const t of todo) {
+      try {
+        await rpc.call(G('session/extensions/remove'), { sessionId: chat.id, extensionKey: t.key });
+        await rpc.call(G('session/extensions/add'), { sessionId: chat.id, extension: t.extension });
+        refreshed.push(t.name);
+      } catch (e) { failed.push(t.name + ': ' + errMsg(e)); }
+    }
+    chat.extensionResults = [];   // the dialog recomputes the header count from Goose's list
+    if (failed.length) toast('Refreshed ' + refreshed.length + ', failed ' + failed.length + ': ' + failed.join('; '), { kind: 'error', timeout: 9000 });
+    else toast('Refreshed ' + refreshed.join(', '), { kind: 'success' });
+    return { refreshed, failed };
+  } catch (e) { toastError(e, 'Refresh extensions'); return null; }
+}
+
 // ----- dialogs -----
 export async function extensionsDialog(chat) {
   const body = h('div', { class: 'stack' }, spinner(16));
@@ -268,9 +320,13 @@ export async function extensionsDialog(chat) {
       chat.extensionResults = [...active.map((e) => ({ name: nm(e), success: true })), ...failed.map((n) => ({ name: n, success: false, error: startErr.get(n) }))];
       chat.emit('state');
       const okCount = active.length, total = active.length + failed.length;
+      const outdated = outdatedExtensions(listed, cfg.extensions);
+      const stale = new Set(outdated.map((o) => o.key));
       body.replaceChildren(
         h('div', { class: 'ext-summary' + (failed.length ? ' warn' : '') }, icon(failed.length ? 'alert' : 'check', 15),
           h('span', null, okCount + ' of ' + total + ' extensions loaded' + (failed.length ? ', ' + failed.length + ' failed' : ''))),
+        outdated.length ? banner('warn', outdated.length + ' extension' + (outdated.length > 1 ? 's use an older definition' : ' uses an older definition') + ' than your configuration (' + outdated.map((o) => o.name).join(', ') + '). This chat keeps the definitions it was created with. ',
+          canEdit ? btn('Refresh extensions', async () => { await refreshExtensions(chat); load(); }, { size: 'sm', icon: 'refresh', variant: 'primary' }) : null) : null,
         failed.length ? h('h4', null, 'Failed to start') : null,
         failed.length ? table([
           { label: 'Extension', render: (n) => h('div', null, h('div', { class: 'strong' }, n), h('pre', { class: 'ext-error' }, String(startErr.get(n)))) },
@@ -285,7 +341,7 @@ export async function extensionsDialog(chat) {
         h('h4', null, 'Active in this session'),
         table([
           { label: '', render: () => h('span', { class: 'ok', title: 'Loaded' }, icon('check', 14)) },
-          { label: 'Extension', render: (r) => h('div', null, h('div', { class: 'strong' }, r.extension.display_name || nm(r)), h('div', { class: 'muted small' }, r.extension.description || '')) },
+          { label: 'Extension', render: (r) => h('div', null, h('div', { class: 'strong' }, r.extension.display_name || nm(r), stale.has(r.extensionKey) ? h('span', { class: 'badge badge-warn', title: 'Defined differently in your configuration now' }, ' outdated') : null), h('div', { class: 'muted small' }, r.extension.description || '')) },
           { label: 'Type', render: (r) => h('span', { class: 'badge' }, r.extension.type) },
           { label: '', class: 'right', render: (r) => canEdit ? btn('Remove', async () => { try { await rpc.call(G('session/extensions/remove'), { sessionId: chat.id, extensionKey: r.extensionKey }); toast('Removed ' + nm(r), { kind: 'success' }); load(); } catch (e) { toastError(e); } }, { size: 'sm', variant: 'danger-soft' }) : null },
         ], active, { empty: 'No extensions active' }),
@@ -338,7 +394,7 @@ export function systemPromptDialog(chat) {
   let m;
   m = modal({
     title: 'Session system prompt', size: 'lg',
-    body: h('div', { class: 'stack' }, h('p', { class: 'muted' }, 'Applies only to this chat. Use Settings → System prompts to change the defaults.'), field('Mode', modeSel), field('Text', ta)),
+    body: h('div', { class: 'stack' }, (store.get('gooseCaps') || {}).persistentSystemPrompt === false ? banner('info', 'This Goose version keeps the override only while the chat is open in this worker. Goose Web applies it again when you reopen the chat, as long as the gateway has not restarted.') : null, h('p', { class: 'muted' }, 'Applies only to this chat. Use Settings → System prompts to change the defaults.'), field('Mode', modeSel), field('Text', ta)),
     footer: [btn('Cancel', () => m.close()), btn('Apply', async () => {
       try { await rpc.call(G('session/system-prompt/set'), { sessionId: chat.id, mode, text: ta.value }); toast('System prompt updated', { kind: 'success' }); m.close(); } catch (e) { toastError(e, 'System prompt'); }
     }, { variant: 'primary' })],

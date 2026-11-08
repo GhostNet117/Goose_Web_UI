@@ -738,6 +738,8 @@ async def _drop_sandbox(c: Ctx, u: dict) -> None:
     key = u["username"].lower()
     if c.workers.get(key):
         await c.workers.stop(key, "(sandbox removed)")
+    from . import relay as rl
+    await asyncio.to_thread(rl.undo_relays, state_dir, name, str(c.profiles.root_for(u)))
     st = await asyncio.to_thread(sb.remove, state_dir, name)
     c.db.audit("sandbox.remove", target=u["username"], detail={"container": name, "grants": sorted(st.get("grants", {}))})
 

@@ -20,6 +20,8 @@ export const ACCENTS = ['#7c5cff', '#3b82f6', '#06b6d4', '#10b981', '#f59e0b', '
 export const DEFAULT_PREFS = {
   theme: 'system', accent: '', density: 'comfortable', fontSize: 14, codeTheme: 'auto',
   enterToSend: true, showTimestamps: false, pinned: [], recentFolders: [], lastCwd: '',
+  // Chat history shown at once (items; 0 = all) and whether scrolling to the top loads earlier messages.
+  historyWindow: 300, autoLoadEarlier: true,
   notifications: { browser: false, sound: false, events: ['needs_you', 'done', 'error'] },
   sidebar: { collapsed: {}, showArchived: false, includeScheduled: true, width: 288 },
   herd: { all: false },

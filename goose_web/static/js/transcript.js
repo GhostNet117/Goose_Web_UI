@@ -1,5 +1,6 @@
 // Transcript: incremental, windowed rendering of a session's update stream.
-// Items are built lazily; only the last WINDOW items are attached to the DOM until "show earlier".
+// Items are built lazily; only the last windowSize() items are attached to the DOM until "show earlier"
+// (button, or scrolling to the top).
 import { h, prettyJson, copyBtn, iconBtn, toDate, fmtNum, fmtCost, btn, confirmDialog, toast, toastError } from './ui.js';
 import { router } from './router.js';
 import { icon, logo } from './icons.js';
@@ -7,8 +8,9 @@ import { setMarkdown } from './markdown.js';
 import { askCard } from './asks.js';
 import { prefs, activityPrefs } from './prefs.js';
 
-const WINDOW = 80;
-const PAGE = 60;
+// Items attached at once (Settings > Chat > Messages shown in a chat; 0 = all) and per "show earlier" step.
+const windowSize = () => { const v = Number(prefs().historyWindow ?? 300); return v > 0 ? Math.max(50, v) : Infinity; };
+const pageSize = () => Math.min(200, Math.max(60, Math.floor(windowSize() / 2)));
 const MAX_LIVE = 200000;
 
 const KIND_ICON = { read: 'file', edit: 'edit', delete: 'trash', move: 'file', search: 'search', execute: 'terminal', think: 'brain', fetch: 'globe', switch_mode: 'sliders', other: 'tool' };
@@ -38,6 +40,20 @@ export class Transcript {
     this.activityEl = h('div', { class: 'tr-item tr-agent-side tr-activity-wrap', hidden: true }, this.activityBar);
     this.turn = null;
     this.root.append(this.moreBtn, this.list, this.activityEl);
+    // Scrolling to the top loads earlier messages. Armed only by the user's own scrolling, so the
+    // initial render (before the chat scrolls to the bottom) never pulls in the whole history.
+    this.armed = false;
+    const arm = () => { this.armed = true; };
+    for (const ev of ['wheel', 'touchmove', 'keydown']) this.root.addEventListener(ev, arm, { passive: true });
+    if ('IntersectionObserver' in window) {
+      this.moreObs = new IntersectionObserver((entries) => {
+        if (!entries.some((e) => e.isIntersecting) || this.moreBtn.hidden || this.bulk || !this.armed || prefs().autoLoadEarlier === false) return;
+        this.showEarlier();
+        // Still at the top (short messages)? Observe again for a fresh callback.
+        requestAnimationFrame(() => { this.moreObs.unobserve(this.moreBtn); this.moreObs.observe(this.moreBtn); });
+      }, { rootMargin: '200px 0px 0px 0px' });
+      this.moreObs.observe(this.moreBtn);
+    }
     this.clear();
   }
 
@@ -123,7 +139,7 @@ export class Transcript {
     item.first = item.agentSide && (!prev || !prev.agentSide);
     this.items.push(item);
     if (prev && prev.kind === 'agent' && item.kind !== 'agent') this.finalizeItem(prev);
-    if (this.items.length - this.firstAttached > WINDOW * 2) this.trimTop();
+    if (this.items.length - this.firstAttached > windowSize() * 2) this.trimTop();
     this.attach(item);
     this.chat.emit('transcript:append', item);
     return item;
@@ -133,26 +149,32 @@ export class Transcript {
     if (before) this.list.insertBefore(item.el, before); else this.list.appendChild(item.el);
   }
   trimTop() {
-    const target = this.items.length - WINDOW;
+    const target = this.items.length - windowSize();
     for (let i = this.firstAttached; i < target; i++) { const it = this.items[i]; if (it.el && it.el.parentNode) it.el.remove(); }
     this.firstAttached = target;
-    this.moreBtn.hidden = false;
+    this.updateMore();
+  }
+  updateMore() {
+    this.moreBtn.hidden = this.firstAttached <= 0;
+    const label = this.moreBtn.querySelector('span');
+    if (label) label.textContent = 'Show earlier messages (' + this.firstAttached + ' more)';
   }
   showEarlier() {
-    const start = Math.max(0, this.firstAttached - PAGE);
+    const start = Math.max(0, this.firstAttached - pageSize());
     const anchor = this.list.firstChild;
     const scroller = this.root.closest('.chat-scroll');
     const prevH = scroller ? scroller.scrollHeight : 0;
     for (let i = start; i < this.firstAttached; i++) { const it = this.items[i]; this.attach(it, anchor); if (it.kind === 'tool') this.renderTool(it); }
     this.firstAttached = start;
-    this.moreBtn.hidden = start === 0;
+    this.updateMore();
     if (scroller) scroller.scrollTop += scroller.scrollHeight - prevH;
   }
   // replay: build window only at the end
   beginBulk() { this.bulk = true; }
   endBulk() {
     this.bulk = false;
-    const start = Math.max(0, this.items.length - WINDOW);
+    this.armed = false;
+    const start = Math.max(0, this.items.length - windowSize());
     this.list.replaceChildren();
     for (let i = start; i < this.items.length; i++) {
       const it = this.items[i];
@@ -164,7 +186,7 @@ export class Transcript {
       else if (it.kind === 'tool') this.renderTool(it);
     }
     this.firstAttached = start;
-    this.moreBtn.hidden = start === 0;
+    this.updateMore();
   }
 
   // ---------- builders ----------

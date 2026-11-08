@@ -33,6 +33,7 @@ export const store = new Store({
   herd: new Map(),     // sessionId -> Agent
   asks: new Map(),     // request id -> ask
   agentInfo: null,     // initialize result from _gw/hello
+  gooseCaps: null,     // what the worker's Goose version supports (_gw/hello)
 });
 
 export const bus = new Emitter();

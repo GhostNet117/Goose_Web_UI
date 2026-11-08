@@ -278,6 +278,7 @@ def cmd_sandbox(args, settings) -> int:
         print(f"Sandbox: {'ON' if on else 'off'} (sandbox.enabled), network: {settings.get('sandbox', 'network')}, "
               f"platform: {'Windows AppContainer' if sb.IS_WINDOWS else 'not supported (fail closed when on)'}")
         print(f"Extra program folders (sandbox.read_dirs): {settings.get('sandbox', 'read_dirs') or '-'}")
+        print(f"Relayed local services (sandbox.relays): {settings.get('sandbox', 'relays') or '-'}")
         for st in sb.all_states(state_dir):
             print(f"  {st.get('name')}  {st.get('sid')}")
             for p, r in sorted((st.get("grants") or {}).items()):
@@ -287,6 +288,11 @@ def cmd_sandbox(args, settings) -> int:
     db = Database(settings.system_dir / "goose-web.db")
     u = db.user_by_name(args.user or "")
     name = sb.container_name(str(settings.profiles_root), u["username"] if u else (args.user or ""))
+    from . import relay as rl
+    from .profiles import Profiles
+    restored = rl.undo_relays(state_dir, name, str(Profiles(settings, db).root_for(u)) if u else None)
+    if restored:
+        print(f"Restored the relayed service URLs in {len(restored)} file(s).")
     st = sb.remove(state_dir, name)
     if not st:
         print(f"No sandbox recorded for {args.user!r} ({name}).")
@@ -426,6 +432,15 @@ def cmd_check(args, settings) -> int:
     gb = settings.goose_binary
     gv = goose_version(gb)
     line("goose binary", f"{gb} ({gv or 'not runnable'})", bool(gv))
+    if gv:
+        from .hub import MIN_GOOSE, MODERN_GOOSE, parse_version
+        v = parse_version(gv)
+        if v and v < MIN_GOOSE:
+            line("goose version", f"{gv} is older than {'.'.join(map(str, MIN_GOOSE))}, the oldest supported version", False)
+        elif v and v < MODERN_GOOSE:
+            print(f"[OK] goose version: {gv} is supported. Goose {'.'.join(map(str, MODERN_GOOSE))} or later adds live "
+                  "voice, a saved per-chat system prompt, the tool-shim option and the 225k compaction cap setting "
+                  "(GOOSE_AUTO_COMPACT_TOKEN_LIMIT); see docs/ADMINISTRATION.md 'Goose versions'.")
     line("running as", f"{winsec.current_user()} integrity={winsec.integrity_level()}", not winsec.is_elevated())
     line("profiles root", settings.profiles_root, settings.profiles_root.exists())
     if os.name == "nt":

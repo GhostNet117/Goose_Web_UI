@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.10.0 - 2026-11-08
+
+- **Goose 1.50 support:** Goose Web now works with Goose 1.50 and later (tested with 1.50.1 and 1.57.0). It reads the
+  worker's Goose version and adapts: direct tool calls are checked against the named extension (Goose 1.50 ignores
+  it - checked on every version now), live voice and the tool-shim option are hidden or refused, chat import sends
+  the `source` 1.50 needs, and a per-chat system prompt is re-applied when the chat is reopened (1.50 does not save
+  it). `goose-web check` and `install.ps1` report the Goose version (ADMINISTRATION 11.7).
+- **Refresh extensions:** chats keep the extension definitions they were created with. Goose Web marks extensions
+  whose definition changed since as **outdated** and offers **Refresh extensions** (chat menu, Session extensions,
+  and a notice when such a chat opens): it removes and re-adds them through Goose with the current definition.
+- **Longer visible history:** a chat now shows the last 300 messages and tool steps (was 80; Settings > Preferences >
+  Chat > Messages shown in a chat: 100, 300, 1000 or All) and loads earlier ones automatically when you scroll to the
+  top. The old limit looked like early compaction in tool-heavy chats.
+- **Relays for sandboxed users:** `sandbox.relays: ["127.0.0.1:8317"]` lets sandboxed agents use a local service such
+  as a model proxy, through a forwarder in the user's own container and a named pipe only that container can open;
+  the user's provider URLs are pointed at the forwarder and restored when no longer needed. The rest of loopback stays
+  closed (ADMINISTRATION 11.6, SECURITY-ASSESSMENT 8.3).
+
 ## 1.9.0 - 2026-11-08
 
 - **Guided setup** (`scripts\install.ps1`): asks for the Goose program folder, the first administrator's Goose

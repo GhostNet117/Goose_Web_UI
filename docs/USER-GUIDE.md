@@ -379,6 +379,12 @@ Click the chip (or **Session extensions...** in the session menu) to open the **
 - **Add from your configured extensions**: extensions you have configured but that are not in this chat.
   **Add** loads one into this chat.
 
+**Refresh extensions.** A chat keeps the extension settings it was started with. When an extension has been changed
+since (for example a new command that starts faster), the dialog marks it **outdated** and shows **Refresh
+extensions**; opening such a chat also shows a notice with the same button. Refreshing takes the outdated extensions
+out of this chat and adds them again with your current settings. Your messages are not touched. **Refresh
+extensions** is also in the chat menu. Stop a running reply first.
+
 Retry, Remove and Add need the `extensions_edit` permission. Without it the dialog is read-only.
 
 ### Context and cost meter
@@ -552,7 +558,9 @@ rules.
 - **Usage footer**: under a reply you may see input and output tokens, the cost and the time it took.
 - **Images from the internet** in replies are not loaded, for security. Their address is shown instead. Links
   open in a new tab.
-- **Show earlier messages** at the top loads older parts of a long chat.
+- **Long chats**: the chat shows the last 300 messages and tool steps (Settings > Preferences > Chat > **Messages
+  shown in a chat**: 100, 300, 1000 or All). Scroll to the top to load earlier ones, or click **Show earlier
+  messages (N more)**. Nothing is deleted: this only limits what the page draws at once.
 - **Jump to latest** (the down-arrow button) appears when you scroll up. Click it to return to the end.
 - **System lines** explain why a run ended, for example "Stopped: output token limit reached", "Stopped:
   maximum turns reached" or "The model refused to continue".
@@ -988,6 +996,8 @@ These settings belong to Goose Web and follow you to every device.
 |---|---|---|
 | Enter sends the message | On: `Enter` sends. Off: `Ctrl+Enter` sends and `Enter` adds a line. | On |
 | Show message timestamps | Shows the time on your messages. | Off |
+| Messages shown in a chat | Last 100, Last 300, Last 1000, All | Last 300 |
+| Load earlier messages when scrolling up | On, Off | On |
 | Thinking | Auto, Always expanded, Collapsed | Auto |
 | Tool details | Auto, Detailed, Concise | Auto |
 | Live activity bar | On, Off | On |
