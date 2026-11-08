@@ -1,4 +1,5 @@
-"""One `goose serve` process per profile, on loopback, with a random port and a random secret.
+"""One goose process per profile: `goose serve` on loopback (random port + secret), or - for sandboxed workers
+(sandbox.py, spec 012) - `goose acp` inside the user's AppContainer, connected over its stdin/stdout.
 
 A worker is started lazily on first use. It is stopped after `goose.idle_minutes` without browser
 clients, active runs or a scheduler duty, and restarted with backoff if it crashes. Every worker inherits
@@ -16,6 +17,7 @@ import json
 import logging
 import os
 import secrets
+from typing import Any
 import socket
 import subprocess
 import sys
@@ -199,7 +201,14 @@ class Worker:
     restarts: int = 0
     last_error: str = ""
     restart_pending: bool = False
+    sandbox: dict | None = None      # {name, profile_root, grants, caps} -> AppContainer + stdio transport
+    sandbox_sid: str = ""
+    channel: Any = None              # sandbox.StdioChannel of the running stdio worker
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    @property
+    def transport(self) -> str:
+        return "stdio" if self.sandbox else "websocket"
 
     @property
     def url(self) -> str:
@@ -209,7 +218,8 @@ class Worker:
         return {"key": self.key, "username": self.username, "pid": self.proc.pid if self.proc else None,
                 "port": self.port, "state": self.state, "startedAt": self.started_at, "scheduler": self.scheduler,
                 "restarts": self.restarts, "lastError": self.last_error, "native": self.native,
-                "pathRoot": self.path_root, "restartPending": self.restart_pending}
+                "pathRoot": self.path_root, "restartPending": self.restart_pending, "transport": self.transport,
+                "sandboxed": bool(self.sandbox), "sandboxSid": self.sandbox_sid}
 
 
 class WorkerManager:
@@ -256,15 +266,16 @@ class WorkerManager:
         return self.workers.get(key)
 
     def register(self, key: str, username: str, path_root: str | None, native: bool,
-                 recipe_dirs: list[str]) -> Worker:
+                 recipe_dirs: list[str], sandbox: dict | None = None) -> Worker:
         w = self.workers.get(key)
         if w is None:
-            w = Worker(key=key, username=username, path_root=path_root, native=native, recipe_dirs=recipe_dirs)
+            w = Worker(key=key, username=username, path_root=path_root, native=native, recipe_dirs=recipe_dirs,
+                       sandbox=sandbox)
             self.workers[key] = w
         else:
-            if (w.path_root, w.recipe_dirs) != (path_root, recipe_dirs) and w.state == "ready":
+            if (w.path_root, w.recipe_dirs, w.sandbox) != (path_root, recipe_dirs, sandbox) and w.state == "ready":
                 w.restart_pending = True
-            w.path_root, w.native, w.recipe_dirs = path_root, native, recipe_dirs
+            w.path_root, w.native, w.recipe_dirs, w.sandbox = path_root, native, recipe_dirs, sandbox
         return w
 
     def _env(self, w: Worker) -> dict:
@@ -287,7 +298,16 @@ class WorkerManager:
             # Spec 009: Goose loads only the gateway-written hints file (config/.goose-web-hints.md), never an
             # AGENTS.md / .goosehints in a working folder. The env var beats config.yaml and extra_env.
             env["CONTEXT_FILE_NAMES"] = json.dumps([ISOLATED_HINTS_FILENAME])
-        env["GOOSE_SERVER__SECRET_KEY"] = w.secret
+        if w.sandbox:
+            # The container cannot reach the account's TEMP or caches: keep them in the profile (granted Modify).
+            root = w.sandbox["profile_root"]
+            for k, sub in (("TEMP", "tmp"), ("TMP", "tmp"), ("UV_CACHE_DIR", "cache/uv"), ("PIP_CACHE_DIR", "cache/pip"),
+                           ("npm_config_cache", "cache/npm"), ("XDG_CACHE_HOME", "cache")):
+                d = os.path.join(root, *sub.split("/"))
+                os.makedirs(d, exist_ok=True)
+                env[k] = d
+        else:
+            env["GOOSE_SERVER__SECRET_KEY"] = w.secret
         return env
 
     async def ensure(self, key: str) -> Worker:
@@ -302,6 +322,8 @@ class WorkerManager:
         return w
 
     async def _start(self, w: Worker) -> None:
+        if w.sandbox:
+            return await self._start_sandboxed(w)
         binary = self.s.goose_binary
         w.port = _free_port()
         w.secret = secrets.token_urlsafe(32)
@@ -351,6 +373,49 @@ class WorkerManager:
         w.state, w.started_at, w.restart_pending, w.last_error = "ready", time.time(), False, ""
         log.info("worker %s ready on port %s (pid %s, scheduler=%s)", w.key, w.port, w.proc.pid, w.scheduler)
 
+    async def _start_sandboxed(self, w: Worker) -> None:
+        """`goose acp` inside the user's AppContainer; the hub talks to it over stdin/stdout (spec 012)."""
+        from . import sandbox as sb
+        w.state = "starting"
+        w.scheduler, _ = self.wants_scheduler(w)
+        spec = w.sandbox or {}
+        try:
+            if not sb.IS_WINDOWS:
+                raise sb.SandboxError("sandbox.enabled is on, but the sandbox needs Windows; this worker is not "
+                                      "started (fail closed). Turn sandbox.enabled off on this system.")
+            state = await asyncio.to_thread(sb.prepare, spec["name"], str(self.s.system_dir / "sandbox"),
+                                            spec["grants"])
+        except Exception as e:
+            w.state, w.last_error = "crashed", f"sandbox: {e}"
+            raise RuntimeError(w.last_error) from e
+        w.sandbox_sid = state["sid"]
+        args = [self.s.goose_binary, "acp"]
+        if w.scheduler:
+            args.append("--enable-scheduler")
+        rotate_log(self.log_dir / f"worker-{w.key}.log")
+        logf = open(self.log_dir / f"worker-{w.key}.log", "ab", buffering=0)
+        logf.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} start {' '.join(args[1:])} (sandbox {spec['name']}, "
+                   f"{state['sid']}) root={w.path_root}\n".encode())
+        cwd = os.path.join(spec["profile_root"], "workspace")
+        if not os.path.isdir(cwd):
+            cwd = spec["profile_root"]
+        try:
+            w.proc = sb.spawn(args, self._env(w), cwd, state["sid"], spec.get("caps") or [], logf, job=self.job)
+        except Exception as e:
+            w.state, w.last_error = "crashed", f"cannot start goose in the sandbox: {e}"
+            raise RuntimeError(w.last_error) from e
+        finally:
+            logf.close()
+        w.channel = sb.StdioChannel(w.proc, asyncio.get_running_loop())
+        await asyncio.sleep(0.3)
+        if w.proc.poll() is not None:
+            w.state = "crashed"
+            w.last_error = f"goose acp exited with code {w.proc.returncode} (see worker-{w.key}.log)"
+            raise RuntimeError(w.last_error)
+        w.port, w.secret = 0, ""
+        w.state, w.started_at, w.restart_pending, w.last_error = "ready", time.time(), False, ""
+        log.info("worker %s ready in sandbox %s (pid %s, scheduler=%s)", w.key, spec["name"], w.proc.pid, w.scheduler)
+
     def _kill(self, w: Worker) -> None:
         p = w.proc
         if p and p.poll() is None:
@@ -373,6 +438,7 @@ class WorkerManager:
                 except Exception:
                     pass
         w.proc = None
+        w.channel = None
 
     async def stop(self, key: str, reason: str = "") -> None:
         w = self.workers.get(key)

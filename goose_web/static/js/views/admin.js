@@ -440,6 +440,7 @@ function systemTab(body) {
           { label: 'Up', render: (w) => w.startedAt ? relTime(w.startedAt) : '—' },
           { label: 'Clients', key: 'clients' }, { label: 'Runs', key: 'activeRuns' },
           { label: 'Scheduler', render: (w) => w.scheduler ? badge('owner', 'accent') : '' },
+          { label: 'Sandbox', render: (w) => w.sandboxed ? h('span', { title: 'AppContainer ' + (w.sandboxSid || '') + ' - talks to the gateway over stdio, no network port' }, badge('AppContainer', 'ok')) : (w.native ? badge('native', '') : '') },
           { label: 'Restarts', render: (w) => h('span', { title: w.lastError || '' }, String(w.restarts || 0), w.lastError ? h('span', { class: 'badge badge-err' }, 'error') : null) },
           { label: '', class: 'right', render: (w) => h('span', { class: 'row' },
             btn('Restart', async () => { if (w.activeRuns && !(await confirmDialog({ title: 'Restart ' + (w.username || w.key) + '?', message: w.activeRuns + ' run(s) are active and will be interrupted.', confirmText: 'Restart', danger: true }))) return; try { await POST('/api/admin/system/workers/' + encodeURIComponent(w.key) + '/restart', {}); toast('Restarting', { kind: 'success' }); setTimeout(load, 1500); } catch (e) { toastError(e); } }, { size: 'sm' }),

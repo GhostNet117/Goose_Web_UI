@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.8.0 - 2026-11-08
+
+- **Sandbox (Windows):** `sandbox.enabled` runs every isolated non-admin user's agent in its own Windows AppContainer.
+  The operating system then limits it to the user's profile, the team folder and the team's extra (approved) folders;
+  loopback stays closed. The worker is `goose acp`, connected over its stdin/stdout - no port, no loopback exemption,
+  no administrator rights. Grants follow team and folder changes and are revoked when the user is removed.
+  `goose-web sandbox status|remove`, Admin > System shows sandboxed workers (ADMINISTRATION 11.6,
+  SECURITY-ASSESSMENT 8.2).
+
 ## 1.7.0 - 2026-11-08
 
 **Security fix - upgrade if you have non-admin users.** Per-session MCP servers (`mcpServers`) on `session/load`,

@@ -70,6 +70,12 @@ DEFAULTS: dict[str, Any] = {
         "extra_env": {},
         "default_workdir_native": "",     # admin native profile: default folder for new chats (default: home)
     },
+    # Windows: run every isolated non-admin user's worker in its own AppContainer (sandbox.py, spec 012).
+    "sandbox": {
+        "enabled": False,
+        "network": "internet",            # none | internet | internet+lan (loopback is never reachable)
+        "read_dirs": [],                  # extra program folders the workers may read and run (Python, node, uv, git)
+    },
     "auth": {
         "session_hours": 12,
         "remember_days": 30,

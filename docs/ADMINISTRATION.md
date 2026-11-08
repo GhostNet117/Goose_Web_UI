@@ -1035,6 +1035,8 @@ Implications:
 
 ### 11.3 Isolation limits
 
+On Windows the limits below about the shared OS account are closed for non-admin users by the sandbox (11.6).
+
 All workers run as the gateway's OS account. A tool that can read files or run commands can reach other profiles,
 the database and the native profile. That is why the shell extensions and stdio MCP servers are off for non-admins
 unless `allow_shell` is on; grant it only to people you would trust with that OS account. Home-folder skill and
@@ -1095,6 +1097,60 @@ in the profile you are signed in to; for isolated profiles each user's own `conf
 - **"It compacts every few messages" in the browser:** check first whether Goose compacted at all (Goose's log line
   "Performing message compaction"). The transcript shows the last 80 items and hides older ones behind "Show earlier
   messages", which in tool-heavy chats can look like lost history.
+
+### 11.6 Sandboxing users' agents (Windows AppContainer)
+
+All workers run as the one OS account the gateway runs as. Goose Web's own file browser keeps users inside their
+folders, but an agent's shell, scripts and command (stdio) extensions run as that account and could otherwise read
+anything it can: other users' profiles and chats, other teams' folders, the native Goose profile and its secrets, the
+gateway's database. On Windows, turn on the sandbox to make the operating system enforce the folder boundaries:
+
+```yaml
+sandbox:
+  enabled: true
+  network: internet          # none | internet | internet+lan
+  read_dirs: []              # extra program folders agents may run, e.g. C:\Program Files\nodejs, a Python install
+```
+
+What it does, for every **isolated, non-admin** user (administrators and the native profile are never sandboxed):
+
+- The user's worker - `goose acp` and everything it starts: shells, scripts, MCP servers - runs inside the user's own
+  Windows **AppContainer** (`GooseWeb.<id>.<username>`; created without administrator rights, same name = same
+  security identifier after restarts and upgrades). It is also in the gateway's kill-on-close job object.
+- The kernel allows file access only where an ACL grants that container: **Modify** on the user's profile folder
+  (workspace included), the team folder and the team's **extra folders** (the team's Experience page > Folders: these
+  are the team's *approved folders*), and **Read & execute** on the goose CLI's folder and `sandbox.read_dirs`.
+  Everything else is denied - including the gateway's `_system` folder, other users' profiles, the native Goose
+  profile (for example `C:\AI\Goose_appdata`) and every other folder on the disk that does not grant access to "ALL
+  APPLICATION PACKAGES" (system folders such as `C:\Windows` stay readable, as for any Windows app).
+- The gateway talks to the worker over the worker's own stdin/stdout pipes - no network port, no shared secret, no
+  loopback exemption, no administrator rights. **Loopback (127.0.0.1) stays closed** for the container, so local
+  services (a browser's remote-debugging port, a local model proxy, other workers) cannot be reached from it.
+  `network: internet` allows outbound internet (needed for cloud model providers); `internet+lan` also the local
+  network; `none` nothing.
+- Grants follow changes: adding or removing an extra folder, moving a user to another team, or making a user an
+  administrator updates the ACLs at the worker's next start (a running worker restarts when it is idle). Deleting a
+  user revokes every grant and deletes the container. The applied grants are recorded in `<system_dir>/sandbox/`.
+
+Requirements and limits:
+
+- Windows 10/11 or Server 2019+. On other systems `sandbox.enabled: true` makes isolated non-admin workers refuse to
+  start (fail closed); use one OS account or container per team there.
+- **Model providers must be reachable over the network** (cloud APIs, or a server elsewhere on the LAN with
+  `internet+lan`). A provider that only listens on 127.0.0.1 of the same machine cannot be used by sandboxed users.
+- Programs the agents run must be readable by the container: tools under `C:\Program Files` usually are; per-user
+  installs (Python, node, uv in the user profile) must be added to `sandbox.read_dirs`. The workers' temp, uv, pip and
+  npm caches live in the user's profile (`tmp\`, `cache\`).
+- The Windows Credential Manager is not reachable from a container; isolated profiles already keep their secrets in
+  their own `secrets.yaml`.
+- Windows file shares (SMB) cannot be limited per container: the file server sees only the shared account. Teams that
+  need their own shares need their own account.
+- Granting a folder rewrites its ACL (with inheritance to everything below it), once per change; the account the
+  gateway runs as must be allowed to change permissions on the approved folders.
+
+Check: `goose-web check` (`[OK] sandbox`), `goose-web sandbox status` (every container, its SID and grants),
+Admin > System (the Sandbox column shows **AppContainer** for sandboxed workers). Remove one user's container by hand:
+`goose-web sandbox remove <username>` (stop the worker first).
 
 ## 12. Workers
 

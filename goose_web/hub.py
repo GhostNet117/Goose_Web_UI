@@ -241,9 +241,17 @@ class Upstream:
             self.broadcast({"jsonrpc": "2.0", "method": "_gw/upstream", "params": {"state": "starting"}})
             try:
                 w = await self.hub.workers.ensure(self.key)
-                self.ws = await websockets.connect(w.url, additional_headers={"X-Secret-Key": w.secret},
-                                                   max_size=64 * 1024 * 1024, ping_interval=20, ping_timeout=60,
-                                                   open_timeout=20, compression=None)
+                if w.transport == "stdio":
+                    # Sandboxed worker (spec 012): one ACP connection per process, over its stdin/stdout.
+                    if w.channel is None or w.channel.claimed:
+                        await self.hub.workers.stop(self.key, "(new connection)")
+                        w = await self.hub.workers.ensure(self.key)
+                    w.channel.claimed = True
+                    self.ws = w.channel
+                else:
+                    self.ws = await websockets.connect(w.url, additional_headers={"X-Secret-Key": w.secret},
+                                                       max_size=64 * 1024 * 1024, ping_interval=20, ping_timeout=60,
+                                                       open_timeout=20, compression=None)
                 self._reader = asyncio.create_task(self._read_loop(self.ws))
                 self.state = "ready"
                 self.init_result = await self.request("initialize", INIT_PARAMS, timeout=60)

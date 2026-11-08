@@ -474,6 +474,12 @@ of two modes is on:
   text. Edit your personal part here and the documents in Admin > Hints.
 - Otherwise you edit the native `.goosehints` file directly here, and library documents are not applied to it.
 
+### What your agent can reach
+
+If your administrator turned on the sandbox, your agent - its shell, scripts and tools - can only use your workspace,
+your team's folder and the folders your team was given; everything else on the server answers "Access is denied", and
+it cannot connect to services on the server itself. Ask your administrator to add a folder to your team if you need it.
+
 ### Editing a message you sent
 
 Hover over one of your messages and click the pencil (**Edit and rerun from here**). The text opens in place; change

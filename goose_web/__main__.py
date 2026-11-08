@@ -268,6 +268,34 @@ def cmd_native_hints(args, settings) -> int:
     return 0
 
 
+def cmd_sandbox(args, settings) -> int:
+    """Spec 012: show the per-user AppContainers and their folder grants, or remove one user's."""
+    from . import sandbox as sb
+    state_dir = str(settings.system_dir / "sandbox")
+    if args.action == "status":
+        on = bool(settings.get("sandbox", "enabled"))
+        print(f"Sandbox: {'ON' if on else 'off'} (sandbox.enabled), network: {settings.get('sandbox', 'network')}, "
+              f"platform: {'Windows AppContainer' if sb.IS_WINDOWS else 'not supported (fail closed when on)'}")
+        print(f"Extra program folders (sandbox.read_dirs): {settings.get('sandbox', 'read_dirs') or '-'}")
+        for st in sb.all_states(state_dir):
+            print(f"  {st.get('name')}  {st.get('sid')}")
+            for p, r in sorted((st.get("grants") or {}).items()):
+                print(f"      {r:6}  {p}")
+        return 0
+    from .db import Database
+    db = Database(settings.system_dir / "goose-web.db")
+    u = db.user_by_name(args.user or "")
+    name = sb.container_name(str(settings.profiles_root), u["username"] if u else (args.user or ""))
+    st = sb.remove(state_dir, name)
+    if not st:
+        print(f"No sandbox recorded for {args.user!r} ({name}).")
+        return 1
+    db.audit("sandbox.remove", target=args.user or "", detail={"container": name, "via": "cli"})
+    print(f"Removed {name}: revoked {len(st.get('grants') or {})} grant(s), deleted the AppContainer profile. "
+          "Stop the user's worker first if the gateway is running (Admin > System); a new start recreates it.")
+    return 0
+
+
 def _gateway_tasks() -> list[str]:
     """Windows: scheduled tasks that run this install's gateway (empty list if none or not Windows)."""
     if os.name != "nt":
@@ -405,6 +433,10 @@ def cmd_check(args, settings) -> int:
     with socket.socket() as s:
         free = s.connect_ex(("127.0.0.1", port)) != 0
     line(f"port {port}", "free" if free else "in use (gateway already running?)")
+    if settings.get("sandbox", "enabled"):
+        from . import sandbox as sb
+        line("sandbox", "on: isolated non-admin workers run in their own AppContainer" if sb.IS_WINDOWS else
+             "on, but this system is not Windows: isolated non-admin workers will not start", sb.IS_WINDOWS)
     if os.name == "nt":
         # Information only (a fresh install runs check before it registers the task): autostart at logon.
         tasks = _gateway_tasks()
@@ -467,6 +499,9 @@ def main(argv: list[str] | None = None) -> int:
     nh.add_argument("--adopt", action="store_true",
                     help="enable: keep the current .goosehints as a hints document (on --team, else on the user)")
     nh.add_argument("--doc-name", help="name for the adopted document (default '<user> goose hints')")
+    sbx = sub.add_parser("sandbox", help="per-user AppContainer sandbox: status, or remove one user's")
+    sbx.add_argument("action", choices=["status", "remove"])
+    sbx.add_argument("user", nargs="?")
     sub.add_parser("check", help="diagnostics")
     sub.add_parser("version")
     args = p.parse_args(argv)
@@ -478,7 +513,7 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "serve" and not hasattr(args, "host"):
         args.host, args.port = None, None
     return {"serve": cmd_serve, "init": cmd_init, "user": cmd_user, "ip": cmd_ip, "check": cmd_check,
-            "native-root": cmd_native_root, "native-hints": cmd_native_hints}[cmd](args, settings)
+            "native-root": cmd_native_root, "native-hints": cmd_native_hints, "sandbox": cmd_sandbox}[cmd](args, settings)
 
 
 if __name__ == "__main__":

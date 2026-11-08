@@ -141,8 +141,26 @@ class Ctx:
                 except Exception:
                     log.exception("provisioning %s failed", user["username"])
         self.workers.register(key, user["username"], self.profiles.path_root_env(user), native,
-                              self.profiles.team_recipe_dirs(user) if not native else [])
+                              self.profiles.team_recipe_dirs(user) if not native else [],
+                              sandbox=self.sandbox_spec(user))
         return self.hub.upstream(key, user["username"])
+
+    def sandboxed(self, user: dict) -> bool:
+        """Spec 012: isolated non-admin users run in their own AppContainer when sandbox.enabled is on."""
+        return bool(self.settings.get("sandbox", "enabled")) and not self.profiles.is_native(user) \
+            and user.get("role") != "admin"
+
+    def sandbox_spec(self, user: dict) -> dict | None:
+        if not self.sandboxed(user):
+            return None
+        from . import sandbox as sb
+        root = str(self.profiles.root_for(user))
+        read_dirs = [str(d) for d in (self.settings.get("sandbox", "read_dirs") or []) if d]
+        net = str(self.settings.get("sandbox", "network") or "internet").lower()
+        return {"name": sb.container_name(str(self.settings.profiles_root), user["username"]),
+                "profile_root": root,
+                "grants": sb.desired_grants(root, self.roots_for(user), read_dirs, self.settings.goose_binary),
+                "caps": sb.NETWORK_CAPS.get(net, sb.NETWORK_CAPS["internet"])}
 
     def public_user(self, u: dict) -> dict:
         return {"id": u["id"], "username": u["username"], "displayName": u["display_name"] or u["username"],

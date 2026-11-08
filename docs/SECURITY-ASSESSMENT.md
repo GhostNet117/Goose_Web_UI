@@ -407,7 +407,7 @@ built; they are possible future work.
    with Admin > Users > View effective hints.
 3. Review the audit log for `team.migrate.membership` (memberships dropped by the upgrade) and
    `user.team.directory` (a directory user matched several teams).
-4. Keep `allow_shell` and `config_edit` off for every non-admin team (7.2).
+4. Keep `allow_shell` and `config_edit` off for every non-admin team (7.2). On Windows, turn on `sandbox.enabled` as well (8.2).
 
 ## 8. Addendum: goose-web 1.5.1 - 1.7.0 (2026-11-08)
 
@@ -433,9 +433,26 @@ current major is planned), highlight.js 11.12.0, qrcode-generator 1.4.4. Secrets
 private addresses or internal names in any commit or file; detect-secrets hits are test fixtures and the
 common-password list. `.gitignore` also excludes `config.yaml`, `DEPLOYED.json`, `*.log`, `.env`, `*.sqlite`.
 
-### 8.2 Still accepted
+### 8.2 One OS account for all profiles (7.2): sandbox in 1.8.0
 
-7.2 (one OS account for all team profiles) is unchanged. A per-team Windows AppContainer design (each team's worker
-and everything it starts can only reach the folders granted to that team; creating containers needs no admin; the
-gateway-to-worker loopback connection needs a one-time `CheckNetIsolation LoopbackExempt` per team, run as admin)
-has been prototyped successfully and is planned; until then the 7.2 mitigations apply.
+1.8.0 adds an optional, OS-enforced boundary for 7.2 on Windows (`sandbox.enabled`, ADMINISTRATION 11.6): each
+isolated non-admin user's worker and everything it starts run in the user's own AppContainer, with file access only to
+that user's profile, the team folder and the team's extra folders. The gateway talks to the worker over inherited
+stdin/stdout pipes, so the container needs no network listener and no loopback exemption, and loopback stays closed
+(local services such as a browser's debugging port or a local model proxy are unreachable from it). Design choices:
+
+- Per **user**, not per team: members of one team cannot read each other's profiles (chats, `secrets.yaml`), while
+  the team folder and extra folders are granted to every member.
+- A loopback exemption per container (`CheckNetIsolation LoopbackExempt`) was rejected: it is a developer setting,
+  opens all of 127.0.0.1 to the container, is commonly reset by policy, and persistent exemptions cover outbound
+  loopback only.
+- The grant records live in `<system_dir>/sandbox/`, outside every container.
+
+Verified: a sandboxed user's agent read and wrote its approved folders; got "Access is denied" for another team's
+folder, the gateway's configuration and database folder, the administrator's native profile and other files of the
+account; could not connect to 127.0.0.1; could reach the internet (`network: internet`); after the user was removed no
+container ACE was left. `tests/test_sandbox.py` runs the kernel check on every Windows CI run.
+
+Still accepted: administrators and the native profile run unsandboxed (they are trusted); without `sandbox.enabled`,
+or on Linux/macOS, 7.2 applies unchanged; SMB shares cannot be restricted per container; system folders readable by
+all Windows apps stay readable.

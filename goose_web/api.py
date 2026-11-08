@@ -721,8 +721,25 @@ async def _reprovision(c: Ctx, users: list[dict]) -> dict:
         if w and changes and w.state == "ready":
             w.restart_pending = True
         if w:
-            w.recipe_dirs = c.profiles.team_recipe_dirs(u)
+            # recipe folders and (spec 012) the sandbox's folder grants follow team/folder changes; a changed
+            # sandbox spec marks the worker for a restart when it is quiet
+            c.workers.register(w.key, u["username"], c.profiles.path_root_env(u), False,
+                               c.profiles.team_recipe_dirs(u), sandbox=c.sandbox_spec(u))
     return out
+
+
+async def _drop_sandbox(c: Ctx, u: dict) -> None:
+    """Spec 012: stop the user's sandboxed worker, revoke its folder grants and delete its AppContainer."""
+    from . import sandbox as sb
+    name = sb.container_name(str(c.settings.profiles_root), u["username"])
+    state_dir = str(c.settings.system_dir / "sandbox")
+    if not sb.load_state(state_dir, name):
+        return
+    key = u["username"].lower()
+    if c.workers.get(key):
+        await c.workers.stop(key, "(sandbox removed)")
+    st = await asyncio.to_thread(sb.remove, state_dir, name)
+    c.db.audit("sandbox.remove", target=u["username"], detail={"container": name, "grants": sorted(st.get("grants", {}))})
 
 
 async def admin_users(request: Request):
@@ -848,6 +865,7 @@ async def admin_user(request: Request):
             raise HTTPError(400, "last_admin", "Keep at least one administrator")
         await c.workers.stop(u["username"].lower(), "(user deleted)")
         c.hub.upstreams.pop(u["username"].lower(), None)
+        await _drop_sandbox(c, u)
         where = await asyncio.to_thread(c.profiles.archive_profile, u, request.query_params.get("purgeProfile") == "1")
         c.db.execute("DELETE FROM users WHERE id=?", (u["id"],))
         c.audit(request, "user.delete", admin, target=u["username"], detail={"profile": where})
@@ -890,6 +908,11 @@ async def admin_user(request: Request):
         c.auth.revoke_user_tokens(u["id"])
     u2 = c.db.user_by_id(u["id"])
     changes = await _reprovision(c, [u2]) if {"team", "teams", "hints", "policyOverrides"} & b.keys() else {}
+    if "role" in b and c.workers.get(u2["username"].lower()) and not c.profiles.is_native(u2):
+        c.workers.register(u2["username"].lower(), u2["username"], c.profiles.path_root_env(u2), False,
+                           c.profiles.team_recipe_dirs(u2), sandbox=c.sandbox_spec(u2))
+        if not c.sandboxed(u2):
+            await _drop_sandbox(c, u2)
     c.audit(request, "user.update", admin, target=u["username"], detail={"fields": sorted(b.keys() - {"password"})})
     return ok({"user": _admin_user_view(c, u2), "changes": changes.get(u["username"], [])})
 
