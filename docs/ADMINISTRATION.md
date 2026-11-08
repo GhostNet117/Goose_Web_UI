@@ -92,6 +92,25 @@ cd C:\GooseWeb
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 
+**Guided setup.** Without `-NonInteractive` the installer asks six questions, each with a detected default, shows a
+summary and changes nothing until you confirm:
+
+1. **Goose program** - the folder Goose is installed in (for example `C:\AI\Goose`; for a Goose Desktop install the
+   command-line tool in `resources\bin\goose.exe` is used, never the Desktop app itself) or `goose.exe`.
+2. **The first administrator's Goose data** - [1] an existing Goose appdata folder (`config\`, `data\`, `state\`;
+   Goose Desktop's is `%APPDATA%\Block\goose`, or `GOOSE_PATH_ROOT` if set), shown with the number of chats it holds,
+   or [2] **start fresh** in a new, empty folder (for example `C:\AI\Goose_appdata`). If your chat sessions live in
+   another folder, give it: Goose only reads sessions from `<appdata>\data\sessions`, so the installer links that
+   folder there (a directory junction; refused if `data\sessions` already holds sessions - move them first).
+3. **The administrator's Goose Web user name** (default: your Windows user name).
+4. **Goose Web's own data folder** (users, teams, per-user profiles; default `C:\Goose_Web_Profiles`).
+5. **Which Windows account runs the gateway** - [1] you, starting when you sign in, or [2] a **service account** or
+   gMSA, starting at boot without anyone signing in (section 5.1).
+6. **Sandbox** non-admin users' agents (default yes; section 11.6).
+
+The same answers can be given as parameters with `-NonInteractive`: `-GooseBinary`, `-GooseAppData` (+ `-Fresh` to
+create it), `-SessionsDir`, `-Admin`, `-ProfilesRoot`, `-RunAs`, `-Sandbox on|off`.
+
 Without git, download the release ZIP from GitHub and unpack it to the final folder; upgrades then use
 `upgrade.ps1 -NoGit` after you replace the files.
 
@@ -301,10 +320,29 @@ fine). It stops when the user signs out. `goose-web check` shows the task (`[OK]
 `[--] ... none registered` when it is missing; the installer registers it, a re-run of the installer keeps an
 existing one (`-Reregister` registers it again), and `upgrade.ps1` never changes it.
 
-Start at boot without anyone signing in is not part of the default setup: it needs a task that stores the account's
-password ("Run whether user is logged on or not"); an S4U task or a SYSTEM service cannot read the account's Windows
-Credential Manager secrets that the native profile's providers use, and every program the agents depend on (for
-example a local model proxy that starts at logon) must then start at boot as well.
+#### Running as a service account (start at boot, nobody signed in)
+
+Choose [2] in the installer's question 5, or pass `-RunAs DOMAIN\svc-goose` (a normal account; use one that is **not**
+an administrator) or `-RunAs DOMAIN\gmsa-goose$` (a group managed service account). Then:
+
+- `register-service.ps1 -Mode Service` registers the task with an **at startup** trigger and the logon type
+  "run whether the user is logged on or not", RunLevel Limited. For a normal account it asks for the password in a
+  secure prompt in the elevated window (Windows stores it for the task; it is never written to a file); a gMSA needs
+  no password. Task Scheduler gives the account "Log on as a batch job"; a domain policy may have to allow it.
+  `register-service.ps1 -DryRun ...` shows what would be registered.
+- The installer grants the account what it needs: full control of Goose Web's data folder; Read & execute on the
+  install folder, the virtualenv's Python and the Goose program folder; Modify on the first administrator's Goose
+  appdata folder and a linked sessions folder. Put the install folder outside any user profile (for example
+  `C:\AI\Goose_Web`). Python and Goose installed per user (in a user profile) work only if that grant succeeds;
+  installs under `C:\Program Files` are readable anyway.
+- You sign in to Goose Web with the administrator's **Goose Web** account; the Windows account only runs the
+  processes. Goose Desktop (under your own Windows account) and the gateway (under the service account) can share
+  the same Goose appdata folder.
+- Provider keys that Goose stored in **your** Windows Credential Manager are not visible to the service account:
+  enter them again in Goose Web (Settings > Providers) - they then go to the service account's store.
+- `upgrade.ps1` is run by you (not the service account); stopping and starting a task that runs as another account
+  usually needs administrator rights, so the upgrade asks once (UAC) at the restart step.
+- Every program the agents depend on (for example a local model proxy) must also run without a signed-in user.
 
 ```powershell
 # start, stop and inspect the task
@@ -1103,11 +1141,12 @@ in the profile you are signed in to; for isolated profiles each user's own `conf
 All workers run as the one OS account the gateway runs as. Goose Web's own file browser keeps users inside their
 folders, but an agent's shell, scripts and command (stdio) extensions run as that account and could otherwise read
 anything it can: other users' profiles and chats, other teams' folders, the native Goose profile and its secrets, the
-gateway's database. On Windows, turn on the sandbox to make the operating system enforce the folder boundaries:
+gateway's database. On Windows the sandbox (on by default since 1.9.0) makes the operating system enforce the folder
+boundaries:
 
 ```yaml
 sandbox:
-  enabled: true
+  enabled: auto              # default: on for Windows, off elsewhere; true | false
   network: internet          # none | internet | internet+lan
   read_dirs: []              # extra program folders agents may run, e.g. C:\Program Files\nodejs, a Python install
 ```

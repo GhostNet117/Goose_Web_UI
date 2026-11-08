@@ -37,6 +37,17 @@ def _find_goose() -> str:
     return "goose"
 
 
+def sandbox_on(settings: "Settings") -> bool:
+    """sandbox.enabled: true / false, or "auto" (default) = on for Windows, where the AppContainer sandbox exists."""
+    v = settings.get("sandbox", "enabled")
+    if isinstance(v, str):
+        v = v.strip().lower()
+        if v == "auto":
+            return IS_WINDOWS
+        return v in ("1", "true", "yes", "on")
+    return bool(v)
+
+
 def default_native_goose_root() -> str:
     """Where Goose keeps its profile when GOOSE_PATH_ROOT is not set (config/ and data/ live below it)."""
     if IS_WINDOWS:
@@ -72,7 +83,7 @@ DEFAULTS: dict[str, Any] = {
     },
     # Windows: run every isolated non-admin user's worker in its own AppContainer (sandbox.py, spec 012).
     "sandbox": {
-        "enabled": False,
+        "enabled": "auto",                # auto = on for Windows, off elsewhere; true | false
         "network": "internet",            # none | internet | internet+lan (loopback is never reachable)
         "read_dirs": [],                  # extra program folders the workers may read and run (Python, node, uv, git)
     },

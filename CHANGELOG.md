@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.9.0 - 2026-11-08
+
+- **Guided setup** (`scripts\install.ps1`): asks for the Goose program folder, the first administrator's Goose
+  appdata (existing - with a chat count - or fresh), a separate chat-sessions folder (linked in), the administrator's
+  user name, Goose Web's data folder, the Windows account that runs the gateway, and the sandbox; summary before any
+  change; every answer also a parameter for `-NonInteractive`. The Desktop app's `Goose.exe` is never mistaken for
+  the CLI.
+- **Service account:** `-RunAs DOMAIN\svc` or a gMSA (`DOMAIN\name$`) registers a start-at-boot task (password in a
+  secure prompt, none for a gMSA) and grants the account the folders it needs. `register-service.ps1 -Mode Service`,
+  `-DryRun`. `upgrade.ps1` asks for elevation once if restarting such a task needs it.
+- **Sandbox on by default on Windows:** `sandbox.enabled` defaults to `auto` (on for Windows, off elsewhere). Upgrading
+  turns it on for existing Windows installs: non-admin users' agents are then confined to their profile, team folder
+  and the team's extra folders, and cannot reach services on 127.0.0.1 (for example a local model proxy). Set
+  `sandbox.enabled: false` to keep the old behaviour.
+
 ## 1.8.0 - 2026-11-08
 
 - **Sandbox (Windows):** `sandbox.enabled` runs every isolated non-admin user's agent in its own Windows AppContainer.

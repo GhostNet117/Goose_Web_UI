@@ -171,9 +171,18 @@ try {
     if ($r.code) { throw "goose-web check failed; the gateway was NOT restarted and still runs the old version. Fix the [!!] items and run upgrade.ps1 -NoGit." }
 
     # 7. restart + health
-    Stop-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName
-    Start-Sleep 3
-    Start-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName
+    try {
+        Stop-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName
+        Start-Sleep 3
+        Start-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName
+    } catch {
+        # A task that runs as a service account usually needs administrator rights to stop/start: ask once (UAC).
+        Say "Restarting $taskFull needs administrator rights (it runs as $($task.Principal.UserId)); asking once."
+        $restart = "Stop-ScheduledTask -TaskPath '$($task.TaskPath)' -TaskName '$($task.TaskName)'; Start-Sleep 3; " +
+                   "Start-ScheduledTask -TaskPath '$($task.TaskPath)' -TaskName '$($task.TaskName)'"
+        $p = Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile', '-Command', $restart) -Wait -PassThru
+        if ($p.ExitCode) { throw "The restart was refused. The new version is installed; restart the task as an administrator: $restart" }
+    }
     $ok = $false
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep 2

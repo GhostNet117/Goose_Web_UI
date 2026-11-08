@@ -147,7 +147,8 @@ class Ctx:
 
     def sandboxed(self, user: dict) -> bool:
         """Spec 012: isolated non-admin users run in their own AppContainer when sandbox.enabled is on."""
-        return bool(self.settings.get("sandbox", "enabled")) and not self.profiles.is_native(user) \
+        from .config import sandbox_on
+        return sandbox_on(self.settings) and not self.profiles.is_native(user) \
             and user.get("role") != "admin"
 
     def sandbox_spec(self, user: dict) -> dict | None:

@@ -47,6 +47,23 @@ def test_desired_and_diff_grants(tmp_path):
     assert apply == {"A": "modify", "D": "read"} and sorted(revoke) == ["A", "C"]
 
 
+def test_sandbox_default_is_auto(monkeypatch):
+    import goose_web.config as cfgmod
+
+    class S:
+        def __init__(self, v):
+            self.v = v
+
+        def get(self, *k):
+            return self.v
+    assert cfgmod.DEFAULTS["sandbox"]["enabled"] == "auto"
+    monkeypatch.setattr(cfgmod, "IS_WINDOWS", True)
+    assert cfgmod.sandbox_on(S("auto")) is True and cfgmod.sandbox_on(S(False)) is False
+    monkeypatch.setattr(cfgmod, "IS_WINDOWS", False)
+    assert cfgmod.sandbox_on(S("auto")) is False and cfgmod.sandbox_on(S(True)) is True
+    assert cfgmod.sandbox_on(S("off")) is False and cfgmod.sandbox_on(S("true")) is True
+
+
 def test_sandbox_spec_only_for_isolated_non_admins(tmp_path, monkeypatch):
     from tests.test_team_profiles import ANYCHAT, team, user
     from goose_web.auth import AuthService
@@ -65,8 +82,9 @@ def test_sandbox_spec_only_for_isolated_non_admins(tmp_path, monkeypatch):
     db.set_user_team(bob["id"], tid)
     root = user(db, "root", role="admin")
     nat = user(db, "nat", role="admin", profile_mode="native", profile_path=str(tmp_path / "native"))
-    assert c.sandbox_spec(bob) is None                                                 # off by default
-    s.data.setdefault("sandbox", {})["enabled"] = True
+    s.data.setdefault("sandbox", {})["enabled"] = False
+    assert c.sandbox_spec(bob) is None                                                 # switched off
+    s.data["sandbox"]["enabled"] = True
     spec = c.sandbox_spec(db.user_by_id(bob["id"]))
     assert c.sandbox_spec(root) is None and c.sandbox_spec(nat) is None                 # admins never sandboxed
     prof = os.path.normpath(str(tmp_path / "profiles" / "bob"))

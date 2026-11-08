@@ -273,7 +273,8 @@ def cmd_sandbox(args, settings) -> int:
     from . import sandbox as sb
     state_dir = str(settings.system_dir / "sandbox")
     if args.action == "status":
-        on = bool(settings.get("sandbox", "enabled"))
+        from .config import sandbox_on
+        on = sandbox_on(settings)
         print(f"Sandbox: {'ON' if on else 'off'} (sandbox.enabled), network: {settings.get('sandbox', 'network')}, "
               f"platform: {'Windows AppContainer' if sb.IS_WINDOWS else 'not supported (fail closed when on)'}")
         print(f"Extra program folders (sandbox.read_dirs): {settings.get('sandbox', 'read_dirs') or '-'}")
@@ -433,7 +434,8 @@ def cmd_check(args, settings) -> int:
     with socket.socket() as s:
         free = s.connect_ex(("127.0.0.1", port)) != 0
     line(f"port {port}", "free" if free else "in use (gateway already running?)")
-    if settings.get("sandbox", "enabled"):
+    from .config import sandbox_on
+    if sandbox_on(settings):
         from . import sandbox as sb
         line("sandbox", "on: isolated non-admin workers run in their own AppContainer" if sb.IS_WINDOWS else
              "on, but this system is not Windows: isolated non-admin workers will not start", sb.IS_WINDOWS)
