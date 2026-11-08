@@ -45,12 +45,14 @@ $InstallDir = Split-Path -Parent $PSScriptRoot
 $venvPy = Join-Path $InstallDir '.venv\Scripts\python.exe'
 $venvPyw = Join-Path $InstallDir '.venv\Scripts\pythonw.exe'
 if (-not $Log) { $Log = Join-Path $env:TEMP ('goose-web-upgrade-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss')) }
+# -Ref is passed to git: only a plain tag/branch/commit name (no option-like or shell-special values).
+if ($Ref -and $Ref -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$') { throw "Invalid -Ref '$Ref' (use a tag, branch or commit id)." }
 
 if ($Detached) {
     # WMI starts the process outside the caller's process tree and job, so a gateway restart cannot kill it.
     $argsList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$PSCommandPath`"",
         '-Log', "`"$Log`"", '-WaitFirst', $DelaySeconds)
-    if ($Ref) { $argsList += @('-Ref', $Ref) }
+    if ($Ref) { $argsList += @('-Ref', "`"$Ref`"") }
     if ($NoGit) { $argsList += '-NoGit' }
     if ($Force) { $argsList += '-Force' }
     if ($TaskName) { $argsList += @('-TaskName', "`"$TaskName`"") }
@@ -129,6 +131,9 @@ try {
         if ($r.code) { throw "Database backup failed; nothing was changed." }
     }
     Say "Backup: $bdir (config.yaml, goose-web.db)"
+    # The backups hold full database copies (password hashes, 2FA and directory secrets): keep the newest 10 only.
+    Get-ChildItem (Join-Path $root 'backups') -Directory -Filter 'upgrade-*' | Sort-Object Name -Descending |
+        Select-Object -Skip 10 | ForEach-Object { Remove-Item $_.FullName -Recurse -Force; Say "Removed old backup $($_.Name)" }
 
     # 4. code
     if (-not $NoGit) {
@@ -136,7 +141,11 @@ try {
         $dirty = @(git -C $InstallDir status --porcelain --untracked-files=no)
         if ($dirty.Count) { throw "The install folder has local changes to tracked files; commit/stash them first (git -C `"$InstallDir`" status)." }
         $r = Run git @('-C', $InstallDir, 'fetch', '--tags', 'origin'); if ($r.code) { throw "git fetch failed." }
-        if ($Ref) { $r = Run git @('-C', $InstallDir, 'checkout', '--quiet', $Ref) } else { $r = Run git @('-C', $InstallDir, 'pull', '--ff-only') }
+        if ($Ref) {
+            $sha = (Run git @('-C', $InstallDir, 'rev-parse', '--verify', '--quiet', "$Ref^{commit}")).out | Select-Object -Last 1
+            if (-not $sha -or $sha -notmatch '^[0-9a-f]{40}$') { throw "Unknown -Ref '$Ref' (not a commit, tag or branch in the clone)." }
+            $r = Run git @('-C', $InstallDir, 'checkout', '--quiet', $sha)
+        } else { $r = Run git @('-C', $InstallDir, 'pull', '--ff-only') }
         if ($r.code) { throw "Updating the code failed (see the log). Nothing else was changed; the gateway still runs the old version." }
         Say ("Code now at " + ((git -C $InstallDir log -1 --format='%h %s') | Select-Object -First 1))
     }

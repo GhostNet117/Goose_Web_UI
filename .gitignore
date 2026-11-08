@@ -21,6 +21,11 @@ profiles/
 _system/
 secrets.yaml
 config.local.yaml
+config.yaml
+DEPLOYED.json
+*.log
+.env
+*.sqlite
 *.pem
 *.key
 

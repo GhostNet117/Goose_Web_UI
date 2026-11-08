@@ -12,7 +12,10 @@ Isolated workers run with CONTEXT_FILE_NAMES=[".goose-web-hints.md"] (workers.py
 gateway-written hints file, never an AGENTS.md / .goosehints planted in a working folder (spec 009).
 
 The admin's native profile (profile_mode = native) is NEVER provisioned. The gateway only reads it, except
-when the admin saves their own goose hints in the UI (the previous file is backed up first).
+for its goose hints: an admin saves them in the UI (the previous file is backed up first), or - managed native
+hints, spec 011 - the gateway writes the native user's composed hints (personal + assigned + team documents) into
+the native profile's own config/.goosehints, so Goose Desktop, the goose CLI and scheduled runs on that account load
+the same hints as the web chats. Setting `native_hints_owner` = that user's id (one per native profile).
 """
 from __future__ import annotations
 
@@ -39,6 +42,12 @@ PRECEDENCE_NOTE = ("\n# How to use these hints: they are listed from lowest to h
                    "# last and are final: if a personal hint conflicts with a team hint, follow the team hint.\n")
 # The only hints file name Goose loads for isolated profiles (CONTEXT_FILE_NAMES, set by workers.py).
 GW_HINTS_FILENAME = ".goose-web-hints.md"
+# Header of a native profile's .goosehints when Goose Web manages it (spec 011).
+NATIVE_HINTS_HEADER = ("# Managed by Goose Web (managed native hints). Goose Desktop, the goose CLI and scheduled runs on\n"
+                       "# this Windows account load this file too. Edit the documents in Goose Web: Admin > Hints (team\n"
+                       "# and assigned documents) or Settings > Goose hints (personal). Changes made directly in this\n"
+                       "# file are overwritten; the previous versions are in <system_dir>/backups/native-hints.\n")
+NATIVE_HINTS_SETTING = "native_hints_owner"
 LEGACY_HINTS_FILENAME = ".goosehints"
 # File names a non-admin may not upload or create: Goose's default context files and ours (lower case).
 HINT_FILE_NAMES = frozenset({".goosehints", "agents.md", GW_HINTS_FILENAME.lower()})
@@ -163,7 +172,7 @@ class Profiles:
         """Header, precedence rule, personal hints (if the team allows them), documents an admin assigned to
         this user, then the team's documents LAST, so team hints are final (spec 009)."""
         s = self.hint_sections(user)
-        parts = [HINTS_HEADER, PRECEDENCE_NOTE]
+        parts = [NATIVE_HINTS_HEADER if self.is_native(user) else HINTS_HEADER, PRECEDENCE_NOTE]
         if s["personal"]:
             parts.append(f"\n# ---- personal hints (lowest precedence) ----\n{s['personal'].rstrip()}\n")
         for h in s["user"]:
@@ -186,6 +195,13 @@ class Profiles:
             return self.native_hints_path(user).read_text(encoding="utf-8")
         except FileNotFoundError:
             return ""
+
+    def native_hints_managed(self, user: dict) -> bool:
+        """Spec 011: Goose Web writes this native user's composed hints into the native .goosehints."""
+        if not self.is_native(user):
+            return False
+        owner = self.db.get_setting(NATIVE_HINTS_SETTING)
+        return owner is not None and str(owner) == str(user["id"])
 
     def write_native_hints(self, user: dict, content: str) -> str:
         """Admin saves their own hints explicitly. Back up first. Returns the backup path."""
@@ -211,8 +227,13 @@ class Profiles:
         return False
 
     def write_hints(self, user: dict) -> None:
-        """Rewrite only the composed hints file of an isolated profile (safe while Goose runs)."""
+        """Rewrite only the composed hints file of an isolated profile (safe while Goose runs). A native user's
+        .goosehints is rewritten only when managed native hints are on for that user (and only if it changed)."""
         if self.is_native(user):
+            if self.native_hints_managed(user):
+                text = self.compose_hints(user)
+                if self.read_native_hints(user) != text:
+                    self.write_native_hints(user, text)
             return
         self.ensure_layout(user)
         _atomic_write(self.hints_path(user), self.compose_hints(user))

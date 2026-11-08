@@ -101,3 +101,26 @@ def test_reserved_usernames(tmp_path):
     db = Database(tmp_path / "t.db")
     with pytest.raises(ValueError):
         db.create_user(username="AppData", role="user")
+
+
+def test_per_session_mcp_servers_need_allow_shell_on_every_entry_point():
+    """1.7.0 security fix (NEW-30): Goose persists mcpServers given on session/new, load, fork and resume, and a
+    stdio server is an arbitrary command. Before 1.7.0 only session/new was checked (GW-32)."""
+    stdio = [{"name": "x", "command": "cmd.exe", "args": ["/c", "whoami"], "env": []}]
+    base = {**MEMBER, "allow_shell": False}
+    for method in ("session/new", "session/load", "session/fork", "session/resume"):
+        with pytest.raises(pol.Denied, match="allow_shell"):
+            chk(method, {"sessionId": "s1", "cwd": ROOT, "mcpServers": stdio}, policy=dict(base))
+        chk(method, {"sessionId": "s1", "cwd": ROOT, "mcpServers": []}, policy=dict(base))   # the normal case
+        chk(method, {"sessionId": "s1", "cwd": ROOT, "mcpServers": stdio}, policy={**base, "allow_shell": True})
+        chk(method, {"sessionId": "s1", "cwd": "/anywhere", "mcpServers": stdio}, admin=True)
+
+
+def test_fork_meta_reduced_to_cut_point_for_members():
+    params = {"sessionId": "s1", "cwd": ROOT, "_meta": {"conversationBefore": 1762598040, "enabledExtensions": ["x"],
+                                                         "anything": 1}}
+    chk("session/fork", params)
+    assert params["_meta"] == {"conversationBefore": 1762598040}
+    admin_params = {"sessionId": "s1", "cwd": ROOT, "_meta": {"conversationBefore": 1, "other": 2}}
+    chk("session/fork", admin_params, admin=True)
+    assert admin_params["_meta"] == {"conversationBefore": 1, "other": 2}

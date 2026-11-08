@@ -947,10 +947,43 @@ path, the team, and a warning when the user's personal hints are dropped.
 Saving, renaming or deleting a document rewrites the hints of every user it is assigned to immediately; this is
 safe while Goose runs. Edits made directly in an isolated profile's `.goose-web-hints.md` file are overwritten.
 
-The native profile is different: its `.goosehints` belongs to the admin and is never composed, and Goose still
-loads `AGENTS.md` and `.goosehints` from the working folder as usual. The admin edits the file in their own
-settings, and the previous file is copied to `<system_dir>/backups/native-hints/` before each save. Shared documents
-assigned to a native-profile admin are listed but not written into that file.
+The native profile is different. By default its `.goosehints` belongs to the admin and is never composed, and
+Goose still loads `AGENTS.md` and `.goosehints` from the working folder as usual. The admin edits the file in their
+own settings, and the previous file is copied to `<system_dir>/backups/native-hints/` before each save. Shared
+documents assigned to a native-profile admin are listed but not written into that file - unless **managed native
+hints** are on (section 10.1).
+
+### 10.1 Managed native hints (the admin's hints from the library)
+
+With managed native hints, Goose Web composes the native admin's hints exactly like an isolated user's (personal
+hints, then documents assigned to the admin, then the admin's team documents last) and writes them into the native
+profile's own `config/.goosehints`. Because that is Goose's normal global hints file, **Goose Desktop, the goose CLI
+and scheduled runs on that Windows account load the same text as the web chats**: you manage your hints in one place,
+in the browser. Typical setup: an "Admins" team that holds your hints document.
+
+```powershell
+cd C:\GooseWeb
+.venv\Scripts\python.exe -m goose_web --config <config> native-hints status
+# turn it on for the native admin, put them in the team Admins (created if missing) and keep the current
+# .goosehints as a document of that team:
+.venv\Scripts\python.exe -m goose_web --config <config> native-hints enable <admin> --team Admins --adopt
+.venv\Scripts\python.exe -m goose_web --config <config> native-hints disable
+```
+
+- `enable` writes the composed text at once; the previous file goes to `<system_dir>/backups/native-hints/`. From
+  then on, saving a hints document, a team change, or the admin's personal hints (Settings > Goose hints) rewrites
+  the file; it is only written when the text changes. The file starts with a header that says it is managed and that
+  direct edits are overwritten.
+- `--adopt` turns the current `.goosehints` into a library document named "<admin> goose hints" (`--doc-name` to
+  choose), assigned to `--team` or, without it, to the admin directly. Without `--adopt`, the old text is only in the
+  backup.
+- Administrators are not restricted by team policies, so the Admins team needs no providers or modes for them; a
+  non-admin you later put in that team gets nothing until you allow it on the team's Experience page.
+- `disable` stops the rewriting; the file keeps its last text and you edit it directly again.
+- One native admin per native profile (it is one folder); the setting is `native_hints_owner`.
+- Audit: `hints.native.managed`, `hints.native.unmanaged`, and `hints.update` / `hints.personal.save` for edits.
+- What Goose still loads in addition (native profile only): `AGENTS.md` and `.goosehints` in the chat's working
+  folder up to its git root. Admin > Users > View effective hints shows the managed text and this note.
 
 ## 11. Profiles
 
@@ -1015,6 +1048,53 @@ extensions, its members' agents can read other users' profiles and other teams' 
 raw config editing (`config_edit`) off for non-admin teams; the Experience page warns when Shell is on. Separate
 Windows accounts per team would close this gap; they are not built (possible future work). See
 [SECURITY-ASSESSMENT.md](SECURITY-ASSESSMENT.md#7-addendum-goose-web-150-team-profiles-with-least-privilege).
+
+### 11.4 Your own admin account: native or isolated, and moving from Desktop to the browser
+
+| | Native profile (installer default for the first admin) | Isolated profile |
+|---|---|---|
+| Goose data | your existing Goose folder (`%APPDATA%\Block\goose`, or `GOOSE_PATH_ROOT`; section 3.4) | `<profiles_root>/<username>/` (new, empty) |
+| Shared with Goose Desktop / CLI / schedules | yes: same chats, recipes, extensions, providers, settings, schedules | no |
+| Hints | the native `.goosehints`; with managed native hints (10.1) composed from the Hints library and your team | composed `.goose-web-hints.md` from the library and your team |
+| Policies | none (administrators are unrestricted) | none for administrators |
+| Folders | every drive | every drive for administrators |
+
+Recommended for a single person who used Goose Desktop and now wants to work mainly in the browser (no remote
+desktop needed): **keep the native profile and turn on managed native hints**:
+
+1. Admin > Teams: create a team for administrators (for example "Admins"), or let the command create it.
+2. Run `native-hints enable <you> --team Admins --adopt` (10.1). Your current hints become the document
+   "<you> goose hints" on that team, and the native `.goosehints` is now written by Goose Web.
+3. Check Admin > Users > View effective hints (or Settings > Goose hints > Effective). Edit the document in
+   Admin > Hints from now on; your personal hints (Settings > Goose hints) come first and the team document last.
+4. Goose Desktop, if you still open it, uses the same chats and the same hints.
+
+Moving the admin to an isolated profile instead (a clean start, nothing shared with Desktop): create a second admin
+account with profile mode Isolated (Admin > Users > New), sign in with it, re-create the providers and extensions
+you need in its Settings, and keep or disable the old native account. Chats, recipes and schedules of the native
+profile are not copied. Changing an existing account's profile mode is not offered, because it would point the
+account at a different set of chats.
+
+Moving the native Goose folder itself (for example to `C:\AI\Goose_appdata`): section 3.4 (`goose-web native-root`).
+
+### 11.5 Goose settings that matter for long chats and slow extensions (Goose 1.57)
+
+Administrators can change any Goose configuration key in **Settings > Advanced config** (written through Goose itself,
+in the profile you are signed in to; for isolated profiles each user's own `config.yaml`).
+
+- **Chats compact at about 225k tokens even on 1M-token models.** Goose 1.57 compacts at
+  `min(GOOSE_AUTO_COMPACT_THRESHOLD (0.8), GOOSE_AUTO_COMPACT_TOKEN_LIMIT / context_limit)` of the model's context
+  window, and `GOOSE_AUTO_COMPACT_TOKEN_LIMIT` defaults to 225000. Set it to your largest model window (for example
+  `1000000`) so every model compacts at 80% of its own window. The value is read at the start of each turn. Do not
+  use `GOOSE_CONTEXT_LIMIT` for this: it overrides the window of every model.
+- **Extensions missing from new chats ("process quit before initialization").** Goose 1.57 gives a command (stdio)
+  extension 10 seconds to answer its first handshake; slow starters (Python/uv/node servers, several chats starting
+  at once) are dropped silently. Make the server start faster, give it a launcher that answers the handshake at once,
+  or use a remote (HTTP) extension. Each chat stores the extension commands it was created with, so a changed
+  extension command reaches older chats only after removing and re-adding the extension in that chat.
+- **"It compacts every few messages" in the browser:** check first whether Goose compacted at all (Goose's log line
+  "Performing message compaction"). The transcript shows the last 80 items and hides older ones behind "Show earlier
+  messages", which in tool-heavy chats can look like lost history.
 
 ## 12. Workers
 

@@ -295,10 +295,17 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
         meta["client"] = "goose-web"
         meta.pop("hidden", None)
         params["_meta"] = meta
-        if params.get("mcpServers") and not is_admin and not policy.get("allow_shell"):
-            raise Denied("per-session MCP servers need the allow_shell permission")
         if not is_admin and meta.get("enabledExtensions") is not None and not policy.get("extensions_edit"):
             raise Denied("choosing session extensions needs the extensions_edit permission")
+    if method in ("session/new", "session/load", "session/fork", "session/resume"):
+        # Goose persists per-session MCP servers given on ANY of these (prepare_session_for_activation), and a
+        # stdio server is an arbitrary command: same rule for all four (1.7.0 security fix NEW-30; GW-32).
+        if params.get("mcpServers") and not is_admin and not policy.get("allow_shell"):
+            raise Denied("per-session MCP servers need the allow_shell permission")
+    if method == "session/fork" and not is_admin:
+        meta = params.get("_meta")
+        if isinstance(meta, dict):   # only the cut point (Edit > Branch); nothing else reaches Goose from a non-admin
+            params["_meta"] = {k: v for k, v in meta.items() if k == "conversationBefore"}
     if method == TOOLS_CALL:
         check_tool_call_target(params)  # every user, admins included (NEW-01)
     if is_admin:

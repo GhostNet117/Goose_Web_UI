@@ -190,6 +190,84 @@ def cmd_native_root(args, settings) -> int:
     return 0
 
 
+def cmd_native_hints(args, settings) -> int:
+    """Managed native hints (spec 011): Goose Web writes a native user's composed hints (personal + assigned + team
+    documents) into the native profile's config/.goosehints, which Goose Desktop, the CLI and schedules load too."""
+    import time
+    from .db import Database
+    from .profiles import NATIVE_HINTS_HEADER, NATIVE_HINTS_SETTING, Profiles
+    db = Database(settings.system_dir / "goose-web.db")
+    prof = Profiles(settings, db)
+    owner = db.get_setting(NATIVE_HINTS_SETTING)
+    if args.action == "status":
+        u = db.user_by_id(int(owner)) if owner not in (None, "") else None
+        print(f"Managed native hints: {'ON for ' + u['username'] if u else 'off'}")
+        for n in [x for x in db.users() if x["profile_mode"] == "native"]:
+            sec = prof.hint_sections(n)
+            print(f"  native user {n['username']}: team {sec['team']['name'] if sec['team'] else '-'}, "
+                  f"{len(sec['user'])} assigned + {len(sec['teamDocs'])} team document(s), file {prof.native_hints_path(n)}")
+        return 0
+    if args.action == "disable":
+        db.execute("DELETE FROM settings WHERE key=?", (NATIVE_HINTS_SETTING,))
+        db.audit("hints.native.unmanaged", target=str(owner or ""))
+        print("Managed native hints: off. The native .goosehints keeps its current text; edit it in Settings > Goose "
+              "hints or directly. Earlier versions: " + str(settings.system_dir / "backups" / "native-hints"))
+        return 0
+    # enable
+    u = db.user_by_name(args.user or "")
+    if not u or u["profile_mode"] != "native":
+        print(f"error: {args.user!r} is not a native-profile user", file=sys.stderr)
+        return 2
+    team = None
+    if args.team:
+        team = db.one("SELECT * FROM teams WHERE name=?", (args.team,))
+        if not team:
+            tid = db.execute("INSERT INTO teams(name, description, policy, created_at) VALUES(?,?,?,?)",
+                             (args.team, "Administrators (created by goose-web native-hints)", "{}", time.time()))
+            team = db.one("SELECT * FROM teams WHERE id=?", (tid,))
+            print(f"Created team {args.team!r} (administrators bypass team policies; non-admin members get nothing "
+                  "until you allow it on its Experience page)")
+        cur = db.user_team(u["id"])
+        if cur and cur["id"] != team["id"]:
+            print(f"Moving {u['username']} from team {cur['name']!r} to {team['name']!r} (one team per user)")
+        db.set_user_team(u["id"], team["id"])
+    adopted = None
+    if args.adopt:
+        text = prof.read_native_hints(u)
+        if not text.strip():
+            print("Nothing to adopt: the native .goosehints is empty or missing.")
+        elif text.startswith(NATIVE_HINTS_HEADER[:40]):
+            print("Not adopted: the native .goosehints is already written by Goose Web.")
+        else:
+            name = args.doc_name or f"{u['username']} goose hints"
+            base, i = name, 2
+            while db.one("SELECT id FROM hints_docs WHERE name=?", (name,)):
+                name, i = f"{base} ({i})", i + 1
+            hid = db.execute("INSERT INTO hints_docs(name, description, content, updated_at) VALUES(?,?,?,?)",
+                             (name, f"Adopted from {prof.native_hints_path(u)} on {time.strftime('%Y-%m-%d')}",
+                              text, time.time()))
+            if team:
+                db.execute("INSERT OR IGNORE INTO team_hints(team_id, hints_id) VALUES(?,?)", (team["id"], hid))
+            else:
+                db.execute("INSERT OR IGNORE INTO user_hints(user_id, hints_id) VALUES(?,?)", (u["id"], hid))
+            adopted = name
+            print(f"Adopted the current .goosehints as hints document {name!r} "
+                  f"(assigned to {'team ' + team['name'] if team else 'user ' + u['username']})")
+    db.set_setting(NATIVE_HINTS_SETTING, u["id"])
+    u = db.user_by_id(u["id"])
+    before = prof.read_native_hints(u)
+    prof.write_hints(u)
+    changed = prof.read_native_hints(u) != before
+    db.audit("hints.native.managed", target=u["username"], detail={"team": team["name"] if team else None,
+                                                                   "adopted": adopted, "rewritten": changed})
+    print(f"Managed native hints: ON for {u['username']}. {prof.native_hints_path(u)} "
+          f"{'rewritten (previous version backed up to ' + str(settings.system_dir / 'backups' / 'native-hints') + ')' if changed else 'unchanged'}.")
+    if not adopted and not args.adopt and before.strip() and not before.startswith(NATIVE_HINTS_HEADER[:40]):
+        print("warning: the previous text was replaced, not adopted (use --adopt to keep it as a document). "
+              "It is in the backup folder above.")
+    return 0
+
+
 def _gateway_tasks() -> list[str]:
     """Windows: scheduled tasks that run this install's gateway (empty list if none or not Windows)."""
     if os.name != "nt":
@@ -382,6 +460,13 @@ def main(argv: list[str] | None = None) -> int:
     ipc.add_argument("--all", action="store_true", help="unblock every address and clear all counters")
     nr = sub.add_parser("native-root", help="show or move the native Goose profile (Goose appdata folder)")
     nr.add_argument("path", nargs="?", help="new folder that contains config\\ (e.g. C:\\AI\\Goose_appdata)")
+    nh = sub.add_parser("native-hints", help="let Goose Web manage the native profile's .goosehints")
+    nh.add_argument("action", choices=["status", "enable", "disable"])
+    nh.add_argument("user", nargs="?", help="enable: the native-profile user whose hints are written")
+    nh.add_argument("--team", help="enable: put the user in this team (created if missing), e.g. Admins")
+    nh.add_argument("--adopt", action="store_true",
+                    help="enable: keep the current .goosehints as a hints document (on --team, else on the user)")
+    nh.add_argument("--doc-name", help="name for the adopted document (default '<user> goose hints')")
     sub.add_parser("check", help="diagnostics")
     sub.add_parser("version")
     args = p.parse_args(argv)
@@ -393,7 +478,7 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "serve" and not hasattr(args, "host"):
         args.host, args.port = None, None
     return {"serve": cmd_serve, "init": cmd_init, "user": cmd_user, "ip": cmd_ip, "check": cmd_check,
-            "native-root": cmd_native_root}[cmd](args, settings)
+            "native-root": cmd_native_root, "native-hints": cmd_native_hints}[cmd](args, settings)
 
 
 if __name__ == "__main__":

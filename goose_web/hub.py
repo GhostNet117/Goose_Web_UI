@@ -370,7 +370,7 @@ class Upstream:
                 s0 = self.sessions.get(str(params.get("sessionId") or ""))
                 if s0 is not None and (s0.running() or s0.prompts):
                     raise RpcError(-32002, "this chat is running: stop it before editing a message")
-                if not isinstance(params.get("truncateFrom"), int) or params["truncateFrom"] <= 0:
+                if type(params.get("truncateFrom")) is not int or params["truncateFrom"] <= 0:   # bool is an int
                     raise RpcError(-32602, "truncateFrom must be a positive unix time in seconds")
             if method == "session/prompt":
                 self._check_concurrency(client, params)
@@ -998,7 +998,8 @@ class Hub:
                         "_goose/unstable/schedules/delete", "_goose/unstable/apps/import", "_goose/unstable/apps/delete",
                         "_goose/unstable/sources/create", "_goose/unstable/sources/update", "_goose/unstable/sources/delete",
                         "_goose/unstable/tools/permissions/set", "_goose/unstable/tools/call",
-                        "_goose/unstable/session/extensions/add", "_goose/unstable/defaults/save", "session/delete")
+                        "_goose/unstable/session/extensions/add", "_goose/unstable/defaults/save", "session/delete",
+                        TRUNCATE)
     QUIET = ("/list", "/read", "/get", "/status", "config/read-all")
 
     def audit_call(self, client: Client, up: Upstream, method: str, params: dict) -> None:

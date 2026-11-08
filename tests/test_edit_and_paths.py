@@ -106,3 +106,59 @@ def test_no_author_specific_goose_path(monkeypatch):
     monkeypatch.setattr(cfgmod.os.path, "isfile", lambda p: seen.append(p) or False)
     assert cfgmod._find_goose() == "goose"
     assert seen and not any("dist-windows" in p for p in seen)
+
+
+def test_managed_native_hints(tmp_path, capsys):
+    """Spec 011: Goose Web writes the native user's composed hints into the native .goosehints."""
+    import time
+    from goose_web.__main__ import main
+    from goose_web.config import load_settings
+    from goose_web.db import Database
+    from goose_web.profiles import NATIVE_HINTS_HEADER, Profiles
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(f"paths:\n  profiles_root: \"{tmp_path.as_posix()}\"\n", encoding="utf-8")
+    native = tmp_path / "Goose_appdata"
+    (native / "config").mkdir(parents=True)
+    hints = native / "config" / ".goosehints"
+    hints.write_text("# my old hints\n- always use the graph\n", encoding="utf-8")
+    assert main(["--config", str(cfg), "init", "--admin", "boss", "--password", "Long-enough-pw-1!", "--native-root", str(native)]) == 0
+    assert main(["--config", str(cfg), "native-hints", "enable", "nobody"]) == 2
+    assert main(["--config", str(cfg), "native-hints", "enable", "boss", "--team", "Admins", "--adopt"]) == 0
+    out = capsys.readouterr().out
+    assert "Created team 'Admins'" in out and "Adopted the current .goosehints as hints document 'boss goose hints'" in out
+    text = hints.read_text(encoding="utf-8")
+    assert text.startswith(NATIVE_HINTS_HEADER) and "- always use the graph" in text and "# ==== Team: Admins (final" in text
+    backups = list((tmp_path / "_system" / "backups" / "native-hints").glob(".goosehints.*"))
+    assert len(backups) == 1 and backups[0].read_text(encoding="utf-8").startswith("# my old hints")
+    settings = load_settings(str(cfg))
+    db = Database(settings.system_dir / "goose-web.db")
+    prof = Profiles(settings, db)
+    boss = db.user_by_name("boss")
+    assert prof.native_hints_managed(boss) and db.user_team(boss["id"])["name"] == "Admins"
+    # editing the team document in the library rewrites the native file
+    db.execute("UPDATE hints_docs SET content=?, updated_at=? WHERE name='boss goose hints'", ("- new rule\n", time.time()))
+    prof.write_hints(boss)
+    assert "- new rule" in hints.read_text(encoding="utf-8") and "always use the graph" not in hints.read_text(encoding="utf-8")
+    # personal hints of the native admin come first (lowest precedence)
+    db.update_user(boss["id"], personal_hints="- personal one")
+    prof.write_hints(db.user_by_name("boss"))
+    t = hints.read_text(encoding="utf-8")
+    assert t.index("- personal one") < t.index("# ==== Team: Admins")
+    # unchanged content is not rewritten (no extra backup)
+    n = len(list((tmp_path / "_system" / "backups" / "native-hints").iterdir()))
+    prof.write_hints(db.user_by_name("boss"))
+    assert len(list((tmp_path / "_system" / "backups" / "native-hints").iterdir())) == n
+    # a second enable --adopt does not adopt Goose Web's own file
+    assert main(["--config", str(cfg), "native-hints", "enable", "boss", "--adopt"]) == 0
+    assert "already written by Goose Web" in capsys.readouterr().out
+    assert main(["--config", str(cfg), "native-hints", "status"]) == 0
+    assert "ON for boss" in capsys.readouterr().out
+    # disable: the file stays, the gateway stops writing it
+    assert main(["--config", str(cfg), "native-hints", "disable"]) == 0
+    before = hints.read_text(encoding="utf-8")
+    db.update_user(boss["id"], personal_hints="- changed after disable")
+    prof.write_hints(db.user_by_name("boss"))
+    assert hints.read_text(encoding="utf-8") == before
+    assert not prof.native_hints_managed(db.user_by_name("boss"))
+    acts = [r["action"] for r in db.query("SELECT action FROM audit WHERE action LIKE 'hints.native.%'")]
+    assert "hints.native.managed" in acts and "hints.native.unmanaged" in acts

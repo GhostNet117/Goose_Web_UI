@@ -280,3 +280,36 @@ def test_api_one_team_move_hints_view_and_upload_refusal(env, tmp_path):
         c.upstream_for = lambda u: None          # no Goose worker in this test
         me = tc.get("/api/me").json()
         assert me["team"] == {"id": t2, "name": "B"} and me["policy"]["chat_blocked"] == ""
+
+
+def test_api_managed_native_hints(env, tmp_path):
+    """Spec 011: /api/me/hints and the admin hints view for a native admin with managed native hints."""
+    from goose_web.profiles import NATIVE_HINTS_HEADER, NATIVE_HINTS_SETTING
+    s, db, pr, c = env
+    native = tmp_path / "appdata"
+    (native / "config").mkdir(parents=True)
+    (native / "config" / ".goosehints").write_text("raw file\n", encoding="utf-8")
+    admin = user(db, "root", role="admin", profile_mode="native", profile_path=str(native))
+    with client_for(c) as tc:
+        h = sign_in(tc, c, admin)
+        r = tc.get("/api/me/hints").json()
+        assert r["native"] is True and r["managed"] is False and r["personal"] == "raw file\n"
+        # unmanaged: a save writes the raw file (unchanged 1.5 behaviour)
+        assert tc.put("/api/me/hints", json={"personal": "raw v2\n"}, headers=h).status_code == 200
+        assert (native / "config" / ".goosehints").read_text(encoding="utf-8") == "raw v2\n"
+        # managed: an Admins team with a document; personal hints are stored in the DB and composed
+        tid = team(db, "Admins")
+        db.set_user_team(admin["id"], tid)
+        hid = db.execute("INSERT INTO hints_docs(name, content, updated_at) VALUES('Admin rules', '- rule A', 0)")
+        db.execute("INSERT INTO team_hints(team_id, hints_id) VALUES(?,?)", (tid, hid))
+        db.set_setting(NATIVE_HINTS_SETTING, admin["id"])
+        assert tc.put("/api/me/hints", json={"personal": "- mine"}, headers=h).status_code == 200
+        text = (native / "config" / ".goosehints").read_text(encoding="utf-8")
+        assert text.startswith(NATIVE_HINTS_HEADER) and text.index("- mine") < text.index("- rule A")
+        r = tc.get("/api/me/hints").json()
+        assert r["managed"] is True and r["personal"] == "- mine" and r["team"]["name"] == "Admins"
+        r = tc.get(f"/api/admin/users/{admin['id']}/hints").json()
+        assert r["managed"] is True and r["effective"] == text and r["team"] == "Admins"
+        # a library edit rewrites the native file for its users
+        assert tc.put(f"/api/admin/hints/{hid}", json={"content": "- rule B"}, headers=h).json()["updatedUsers"] == ["root"]
+        assert "- rule B" in (native / "config" / ".goosehints").read_text(encoding="utf-8")

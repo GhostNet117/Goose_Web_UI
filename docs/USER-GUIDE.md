@@ -464,6 +464,16 @@ While a turn runs, the header shows "Working", and the composer changes:
 If you try to leave the page while messages are still queued, the browser asks you to confirm, because queued
 messages are kept in the page.
 
+### Your goose hints as an administrator with the native profile
+
+If your account uses the native profile (the Goose folder Goose Desktop uses), Settings > Goose hints says which
+of two modes is on:
+
+- **Managed native hints:** Goose Web writes your effective hints (your personal hints, documents assigned to you,
+  your team's documents last) into the native `.goosehints`, so Goose Desktop and your scheduled runs use the same
+  text. Edit your personal part here and the documents in Admin > Hints.
+- Otherwise you edit the native `.goosehints` file directly here, and library documents are not applied to it.
+
 ### Editing a message you sent
 
 Hover over one of your messages and click the pencil (**Edit and rerun from here**). The text opens in place; change

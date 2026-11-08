@@ -13,7 +13,7 @@ it, on a desktop or a phone.
   `%APPDATA%\Block\goose`) with all of its chats, recipes and settings. Nothing gets copied around, and Goose
   Desktop keeps working on the same profile.
 
-`goose-web 1.6.0` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
+`goose-web 1.7.0` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
 
 ## Features
 
@@ -82,6 +82,7 @@ REST and WebSocket contract: [docs/API.md](docs/API.md).
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Developers: how it works inside |
 | [docs/API.md](docs/API.md), [docs/acp-reference.md](docs/acp-reference.md) | REST/WebSocket contract and the Goose ACP methods used |
 | [docs/SECURITY-ASSESSMENT.md](docs/SECURITY-ASSESSMENT.md), [SECURITY.md](SECURITY.md) | Threat model, findings, how to report a vulnerability |
+| [CHANGELOG.md](CHANGELOG.md) | What changed in each release, and security fixes to upgrade for |
 
 ## Deployment options
 

@@ -318,11 +318,17 @@ async def me_hints(request: Request):
     if request.method == "GET":
         assigned = [{"id": h["id"], "name": h["name"], "description": h["description"], "content": h["content"]}
                     for h in c.profiles.assigned_hints(u)]
-        if native:
+        managed = native and c.profiles.native_hints_managed(u)
+        if native and not managed:
             text = await asyncio.to_thread(c.profiles.read_native_hints, u)
             return ok({"personal": text, "assigned": assigned, "effective": text, "editable": True, "native": True,
-                       "path": str(c.profiles.native_hints_path(u))})
+                       "managed": False, "path": str(c.profiles.native_hints_path(u))})
         sec = c.profiles.hint_sections(u)
+        if managed:
+            return ok({"personal": u["personal_hints"], "assigned": assigned, "effective": c.profiles.compose_hints(u),
+                       "editable": True, "native": True, "managed": True, "path": str(c.profiles.native_hints_path(u)),
+                       "personalDropped": False,
+                       "team": {"id": sec["team"]["id"], "name": sec["team"]["name"]} if sec["team"] else None})
         return ok({"personal": u["personal_hints"], "assigned": assigned, "effective": c.profiles.compose_hints(u),
                    "editable": bool(pol.get("hints_edit")), "native": False,
                    "personalDropped": sec["personalDropped"],
@@ -331,7 +337,7 @@ async def me_hints(request: Request):
         raise HTTPError(403, "forbidden", "Your administrator manages your goose hints")
     b = await body_json(request, 512 * 1024)
     text = str(b.get("personal") or "")
-    if native:
+    if native and not c.profiles.native_hints_managed(u):
         backup = await asyncio.to_thread(c.profiles.write_native_hints, u, text)
         c.audit(request, "hints.native.save", u, detail={"backup": backup})
     else:
@@ -703,6 +709,7 @@ async def _reprovision(c: Ctx, users: list[dict]) -> dict:
     out = {}
     for u in users:
         if c.profiles.is_native(u):
+            await asyncio.to_thread(c.profiles.write_hints, u)   # managed native hints only (spec 011)
             continue
         try:
             changes = await asyncio.to_thread(c.profiles.provision, u)
@@ -794,6 +801,15 @@ async def admin_user_hints(request: Request):
     c = ctx(request)
     c.require(request, admin=True)
     u = _get_user(c, request)
+    if c.profiles.native_hints_managed(u):
+        sec = c.profiles.hint_sections(u)
+        return ok({"username": u["username"], "native": True, "managed": True, "effective": c.profiles.compose_hints(u),
+                   "path": str(c.profiles.native_hints_path(u)), "team": sec["team"]["name"] if sec["team"] else None,
+                   "personalDropped": False,
+                   "note": "Native profile with managed native hints: Goose Web writes this text to the native "
+                           ".goosehints, which Goose Desktop, the goose CLI and scheduled runs on this account load "
+                           "too. Goose also loads AGENTS.md and .goosehints from the chat's working folder up to its "
+                           "git root."})
     if c.profiles.is_native(u):
         text = await asyncio.to_thread(c.profiles.read_native_hints, u)
         return ok({"username": u["username"], "native": True, "effective": text,
