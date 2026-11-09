@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [windows-latest]          # Windows only since 1.13 (no Linux/macOS sandbox yet)
         python-version: ["3.11", "3.13"]
     steps:
       # Vendored static files are checked against SHA256SUMS byte for byte: keep LF on Windows too.

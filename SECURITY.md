@@ -7,7 +7,8 @@
 | 1.x | Yes |
 | < 1.0 | No |
 
-Fixes go into the latest 1.x release.
+Fixes go into the latest 1.x release. Since 1.13.0 Goose Web supports Windows only; Linux, macOS and Docker setups
+of earlier releases are not supported (see the [README](README.md#windows-only)).
 
 ## Reporting a vulnerability
 
@@ -16,7 +17,7 @@ the repository's **Security** tab. Do not open a public issue, pull request or d
 
 Include:
 
-- the goose-web version (`goose-web version`), the Goose version, and the OS or Docker setup
+- the goose-web version (`goose-web version`), the Goose version, and the Windows version
 - the steps to reproduce, and what an attacker gains
 - any relevant configuration, with secrets removed
 
@@ -25,8 +26,8 @@ you in the advisory unless you prefer otherwise.
 
 ## Scope
 
-In scope: the goose-web gateway and its web UI. That covers the code in `goose_web/`, the installers in `scripts/`
-and the container files in `docker/`. Examples:
+In scope: the goose-web gateway and its web UI. That covers the code in `goose_web/` and the installers in `scripts/`.
+Examples:
 
 - authentication or session bypass, CSRF, cross-site WebSocket hijacking, XSS
 - a non-admin user escaping the policy firewall (`goose_web/policy.py`) or folder confinement, or reaching another
@@ -49,6 +50,7 @@ Out of scope (report these upstream or to the relevant vendor):
 The threat model, verified controls, findings and the deployment hardening checklist are in
 [docs/SECURITY-ASSESSMENT.md](docs/SECURITY-ASSESSMENT.md) (the project's security assessment for v1.0.0).
 
-Main hardening defaults: the gateway binds to `127.0.0.1` (Docker publishes on `127.0.0.1` only), the first admin
+Main hardening defaults: the gateway binds to `127.0.0.1`, non-admin users' agents run in their own Windows
+AppContainer, the first admin
 gets a random password that is shown once and must be changed at first sign-in, the `Host` header is checked
 against an allow-list, and Python dependencies are installed from a hash-locked `requirements.lock`.

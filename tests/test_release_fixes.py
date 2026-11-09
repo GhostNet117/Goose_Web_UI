@@ -177,7 +177,7 @@ def test_host_only(raw, host):
 
 def test_allowed_hosts_defaults_and_deployment_shape():
     assert gw_app.allowed_hosts(make_settings()) == {"localhost", "127.0.0.1", "::1"}
-    # docker: binds every address, published on loopback
+    # bound to every address: only loopback names, never the wildcard
     assert gw_app.allowed_hosts(make_settings(host="0.0.0.0")) == {"localhost", "127.0.0.1", "::1"}
     assert gw_app.allowed_hosts(make_settings(host="::")) == {"localhost", "127.0.0.1", "::1"}
     # LAN bind + public URL behind a reverse proxy that passes the public Host
@@ -211,7 +211,7 @@ def test_host_guard_http():
         assert client.head("/healthz", headers={"Host": "evil.example"}).status_code == 200
 
 
-def test_host_guard_docker_defaults():
+def test_host_guard_wildcard_bind():
     with TestClient(_ping_app(make_settings(host="0.0.0.0")), base_url="http://127.0.0.1:8710") as client:
         assert client.get("/api/ping").status_code == 200
         assert client.get("/api/ping", headers={"Host": "localhost:8710"}).status_code == 200

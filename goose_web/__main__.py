@@ -51,7 +51,19 @@ def _tls_override(settings) -> dict | None:
     return v if isinstance(v, dict) else None
 
 
+WINDOWS_ONLY = ("Goose Web 1.13 runs on Windows only: Linux and macOS have no per-user sandbox yet, so team members' "
+                "agents would share this account with full access to every profile. See docs/ADMINISTRATION.md "
+                "section 2. Releases up to 1.12.0 ran on Linux and macOS but are unsupported.")
+
+
+def platform_supported() -> bool:
+    return sys.platform == "win32"
+
+
 def cmd_serve(args, settings) -> int:
+    if not platform_supported():
+        print("goose-web: " + WINDOWS_ONLY, file=sys.stderr)
+        return 3
     from . import winsec
     winsec.ensure_unelevated(bool(settings.get("server", "allow_elevated")))
     _setup_logging(settings)
@@ -159,7 +171,7 @@ def generate_admin_password(length: int = 20) -> str:
 
 
 def _read_password_file(path: str) -> str:
-    """First line of a file (or of stdin for '-'), e.g. a Docker secret. Trailing CR/LF is removed."""
+    """First line of a file (or of stdin for '-'), e.g. a password file. Trailing CR/LF is removed."""
     if path == "-":
         line = sys.stdin.readline()
     else:
@@ -635,6 +647,7 @@ def cmd_check(args, settings) -> int:
         ok &= bool(good)
         print(f"[{'OK' if good else '!!'}] {label}: {value}")
     line("goose-web", __version__)
+    line("platform", sys.platform + ("" if platform_supported() else " - " + WINDOWS_ONLY), platform_supported())
     line("config file", settings.source or "(defaults)")
     gb = settings.goose_binary
     gv = goose_version(gb)

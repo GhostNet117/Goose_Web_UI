@@ -284,13 +284,19 @@ def test_requirements_lock_is_hashed_and_covers_pyproject():
     assert blocks and all("--hash=sha256:" in b for b in blocks)
 
 
-def test_dockerfile_verifies_downloads():
-    df = (REPO / "docker" / "Dockerfile").read_text(encoding="utf-8")
-    assert re.search(r"^FROM python:[\w.-]+@sha256:[0-9a-f]{64}", df, re.M)
-    assert re.search(r"^ARG GOOSE_SHA256_AMD64=[0-9a-f]{64}$", df, re.M)
-    assert re.search(r"^ARG GOOSE_SHA256_ARM64=[0-9a-f]{64}$", df, re.M)
-    assert "sha256sum -c" in df and "--no-deps ." in df
-    assert re.search(r"pip install --require-hashes .*-r requirements\.lock", df)
+def test_windows_only_release():
+    """1.13: Linux, macOS and Docker are not shipped (no per-user sandbox there yet) and serve refuses them."""
+    for gone in ("docker", "scripts/install.sh", ".dockerignore"):
+        assert not (REPO / gone).exists(), gone
+    from goose_web import __main__ as cli
+    assert "Windows only" in cli.WINDOWS_ONLY
+
+
+def test_serve_refuses_other_systems(monkeypatch, capsys):
+    from goose_web import __main__ as cli
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    assert cli.cmd_serve(None, None) == 3
+    assert "Windows only" in capsys.readouterr().err
 
 
 def test_github_actions_pinned_by_sha():

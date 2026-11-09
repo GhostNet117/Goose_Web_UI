@@ -8,12 +8,25 @@ it, on a desktop or a phone.
 
 - **Each person gets an isolated Goose profile.** Their worker runs with `GOOSE_PATH_ROOT=<profiles_root>/<user>`,
   so their chats, recipes, skills, extensions, providers and secrets stay in their own folder. All workers run as
-  the same OS account.
+  the same OS account, and each non-admin user's worker runs in its own Windows AppContainer sandbox.
 - **The admin keeps their native Goose profile.** The admin is bound to the existing Goose profile (for example
   `%APPDATA%\Block\goose`) with all of its chats, recipes and settings. Nothing gets copied around, and Goose
   Desktop keeps working on the same profile.
 
-`goose-web 1.12.0` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
+`goose-web 1.13.0` - Python 3.11+ - Windows 10/11 and Windows Server 2019+ - Apache-2.0
+
+## Windows only
+
+Goose Web currently runs on **Windows only** (Windows 10/11 and Windows Server 2019 or later); `goose-web serve`
+refuses to start on other systems. The reason is the sandbox: on Windows each non-admin user's agent runs in its own
+AppContainer, so the operating system enforces the folder boundaries between users and blocks loopback
+([ADMINISTRATION 11.6](docs/ADMINISTRATION.md)). Linux and macOS have no equivalent per-user sandbox in Goose Web
+yet, so team members there would share one OS account with full access to each other's files (the accepted risk
+GW-01, [SECURITY-ASSESSMENT 7.2](docs/SECURITY-ASSESSMENT.md)).
+
+Linux and macOS support, and Docker, may return once a sandbox exists for them (candidates: Linux user namespaces
+with bubblewrap, or one OS account per user; macOS sandbox profiles). Releases up to 1.12.0 in the git history still
+contain the Linux/macOS installer and the Docker files, but they are unsupported.
 
 ## Features
 
@@ -84,17 +97,13 @@ REST and WebSocket contract: [docs/API.md](docs/API.md).
 | [docs/SECURITY-ASSESSMENT.md](docs/SECURITY-ASSESSMENT.md), [SECURITY.md](SECURITY.md) | Threat model, findings, how to report a vulnerability |
 | [CHANGELOG.md](CHANGELOG.md) | What changed in each release, and security fixes to upgrade for |
 
-## Deployment options
+## Deployment
 
-- **Native install (Windows, Linux, macOS).** The gateway runs in a Python virtual environment next to the Goose you
-  installed yourself, and you update Goose yourself as usual. On Windows the admin can share the existing Goose
-  Desktop profile (`%APPDATA%\Block\goose`), so Desktop and the browser see the same chats, recipes and settings.
-- **Docker (Linux image, amd64/arm64).** The image bundles a pinned goose CLI whose release tarball is checked
-  against a SHA-256 at build time. To update Goose, change `GOOSE_VERSION` and the matching `GOOSE_SHA256_AMD64` /
-  `GOOSE_SHA256_ARM64` build args (see `docker/Dockerfile`), then rebuild.
-
-Both install the Python dependencies from the hash-locked `requirements.lock` (`pip install --require-hashes`),
-and then goose-web itself with `--no-deps`.
+goose-web is installed natively on Windows. The gateway runs in a Python virtual environment next to the Goose you
+installed yourself, and you update Goose yourself as usual. The admin can share the existing Goose Desktop profile
+(`%APPDATA%\Block\goose`), so Desktop and the browser see the same chats, recipes and settings. The installer
+installs the Python dependencies from the hash-locked `requirements.lock` (`pip install --require-hashes`), and then
+goose-web itself with `--no-deps`.
 
 ## Quick start
 
@@ -102,11 +111,9 @@ You need Goose 1.50 or later (the `goose` CLI, or Goose Desktop, which bundles i
 features need 1.51-1.55, see [ADMINISTRATION 11.7](docs/ADMINISTRATION.md)) and Python 3.11+ or [uv](https://docs.astral.sh/uv/).
 
 There is no default password. `goose-web init` creates the first admin with a **random initial password and prints
-it once**. The installers show it at the end of their output, and the Docker container prints it to its log on the
-first start. Store it, sign in, and choose a new password (the change is enforced). If you lose it, reset it with
-`goose-web user reset NAME`, which prints a new temporary password.
-
-### Windows
+it once**. The installer shows it at the end of its output. Store it, sign in, and choose a new password (the
+change is enforced). If you lose it, reset it with `goose-web user reset NAME`, which prints a new temporary
+password.
 
 From a **normal, non-elevated** PowerShell in the repository folder (the installer refuses to run elevated):
 
@@ -124,47 +131,6 @@ password the installer printed at the end. You must change it right away.
   prompt. Use `-NoService` to skip that.
 - LAN or reverse proxy example (gateway host `192.168.1.10`, proxy `192.168.1.2`):
   `scripts\install.ps1 -BindHost 192.168.1.10 -PublicUrl https://goose.example.org -TrustedProxy 192.168.1.2 -FirewallRemoteAddress 192.168.1.2`
-
-### Linux / macOS
-
-As your normal user (not root), with `goose` on `PATH`:
-
-```bash
-./scripts/install.sh            # add --systemd for a user service, --public-url / --trusted-proxy for a proxy
-.venv/bin/python -m goose_web --config ~/.local/share/goose-web/_system/config.yaml serve
-```
-
-Sign in as `$USER` with the initial password the installer printed at the end (forced change). The admin starts
-with a fresh profile in
-`<profiles-root>/appdata` unless `--goose-appdata` points at a `GOOSE_PATH_ROOT`-style folder (`config/`, `data/`,
-`state/`).
-
-### Docker
-
-```bash
-docker compose -f docker/compose.yaml up -d --build
-```
-
-On the first start the container prints a random initial admin password to its log, **once**:
-
-```bash
-docker compose -f docker/compose.yaml logs goose-web
-```
-
-Open <http://127.0.0.1:8710> and sign in as `admin` with that password (forced change). The password is not printed
-again on later starts. To preset it instead, set `GOOSE_WEB_ADMIN_PASSWORD_FILE` to a file such as a compose
-secret (see the commented example in `docker/compose.yaml`). It is read on the first start only and removed from
-the environment before the gateway starts. Everything persistent lives in the `/data` volume (`goose-web-data`):
-database, profiles and the admin profile `/data/appdata`. The compose file already includes this hardening:
-
-- runs as non-root uid 1000, read-only root filesystem, tmpfs `/tmp` and `/home/goose`
-- `cap_drop: [ALL]`, `no-new-privileges`, `pids_limit: 1024`, `mem_limit: 4g`
-- port published on `127.0.0.1` only
-
-For a proxy, set `GOOSE_WEB__SERVER__PUBLIC_URL` and `GOOSE_WEB__SERVER__TRUSTED_PROXIES` in `environment:`.
-The container listens on `0.0.0.0`, so only `localhost`, `127.0.0.1`, `::1` and the `public_url` host are accepted
-in the Host header. If users open it under another name or IP, add that to `GOOSE_WEB__SERVER__ALLOWED_HOSTS`
-(comma separated). See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ## Reverse proxy
 
@@ -216,29 +182,29 @@ Every key, the CLI, policies, profile layout, scheduler rules and scripts are de
   (accounts bound to issuer + subject) are supported. API tokens are sent only in the `Authorization` header.
 - Non-admins go through a default-deny ACP firewall with folder confinement (symlinks resolved). Shell extensions
   are off unless `allow_shell` is set. MCP Apps can only call tools of their own extension.
+  Their agents run in their own Windows AppContainer (on by default), which limits them to their folders and
+  closes loopback.
 - HTTPS out of the box: a built-in local CA and server certificate for every local name and address, renewed
   automatically; or your own certificate; or off behind a reverse proxy (Admin > System > HTTPS).
 - Every user action is attributable (user, client address, time): sign-ins, admin changes, agent calls and everyday
   chat activity, in the audit log and a JSON-lines activity log. All logs stay under 0.5 % of the disk.
 - Workers listen on loopback only, each with its own secret. The gateway never runs elevated.
 - Personal webhooks cannot reach internal addresses unless `notify.allow_private_targets` is turned on.
-- Dependencies are installed from a hash-locked `requirements.lock`. The Docker base image and the goose CLI are
-  pinned and checksum-verified.
+- Dependencies are installed from a hash-locked `requirements.lock`.
 
 Full threat model and findings: [docs/SECURITY-ASSESSMENT.md](docs/SECURITY-ASSESSMENT.md). To report a
 vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Limitations
 
-- **Profile isolation is a privacy boundary, not a hard security boundary.** All workers run as one OS user, so a
-  tool that can read files or run commands can reach other profiles. That is why the shell/developer extensions are
+- **Without the sandbox, profile isolation is a privacy boundary, not a hard security boundary.** All workers run
+  as one OS user. The AppContainer sandbox (on by default) confines non-admin users' agents; without it, a tool that
+  can read files or run commands can reach other profiles. That is why the shell/developer extensions are
   off for non-admins unless their policy sets `allow_shell`. Admins have the full power of that OS account.
   Team folders and team policies are enforced by the gateway, not by OS permissions, so keep Shell and raw config
   editing off for non-admin teams.
 - **Home-folder skill and recipe folders are shared.** `~/.agents/skills`, `~/.agents/recipes` and similar folders
   are not moved by `GOOSE_PATH_ROOT` and are visible to all profiles.
-- **On Linux an existing `~/.config/goose` profile is not imported automatically.** The admin starts fresh unless
-  `--goose-appdata` points at a `GOOSE_PATH_ROOT`-style folder.
 - **One scheduler per profile.** Goose Desktop and the gateway must not both run the scheduler for the native
   profile, or jobs fire twice. `native_scheduler: auto` (the default) runs it in the gateway only while Desktop is
   closed.

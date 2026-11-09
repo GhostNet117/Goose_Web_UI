@@ -1,5 +1,8 @@
 # Security assessment: Goose AI Web Interface (goose-web v1.0.0)
 
+> Since 1.13.0 Goose Web supports Windows only; statements about Linux, macOS and Docker below describe earlier
+> versions.
+
 - **Version:** goose-web 1.0.0
 - **Date:** 2026-11-06
 - **Scope:** the goose-web gateway as a LAN-exposed service: `goose_web/*.py`, the SPA in `goose_web/static/`,

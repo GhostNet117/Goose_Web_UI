@@ -18,8 +18,7 @@ Related documents:
 | [../SECURITY.md](../SECURITY.md) | How to report a security vulnerability |
 
 Examples in this guide use the address `https://goose.example.org`, the LAN address `192.168.1.10`, the users
-`alice` and `bob`, the Windows install folder `C:\GooseWeb` and the Linux install folder `/opt/goose-web`.
-Replace them with your own values.
+`alice` and `bob` and the install folder `C:\GooseWeb`. Replace them with your own values.
 
 ## Contents
 
@@ -66,9 +65,6 @@ Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8710/healthz | Select-Object
 | Connection refused | The gateway is not running, or listens on another host/port (`server.host`, `server.port`, `serve --host/--port`). |
 | `ok` locally but not through the proxy | The reverse proxy is the problem (section 5 and section 6). |
 
-The Docker image runs the same check as its `HEALTHCHECK`; `docker compose -f docker/compose.yaml ps` shows the
-container as `healthy` or `unhealthy`.
-
 ### 1.2 Run the built-in check
 
 `check` verifies the configuration, the Goose binary, the account the gateway runs as, the profiles root and the
@@ -79,14 +75,6 @@ different database).
 C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles\_system\config.yaml check
 ```
 
-```sh
-/opt/goose-web/.venv/bin/python -m goose_web --config ~/.local/share/goose-web/_system/config.yaml check
-```
-
-```sh
-docker compose -f docker/compose.yaml exec goose-web python -m goose_web check
-```
-
 Each line has the form `[OK] label: value` or `[!!] label: value`. The command exits with code 1 if any check
 failed.
 
@@ -95,9 +83,9 @@ failed.
 | `goose-web version` | never | informational |
 | `config file` | never; shows `(defaults)` when no file was found | if you see `(defaults)` but expected a file, pass `--config` or set `GOOSE_WEB_CONFIG` |
 | `goose binary: <path> (<version>)` | the binary cannot be run (`not runnable`) | see section 7.2 |
-| `running as: <user> integrity=<level>` | the process is elevated (Windows Administrator token) or root | run as the normal user, see section 7.1 |
+| `running as: <user> integrity=<level>` | the process is elevated (Windows Administrator token) | run as the normal user, see section 7.1 |
 | `profiles root` | the folder does not exist | create it or correct `paths.profiles_root` |
-| `goose desktop running` | never (Windows only, informational) | matters for the native scheduler, section 12 |
+| `goose desktop running` | never (informational) | matters for the native scheduler, section 12 |
 | `port N: free` / `in use (gateway already running?)` | never (informational) | `in use` is expected while the gateway runs; if it is not running, another program holds the port |
 
 Other useful commands:
@@ -151,10 +139,7 @@ are larger and rotate sooner.
 
 | Install | Gateway and worker logs |
 | --- | --- |
-| Windows (installer or code default) | `C:\Goose_Web_Profiles\_system\logs\` |
-| Linux / macOS installer | `~/.local/share/goose-web/_system/logs/` |
-| Docker | `/data/_system/logs/` inside the container (the `goose-web-data` volume) |
-| POSIX without the installer | `$GOOSE_WEB_PROFILES/_system/logs/`, else `/var/lib/goose-web/profiles/_system/logs/` |
+| Installer or code default | `C:\Goose_Web_Profiles\_system\logs\` |
 
 | Log | File | Rotation | Notes |
 | --- | --- | --- | --- |
@@ -162,7 +147,7 @@ are larger and rotate sooner.
 | User activity | `<system_dir>/logs/activity.jsonl` | 20 MB, 10 old files | One JSON line per user action (sign-ins, admin changes, agent calls, chats opened/started/prompted, connections). |
 | Worker (one per user) | `<system_dir>/logs/worker-<username>.log` (lower-case user name) | checked before each worker start: above 10 MB it is rotated, 3 old files | Each start writes `==== <time> start serve ... root=<profile or (default)>`. Contains everything `goose serve` prints. |
 | Goose's own logs | `<profile root>/data/logs/` for each profile | managed by Goose | Provider/LLM and extension errors often only appear here. |
-| Service output | Windows logon task: none (runs `pythonw.exe` without a console). Linux: `journalctl --user -u goose-web -f`. Docker: `docker compose -f docker/compose.yaml logs -f goose-web`. | | |
+| Service output | Windows logon task: none (runs `pythonw.exe` without a console). | | |
 | Audit log | `audit` table in `<system_dir>/goose-web.db`, viewed in Admin > Audit log | `logs.audit_days` (365) and `logs.audit_max_rows` | |
 
 All logs together are kept under `logs.max_disk_percent` (0.5 %) of the disk: the oldest unused files are deleted
@@ -286,14 +271,6 @@ Always pass the service's configuration file:
 C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles\_system\config.yaml user reset alice
 ```
 
-```sh
-/opt/goose-web/.venv/bin/python -m goose_web --config ~/.local/share/goose-web/_system/config.yaml user reset alice
-```
-
-```sh
-docker compose -f docker/compose.yaml exec goose-web python -m goose_web user reset admin
-```
-
 To choose the password instead of generating one, add `--password <value>`. Run `user list` first if you are not
 sure of the exact user name. `no such user` almost always means the wrong database (missing `--config`).
 
@@ -348,14 +325,6 @@ gateway machine with the service's configuration file; the gateway may keep runn
 C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles\_system\config.yaml user reset-totp alice
 ```
 
-```sh
-/opt/goose-web/.venv/bin/python -m goose_web --config ~/.local/share/goose-web/_system/config.yaml user reset-totp alice
-```
-
-```sh
-docker compose -f docker/compose.yaml exec goose-web python -m goose_web user reset-totp alice
-```
-
 It prints `Two-factor removed for alice: signed out everywhere, N API token(s) revoked. ...` and has the same effect
 as the button. The audit entry `user.totp.reset` carries `"via": "cli"`. A user without two-factor is left
 unchanged (`alice does not use two-factor; nothing changed`). If the password is in doubt as well, also run
@@ -390,7 +359,6 @@ The allow-list is:
 | `invalid host` when opening `http://192.168.1.10:8710` | The gateway listens on `0.0.0.0` (wildcard, not added) and the IP is not in `allowed_hosts`. | Add `192.168.1.10` to `server.allowed_hosts` (and its origin to `server.allowed_origins` if `public_url` is set). |
 | `invalid host` through the reverse proxy | The proxy forwards its own upstream name (for example `Host: 127.0.0.1:8710` is fine, but `Host: goose-backend` is not) or a host that differs from `public_url`. | Make the proxy pass the original host (nginx `proxy_set_header Host $host;`; Caddy does this by default) and set `public_url` to that host, or add the name to `allowed_hosts`. |
 | `invalid host` only through the proxy, Host is correct | The proxy is in `trusted_proxies` and sends an `X-Forwarded-Host` that is not allow-listed. A trusted forwarded host must be allowed too. | Add that name to `allowed_hosts`, or stop sending `X-Forwarded-Host`. |
-| `invalid host` in Docker | The image listens on `0.0.0.0`; only localhost names and `public_url` are allowed. | Set `GOOSE_WEB__SERVER__PUBLIC_URL` or `GOOSE_WEB__SERVER__ALLOWED_HOSTS` (for example `goose.example.org,192.168.1.10`) in the compose file. |
 | `invalid host` after renaming the server | The new name is not on the list. | Update `public_url` or `allowed_hosts` and restart. |
 
 Port numbers are ignored in the comparison; only the host part counts. Configuration changes take effect after a
@@ -464,13 +432,10 @@ are ignored. See [ADMINISTRATION.md](ADMINISTRATION.md) section 6 for the full p
 | --- | --- | --- |
 | `goose-web: elevated token detected - relaunching as a normal user (Medium integrity).` | Started from an elevated ("Run as administrator") prompt on Windows. The gateway restarts itself un-elevated. | Nothing, but start it from a normal prompt in future. |
 | `goose-web: could not de-elevate (<error>); refusing to run elevated.` / `goose-web: still elevated after de-elevation; refusing to run.` (exit code 3) | Could not drop elevation (for example the built-in Administrator account or UAC off). | Run as a normal user without elevation. `server.allow_elevated` exists but is not recommended. |
-| `goose-web refuses to run as root; run it as the Goose user (or set server.allow_elevated).` (exit code 3) | Started as root on Linux or macOS. | Run it as the normal user who owns the Goose profiles (the installer sets up a user service). |
-| `goose-web: refusing to run as root; use the image's default user (uid 1000).` (exit code 3) | Docker container started with `--user root` or `user: root`. | Remove the user override. |
-| `goose-web: GOOSE_WEB_ADMIN_PASSWORD_FILE=<path> is not readable` (exit code 2) | The Docker secret file is missing or not readable by uid 1000. | Fix the mount or the file permissions. |
+| `Goose Web 1.13 runs on Windows only: Linux and macOS have no per-user sandbox yet ...` | Started on Linux or macOS. Goose Web supports Windows only since 1.13.0 (ADMINISTRATION 2). | Run it on Windows 10/11 or Windows Server 2019+. |
 | `This installer must run as the normal Windows user (not 'Run as administrator').` (exit code 3) | `install.ps1` was run elevated. | Run it from a normal PowerShell window. |
-| `goose CLI not found on PATH. Install it first:` (install.sh, exit code 1) | The Goose CLI is not installed. | Install the Goose CLI with the command the installer prints, then re-run. |
 | Address already in use; `check` shows `port 8710: in use (gateway already running?)` | A gateway is already running (the Windows logon task ignores a second instance), or another program uses the port. | Stop the other instance, or use `serve --port` / `server.port`. |
-| Starts, but has no users and shows a different install | No `--config` (or `GOOSE_WEB_CONFIG`), so it uses the default profiles root, not the installer's. This matters especially on Linux, where the installer uses `~/.local/share/goose-web`. | Start it the same way the service does, with `--config`. |
+| Starts, but has no users and shows a different install | No `--config` (or `GOOSE_WEB_CONFIG`), so it uses the default profiles root, not the installer's. | Start it the same way the service does, with `--config`. |
 | `Goose profile folder not found: <path>` from `init` | The `--native-root` path does not exist. | Use `--native-root auto`, `fresh`, or an existing Goose profile folder. |
 | `empty password in <file>` / `empty password in stdin` from `init` | The password file or stdin was empty. | Provide a non-empty password, or omit `--password-file` to have one generated. |
 | `Already initialised (N users). Native profile: <root>` | `init` was run on an existing database. | Nothing to do. `--force` exists for deliberate re-initialisation; take a backup first. |
@@ -503,14 +468,12 @@ How the Goose binary is found, in this order:
 
 1. `goose.binary` in the configuration (recommended for services).
 2. `goose` on the `PATH` of the gateway process. Services often have a shorter `PATH` than your shell.
-3. Known install locations: on Windows `%LOCALAPPDATA%\Programs\Goose\resources\bin\goose.exe` and
-   `%USERPROFILE%\.local\bin\goose.exe` (plus a Goose Desktop build folder); on Linux and macOS
-   `/usr/local/bin/goose` and `~/.local/bin/goose`.
+3. Known install locations: `%LOCALAPPDATA%\Programs\Goose\resources\bin\goose.exe` and
+   `%USERPROFILE%\.local\bin\goose.exe` (plus a Goose Desktop build folder).
 4. Plain `goose`, which fails with `cannot start goose` if none of the above exists.
 
 About versions: the gateway does not check for a minimum Goose version. It needs a Goose CLI that provides
-`goose serve` (the ACP server). The Docker image pins Goose 1.57.0 and verifies its checksum. If a native install
-fails after a Goose update or downgrade, compare with that version. The version shown in Admin > System is read
+`goose serve` (the ACP server); every release since 1.50 is tested (ADMINISTRATION 11.7). The version shown in Admin > System is read
 at gateway start, so restart the gateway after changing Goose.
 
 ### 7.3 A worker keeps crashing or restarting
@@ -626,8 +589,6 @@ the page** (or reconnect) before it applies to chats.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| A command-based (stdio) extension fails in Docker with "not found" for `npx`, `uvx` or `node` | The Docker image does not include Node.js or uv. | Use remote (HTTP) extensions, or build your own image that adds them. |
-| An extension fails in Docker when writing files or caches | The container's root file system is read-only and the home folder is a temporary file system; only `/data` persists. | Point the extension's data and cache paths into `/data`, or adjust the compose file. |
 | An extension cannot find its API key | Isolated workers do not use the OS keyring and do not inherit the gateway's `GOOSE_*` variables (section 7.5). | Enter the secret in the user's settings, or pass non-secret variables via `goose.extra_env`. |
 | An extension works in Goose Desktop but not in Goose Web | Different profile (isolated vs native) or different environment/`PATH` of the service. | Compare the profile used, and the `PATH` of the service account. |
 | An extension that failed at the chat's start still shows "failed" after a successful Retry, once the page reloads or reconnects, although its tools work (before 1.5.1) | The gateway replayed the chat's cached start-up status. Fixed in 1.5.1: Retry, add and remove now update it. | Upgrade. Retry on an extension that is already running is a harmless no-op: Goose keeps the running process and does not restart it. |
@@ -644,9 +605,9 @@ Schedules are run by the Goose scheduler inside a worker. Exactly one program mu
 | Profile | Who runs its schedules |
 | --- | --- |
 | Isolated (per-user) profile | Always the Goose Web worker for that user. |
-| Native (shared) profile, `goose.native_scheduler: on` | Goose Web. The Docker image sets this. |
+| Native (shared) profile, `goose.native_scheduler: on` | Goose Web. |
 | Native profile, `off` | Goose Desktop, or nobody. |
-| Native profile, `auto` (default) | Goose Web only while Goose Desktop is **not** running on that profile (Windows detection). On other systems `auto` behaves like `on`. |
+| Native profile, `auto` (default) | Goose Web only while Goose Desktop is **not** running on that profile. |
 
 When Goose Web does not own the scheduler, the Schedules page shows a banner:
 `The scheduler is not active in this Goose Web instance: <reason> (owner: <owner>). Schedules are read-only here.`
@@ -662,10 +623,8 @@ Other reasons schedules do not fire:
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | Nothing runs while nobody is signed in to Windows | The Windows logon task runs the gateway only while that Windows user is logged on. | Keep the user logged on (locked screen is fine), or run the gateway differently (see [ADMINISTRATION.md](ADMINISTRATION.md) section 5). |
-| Nothing runs after logout on Linux | A systemd user service stops at logout unless lingering is enabled. | `loginctl enable-linger <user>` |
 | One user's schedules never run | The account is disabled (workers for disabled users are not started), or the worker keeps crashing (section 7.3). | Enable the account; fix the worker. |
 | User cannot create a schedule | The policy does not grant `schedules`. | Grant `schedules`. |
-| Schedules run at the wrong time in Docker | The compose file sets `TZ: UTC`. | Set `TZ` to your time zone, or write cron expressions in UTC. |
 | Schedule ran but failed | The scheduled run uses the profile's provider, extensions and recipe. | Read Goose's log in `<profile>/data/logs` and the worker log. |
 | Schedule count shown as zero | The count comes from `<profile>/data/schedule.json`; the file is missing or unreadable. | Check the file and its owner. |
 
@@ -745,7 +704,7 @@ The gateway sends these files with `Cache-Control: no-cache`.
 | Service-account gateway: `Access is denied` for the venv, Goose or the appdata folder in the gateway log | The account cannot read the install, Python or Goose folders, or write the appdata. | Re-run the installer with `-RunAs` (it grants them), or grant Read & execute / Modify yourself; prefer installs outside user profiles. |
 | A sandboxed user's chat fails with a provider or connection error, other users are fine | The container cannot reach 127.0.0.1; the provider runs on this machine's loopback. | Use a provider reachable over the network (set `sandbox.network: internet+lan` for a LAN server), or keep that user unsandboxed (administrator). ADMINISTRATION 11.6. |
 | A sandboxed agent says `Access is denied` for a folder it should use | The folder is not the user's profile, the team folder or one of the team's extra folders, or it did not exist when the worker started. | Add it to the team's extra folders (Experience > Folders); the grant is applied at the worker's next start (Admin > System > Restart). Programs: `sandbox.read_dirs`. Check with `goose-web sandbox status`. |
-| Worker error `sandbox: ...` / `cannot start goose in the sandbox` | Creating the AppContainer, changing a folder's ACL or starting the process failed (for example the gateway's account may not change permissions on an approved folder), or the system is not Windows. | Read `worker-<user>.log` and the gateway log; fix the folder's permissions; on non-Windows systems turn `sandbox.enabled` off. |
+| Worker error `sandbox: ...` / `cannot start goose in the sandbox` | Creating the AppContainer, changing a folder's ACL or starting the process failed (for example the gateway's account may not change permissions on an approved folder). | Read `worker-<user>.log` and the gateway log; fix the folder's permissions. |
 | Your hints changed in Goose Desktop too after `native-hints enable` | That is the point of managed native hints: one `.goosehints` for the native profile. | `native-hints disable` stops it; earlier versions are in `<system_dir>/backups/native-hints/`. |
 | `upgrade.ps1`: `Expected one gateway task for this install, found 0` | The install has no logon task (installed with `-NoService`, or the task was deleted). | Register it (`scripts\register-service.ps1`, elevated) or pass `-TaskName '\Folder\Name'`. |
 | `name_taken` (409) | A file or folder with that name already exists. | Choose another name. |
@@ -784,7 +743,7 @@ Include:
 
 - the Goose Web version (`goose-web version`, or `python -m goose_web version`);
 - the Goose version (`goose --version`);
-- the operating system, or the Docker setup;
+- the Windows version;
 - steps to reproduce and the impact;
 - your configuration with all secrets removed (passwords, client secrets, tokens, webhook URLs).
 

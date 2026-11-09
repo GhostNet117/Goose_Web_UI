@@ -18,13 +18,13 @@ Related documents:
 | [../SECURITY.md](../SECURITY.md) | supported versions and how to report a vulnerability |
 
 Examples in this guide use the host name `goose.example.org`, the gateway address `192.168.1.10`, a reverse proxy at
-`192.168.1.2`, the users `alice` and `bob`, the install folder `C:\GooseWeb` (Windows) or `/opt/goose-web`
-(Linux), and the default profiles root `C:\Goose_Web_Profiles` (Windows). Replace them with your own values.
+`192.168.1.2`, the users `alice` and `bob`, the install folder `C:\GooseWeb`
+and the default profiles root `C:\Goose_Web_Profiles`. Replace them with your own values.
 
 ## Contents
 
 1. [How the gateway works, in short](#1-how-the-gateway-works-in-short)
-2. [Choosing an installation](#2-choosing-an-installation)
+2. [Supported platform: Windows only](#2-supported-platform-windows-only)
 3. [Installing](#3-installing)
 4. [First start and the initial admin password](#4-first-start-and-the-initial-admin-password)
 5. [Running as a service](#5-running-as-a-service)
@@ -61,19 +61,31 @@ Examples in this guide use the host name `goose.example.org`, the gateway addres
 - State lives in a SQLite database `<system_dir>/goose-web.db` (default `<profiles_root>/_system/goose-web.db`) and in
   the profile folders under `paths.profiles_root`.
 - All workers run as the same OS account as the gateway. Profile isolation keeps users' chats, settings and secrets
-  apart, but it is a privacy boundary, not a hard security boundary (see section 11).
+  apart, but it is a privacy boundary, not a hard security boundary (see section 11). The Windows sandbox makes the
+  operating system enforce the folder boundaries of non-admin users' agents (section 11.6).
 
-## 2. Choosing an installation
+## 2. Supported platform: Windows only
 
-| Option | Use it when | Notes |
-|---|---|---|
-| Native Windows (`scripts/install.ps1`) | Goose Desktop or the goose CLI is already used on a Windows machine and the admin wants to keep that Goose profile | The admin is bound to the existing profile in `%APPDATA%\Block\goose`, so Goose Desktop and the browser see the same chats, recipes and settings. You update Goose yourself. Includes a logon task, a firewall rule, the ownership check and the host-task view. |
-| Native Linux or macOS (`scripts/install.sh`) | the goose CLI is installed on a server or workstation and extensions need tools installed on the host | Needs `goose` on `PATH`. The admin starts with a fresh profile unless `--goose-appdata` points at a `GOOSE_PATH_ROOT`-style folder (`config/`, `data/`, `state/`). `--systemd` creates a systemd user service (Linux). |
-| Docker (`docker/compose.yaml`) | you want a self-contained Linux server with a pinned, checksum-verified goose CLI and container hardening | Image for amd64 and arm64, built locally from `docker/Dockerfile`. Everything persistent is in the `/data` volume. The image contains Python, `git` and `curl`, but no Node.js or `uv`, so stdio MCP extensions that need `npx` or `uvx` do not run unless you extend the image. The root file system is read-only and the home folder is a tmpfs, so anything written to `~` is lost when the container restarts. |
+Goose Web 1.13 runs on Windows only: Windows 10/11 or Windows Server 2019 and later, with Python 3.11 or later (the
+installer prefers `uv` with Python 3.13 when `uv` is available). `goose-web serve` refuses to start on any other
+system.
 
-All three install the Python dependencies from the hash-locked `requirements.lock` (`pip install --require-hashes`)
-and then goose-web itself with `--no-deps`. Python 3.11 or later is required for native installs (the installers
-prefer `uv` with Python 3.13 when `uv` is available).
+Why: on Windows each isolated non-admin user's agent runs in its own AppContainer (section 11.6), so the operating
+system enforces the folder boundaries between users and blocks loopback. Linux and macOS have no equivalent per-user
+sandbox in Goose Web yet. There, every team member's agent would run under one shared OS account with full access to
+the other profiles, the database and the admin's Goose profile (the accepted risk GW-01, see
+[SECURITY-ASSESSMENT.md](SECURITY-ASSESSMENT.md#72-known-risk-one-windows-account-for-all-team-profiles) 7.2).
+
+Linux and macOS support, and the Docker image, may return once Goose Web has a sandbox for them (candidates: Linux
+user namespaces with bubblewrap, or one OS account per user; macOS sandbox profiles). Releases up to 1.12.0 in the
+git history still contain the Linux/macOS installer and the Docker files, but they are unsupported.
+
+There is one installation type: native, with `scripts\install.ps1` (section 3). Use it on the Windows machine where
+Goose Desktop or the goose CLI is already used. The admin is bound to the existing profile in
+`%APPDATA%\Block\goose`, so Goose Desktop and the browser see the same chats, recipes and settings. You update Goose
+yourself. The installer adds a logon task and a firewall rule; the ownership check and the host-task view are in the
+admin console. It installs the Python dependencies from the hash-locked `requirements.lock`
+(`pip install --require-hashes`) and then goose-web itself with `--no-deps`.
 
 ## 3. Installing
 
@@ -122,7 +134,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -GooseBinary C:\AI\
   -GooseAppData C:\AI\Goose_appdata -ProfilesRoot C:\AI\Goose_Web_Profiles
 ```
 
-See section 3.4 for what these folders are and how to change them later.
+See section 3.2 for what these folders are and how to change them later.
 
 What it does:
 
@@ -165,81 +177,7 @@ The installer never writes into the Goose profile folder. Running it again on an
 `config.yaml`, keeps the database and the admin password ("Already initialised"), reinstalls the dependencies and
 registers the task again.
 
-### 3.2 Linux and macOS
-
-Run as the normal user that uses goose, not as root (the script exits with code 3 as root). The goose CLI must be
-on `PATH`; if it is missing, the script prints the official download command and stops.
-
-```bash
-cd /opt/goose-web
-./scripts/install.sh --systemd \
-  --host 192.168.1.10 --public-url https://goose.example.org --trusted-proxy 192.168.1.2
-```
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--profiles-root DIR` | `~/.local/share/goose-web` | parent of all profiles and of `_system` (made `chmod 700`) |
-| `--goose-appdata DIR\|fresh` | `auto` | the admin's Goose profile. An existing `~/.config/goose` has no `config/` subfolder and is therefore not picked up, so the admin starts fresh in `<profiles-root>/appdata` |
-| `--host`, `--port` | `127.0.0.1`, `8710` | listen address and port |
-| `--public-url URL` | empty | external `https://` URL |
-| `--trusted-proxy IP` | none | repeatable; added to `127.0.0.1` and `::1` |
-| `--systemd` | off | create and start the user unit `goose-web.service` |
-
-The script writes `<profiles-root>/_system/config.yaml` (with `goose.binary` set to the goose found on `PATH`) if it
-is missing, runs `init` and `check`, and prints the initial admin password at the end. Because the profiles root is
-not the built-in default, always pass `--config <profiles-root>/_system/config.yaml` to later commands.
-
-### 3.3 Docker
-
-From the repository root:
-
-```bash
-docker compose -f docker/compose.yaml up -d --build
-docker compose -f docker/compose.yaml logs goose-web     # shows the initial admin password, first start only
-```
-
-The image runs as uid 1000 (`goose`) under `tini`. The compose file publishes the port on `127.0.0.1:8710` only and
-already applies this hardening: read-only root file system, tmpfs for `/tmp` and `/home/goose`, `cap_drop: [ALL]`,
-`no-new-privileges`, `pids_limit: 1024`, `mem_limit: 4g`.
-
-Settings are passed as environment variables (there is no `config.yaml` in the container unless you mount one and
-set `GOOSE_WEB_CONFIG`). The image already sets:
-
-| Variable | Value |
-|---|---|
-| `GOOSE_WEB__SERVER__HOST` | `0.0.0.0` |
-| `GOOSE_WEB__SERVER__PORT` | `8710` |
-| `GOOSE_WEB__PATHS__PROFILES_ROOT` | `/data` |
-| `GOOSE_WEB__GOOSE__BINARY` | `/usr/local/bin/goose` |
-| `GOOSE_WEB__GOOSE__NATIVE_SCHEDULER` | `on` (there is no Goose Desktop in the container) |
-| `GOOSE_WEB__GOOSE__DEFAULT_WORKDIR_NATIVE` | `/data/workspace` |
-| `GOOSE_DISABLE_KEYRING` | `1` |
-
-Variables read only on the first start (when `/data/_system/goose-web.db` does not exist yet):
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `GOOSE_WEB_ADMIN` | `admin` | admin user name |
-| `GOOSE_WEB_NATIVE_ROOT` | `fresh` (`/data/appdata`) | the admin's Goose profile folder; mount an existing `GOOSE_PATH_ROOT`-style profile and point this at it to reuse it |
-| `GOOSE_WEB_ADMIN_PASSWORD_FILE` | not set | file with the initial admin password, for example a compose secret |
-| `GOOSE_WEB_ADMIN_PASSWORD` | not set | the password itself; visible in `docker inspect`, so prefer the `_FILE` variant |
-
-To give users access to host folders, mount them (for example `/srv/projects:/workspaces`) and add the container
-path to a team's extra folders (section 9).
-
-Behind a reverse proxy, add to `environment:`:
-
-```yaml
-      GOOSE_WEB__SERVER__PUBLIC_URL: https://goose.example.org
-      GOOSE_WEB__SERVER__TRUSTED_PROXIES: '["127.0.0.1", "::1", "192.168.1.2"]'
-      # only if users open the gateway under another name or address:
-      # GOOSE_WEB__SERVER__ALLOWED_HOSTS: goose,192.168.1.10
-```
-
-Trust only the proxy's own address. Every host in a trusted range can forge the client IP that rate limiting, the
-lockout, the address block and the audit log rely on, so do not trust a whole Docker network range unless you must.
-
-### 3.4 Custom Goose folders (program and appdata)
+### 3.2 Custom Goose folders (program and appdata)
 
 Two Goose folders matter, and both can live anywhere:
 
@@ -267,7 +205,7 @@ web users never use the native profile; their profiles are below the profiles ro
 
 There is no default password. `goose-web init` creates the first admin:
 
-- user name: `--admin`, otherwise the current OS user (`%USERNAME%` / `$USER`), otherwise `admin`
+- user name: `--admin`, otherwise the current OS user (`%USERNAME%`), otherwise `admin`
 - sign-in: local password, role `admin`, profile mode `native` (bound to the folder chosen by `--native-root`)
 - password: a random 20-character password, printed once in a framed block. Only its hash is stored.
 - the change of this password is enforced at the first sign-in (`must_change_pw`); until then the account can do
@@ -275,8 +213,7 @@ There is no default password. `goose-web init` creates the first admin:
 - a team called **Everyone** is created and made the default team for new users. Like every new team it starts
   with nothing allowed: choose its providers, models and approval modes before its members can chat (section 9)
 
-The installers keep the output of `init` and print it at the end; Docker prints it to the container log on the
-first start only.
+The installer keeps the output of `init` and prints it at the end.
 
 To preset the password instead of generating one:
 
@@ -285,10 +222,9 @@ To preset the password instead of generating one:
 | `--password-file FILE` | `python -m goose_web --config C:\Goose_Web_Profiles\_system\config.yaml init --admin alice --password-file C:\secure\initial.txt` (first line of the file; trailing CR/LF removed) |
 | `--password-file -` | read the first line from stdin, so the password never appears on a command line |
 | `--password PW` | possible, but the password is then visible in the process list and shell history |
-| Docker | `GOOSE_WEB_ADMIN_PASSWORD_FILE=/run/secrets/goose_web_admin_password` (preferred) or `GOOSE_WEB_ADMIN_PASSWORD` |
 
 A preset password that does not meet the password rules only produces a warning, because it must be changed at
-first sign-in anyway. Both Docker variables are removed from the environment before the gateway starts.
+first sign-in anyway.
 
 `init` on an existing database does nothing except report "Already initialised" (and record the native root if none
 was stored). `init --force` rewrites the admin: it sets role `admin`, a new password with forced change, local
@@ -363,41 +299,7 @@ or a Password/S4U logon task). If it is started elevated anyway, it relaunches i
 Medium-integrity token, or refuses to run (exit code 3). `server.allow_elevated: true` disables this guard; leave it
 off.
 
-### 5.2 Linux: systemd user service
-
-`install.sh --systemd` writes `~/.config/systemd/user/goose-web.service` (`Restart=on-failure`, `RestartSec=5`,
-`NoNewPrivileges=yes`) and enables it.
-
-```bash
-systemctl --user status goose-web
-systemctl --user restart goose-web
-journalctl --user -u goose-web -f
-loginctl enable-linger "$USER"     # start the user service at boot, without an interactive login
-```
-
-The gateway refuses to run as root (exit code 3) unless `server.allow_elevated` is true. Do not run it as root.
-
-### 5.3 macOS
-
-The installer offers no service integration on macOS. Run the gateway as the normal user with:
-
-```bash
-/opt/goose-web/.venv/bin/python -m goose_web --config ~/.local/share/goose-web/_system/config.yaml serve
-```
-
-If you want it to start automatically, wrap that command in your own launchd agent for the same user.
-
-### 5.4 Docker
-
-The compose file uses `restart: unless-stopped` and a health check (`curl -fsS http://127.0.0.1:8710/healthz`).
-
-```bash
-docker compose -f docker/compose.yaml ps
-docker compose -f docker/compose.yaml restart goose-web
-docker compose -f docker/compose.yaml logs -f goose-web
-```
-
-### 5.5 What happens at start and stop
+### 5.2 What happens at start and stop
 
 At start the gateway opens the database (applying migrations and the audit purge), reads the goose version, and
 registers a worker for every enabled user so that profiles with schedules can run without anyone connected. It
@@ -518,7 +420,7 @@ page, which loads it at once), `goose-web tls export-ca FILE`, `goose-web tls tr
 
 With HTTPS on (built-in or files), the session cookie is the `Secure` `__Host-gw` cookie; HSTS is sent only when
 `public_url` is an `https://` URL. Plain `http://` to the port no longer answers: update bookmarks, monitoring and
-health checks (`scripts\upgrade.ps1` and the Docker health check try `https` first).
+health checks (`scripts\upgrade.ps1` tries `https` first).
 
 Behind a reverse proxy:
 
@@ -687,15 +589,11 @@ How it works:
 | Delete | "Delete...": stops the worker and removes the account. The isolated profile folder is moved to `<profiles_root>/_deleted/<user>-<timestamp>`, or deleted permanently if you tick the box. The native profile is never moved or deleted. | none |
 
 Console commands work on the database directly. Run them on the gateway host, as the same OS account as the
-gateway (not elevated, not root), and with the same `--config`:
+gateway (not elevated), and with the same `--config`:
 
 ```powershell
 C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles\_system\config.yaml user list
 C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles\_system\config.yaml user reset bob
-```
-
-```bash
-docker compose -f docker/compose.yaml exec goose-web python -m goose_web user reset admin
 ```
 
 ### 7.7 Sign-in protection and sessions
@@ -1103,8 +1001,8 @@ Every non-native user gets `<profiles_root>/<username>/`, which is the `GOOSE_PA
 
 ### 11.2 The native profile
 
-Profile mode `native` binds an admin to an existing Goose profile folder (on Windows normally `%APPDATA%\Block\goose`;
-on a fresh install `<profiles_root>/appdata`; in Docker `/data/appdata`). It is stored as the `native_root` setting.
+Profile mode `native` binds an admin to an existing Goose profile folder (normally `%APPDATA%\Block\goose`;
+on a fresh install `<profiles_root>/appdata`). It is stored as the `native_root` setting.
 
 Implications:
 
@@ -1115,7 +1013,7 @@ Implications:
 - When the folder is Goose's default location, `GOOSE_PATH_ROOT` is not set for the native worker, and the worker
   inherits the gateway's full environment (including any `GOOSE_*` variables and the OS keyring).
 - The native admin's default folder for new chats is `goose.default_workdir_native` (default: the home folder),
-  and the file browser offers every drive (Windows) or `/`.
+  and the file browser offers every drive.
 - Only admins can have the native profile. Use it for one admin at most: every native user gets the same folder,
   and two workers on one profile would, for example, both run its scheduler. Additional admins should use isolated
   profiles.
@@ -1144,7 +1042,7 @@ Windows accounts per team would close this gap; they are not built (possible fut
 
 | | Native profile (installer default for the first admin) | Isolated profile |
 |---|---|---|
-| Goose data | your existing Goose folder (`%APPDATA%\Block\goose`, or `GOOSE_PATH_ROOT`; section 3.4) | `<profiles_root>/<username>/` (new, empty) |
+| Goose data | your existing Goose folder (`%APPDATA%\Block\goose`, or `GOOSE_PATH_ROOT`; section 3.2) | `<profiles_root>/<username>/` (new, empty) |
 | Shared with Goose Desktop / CLI / schedules | yes: same chats, recipes, extensions, providers, settings, schedules | no |
 | Hints | the native `.goosehints`; with managed native hints (10.1) composed from the Hints library and your team | composed `.goose-web-hints.md` from the library and your team |
 | Policies | none (administrators are unrestricted) | none for administrators |
@@ -1166,7 +1064,7 @@ you need in its Settings, and keep or disable the old native account. Chats, rec
 profile are not copied. Changing an existing account's profile mode is not offered, because it would point the
 account at a different set of chats.
 
-Moving the native Goose folder itself (for example to `C:\AI\Goose_appdata`): section 3.4 (`goose-web native-root`).
+Moving the native Goose folder itself (for example to `C:\AI\Goose_appdata`): section 3.2 (`goose-web native-root`).
 
 ### 11.5 Goose settings that matter for long chats and slow extensions (Goose 1.55 and later)
 
@@ -1203,7 +1101,7 @@ boundaries:
 
 ```yaml
 sandbox:
-  enabled: auto              # default: on for Windows, off elsewhere; true | false
+  enabled: auto              # default: on; true | false
   network: internet          # none | internet | internet+lan
   read_dirs: []              # extra program folders agents may run, e.g. C:\Program Files\nodejs, a Python install
   relays: []                 # local services sandboxed agents may use, e.g. ["127.0.0.1:8317"] (a local model proxy)
@@ -1231,8 +1129,7 @@ What it does, for every **isolated, non-admin** user (administrators and the nat
 
 Requirements and limits:
 
-- Windows 10/11 or Server 2019+. On other systems `sandbox.enabled: true` makes isolated non-admin workers refuse to
-  start (fail closed); use one OS account or container per team there.
+- Windows 10/11 or Server 2019+ (Goose Web refuses to start on other systems; section 2).
 - **Model providers must be reachable over the network** (cloud APIs, or a server elsewhere on the LAN with
   `internet+lan`), or be listed in `sandbox.relays` (below). A container cannot reach this machine's own LAN
   address either, so a service on this machine is reachable only through a relay.
@@ -1313,7 +1210,7 @@ running.
 | Pending restart | after a profile change (section 9.6) or a scheduler hand-over (section 13), when no run is active |
 | Stop by admin | Admin > System > Stop: in-flight calls fail with "stopped by an administrator"; the worker starts again when the user connects |
 | Restart by admin | Admin > System > Restart: active runs are interrupted (the UI asks for confirmation) |
-| Process tree | stopping a worker also stops its MCP server processes (Windows: `taskkill /T`; Linux/macOS: the worker's process group) |
+| Process tree | stopping a worker also stops its MCP server processes (`taskkill /T`) |
 | Concurrency | `max_concurrent_runs` per profile for non-admins |
 
 Worker output goes to `<system_dir>/logs/worker-<username>.log` (section 18).
@@ -1330,7 +1227,7 @@ scheduler inside the worker. A worker runs the scheduler when it is started with
 | native | `off` | never (schedules run in Goose Desktop, or not at all) |
 | native | `auto` (default) | only while Goose Desktop is not running |
 
-- In `auto` mode the gateway checks for Goose Desktop (Windows only; on other systems `auto` behaves like `on`).
+- In `auto` mode the gateway checks for Goose Desktop.
   When Desktop starts or stops, the native worker is restarted once no run is active, which hands the scheduler
   over. If detection fails, the gateway assumes Desktop is running, so jobs never fire twice.
 - A worker whose profile has jobs in `data/schedule.json` and that owns its scheduler is started even when nobody is
@@ -1340,8 +1237,6 @@ scheduler inside the worker. A worker runs the scheduler when it is started with
 - The gateway must be running for schedules to fire. With the Windows logon task, that means the gateway user must
   be signed in.
 - Disabled users' workers are not started at gateway start, so their schedules do not run.
-
-The Docker image sets `native_scheduler: on`, because there is no Goose Desktop in the container.
 
 ## 14. Notifications and webhooks
 
@@ -1444,7 +1339,7 @@ host_tasks:
 
 | Log | Location | Rotation |
 |---|---|---|
-| Gateway | `<system_dir>/logs/gateway.log`, and stderr when there is a console (systemd journal, `docker logs`; not under the Windows logon task, which uses `pythonw.exe`) | `logs.gateway_file_mb` (10 MB) x `logs.gateway_files` (5) |
+| Gateway | `<system_dir>/logs/gateway.log`, and stderr when there is a console (not under the Windows logon task, which uses `pythonw.exe`) | `logs.gateway_file_mb` (10 MB) x `logs.gateway_files` (5) |
 | User activity | `<system_dir>/logs/activity.jsonl`: one JSON line per event - `ts` (UTC), `user`, `uid`, `ip`, `action`, `target`, `ok`, `detail`. Every audit event (section 16) plus browser connections (`ws.connect`, `ws.disconnect` with the duration). Prompt text is never logged. `logs.activity: false` turns it off. | `logs.activity_file_mb` (20 MB) x `logs.activity_files` (10) |
 | Worker (Goose stdout/stderr) | `<system_dir>/logs/worker-<username>.log`; each start writes a `==== <time> start serve ... root=<profile>` line | above 10 MB at a worker start it is rotated (3 old files); a running worker's log that passes a tenth of the budget is copied to `.1` and emptied in place |
 | Goose's own logs | `<profile>/state/logs/` (or `data/logs/`) of every isolated profile, or the native profile's log folder | Goose; and the disk budget below |
@@ -1470,13 +1365,12 @@ copy). Set the log level with the environment variable `GOOSE_WEB_LOG_LEVEL` (fo
 | Item | Default location | Why |
 |---|---|---|
 | Database | `<system_dir>/goose-web.db` (plus `-wal` and `-shm` while running) | users, password hashes, TOTP secrets, teams, policies, shared hints, team items, API token hashes, settings including the LDAP bind password, OIDC client secrets and peer tokens, audit log |
-| Configuration | `<system_dir>/config.yaml` (or the file you pass with `--config`), or the compose file and its environment | server, paths, goose and auth settings |
+| Configuration | `<system_dir>/config.yaml` (or the file you pass with `--config`) | server, paths, goose and auth settings |
 | Team library | `<system_dir>/library/` | team recipe files |
 | Native hints backups | `<system_dir>/backups/native-hints/` | earlier versions of the admin's hints |
 | Isolated profiles | `<profiles_root>/<username>/` | each user's chats (`data/sessions/sessions.db`), recipes, skills, extensions, providers and `secrets.yaml` |
 | Archived profiles | `<profiles_root>/_deleted/` | profiles of deleted users |
-| Native profile | `%APPDATA%\Block\goose` on Windows when bound to the existing profile (outside the profiles root); `<profiles_root>/appdata` on fresh installs; `/data/appdata` in Docker | the admin's Goose profile |
-| Docker | the `goose-web-data` volume (all of the above) and any host folders you mounted | |
+| Native profile | `%APPDATA%\Block\goose` when bound to the existing profile (outside the profiles root); `<profiles_root>/appdata` on fresh installs | the admin's Goose profile |
 
 The database and the profiles contain credentials. Encrypt and restrict backups like the originals.
 
@@ -1488,18 +1382,6 @@ API, which produces a consistent copy:
 ```powershell
 C:\GooseWeb\.venv\Scripts\python.exe -c "import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()" C:\Goose_Web_Profiles\_system\goose-web.db D:\Backups\goose-web.db
 ```
-
-```bash
-sqlite3 ~/.local/share/goose-web/_system/goose-web.db ".backup '/backup/goose-web.db'"
-```
-
-```bash
-# Docker: write the copy into the volume, then copy it out
-docker compose -f docker/compose.yaml exec goose-web python -c "import sqlite3; s=sqlite3.connect('/data/_system/goose-web.db'); d=sqlite3.connect('/data/_system/backups/goose-web.db'); s.backup(d); d.close(); s.close()"
-docker compose -f docker/compose.yaml cp goose-web:/data/_system/backups/goose-web.db ./goose-web.db
-```
-
-(Create `/data/_system/backups` first if it does not exist yet.)
 
 ### 19.3 Full backup
 
@@ -1514,20 +1396,10 @@ robocopy "$env:APPDATA\Block\goose" D:\Backups\goose-native /MIR /COPY:DAT /R:1 
 Start-ScheduledTask -TaskPath '\GooseWeb\' -TaskName 'GooseWeb_Gateway'
 ```
 
-```bash
-docker compose -f docker/compose.yaml stop goose-web
-docker run --rm -v goose-web_goose-web-data:/data:ro -v "$PWD":/backup goose-web:latest \
-  tar -czf /backup/goose-web-data.tgz -C /data .
-docker compose -f docker/compose.yaml start goose-web
-```
-
-(The compose project is called `goose-web`, so the volume is normally `goose-web_goose-web-data`; check with
-`docker volume ls`.)
-
 ### 19.4 Restore
 
 1. Stop the gateway.
-2. Put back the profiles root (or volume), the native profile and the configuration.
+2. Put back the profiles root, the native profile and the configuration.
 3. When you restore `goose-web.db`, delete any `goose-web.db-wal` and `goose-web.db-shm` files next to it that do not
    belong to the restored copy.
 4. Restore files as the gateway's OS account (or fix ownership afterwards), so the gateway and Goose can write them.
@@ -1565,51 +1437,24 @@ choose).
   starts itself outside the chat's process tree after `-DelaySeconds` (60) and returns; otherwise the restart would
   end the chat's shell before the gateway is started again. Read the log afterwards.
 
-### 20.2 Linux and macOS
-
-1. Read the release notes and back up (section 19).
-2. Stop the gateway (`systemctl --user stop goose-web`).
-3. Update your clone of the repository (`git pull --ff-only`).
-4. Reinstall the dependencies from the lock file and the package:
-
-   ```bash
-   cd /opt/goose-web
-   .venv/bin/python -m pip install --require-hashes -r requirements.lock
-   .venv/bin/python -m pip install --no-deps -e .
-   ```
-
-   Alternatively, run the installer again: it keeps `config.yaml`, the database and the admin password.
-5. Start the gateway and run `goose-web check`.
-6. Ask users to reload the page (a hard refresh if the old UI still shows, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md)).
+After the upgrade, ask users to reload the page (a hard refresh if the old UI still shows, see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md)).
 
 Database schema changes are applied automatically when the gateway (or a console command) opens the database; the
 version is kept in the `meta` table (`schema_version`, currently 4). Column migrations only add nullable columns
 and indexes. The upgrade to 1.5.0 also converts team policies and memberships once (section 9.8), so back up the
 database first. Keep the pre-upgrade database backup as your rollback path.
 
-### 20.3 Updating Goose (native)
+### 20.2 Updating Goose
 
 Update the goose CLI or Goose Desktop as usual. Workers use the new binary the next time they start: restart them in
 Admin > System, or restart the gateway (the goose version shown in Admin > System is read at gateway start).
 `goose.binary` pins a specific binary; when it is empty the gateway uses `goose` on `PATH`, then the usual install
 locations.
 
-### 20.4 Docker
-
-The image is built locally from the repository. To upgrade goose-web, update the repository and rebuild:
-
-```bash
-docker compose -f docker/compose.yaml up -d --build
-```
-
-To change the bundled goose CLI, set `GOOSE_VERSION` and both checksums together - `GOOSE_SHA256_AMD64` and
-`GOOSE_SHA256_ARM64` in `docker/Dockerfile`, and the `GOOSE_VERSION` build argument in `docker/compose.yaml` - then
-rebuild. A checksum mismatch fails the build on purpose. The base image is pinned by digest; bump it the same way
-(the Dockerfile explains how). The `/data` volume is kept across rebuilds.
-
 ## 21. Uninstalling
 
-Windows (elevated PowerShell):
+In an elevated PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File C:\GooseWeb\scripts\uninstall.ps1 -Port 8710
@@ -1619,26 +1464,10 @@ This stops and removes the logon task and the firewall rule. The profiles root, 
 and the Goose profile is never touched. Delete `C:\Goose_Web_Profiles` and the install folder by hand if you want
 everything gone (back up first).
 
-Linux:
-
-```bash
-systemctl --user disable --now goose-web
-rm ~/.config/systemd/user/goose-web.service
-systemctl --user daemon-reload
-# then delete the install folder and the profiles root if you no longer need them
-```
-
-Docker:
-
-```bash
-docker compose -f docker/compose.yaml down        # keeps the goose-web-data volume
-docker compose -f docker/compose.yaml down -v     # also deletes the volume and all data
-```
-
 ## 22. Checklist for a new deployment
 
-1. Pick the installation type (section 2) and install as the normal Goose user, never elevated or as root.
-2. Store the initial admin password from the installer output or the container log. Sign in and change it.
+1. Check the requirements (section 2) and install as the normal Goose user, never elevated.
+2. Store the initial admin password from the installer output. Sign in and change it.
 3. Run `goose-web check` and fix anything marked `!!`.
 4. Set up the reverse proxy with TLS. Set `server.public_url`, add only the proxy to `server.trusted_proxies`, bind
    `server.host` to the interface the proxy uses, and limit the port in the firewall to the proxy. Restart the
@@ -1666,8 +1495,8 @@ This list follows the code's behaviour; the full reasoning is in
 
 | Area | Do this |
 |---|---|
-| OS account | Run the gateway and every console command as the normal Goose user, not elevated and not root. Keep `server.allow_elevated: false`. On Windows use the logon task with RunLevel Limited. |
-| Exposure | Bind `server.host` to one interface; avoid `0.0.0.0` unless the firewall covers every interface. Allow the port only from the reverse proxy. Docker: keep the port published on `127.0.0.1` or reachable only by the proxy. |
+| OS account | Run the gateway and every console command as the normal Goose user, not elevated. Keep `server.allow_elevated: false`. Use the logon task with RunLevel Limited. |
+| Exposure | Bind `server.host` to one interface; avoid `0.0.0.0` unless the firewall covers every interface. Allow the port only from the reverse proxy. |
 | TLS | Terminate TLS at the proxy and set an `https://` `server.public_url` (Secure `__Host-` cookie, HSTS, strict Origins). |
 | Proxies | Put only the proxy's own address in `server.trusted_proxies`, and make the proxy overwrite `X-Forwarded-For`. |
 | Host and Origin | Keep `server.allowed_hosts` and `server.allowed_origins` empty unless users really use another name or a direct address. |
@@ -1678,12 +1507,12 @@ This list follows the code's behaviour; the full reasoning is in
 | Policies | Leave `allow_shell`, `config_edit`, `extensions_edit`, `providers_edit` and `notify_webhook` off for ordinary teams. Set `allowed_modes`, `allowed_providers`, `allowed_models`, `allowed_roots` and `max_concurrent_runs`, with explicit values rather than Any where you can. Keep personal hints off where team hints must be final. Remember that all teams share one Windows account (section 11.3). |
 | Shared items | Share extensions and providers only when every member may hold the copied credentials. Import MCP Apps and extensions only from trusted sources. |
 | Webhooks | Keep `notify.allow_private_targets: false`. |
-| Native profile | Bind at most one admin to it. Restrict its folder's permissions to the gateway user (plus SYSTEM and Administrators on Windows). |
-| File permissions | Keep the profiles root private (the installers set this: Windows ACL, `chmod 700` on Linux/macOS). Run the ownership check after any elevated activity on Windows. |
+| Native profile | Bind at most one admin to it. Restrict its folder's permissions to the gateway user (plus SYSTEM and Administrators). |
+| File permissions | Keep the profiles root private (the installer restricts its ACL). Run the ownership check after any elevated activity. |
 | Host tasks | Set `host_tasks.enabled: false` if admins do not need the view. |
 | Peers | Use peer tokens of accounts whose agents admins may see; prefer `https://` peer URLs with certificate checks on. |
 | Tokens | Give API tokens an expiry. Disable accounts promptly when people leave (this revokes their sessions and tokens). |
-| Supply chain | Install only with `--require-hashes` from `requirements.lock`; in Docker change the goose version only together with its checksums. |
+| Supply chain | Install only with `--require-hashes` from `requirements.lock`. |
 | Backups and logs | Encrypt and restrict backups of the database and profiles; protect the log folder. Review the audit log for `acp.denied`, failed sign-ins and `ws.impersonate`. |
 | Verification | Run `goose-web check` after every change. |
 

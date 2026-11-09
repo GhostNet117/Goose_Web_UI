@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.13.0 - 2026-11-09
+
+- **Windows only for now.** Linux, macOS and Docker are no longer shipped or supported: Goose Web has no per-user
+  sandbox there yet, so team members' agents would share the gateway's OS account with access to every profile.
+  `scripts/install.sh` and `docker/` are removed, CI runs on Windows only, and `goose-web serve` refuses to start on
+  other systems (`goose-web check` reports it). Support may return once Linux and macOS have a sandbox like the
+  Windows AppContainer one (ADMINISTRATION 2). Releases up to 1.12.0 in the git history still contain those files
+  but are unsupported.
+
 ## 1.12.0 - 2026-11-09
 
 **Security release - upgrade if you have non-admin users.** An independent adversarial assessment of 1.11.0 found one
