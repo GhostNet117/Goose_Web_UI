@@ -189,9 +189,10 @@ export function confirmDialog({ title = 'Are you sure?', message = '', confirmTe
   });
 }
 
-export function promptDialog({ title, label, value = '', placeholder = '', confirmText = 'Save', multiline = false, hint = '', validate } = {}) {
+export function promptDialog({ title, label, value = '', placeholder = '', confirmText = 'Save', multiline = false, hint = '', validate, type = 'text', autocomplete = 'off' } = {}) {
   return new Promise((resolve) => {
-    const inp = multiline ? textarea({ value, placeholder, rows: 8 }) : input({ value, placeholder });
+    // type: 'password' for secrets (masked, D-5); autocomplete e.g. 'current-password'
+    const inp = multiline ? textarea({ value, placeholder, rows: 8 }) : input({ value, placeholder, type, autocomplete });
     const err = h('div', { class: 'field-error' });
     let m;
     const submit = () => {
@@ -243,6 +244,8 @@ export function errMsg(e) {
 // ---------- popover menu ----------
 let openMenu = null;
 export function closeMenu() { if (openMenu) { openMenu.remove(); openMenu = null; } }
+// The app's own open menu, tracked by reference: never ask the DOM for '.menu' (untrusted content could match it, D-7).
+export function isMenuOpen() { return !!(openMenu && openMenu.isConnected); }
 export function menu(anchor, items, { align = 'left' } = {}) {
   closeMenu();
   const m = h('div', { class: 'menu', role: 'menu' });

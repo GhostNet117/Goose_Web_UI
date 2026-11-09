@@ -214,7 +214,9 @@ def _jwt(claims: dict) -> str:
 @pytest.fixture
 def oidc(env, monkeypatch):
     _, db, auth = env
-    auth.save_auth_config({"oidc": [{"id": "corp", "issuer": ISSUER, "clientId": "gw", "clientSecret": "s"}]})
+    # stripDomain on: the pre-A-5 default, still kept by providers saved before 1.11.1
+    auth.save_auth_config({"oidc": [{"id": "corp", "issuer": ISSUER, "clientId": "gw", "clientSecret": "s",
+                                     "stripDomain": True}]})
     meta = {"authorization_endpoint": ISSUER + "/authorize", "token_endpoint": ISSUER + "/token"}
 
     async def discovery(o):
@@ -232,12 +234,12 @@ def oidc(env, monkeypatch):
     monkeypatch.setattr(auth_mod, "httpx", types.SimpleNamespace(AsyncClient=client_factory,
                                                                  HTTPError=httpx.HTTPError))
 
-    async def sign_in_as(sub: str, username: str, iss: str = ISSUER):
+    async def sign_in_as(sub: str, username: str, iss: str = ISSUER, **extra):
         url = await auth.oidc_start("corp", "http://gw/cb")
         q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
         current.clear()
         current.update({"iss": iss, "aud": "gw", "exp": time.time() + 300, "nonce": q["nonce"][0],
-                        "sub": sub, "preferred_username": username})
+                        "sub": sub, "preferred_username": username, **extra})
         return await auth.oidc_callback("corp", "code", q["state"][0], "http://gw/cb", "1.1.1.1")
 
     return db, sign_in_as
@@ -254,9 +256,12 @@ async def test_oidc_new_user_is_bound_and_found_by_subject(oidc):
 
 async def test_oidc_existing_unbound_user_is_bound_on_first_sign_in(oidc):
     db, sign_in_as = oidc
-    legacy = mk_user(db, "ivy", source="oidc", password=None)
+    legacy = mk_user(db, "ivy", source="oidc", password=None, email="ivy@example.org")
     assert legacy["oidc_subject"] is None
-    u = await sign_in_as("sub-ivy", "ivy")
+    with pytest.raises(AuthError) as e:          # A-5: the name alone never binds an existing account
+        await sign_in_as("sub-other", "ivy")
+    assert e.value.code == "oidc_unlinked" and db.user_by_id(legacy["id"])["oidc_subject"] is None
+    u = await sign_in_as("sub-ivy", "ivy", email="ivy@example.org", email_verified=True)
     assert u["id"] == legacy["id"] and u["oidc_subject"] == "sub-ivy"
     assert db.one("SELECT 1 AS x FROM audit WHERE action='user.oidc.bind'")
 

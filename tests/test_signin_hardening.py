@@ -115,8 +115,9 @@ def test_ten_consecutive_failures_block_the_address(env):
     _, db, auth = env
     mk_user(db, "alice")
     codes = fail(auth, ATTACKER, "alice", n=9) + fail(auth, ATTACKER, "ghost", n=1)
-    assert codes[:8] == ["invalid_credentials"] * 8        # account lockout (8) then counts as "locked"
-    assert codes[8] == "locked" and codes[9] == "ip_blocked"
+    # account lockout after 8; a wrong password on the locked account looks the same and still counts (A-3)
+    assert codes[:9] == ["invalid_credentials"] * 9 and codes[9] == "ip_blocked"
+    assert db.user_by_name("alice")["locked_until"] > time.time()
     assert auth.ipblock.is_blocked(ATTACKER)
     # even the right password is refused now, and the refusal is not a new failure
     with pytest.raises(AuthError) as e:

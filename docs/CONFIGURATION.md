@@ -17,6 +17,9 @@ From lowest to highest (`goose_web/config.py: load_settings`):
       **built-in** default root, not a `paths.profiles_root` you configured. If your root is somewhere else, pass
       `--config` (the installers and the systemd unit do).
 
+   A `--config` or `GOOSE_WEB_CONFIG` that names a file that does not exist is a fatal error (1.12): the gateway
+   and every command stop with `config file not found` instead of quietly using another file.
+
    The file is deep-merged over the defaults.
 3. **Environment variables** `GOOSE_WEB__<SECTION>__<KEY>=<value>`, for example
    `GOOSE_WEB__SERVER__PUBLIC_URL=https://goose.example.org`. Names are case-insensitive and must have exactly two
@@ -154,7 +157,7 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 | `ip unblock ADDRESS` | `--all` | Ends the block of ADDRESS (an IPv6 address unblocks its /64) and clears its count, or with `--all` every block and count; audited as `auth.ip.unblocked`. Works while the gateway runs (it re-reads the blocks within 15 seconds), so it is the way back in when the admin's own address is blocked. |
 | `check` | | Diagnostics: version, config file, goose binary and version, OS user and integrity (fails if elevated), profiles root, Goose Desktop running (Windows), whether the port is free, and (Windows, information only) the logon task that autostarts this install. Exit code 1 if something is wrong. |
 | `tls` | `status \| renew \| export-ca FILE \| trust` | Built-in HTTPS (ADMINISTRATION 6.3): show the mode, certificate, names and fingerprints (creates the certificate when the mode is self-signed); renew the server certificate now; copy the local CA certificate to FILE; trust the CA for the current Windows user. |
-| `sandbox` | `status \| remove USER` | Sandbox (ADMINISTRATION 11.6): list every user's AppContainer, SID and folder grants; or revoke one user's grants and delete the container. |
+| `sandbox` | `status \| remove USER \| remove --all` | Sandbox (ADMINISTRATION 11.6): list every user's AppContainer, SID and folder grants; or revoke one user's grants and delete the container. |
 | `native-hints` | `status \| enable USER [--team NAME] [--adopt] [--doc-name NAME] \| disable` | Managed native hints (ADMINISTRATION 10.1): Goose Web writes the native admin's composed hints (personal, assigned, team documents) into the native profile's `config/.goosehints`, which Goose Desktop, the CLI and schedules on that account load too. `--team` puts the user in that team (created if missing); `--adopt` keeps the current file as a library document. Audit `hints.native.managed` / `hints.native.unmanaged`. |
 | `native-root` | `[PATH]` | Without PATH: show the native Goose profile (Goose appdata folder). With PATH: move the native profile to that folder (must contain `config\`), update every native user that used the old one, audit `system.native_root`. Files are not copied. Restart the gateway afterwards. |
 | `version` | | Prints the version. |
@@ -268,7 +271,9 @@ user in several teams keeps the team with the lowest id (audit `team.migrate.mem
   backup). When the folder is Goose's default location, `GOOSE_PATH_ROOT` is not set for that worker.
 - **Isolated profile**: created at the first sign-in. The first provisioning copies the base platform extensions
   (`todo`, `skills`, `apps`, `chatrecall`, `summarize`, `extensionmanager`, `analyze`, `memory`, `summon`, `tom`)
-  from the admin's config, sets `GOOSE_MODE: approve`, and writes `developer` disabled unless `allow_shell`.
+  from the admin's config and sets `GOOSE_MODE: approve`. Without `allow_shell`, `developer`, `computercontroller`,
+  `code_execution`, `orchestrator`, `summon` and `scheduler` are written disabled and team command extensions are
+  left out; `extensionmanager` needs `extensions_edit` and `allow_shell` (ADMINISTRATION 11.1).
   After that, team items (recipes, skills, extensions, providers, with secrets copied from the source profile when
   the item came from a profile library), hints and default models are applied on every reprovision. Items the user
   created are never overwritten.

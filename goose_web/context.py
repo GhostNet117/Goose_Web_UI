@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,6 +22,13 @@ from .profiles import Profiles
 from .workers import WorkerManager
 
 log = logging.getLogger("goose_web")
+
+TOTP_ENROL_MESSAGE = ("Administrators must use two-factor sign-in. Turn it on first in Settings > Two-factor "
+                      "authentication; until then only that page, your password and sign-out are available.")
+
+
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.normpath(path))
 
 
 class HTTPError(Exception):
@@ -81,12 +89,25 @@ class Ctx:
         return _ip_in(peer, self.settings.get("server", "trusted_proxies") or [])
 
     def client_ip(self, conn: HTTPConnection) -> str:
+        """The client address: the peer, or (from a trusted proxy) the right-most X-Forwarded-For entry that is
+        not itself a trusted proxy. Only entries that parse as IP addresses are used; an entry that does not
+        falls back to the peer, so a non-address can never dodge the IP block or reach the audit log (A-7)."""
         peer = conn.client.host if conn.client else ""
-        if self.from_trusted_proxy(conn):
-            xff = conn.headers.get("x-forwarded-for")
-            if xff:
-                return xff.split(",")[-1].strip()[:64]
-        return peer
+        if not self.from_trusted_proxy(conn):
+            return peer
+        xff = conn.headers.get("x-forwarded-for")
+        if not xff:
+            return peer
+        trusted = self.settings.get("server", "trusted_proxies") or []
+        found = ""
+        for entry in reversed(xff.split(",")[-32:]):
+            ip = security.parse_ip(entry)
+            if ip is None:
+                return found or peer
+            found = ip
+            if not _ip_in(ip, trusted):
+                return ip
+        return found or peer
 
     # ---------------------------------------------------------- identity
     def identity(self, conn: HTTPConnection) -> Identity | None:
@@ -96,21 +117,37 @@ class Ctx:
         token = conn.cookies.get(self.cookie_name)
         return self.auth.resolve_cookie(token) if token else None
 
-    def require(self, request: Request, admin: bool = False, allow_pw_change: bool = False) -> Identity:
+    def require(self, request: Request, admin: bool = False, allow_pw_change: bool = False,
+                allow_totp_enrol: bool = False) -> Identity:
+        """The signed-in identity, after the CSRF/Origin checks for cookie writes.
+
+        allow_pw_change: the route stays open to an account that must change its password (and to one that must
+        enrol two-factor). allow_totp_enrol: the route stays open to an administrator who must enrol two-factor
+        first ("require two-factor for administrators", A-8) - the enrolment routes themselves."""
         ident = self.identity(request)
         if ident is None:
             raise HTTPError(401, "unauthorized", "Sign in required")
         if request.method not in ("GET", "HEAD", "OPTIONS") and ident.via == "cookie":
-            origin = request.headers.get("origin")
-            if origin and origin not in self.allowed_origins(request):
-                raise HTTPError(403, "bad_origin", "Cross-origin request refused")
-            if not security.consteq(request.headers.get("x-csrf-token"), ident.session["csrf"]):
-                raise HTTPError(403, "csrf", "Missing or invalid CSRF token. Reload the page.")
+            self.check_csrf(request, ident)
         if ident.user["must_change_pw"] and not allow_pw_change:
             raise HTTPError(403, "password_change_required", "Change your password first")
+        if not (allow_pw_change or allow_totp_enrol) and self.auth.totp_enrolment_required(ident.user):
+            raise HTTPError(403, "totp_enrolment_required", TOTP_ENROL_MESSAGE)
         if admin and ident.user["role"] != "admin":
             raise HTTPError(403, "forbidden", "Administrators only")
         return ident
+
+    def check_csrf(self, request: Request, ident: Identity) -> None:
+        """Origin allow-list + double-submit CSRF token for a cookie-authenticated write."""
+        origin = request.headers.get("origin")
+        if origin and origin not in self.allowed_origins(request):
+            raise HTTPError(403, "bad_origin", "Cross-origin request refused")
+        if not security.consteq(request.headers.get("x-csrf-token"), (ident.session or {}).get("csrf")):
+            raise HTTPError(403, "csrf", "Missing or invalid CSRF token. Reload the page.")
+
+    def must_enrol_or_change(self, user: dict) -> bool:
+        """True while the account may only use the password / two-factor enrolment routes (no WebSocket)."""
+        return bool(user["must_change_pw"]) or self.auth.totp_enrolment_required(user)
 
     # ---------------------------------------------------------- users / profiles / policy
     def policy_for(self, user: dict) -> dict:
@@ -126,17 +163,32 @@ class Ctx:
         return pol.user_roots(policy, str(self.profiles.workspace(user)))
 
     def path_ok(self, user: dict, path: str) -> bool:
+        """May `user` reach `path` through the file API? Never inside system_dir (database, TLS keys, backups,
+        logs, sandbox records) and never a UNC/device path - for administrators too (A-6, A-12)."""
+        if not path or security.is_unc_path(path) or self.in_system_dir(path):
+            return False
         if user["role"] == "admin":
-            import os
-            return bool(path) and os.path.isabs(path)
+            return os.path.isabs(path)
         return pol.path_allowed(path, self.roots_for(user))
+
+    def in_system_dir(self, path: str) -> bool:
+        """True when `path` is system_dir or below it, compared both as written and after resolving links
+        (realpath), case-insensitively on Windows. Anything that cannot be resolved counts as inside."""
+        try:
+            base = self.settings.system_dir
+            bases = {_norm(os.path.abspath(base)), _norm(os.path.realpath(base))}
+            cands = {_norm(os.path.abspath(path)), _norm(os.path.realpath(path))}
+        except (OSError, ValueError):
+            return True
+        return any(c == b or c.startswith(b.rstrip(os.sep) + os.sep) for c in cands for b in bases)
 
     def upstream_for(self, user: dict) -> Upstream:
         key = user["username"].lower()
         native = self.profiles.is_native(user)
         if not native:
-            manifest = self.profiles.root_for(user) / ".goose-web" / "managed.json"
-            if not manifest.exists():
+            # The provisioning manifest lives in <system_dir>/manifests (C-3); a profile without one (new, or
+            # provisioned by 1.11 or older) is provisioned now, which also applies the 1.12 extension pinning.
+            if not self.profiles.manifest_path(user).exists():
                 try:
                     self.profiles.provision(user)
                 except Exception:
@@ -202,10 +254,35 @@ def url_origin(url: str) -> str:
 _ip_in = security.ip_in  # one implementation, shared with the IP block (ipblock.py)
 
 
-async def body_json(request: Request, limit: int = 2 * 1024 * 1024) -> dict:
-    raw = await request.body()
-    if len(raw) > limit:
-        raise HTTPError(413, "too_large", "Request body too large")
+DEFAULT_BODY_LIMIT = 2 * 1024 * 1024
+
+
+class BodyTooLarge(HTTPError):
+    """413 raised while a request body is being received (A-1/A-2); app.BodyLimit turns it into a response."""
+
+    def __init__(self, message: str = "Request body too large"):
+        super().__init__(413, "too_large", message)
+
+
+async def read_body(request: Request, limit: int) -> bytes:
+    """The request body, refused with 413 as soon as it is known to exceed `limit`: up front from Content-Length,
+    otherwise while streaming (chunked bodies), so at most `limit` bytes are ever held in memory (A-1)."""
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        raise HTTPError(400, "bad_request", "Invalid Content-Length")
+    if declared > limit:
+        raise BodyTooLarge()
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf += chunk
+        if len(buf) > limit:
+            raise BodyTooLarge()
+    return bytes(buf)
+
+
+async def body_json(request: Request, limit: int = DEFAULT_BODY_LIMIT) -> dict:
+    raw = await read_body(request, limit)
     if not raw:
         return {}
     try:

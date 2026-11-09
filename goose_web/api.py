@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+import math
 import mimetypes
 import os
 import secrets
@@ -11,16 +13,18 @@ import string
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
+from starlette.responses import (FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse,
+                                 Response)
 from starlette.routing import Route
 
 from . import hosttasks, logjanitor, security, tls, winsec
 from . import policy as acp_policy
 from .auth import AuthError
-from .context import Ctx, HTTPError, body_json
+from .context import Ctx, HTTPError, body_json, read_body
 from .hub import RpcError
 from .policy import ANY, BOOL_KEYS, CHAT_LISTS, DEFAULT_POLICY, LIST_KEYS
 from .profiles import HINT_FILE_NAMES
@@ -50,6 +54,28 @@ def temp_password() -> str:
 
 def _min_pw(c: Ctx) -> int:
     return int(c.settings.get("auth", "min_password_length") or security.PASSWORD_MIN_LENGTH)
+
+
+def int_param(value: Any, name: str, default: int | None = None, lo: int | None = None,
+              hi: int | None = None) -> int | None:
+    """A whole number from a query string or JSON value, or 400 (A-13): "12", 12 and 12.0 are fine; text,
+    booleans, inf, nan and absurd sizes are refused instead of turning into a 500."""
+    if value is None or value == "":
+        return default
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        num = float(value) if isinstance(value, (int, float)) else float(str(value).strip())
+        if not math.isfinite(num) or abs(num) > 2 ** 62:
+            raise ValueError
+        out = int(num)
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPError(400, "bad_request", f"{name} must be a whole number")
+    if lo is not None:
+        out = max(lo, out)
+    if hi is not None:
+        out = min(hi, out)
+    return out
 
 
 def _weak(problems: list[str]) -> HTTPError:
@@ -96,6 +122,8 @@ async def logout(request: Request):
     c = ctx(request)
     token = request.cookies.get(c.cookie_name)
     ident = c.identity(request)
+    if ident and ident.via == "cookie":
+        c.check_csrf(request, ident)   # a valid session is only ended by the page that holds it (A-14)
     if token:
         c.auth.logout(token)
     if ident:
@@ -116,39 +144,135 @@ def _redirect_uri(c: Ctx, request: Request, pid: str) -> str:
     return f"{c.settings.public_url}/api/auth/oidc/{pid}/callback"
 
 
+def _oidc_cookie(c: Ctx) -> str:
+    return "__Host-gw_oidc" if c.secure else "gw_oidc"
+
+
+def _mfa_cookie(c: Ctx) -> str:
+    return "__Host-gw_mfa" if c.secure else "gw_mfa"
+
+
+def _clear_cookie(c: Ctx, resp: Response, name: str) -> None:
+    resp.delete_cookie(name, path="/", secure=c.secure, httponly=True, samesite="lax")
+
+
 async def oidc_start(request: Request):
     c = ctx(request)
     pid = request.path_params["pid"]
+    # A-4: the state is bound to this browser through a short-lived pre-sign-in cookie. SameSite=Lax because the
+    # IdP sends the browser back with a cross-site top-level GET, which Lax cookies (unlike Strict) accompany.
+    binding = security.new_token()
     try:
-        url = await c.auth.oidc_start(pid, _redirect_uri(c, request, pid))
+        url = await c.auth.oidc_start(pid, _redirect_uri(c, request, pid), binding)
     except AuthError as e:
         return RedirectResponse(f"/#/login?error={e.code}", 302)
     except Exception:
+        log.exception("OIDC start failed for provider %s", pid)
         return RedirectResponse("/#/login?error=oidc_unavailable", 302)
-    return RedirectResponse(url, 302)
+    resp = RedirectResponse(url, 302)
+    resp.set_cookie(_oidc_cookie(c), binding, max_age=600, path="/", httponly=True, secure=c.secure, samesite="lax")
+    return resp
 
 
 async def oidc_callback(request: Request):
     c = ctx(request)
     pid = request.path_params["pid"]
     q = request.query_params
+    binding = request.cookies.get(_oidc_cookie(c)) or ""
+
+    def fail(code: str) -> Response:
+        r = RedirectResponse(f"/#/login?error={code}", 302)
+        _clear_cookie(c, r, _oidc_cookie(c))
+        return r
+
     if q.get("error"):
-        return RedirectResponse("/#/login?error=oidc_denied", 302)
+        return fail("oidc_denied")
     try:
         user = await c.auth.oidc_callback(pid, q.get("code", ""), q.get("state", ""), _redirect_uri(c, request, pid),
-                                          c.client_ip(request))
+                                          c.client_ip(request), binding)
     except AuthError as e:
         c.db.audit("auth.oidc", ip=c.client_ip(request), target=pid, detail={"error": e.code}, ok=False)
-        return RedirectResponse(f"/#/login?error={e.code}", 302)
+        return fail(e.code)
     except Exception:
-        return RedirectResponse("/#/login?error=oidc_failed", 302)
-    token, _ = c.auth.create_session(user, c.client_ip(request), request.headers.get("user-agent", ""), f"oidc:{pid}")
-    c.audit(request, "auth.login", user, target=f"oidc:{pid}")
+        log.exception("OIDC callback failed for provider %s", pid)
+        return fail("oidc_failed")
+    if user["totp_enabled"]:
+        # A-8: the account uses two-factor; the IdP sign-in alone does not open a session.
+        pending = c.auth.begin_mfa(user, f"oidc:{pid}")
+        c.audit(request, "auth.oidc.mfa", user, target=f"oidc:{pid}")
+        resp = RedirectResponse("/api/auth/mfa", 302)
+        _clear_cookie(c, resp, _oidc_cookie(c))
+        resp.set_cookie(_mfa_cookie(c), pending, max_age=300, path="/", httponly=True, secure=c.secure,
+                        samesite="lax")
+        return resp
+    return await _finish_sign_in(c, request, user, f"oidc:{pid}", Response(status_code=302))
+
+
+async def _finish_sign_in(c: Ctx, request: Request, user: dict, method: str, resp: Response) -> Response:
+    """Open the session of an OIDC sign-in (after the second factor, if any) and redirect to the app."""
+    token, _ = c.auth.create_session(user, c.client_ip(request), request.headers.get("user-agent", ""), method)
+    c.audit(request, "auth.login", user, target=method)
     if not c.profiles.is_native(user):
         await asyncio.to_thread(c.profiles.provision, user)
-    resp = RedirectResponse("/", 302)
+    resp.status_code = 302
+    resp.headers["location"] = "/"
+    _clear_cookie(c, resp, _oidc_cookie(c))
+    _clear_cookie(c, resp, _mfa_cookie(c))
     _set_cookie(c, resp, token, False)
     return resp
+
+
+_MFA_ERRORS = {"totp_invalid": "That code is not valid. Try the next code.",
+               "locked": "Account temporarily locked after failed attempts. Try again later.",
+               "rate_limited": "Too many attempts. Wait a few minutes.",
+               "ip_blocked": "Sign-in from your network address is blocked. Ask an administrator."}
+
+
+def _mfa_page(message: str = "", expired: bool = False) -> HTMLResponse:
+    """A minimal server-rendered page for the TOTP step after OIDC (no scripts: the SPA's CSP applies)."""
+    note = f'<p class="err">{html.escape(message)}</p>' if message else ""
+    if expired:
+        body = (f"{note}<p>This sign-in has expired.</p><p><a href=\"/\">Sign in again</a></p>")
+    else:
+        body = (f"{note}<form method=\"post\" action=\"/api/auth/mfa\">"
+                "<label for=\"code\">Code from your authenticator app</label>"
+                "<input id=\"code\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" "
+                "maxlength=\"8\" required autofocus>"
+                "<button type=\"submit\">Sign in</button></form>"
+                "<p><a href=\"/\">Cancel</a></p>")
+    page = ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Two-factor sign-in</title>"
+            "<style>body{font-family:system-ui,sans-serif;max-width:22rem;margin:4rem auto;padding:0 1rem}"
+            "input,button{display:block;width:100%;margin:.5rem 0;padding:.5rem;font-size:1.1rem;box-sizing:border-box}"
+            ".err{color:#b00020}</style></head><body><h1>Two-factor sign-in</h1>" + body + "</body></html>")
+    return HTMLResponse(page, status_code=400 if expired else 200, headers={"Cache-Control": "no-store"})
+
+
+async def mfa_step(request: Request):
+    """A-8: second factor for an OIDC sign-in of an account with two-factor enrolled.
+    GET shows the code form; POST (same-origin form) checks the code and opens the session."""
+    c = ctx(request)
+    pending = request.cookies.get(_mfa_cookie(c)) or ""
+    if request.method == "GET":
+        expired = c.auth.mfa_pending(pending) is None
+        page = _mfa_page(expired=expired)
+        if expired:
+            _clear_cookie(c, page, _mfa_cookie(c))
+        return page
+    origin = request.headers.get("origin")
+    if origin and origin not in c.allowed_origins(request):
+        raise HTTPError(403, "bad_origin", "Cross-origin request refused")
+    raw = await read_body(request, 4096)
+    code = (parse_qs(raw.decode("utf-8", "replace")).get("code") or [""])[0]
+    try:
+        user, method = await asyncio.to_thread(c.auth.finish_mfa, pending, code, c.client_ip(request))
+    except AuthError as e:
+        expired = c.auth.mfa_pending(pending) is None
+        page = _mfa_page(_MFA_ERRORS.get(e.code, e.message), expired=expired)
+        if expired:
+            _clear_cookie(c, page, _mfa_cookie(c))
+        return page
+    return await _finish_sign_in(c, request, user, method, Response(status_code=302))
 
 
 # ====================================================================== me
@@ -207,11 +331,16 @@ async def me_password(request: Request):
 
 async def me_prefs(request: Request):
     c = ctx(request)
-    u = c.require(request).user
+    u = c.require(request, allow_totp_enrol=request.method == "GET").user
     if request.method == "GET":
         return ok(u.get("prefs") or {})
     b = await body_json(request, MAX_PREFS)
-    c.db.update_user(u["id"], prefs=b)
+    # Keys starting with "_" belong to the server (for example _notify, saved through /api/me/notify with its
+    # checks): they are never written from here, and the stored ones are kept (A-14).
+    stored = u.get("prefs") or {}
+    prefs = {k: v for k, v in b.items() if not str(k).startswith("_")}
+    prefs.update({k: v for k, v in stored.items() if str(k).startswith("_")})
+    c.db.update_user(u["id"], prefs=prefs)
     return ok()
 
 
@@ -225,7 +354,7 @@ def _check_self_totp_allowed(c: Ctx, u: dict) -> None:
 
 async def totp_setup(request: Request):
     c = ctx(request)
-    u = c.require(request).user
+    u = c.require(request, allow_totp_enrol=True).user
     if u["totp_enabled"]:
         raise HTTPError(409, "already_enabled", "Two-factor is already on")
     _check_self_totp_allowed(c, u)
@@ -238,7 +367,7 @@ async def totp_setup(request: Request):
 
 async def totp_enable(request: Request):
     c = ctx(request)
-    u = c.require(request).user
+    u = c.require(request, allow_totp_enrol=True).user
     if u["totp_enabled"]:
         raise HTTPError(409, "already_enabled", "Two-factor is already on")
     _check_self_totp_allowed(c, u)
@@ -254,11 +383,16 @@ async def totp_enable(request: Request):
 async def totp_disable(request: Request):
     c = ctx(request)
     u = c.require(request).user
-    b = await body_json(request)
-    if u["auth_source"] == "local" and not security.verify_password(str(b.get("password") or ""), u["password_hash"]):
-        raise HTTPError(400, "wrong_password", "Password is not correct")
+    b = await body_json(request, 16 * 1024)
     if u["role"] == "admin" and c.db.get_setting("require_totp_admins"):
         raise HTTPError(403, "required", "Two-factor is required for administrators")
+    # A-8: every account type re-authenticates - local and directory accounts with the current password,
+    # accounts without a password here (OIDC) with a current authenticator code.
+    if not await asyncio.to_thread(c.auth.reauthenticate, u, str(b.get("password") or ""), str(b.get("code") or "")):
+        c.audit(request, "user.totp.disable", u, ok=False)
+        if u["auth_source"] in ("local", "ldap"):
+            raise HTTPError(400, "wrong_password", "Password is not correct")
+        raise HTTPError(400, "totp_invalid", "Enter a current code from your authenticator app to turn two-factor off")
     c.db.update_user(u["id"], totp_enabled=0, totp_secret=None, totp_last_counter=None)
     c.audit(request, "user.totp.disable", u)
     return ok()
@@ -276,7 +410,7 @@ async def me_tokens(request: Request):
     if ident.via != "cookie":
         raise HTTPError(403, "forbidden", "API tokens cannot create tokens")
     b = await body_json(request)
-    days = int(b["days"]) if b.get("days") else None
+    days = int_param(b.get("days") or None, "days", None, 1, 3650)
     tid, token = c.auth.create_api_token(u, str(b.get("name") or "token"), days)
     c.audit(request, "user.token.create", u, target=str(b.get("name") or ""))
     return ok({"id": tid, "token": token})
@@ -508,17 +642,23 @@ async def fs_upload(request: Request):
     u = c.require(request).user
     d = _check_path(c, u, os.path.abspath(request.query_params.get("dir") or ""))
     limit = int(c.settings.get("server", "max_upload_mb") or 25) * 1024 * 1024
-    if int(request.headers.get("content-length") or 0) > limit + 64 * 1024:
+    # app.BodyLimit caps the whole body while it streams in (chunked bodies too), so request.form() never
+    # spools more than max_upload_mb to disk (A-2); this early check only gives the same 413 without the middleware.
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        raise HTTPError(400, "bad_request", "Invalid Content-Length")
+    if declared > limit + 64 * 1024:
         raise HTTPError(413, "too_large", f"Uploads are limited to {limit // 1048576} MB")
     form = await request.form(max_files=20, max_fields=20)
-    d.mkdir(parents=True, exist_ok=True)
     saved = []
     try:
-        for key, f in form.multi_items():
-            if not hasattr(f, "filename") or not f.filename:
-                continue
-            name = safe_upload_name(f.filename)
+        files = [(f, safe_upload_name(f.filename)) for _, f in form.multi_items()
+                 if hasattr(f, "filename") and f.filename]
+        for _, name in files:   # every name is checked before anything is written (A-14)
             _refuse_hint_name(u, name)
+        d.mkdir(parents=True, exist_ok=True)
+        for f, name in files:
             target, out = _create_exclusive(d, name)
             size = 0
             with out:
@@ -733,6 +873,10 @@ async def _drop_sandbox(c: Ctx, u: dict) -> None:
     from . import sandbox as sb
     name = sb.container_name(str(c.settings.profiles_root), u["username"])
     state_dir = str(c.settings.system_dir / "sandbox")
+    # A container under the 1.11 name (C-5) is revoked and deleted too.
+    legacy = await asyncio.to_thread(sb.migrate_legacy, state_dir, str(c.settings.profiles_root), u["username"])
+    if legacy:
+        c.db.audit("sandbox.remove", target=u["username"], detail={"container": "(1.11 name)", "legacy": True})
     if not sb.load_state(state_dir, name):
         return
     key = u["username"].lower()
@@ -998,7 +1142,24 @@ async def admin_user_provision(request: Request):
 
 
 # ====================================================================== admin: teams
-def _clean_policy(p: dict) -> dict:
+def _clean_policy(p: dict, c: Ctx | None = None) -> dict:
+    out = _clean_policy_fields(p)
+    if c is not None:
+        # C-11: no drive roots, system folders, the profiles root, Goose's own data or other users' folders.
+        from .config import default_native_goose_root
+        natives = [default_native_goose_root(), str(c.db.get_setting("native_root") or "")]
+        natives += [str(u.get("profile_path") or "") for u in c.db.users() if u.get("profile_mode") == "native"]
+        try:
+            acp_policy.check_team_folders(out, profiles_root=str(c.settings.profiles_root),
+                                          system_dir=str(c.settings.system_dir),
+                                          native_roots=[n for n in natives if n],
+                                          users_root=os.path.dirname(os.path.expanduser("~")))
+        except ValueError as e:
+            raise HTTPError(400, "bad_folder", f"Not allowed as a team folder: {e}")
+    return out
+
+
+def _clean_policy_fields(p: dict) -> dict:
     out: dict[str, Any] = {}
     for k in BOOL_KEYS:
         if k in p:
@@ -1057,7 +1218,7 @@ async def admin_teams(request: Request):
         raise HTTPError(409, "exists", "A team with that name exists")
     import json as _json
     tid = c.db.execute("INSERT INTO teams(name, description, policy, created_at) VALUES(?,?,?,?)",
-                       (name, str(b.get("description") or "")[:500], _json.dumps(_clean_policy(b.get("policy") or {})),
+                       (name, str(b.get("description") or "")[:500], _json.dumps(_clean_policy(b.get("policy") or {}, c)),
                         time.time()))
     c.audit(request, "team.create", admin, target=name)
     return ok({"id": tid, "team": _team_view(c, c.db.one("SELECT * FROM teams WHERE id=?", (tid,)))})
@@ -1084,7 +1245,7 @@ async def admin_team(request: Request):
     if "name" in b or "description" in b or "policy" in b:
         c.db.execute("UPDATE teams SET name=?, description=?, policy=? WHERE id=?",
                      (str(b.get("name", t["name"]))[:80], str(b.get("description", t["description"]))[:500],
-                      _json.dumps(_clean_policy(b["policy"]) if "policy" in b else (t.get("policy") or {})), tid))
+                      _json.dumps(_clean_policy(b["policy"], c) if "policy" in b else (t.get("policy") or {})), tid))
     moved: list[str] = []
     if "members" in b:
         ids = sorted({int(m) for m in b["members"] or []})
@@ -1293,7 +1454,7 @@ async def admin_audit(request: Request):
     sql, params = "SELECT * FROM audit WHERE 1=1", []
     if q.get("before"):
         sql += " AND id < ?"
-        params.append(int(float(q["before"])))
+        params.append(int_param(q["before"], "before"))
     if q.get("user"):
         sql += " AND username LIKE ?"
         params.append(q["user"].replace("%", "") + "%")
@@ -1301,7 +1462,7 @@ async def admin_audit(request: Request):
         sql += " AND action LIKE ?"
         params.append("%" + q["action"].replace("%", "") + "%")
     sql += " ORDER BY id DESC LIMIT ?"
-    params.append(max(1, min(500, int(q.get("limit") or 100))))
+    params.append(int_param(q.get("limit"), "limit", 100, 1, 500))
     rows = c.db.query(sql, params)
     return ok([{"id": r["id"], "ts": r["ts"], "username": r["username"], "ip": r["ip"], "action": r["action"],
                 "target": r["target"], "detail": r["detail"], "ok": bool(r["ok"])} for r in rows])
@@ -1329,6 +1490,30 @@ async def admin_system(request: Request):
                             if c.settings.get("logs", "activity") else "")})
 
 
+_PEM_MAX_BYTES = 1024 * 1024
+
+
+def _tls_pair_problem(cert_file: str, key_file: str) -> str:
+    """Why a certificate/key pair cannot serve HTTPS, or "" when it can (A-12): the key file must be an
+    unencrypted PEM private key whose public key is the certificate's (the first certificate in certFile)."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+    try:
+        if Path(key_file).stat().st_size > _PEM_MAX_BYTES or Path(cert_file).stat().st_size > _PEM_MAX_BYTES:
+            return "keyFile/certFile is too large to be a PEM file"
+        key = serialization.load_pem_private_key(Path(key_file).read_bytes(), password=None)
+    except (OSError, ValueError, TypeError):
+        return "keyFile is not an unencrypted PEM private key"
+    try:
+        cert = x509.load_pem_x509_certificate(Path(cert_file).read_bytes())
+    except (OSError, ValueError):
+        return "certFile is not a PEM certificate"
+    spki = serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    if key.public_key().public_bytes(*spki) != cert.public_key().public_bytes(*spki):
+        return "keyFile does not belong to the certificate in certFile"
+    return ""
+
+
 async def admin_tls(request: Request):
     """Spec 015: built-in HTTPS - status (GET), choose the mode (PUT), renew now (POST)."""
     c = ctx(request)
@@ -1346,10 +1531,16 @@ async def admin_tls(request: Request):
                    "keyFile": str(b.get("keyFile") or "").strip()}
             if mode == "files":
                 for k in ("certFile", "keyFile"):
+                    if security.is_unc_path(new[k]):   # never make the gateway open an SMB connection (A-12)
+                        raise HTTPError(400, "bad_file", f"{k}: network (UNC) and device paths are not accepted; "
+                                                         "copy the file to a local folder")
                     if not new[k] or not Path(new[k]).is_file():
                         raise HTTPError(400, "bad_file", f"{k}: file not found on the gateway machine")
                 if (tls.describe_cert(new["certFile"]) or {}).get("error"):
                     raise HTTPError(400, "bad_cert", "certFile is not a PEM certificate")
+                problem = await asyncio.to_thread(_tls_pair_problem, new["certFile"], new["keyFile"])
+                if problem:
+                    raise HTTPError(400, "bad_key", problem)
             c.db.set_setting(tls.SETTING_KEY, new)
         c.audit(request, "settings.tls", admin, detail={"mode": mode or "config"})
     elif request.method == "POST":
@@ -1375,7 +1566,8 @@ async def admin_worker_action(request: Request):
         try:
             await c.workers.restart(key)
         except RuntimeError as e:
-            raise HTTPError(500, "start_failed", str(e))
+            log.error("worker %s restart failed: %s", key, e)   # detail in the gateway log only (A-13)
+            raise HTTPError(500, "start_failed", "The worker did not start (see the gateway log)")
     else:
         up = c.hub.upstreams.get(key)
         await c.workers.stop(key, "(admin)")
@@ -1405,8 +1597,9 @@ async def admin_hosttasks(request: Request):
         raise HTTPError(404, "disabled", "Host task view is disabled in config")
     try:
         return ok(await hosttasks.list_tasks(c.settings.get("host_tasks", "path_filter") or "\\*"))
-    except Exception as e:
-        raise HTTPError(500, "tasks_failed", str(e))
+    except Exception:
+        log.exception("host task list failed")   # detail in the gateway log only (A-13)
+        raise HTTPError(500, "tasks_failed", "Could not read the scheduled tasks (see the gateway log)")
 
 
 async def admin_hosttask_action(request: Request):
@@ -1429,9 +1622,12 @@ async def admin_logs(request: Request):
     c = ctx(request)
     c.require(request, admin=True)
     key = request.query_params.get("worker") or ""
-    lines = max(10, min(5000, int(request.query_params.get("lines") or 500)))
+    lines = int_param(request.query_params.get("lines"), "lines", 500, 10, 5000)
     if key:
-        security.safe_name(key)
+        try:
+            security.safe_name(key)
+        except ValueError:
+            raise HTTPError(400, "bad_worker", "worker must be a worker key (a user name)")
         p = c.settings.system_dir / "logs" / f"worker-{key}.log"
     else:
         p = c.settings.system_dir / "logs" / "gateway.log"
@@ -1458,6 +1654,7 @@ routes = [
     Route("/api/auth/logout", logout, methods=["POST"]),
     Route("/api/auth/oidc/{pid}/start", oidc_start),
     Route("/api/auth/oidc/{pid}/callback", oidc_callback),
+    Route("/api/auth/mfa", mfa_step, methods=["GET", "POST"]),
     Route("/api/me", me, methods=["GET", "PATCH"]),
     Route("/api/me/password", me_password, methods=["POST"]),
     Route("/api/me/prefs", me_prefs, methods=["GET", "PUT"]),

@@ -35,13 +35,24 @@ IS_WINDOWS = os.name == "nt"
 # Environment variables that would let the gateway's own configuration leak into an isolated profile.
 _ISOLATION_STRIP_PREFIXES = ("GOOSE_",)
 _ISOLATION_KEEP = {"GOOSE_DISABLE_KEYRING", "GOOSE_TELEMETRY_ENABLED"}
+# The only variables a SANDBOXED worker gets from the gateway's environment (see WorkerManager._sandbox_env).
+# LOCALAPPDATA stays the account's (a path, not a secret): inside an AppContainer Windows' GetTempPath ignores TEMP
+# and returns %LOCALAPPDATA%\Packages\<container>\AC\Temp, the container's own folder; goose acp panics without it.
+SANDBOX_ENV_ALLOW = ("SystemRoot", "windir", "SystemDrive", "ComSpec", "PATHEXT", "PATH", "OS",
+                     "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL",
+                     "PROCESSOR_REVISION", "LOCALAPPDATA")
 # Same value as profiles.GW_HINTS_FILENAME (kept here so workers.py does not import profiles).
 ISOLATED_HINTS_FILENAME = ".goose-web-hints.md"
 
 
 # ------------------------------------------------------------------ Windows job object + process scan
 class _Job:
-    """Kill-on-close job object, so workers die with the gateway even if it crashes."""
+    """Kill-on-close job object, so workers die with the gateway even if it crashes.
+
+    The gateway has one for all workers; every worker also gets its own (nested in the gateway's: a process joins
+    the gateway job first, then the worker job). Everything a worker starts - also detached processes whose parent
+    has exited, which a process-tree kill misses - is in the worker's job, and terminate() ends all of it when the
+    worker is stopped, killed or its user deleted."""
 
     def __init__(self):
         self.handle = None
@@ -51,6 +62,9 @@ class _Job:
         from ctypes import wintypes
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
         h = k32.CreateJobObjectW(None, None)
         if not h:
             return
@@ -76,12 +90,27 @@ class _Job:
         if k32.SetInformationJobObject(h, 9, ctypes.byref(info), ctypes.sizeof(info)):
             self.handle = h
             self._k32 = k32
+        else:
+            k32.CloseHandle(h)
 
-    def add(self, proc: subprocess.Popen) -> None:
+    def add(self, proc: subprocess.Popen) -> bool:
         if self.handle and IS_WINDOWS:
-            from ctypes import wintypes
-            self._k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-            self._k32.AssignProcessToJobObject(self.handle, int(proc._handle))  # type: ignore[attr-defined]
+            import ctypes
+            if self._k32.AssignProcessToJobObject(self.handle, int(proc._handle)):  # type: ignore[attr-defined]
+                return True
+            log.warning("could not put process %s in a job object (%s)", proc.pid, ctypes.get_last_error())
+        return False
+
+    def terminate(self) -> None:
+        """Kill every process in the job (and in jobs nested in it)."""
+        if self.handle and IS_WINDOWS:
+            self._k32.TerminateJobObject(self.handle, 1)
+
+    def close(self) -> None:
+        """Close the handle; kill-on-close ends whatever is still in the job."""
+        h, self.handle = self.handle, None
+        if h and IS_WINDOWS:
+            self._k32.CloseHandle(h)
 
 
 def desktop_running(cli_binary: str = "") -> bool:
@@ -224,6 +253,7 @@ class Worker:
     channel: Any = None              # sandbox.StdioChannel of the running stdio worker
     relay_procs: list = field(default_factory=list)     # forwarders inside the container (relay.py)
     relay_servers: list = field(default_factory=list)   # gateway-side pipe servers
+    job: Any = None                  # the worker's own kill-on-close job object (_Job), Windows
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
@@ -298,7 +328,42 @@ class WorkerManager:
             w.path_root, w.native, w.recipe_dirs, w.sandbox = path_root, native, recipe_dirs, sandbox
         return w
 
+    def _sandbox_env(self, w: Worker) -> dict:
+        """Environment of a sandboxed worker (C-2): built from an allow-list, never from the gateway's environment
+        as a whole, which holds the gateway account's secrets (API keys in user variables and the like).
+
+        Kept from the gateway: SANDBOX_ENV_ALLOW (system locations, processor facts, LOCALAPPDATA - see there) and
+        the non-secret GOOSE_TELEMETRY_ENABLED switch. Set by the gateway: GOOSE_PATH_ROOT, GOOSE_DISABLE_KEYRING,
+        GOOSE_RECIPE_PATH, CONTEXT_FILE_NAMES, and the home (USERPROFILE, HOME, APPDATA), temp and cache folders,
+        all inside the user's profile.
+        Then goose.extra_env (admin-controlled) on top."""
+        env: dict[str, str] = {}
+        for k in SANDBOX_ENV_ALLOW:
+            v = os.environ.get(k)
+            if v is not None:
+                env[k] = v
+        for k in _ISOLATION_KEEP - {"GOOSE_DISABLE_KEYRING"}:
+            if os.environ.get(k) is not None:
+                env[k] = os.environ[k]
+        root = (w.sandbox or {})["profile_root"]
+        env["GOOSE_DISABLE_KEYRING"] = "1"   # secrets stay in the profile's own secrets.yaml
+        env["GOOSE_RECIPE_PATH"] = os.pathsep.join(w.recipe_dirs)
+        env["GOOSE_PATH_ROOT"] = w.path_root or root
+        for k, v in (self.s.get("goose", "extra_env") or {}).items():
+            env[str(k)] = str(v)
+        env["CONTEXT_FILE_NAMES"] = json.dumps([ISOLATED_HINTS_FILENAME])
+        # The container cannot reach the account's home, TEMP or caches: keep them in the profile (granted Modify).
+        for k, sub in (("TEMP", "tmp"), ("TMP", "tmp"), ("UV_CACHE_DIR", "cache/uv"), ("PIP_CACHE_DIR", "cache/pip"),
+                       ("npm_config_cache", "cache/npm"), ("XDG_CACHE_HOME", "cache"),
+                       ("APPDATA", "appdata/Roaming"), ("USERPROFILE", ""), ("HOME", "")):
+            d = os.path.join(root, *[s for s in sub.split("/") if s])
+            os.makedirs(d, exist_ok=True)
+            env[k] = d
+        return env
+
     def _env(self, w: Worker) -> dict:
+        if w.sandbox:
+            return self._sandbox_env(w)
         env = dict(os.environ)
         env.pop("GOOSE_WEB_UNELEVATED", None)
         if not w.native:
@@ -318,16 +383,7 @@ class WorkerManager:
             # Spec 009: Goose loads only the gateway-written hints file (config/.goose-web-hints.md), never an
             # AGENTS.md / .goosehints in a working folder. The env var beats config.yaml and extra_env.
             env["CONTEXT_FILE_NAMES"] = json.dumps([ISOLATED_HINTS_FILENAME])
-        if w.sandbox:
-            # The container cannot reach the account's TEMP or caches: keep them in the profile (granted Modify).
-            root = w.sandbox["profile_root"]
-            for k, sub in (("TEMP", "tmp"), ("TMP", "tmp"), ("UV_CACHE_DIR", "cache/uv"), ("PIP_CACHE_DIR", "cache/pip"),
-                           ("npm_config_cache", "cache/npm"), ("XDG_CACHE_HOME", "cache")):
-                d = os.path.join(root, *sub.split("/"))
-                os.makedirs(d, exist_ok=True)
-                env[k] = d
-        else:
-            env["GOOSE_SERVER__SECRET_KEY"] = w.secret
+        env["GOOSE_SERVER__SECRET_KEY"] = w.secret
         return env
 
     async def ensure(self, key: str) -> Worker:
@@ -349,9 +405,10 @@ class WorkerManager:
             from . import relay as rl
             from . import sandbox as sb
             try:
-                name = sb.container_name(str(self.s.profiles_root), w.username)
-                if rl.undo_relays(str(self.s.system_dir / "sandbox"), name, w.path_root):
-                    log.info("worker %s: restored relayed URLs (no longer sandboxed)", w.key)
+                for name in (sb.container_name(str(self.s.profiles_root), w.username),
+                             sb.legacy_container_name(str(self.s.profiles_root), w.username)):
+                    if rl.undo_relays(str(self.s.system_dir / "sandbox"), name, w.path_root):
+                        log.info("worker %s: restored relayed URLs (no longer sandboxed)", w.key)
             except Exception as e:
                 log.warning("worker %s: could not restore relayed URLs: %s", w.key, e)
         binary = self.s.goose_binary
@@ -382,6 +439,9 @@ class WorkerManager:
             raise RuntimeError(w.last_error) from e
         logf.close()
         self.job.add(w.proc)
+        self._close_job(w)
+        w.job = _Job()       # nested in the gateway's job (joined second): stop() ends everything goose started
+        w.job.add(w.proc)
         deadline = time.time() + float(self.s.get("goose", "start_timeout_seconds") or 45)
         async with httpx.AsyncClient(timeout=1.5) as client:
             while time.time() < deadline:
@@ -413,8 +473,10 @@ class WorkerManager:
             if not sb.IS_WINDOWS:
                 raise sb.SandboxError("sandbox.enabled is on, but the sandbox needs Windows; this worker is not "
                                       "started (fail closed). Turn sandbox.enabled off on this system.")
-            state = await asyncio.to_thread(sb.prepare, spec["name"], str(self.s.system_dir / "sandbox"),
-                                            spec["grants"])
+            state_dir = str(self.s.system_dir / "sandbox")
+            # 1.11 named containers so that two users could share one (C-5): drop this user's old one first
+            await asyncio.to_thread(sb.migrate_legacy, state_dir, str(self.s.profiles_root), w.username)
+            state = await asyncio.to_thread(sb.prepare, spec["name"], state_dir, spec["grants"])
         except Exception as e:
             w.state, w.last_error = "crashed", f"sandbox: {e}"
             raise RuntimeError(w.last_error) from e
@@ -429,6 +491,8 @@ class WorkerManager:
         cwd = os.path.join(spec["profile_root"], "workspace")
         if not os.path.isdir(cwd):
             cwd = spec["profile_root"]
+        self._close_job(w)
+        w.job = _Job()       # the worker's own job (goose, its children, the relay forwarders), nested in self.job
         # Relays first, so goose reads the rewritten provider URLs when it starts.
         try:
             await asyncio.to_thread(self._start_relays, w, state["sid"])
@@ -436,9 +500,11 @@ class WorkerManager:
             self._stop_relays(w)
             log.warning("worker %s: relays not started: %s", w.key, e)
         try:
-            w.proc = sb.spawn(args, self._env(w), cwd, state["sid"], spec.get("caps") or [], logf, job=self.job)
+            w.proc = sb.spawn(args, self._env(w), cwd, state["sid"], spec.get("caps") or [], logf,
+                              job=[self.job, w.job])
         except Exception as e:
             self._stop_relays(w)
+            self._close_job(w)
             w.state, w.last_error = "crashed", f"cannot start goose in the sandbox: {e}"
             raise RuntimeError(w.last_error) from e
         finally:
@@ -447,6 +513,7 @@ class WorkerManager:
         await asyncio.sleep(0.3)
         if w.proc.poll() is not None:
             self._stop_relays(w)
+            self._close_job(w)
             w.state = "crashed"
             w.last_error = f"goose acp exited with code {w.proc.returncode} (see worker-{w.key}.log)"
             raise RuntimeError(w.last_error)
@@ -478,8 +545,12 @@ class WorkerManager:
         logf = open_append_log(self.log_dir / f"worker-{w.key}.log")
         try:
             for r in spec["relays"]:
-                w.relay_servers.append(rl.PipeRelayServer(r["pipe"], sid, r["target"]).start())
-                p = sb.spawn([py, "-I", fwd, r["listen"], r["pipe"]], self._env(w), root, sid, [], logf, job=self.job)
+                # C-1: a new random name per start; the server owns it (first instance) or the relay fails closed,
+                # and the forwarder accepts only a pipe served by this process (the gateway's pid is passed on).
+                pipe = rl.new_pipe_name()
+                w.relay_servers.append(rl.PipeRelayServer(pipe, sid, r["target"]).start())
+                p = sb.spawn([py, "-I", fwd, r["listen"], pipe, str(os.getpid())], self._env(w), root, sid, [], logf,
+                             job=[self.job, w.job])
                 w.relay_procs.append(p)
                 line = p.stdout.readline().decode("utf-8", "replace").strip()
                 if line != "listening":
@@ -504,8 +575,19 @@ class WorkerManager:
                 pass
         w.relay_procs, w.relay_servers = [], []
 
+    @staticmethod
+    def _close_job(w: Worker) -> None:
+        """End every process in the worker's own job (C-7: also detached grandchildren) and drop the job."""
+        j, w.job = w.job, None
+        if j is not None:
+            try:
+                j.terminate()
+            finally:
+                j.close()
+
     def _kill(self, w: Worker) -> None:
         self._stop_relays(w)
+        self._close_job(w)
         p = w.proc
         if p and p.poll() is None:
             try:

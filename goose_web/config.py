@@ -186,25 +186,43 @@ class Settings:
         return (self.get("server", "public_url") or "").rstrip("/")
 
 
+class ConfigError(SystemExit):
+    """A configuration file that was asked for explicitly is missing (A-10). A SystemExit, so the command line
+    stops with the message and exit code 1 and no caller can quietly carry on with another configuration."""
+
+    def __init__(self, message: str):
+        super().__init__(f"goose-web: {message}")
+        self.message = message
+
+
 def config_path_candidates(explicit: str | None) -> list[Path]:
-    out = []
+    """The configuration file to read, as a one-element list (empty = built-in defaults only).
+
+    An explicit --config path, or else GOOSE_WEB_CONFIG, is the only candidate when given: it must exist, it is
+    never replaced by another file (a typo must not make the gateway open the production configuration).
+    Only when neither is given is the default <profiles_root>/_system/config.yaml used, if it exists."""
     if explicit:
-        out.append(Path(explicit))
+        return [Path(explicit)]
     if os.environ.get("GOOSE_WEB_CONFIG"):
-        out.append(Path(os.environ["GOOSE_WEB_CONFIG"]))
-    out.append(Path(_default_profiles_root()) / "_system" / "config.yaml")
-    return out
+        return [Path(os.environ["GOOSE_WEB_CONFIG"])]
+    return [Path(_default_profiles_root()) / "_system" / "config.yaml"]
 
 
 def load_settings(explicit: str | None = None) -> Settings:
     data = copy.deepcopy(DEFAULTS)
     source = None
     for p in config_path_candidates(explicit):
-        if p.is_file():
-            with open(p, encoding="utf-8") as fh:
-                data = _deep_merge(data, yaml.safe_load(fh) or {})
-            source = str(p)
-            break
+        if not p.is_file():
+            if explicit:
+                raise ConfigError(f"config file not found: {p} (--config). Check the path; Goose Web does not "
+                                  "fall back to another configuration.")
+            if os.environ.get("GOOSE_WEB_CONFIG"):
+                raise ConfigError(f"config file not found: {p} (GOOSE_WEB_CONFIG). Check the path; Goose Web "
+                                  "does not fall back to another configuration.")
+            continue
+        with open(p, encoding="utf-8") as fh:
+            data = _deep_merge(data, yaml.safe_load(fh) or {})
+        source = str(p)
     for k, v in os.environ.items():
         if not k.startswith("GOOSE_WEB__"):
             continue

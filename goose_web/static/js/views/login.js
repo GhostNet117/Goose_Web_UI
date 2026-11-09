@@ -4,6 +4,24 @@ import { icon, logo } from '../icons.js';
 import { POST, setCsrf, ApiError } from '../api.js';
 import { router } from '../router.js';
 
+// #/login?error=<code> is set by the gateway's OIDC redirects (api.py oidc_start/oidc_callback, auth.py
+// AuthError codes). Anyone can craft such a link, so only known codes are shown, as fixed text; the raw
+// parameter is never displayed (security assessment 2026-11-09 D-3).
+const LOGIN_ERRORS = new Map([
+  ['oidc_unavailable', 'Single sign-on is not available right now. Try again later.'],
+  ['oidc_denied', 'Single sign-on was cancelled, or this account is not allowed to sign in.'],
+  ['oidc_failed', 'Single sign-on failed. Try again.'],
+  ['oidc_needs_public_url', 'Single sign-on is not set up completely on this server. Ask an administrator.'],
+  ['oidc_state', 'The sign-in expired or did not match. Try again.'],
+  ['oidc_token', 'The identity provider rejected the sign-in.'],
+  ['oidc_claims', 'The identity token failed validation.'],
+  ['oidc_conflict', 'This sign-in identity conflicts with an existing account. Ask an administrator.'],
+  ['oidc_unlinked', 'An account with this name already exists but is not linked to your sign-in identity. Ask an administrator to link the account.'],
+  ['oidc_browser', 'This sign-in was started in another browser. Start it again here.'],
+  ['unknown_provider', 'Unknown sign-in provider.'],
+]);
+export function loginErrorText(code) { return LOGIN_ERRORS.get(String(code)) || 'Sign-in failed. Try again.'; }
+
 export function renderLogin(root, { authConfig, onLoggedIn }) {
   const cfg = authConfig || {};
   const brand = cfg.brand || {};
@@ -22,7 +40,7 @@ export function renderLogin(root, { authConfig, onLoggedIn }) {
   const form = h('form', { class: 'auth-form', autocomplete: 'on' }, credFields, totpField,
     h('label', { class: 'chk' }, remember, h('span', null, 'Keep me signed in')), err, submit);
 
-  if (r.query && r.query.error) err.textContent = decodeURIComponent(r.query.error);
+  if (r.query && r.query.error) err.textContent = loginErrorText(r.query.error);
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();

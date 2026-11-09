@@ -5,7 +5,9 @@ Layout of an isolated profile (GOOSE_PATH_ROOT=<profiles_root>/<username>):
     data/    sessions/sessions.db, logs/        (written by Goose)
     state/                                       (written by Goose)
     workspace/                                   default folder for new chats
-    .goose-web/managed.json                      what the gateway provisioned (so it never touches user items)
+    .goose-web/managed.json                      content-free "provisioned" marker (Goose Web <= 1.11 kept the
+                                                 manifest here; it now lives in <system_dir>/manifests/<user id>.json,
+                                                 outside the user's reach - C-3)
 
 Team shared folders: <profiles_root>/_teams/<team id> (or the team's share_folder), reachable by the members.
 Isolated workers run with CONTEXT_FILE_NAMES=[".goose-web-hints.md"] (workers.py), so Goose loads only the
@@ -32,7 +34,8 @@ import yaml
 
 from .config import Settings, default_native_goose_root
 from .db import Database
-from .policy import ANY, SHELL_EXTENSIONS, allows, effective_policy
+from .policy import (ANY, GUARDED_EXTENSIONS, allows, effective_policy, ext_key, extension_needs,
+                     is_command_extension, missing)
 from .security import safe_name
 
 MANAGED_MARK = ".goose-web-managed"
@@ -79,6 +82,79 @@ def _write_yaml(p: Path, data: dict) -> None:
 
 def _same_path(a: str | Path, b: str | Path) -> bool:
     return os.path.normcase(os.path.normpath(str(a))) == os.path.normcase(os.path.normpath(str(b)))
+
+
+def _safe_id(value: Any) -> str | None:
+    """A manifest entry usable as one file / folder name (security.safe_name rules: no separators, '..', drive,
+    ':' or reserved device name); None if it is not."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return None
+    try:
+        return safe_name(value, 128)
+    except ValueError:
+        return None
+
+
+_REPARSE = 0x400   # FILE_ATTRIBUTE_REPARSE_POINT (junctions, symlinks, mount points)
+
+
+def _is_reparse(p: Path) -> bool:
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if getattr(st, "st_file_attributes", 0) & _REPARSE:
+        return True
+    return os.path.islink(p)
+
+
+def _real_norm(p: str | Path) -> str:
+    return os.path.normcase(os.path.normpath(os.path.realpath(str(p))))
+
+
+def _inside_profile(p: Path, root: Path) -> bool:
+    """`p` (existing or not) lies inside the profile `root`: lexically, after resolving links, and without any
+    junction / symlink between the root and `p` (the root itself included)."""
+    try:
+        rel = Path(os.path.relpath(os.path.abspath(p), os.path.abspath(root)))
+    except ValueError:   # another drive
+        return False
+    if rel.parts and rel.parts[0] == "..":
+        return False
+    cur = Path(os.path.abspath(root))
+    if _is_reparse(cur):
+        return False
+    for part in rel.parts:
+        cur = cur / part
+        if _is_reparse(cur):
+            return False
+    rr, rp = _real_norm(root), _real_norm(p)
+    return rp == rr or rp.startswith(rr.rstrip("\\/") + os.sep)
+
+
+def _delete_target(folder: Path, name: Any, suffix: str, root: Path) -> Path | None:
+    """The file / folder `<folder>/<name><suffix>` a provisioning delete may touch, or None: the name must be a safe
+    id, the folder must lie inside the user's profile without links, and the target's resolved parent must be
+    exactly that folder (C-3)."""
+    sid = _safe_id(name)
+    if sid is None:
+        return None
+    target = folder / f"{sid}{suffix}"
+    if not _inside_profile(target, root) or _is_reparse(target):
+        return None
+    if _real_norm(target.parent) != _real_norm(folder) or os.path.dirname(_real_norm(target)) != _real_norm(folder):
+        return None
+    return target
+
+
+LEGACY_MANIFEST_STUB = ('{"moved": "Goose Web keeps the provisioning manifest in <system_dir>/manifests; this file '
+                        'only marks the profile as provisioned"}\n')
+_GUARDED = {ext_key(n) for n in GUARDED_EXTENSIONS}
+# Description of an extension entry Goose Web pinned off; Goose Web <= 1.11 wrote "... (disabled by policy)" too.
+PINNED_SUFFIX = "(disabled by policy)"
+PINNED_DESCRIPTION = "Turned off by Goose Web: your team does not give the permission it needs " + PINNED_SUFFIX
 
 
 class Profiles:
@@ -240,14 +316,61 @@ class Profiles:
         self._drop_legacy_hints(user)
 
     # ------------------------------------------------------------ provisioning
-    def _manifest_path(self, user: dict) -> Path:
+    def manifest_path(self, user: dict) -> Path:
+        """What the gateway provisioned for this user: <system_dir>/manifests/<user id>.json, outside every profile
+        and container (security assessment 2026-11-09, C-3: the old <profile>/.goose-web/managed.json is writable
+        by the user's sandboxed agent and drove the gateway's deletes)."""
+        return self.s.system_dir / "manifests" / f"{int(user['id'])}.json"
+
+    _manifest_path = manifest_path
+
+    def legacy_manifest_path(self, user: dict) -> Path:
         return self.root_for(user) / ".goose-web" / "managed.json"
 
+    def provisioned(self, user: dict) -> bool:
+        """True once provision() ran for this user (context.upstream_for provisions on first use otherwise)."""
+        return self.manifest_path(user).exists() or self.legacy_manifest_path(user).exists()
+
     def _load_manifest(self, user: dict) -> dict:
+        """The gateway-owned manifest; else (first run after the upgrade) the legacy in-profile one, whose content
+        is untrusted: only well-formed names are kept (every delete is checked again in provision())."""
         try:
-            return json.loads(self._manifest_path(user).read_text(encoding="utf-8"))
-        except (FileNotFoundError, ValueError):
+            data = json.loads(self.manifest_path(user).read_text(encoding="utf-8"))
+            trusted = True
+        except (FileNotFoundError, ValueError, OSError):
+            try:
+                data = json.loads(self.legacy_manifest_path(user).read_text(encoding="utf-8"))
+            except (FileNotFoundError, ValueError, OSError):
+                return {}
+            trusted = False
+        if not isinstance(data, dict):
             return {}
+        out: dict[str, Any] = {}
+        for k in ("extensions", "providers", "secrets", "skills"):
+            v = data.get(k)
+            out[k] = [x for x in v if _safe_id(x) is not None] if isinstance(v, list) else []
+        if trusted:
+            for k in ("pinned", "parked"):
+                if isinstance(data.get(k), dict):
+                    out[k] = data[k]
+        else:
+            # guarded extension keys from an untrusted manifest are never removed (Goose would turn them on)
+            out["extensions"] = [x for x in out["extensions"] if ext_key(x) not in _GUARDED]
+        td = data.get("teamDefault")
+        if isinstance(td, list) and len(td) == 2 and all(isinstance(x, (str, type(None))) for x in td):
+            out["teamDefault"] = td
+        return out
+
+    def _write_manifest(self, user: dict, manifest: dict) -> None:
+        _atomic_write(self.manifest_path(user), json.dumps(manifest, indent=1))
+        legacy = self.legacy_manifest_path(user)
+        # keep a content-free marker where Goose Web <= 1.11 (and context.upstream_for) looks for it
+        try:
+            if not legacy.is_file() or legacy.read_text(encoding="utf-8") != LEGACY_MANIFEST_STUB:
+                if _inside_profile(legacy.parent, self.root_for(user)):
+                    _atomic_write(legacy, LEGACY_MANIFEST_STUB)
+        except OSError:
+            pass
 
     def _native_admin(self) -> dict | None:
         return self.db.one("SELECT * FROM users WHERE profile_mode='native' AND role='admin' ORDER BY id LIMIT 1")
@@ -263,6 +386,7 @@ class Profiles:
             return []
         self.ensure_layout(user)
         changes: list[str] = []
+        root = self.root_for(user)
         cfg_dir = self.config_dir(user)
         teams = self.db.user_teams(user["id"])
         pol = effective_policy(user, teams)
@@ -288,19 +412,10 @@ class Profiles:
                     exts[key] = copy.deepcopy(src)
                     changes.append(f"extension {key} (base)")
             cfg.setdefault("GOOSE_MODE", "approve")
-        # shell extensions follow allow_shell (explicitly disabled so Goose defaults never enable them)
-        for key in SHELL_EXTENSIONS:
-            src = exts.get(key) or (admin_cfg.get("extensions") or {}).get(key)
-            if not pol.get("allow_shell"):
-                if isinstance(exts.get(key), dict) and exts[key].get("enabled"):
-                    exts[key]["enabled"] = False
-                    changes.append(f"extension {key} disabled (allow_shell off)")
-                elif key == "developer" and key not in exts:
-                    exts[key] = {"enabled": False, "type": "platform", "name": "developer",
-                                 "description": "Shell and file editing (disabled by policy)",
-                                 "display_name": "Developer", "bundled": True}
-            elif key == "developer" and isinstance(src, dict) and first_time:
-                exts[key] = {**copy.deepcopy(src), "enabled": True}
+        if first_time and pol.get("allow_shell"):
+            src = (admin_cfg.get("extensions") or {}).get("developer")
+            if isinstance(src, dict):
+                exts["developer"] = {**copy.deepcopy(src), "enabled": True}
 
         def secrets_from(username: str | None, keys: list[str]) -> None:
             if not username or not keys:
@@ -330,10 +445,12 @@ class Profiles:
                 if not isinstance(entry, dict):
                     continue
                 key = payload.get("key") or name
-                is_shell = key.lower() in SHELL_EXTENSIONS or entry.get("type") == "stdio"
+                if ext_key(key) in _GUARDED:
+                    continue   # shell-capable / extension-starting: follows the member's permissions (below)
                 e = copy.deepcopy(entry)
-                if is_shell and not pol.get("allow_shell"):
-                    e["enabled"] = False
+                if is_command_extension(e) and not pol.get("allow_shell"):
+                    # not even dormant: a disabled entry can be switched on (B-2). Removed below if it was there.
+                    continue
                 if exts.get(key) != e:
                     changes.append(f"extension {key}")
                 exts[key] = e
@@ -344,6 +461,8 @@ class Profiles:
                 pid = payload.get("providerId") or name
                 if isinstance(pj, dict):
                     target = cfg_dir / "custom_providers" / f"{safe_name(pid, 128)}.json"
+                    if not _inside_profile(target, root) or _is_reparse(target):
+                        continue   # a junction / link planted in the profile: never write through it (C-3)
                     text = json.dumps(pj, indent=2)
                     if not target.exists() or target.read_text(encoding="utf-8") != text:
                         _atomic_write(target, text)
@@ -356,6 +475,8 @@ class Profiles:
             elif kind == "skill":
                 files = payload.get("files") or {}
                 sdir = cfg_dir / "skills" / safe_name(name, 128)
+                if not _inside_profile(sdir, root) or _is_reparse(sdir):
+                    continue   # never write through a junction / link planted in the profile (C-3)
                 if sdir.exists() and not (sdir / MANAGED_MARK).exists():
                     continue  # the user owns a skill with that name; never overwrite it
                 sdir.mkdir(parents=True, exist_ok=True)
@@ -364,20 +485,23 @@ class Profiles:
                     if rp.is_absolute() or ".." in rp.parts:
                         continue
                     target = sdir / rp
+                    if not _inside_profile(target, root):
+                        continue
                     if not target.exists() or target.read_text(encoding="utf-8", errors="replace") != content:
                         _atomic_write(target, content)
                         changes.append(f"skill {name}/{rel}")
                 (sdir / MANAGED_MARK).write_text(f"team item {it['id']}\n", encoding="utf-8")
                 new_manifest["skills"].append(name)
 
-        # remove items that were provisioned before but are no longer assigned
+        # remove items that were provisioned before but are no longer assigned. Every name comes from the manifest:
+        # only safe ids, and only files / folders whose resolved parent is the expected folder of THIS profile (C-3).
         for key in set(old.get("extensions") or []) - set(new_manifest["extensions"]):
-            if key in exts:
+            if key in exts and ext_key(key) not in _GUARDED:
                 exts.pop(key)
                 changes.append(f"extension {key} removed")
         for pid in set(old.get("providers") or []) - set(new_manifest["providers"]):
-            f = cfg_dir / "custom_providers" / f"{pid}.json"
-            if f.exists():
+            f = _delete_target(cfg_dir / "custom_providers", pid, ".json", root)
+            if f is not None and f.is_file():
                 f.unlink()
                 changes.append(f"provider {pid} removed")
         for k in set(old.get("secrets") or []) - set(new_manifest["secrets"]):
@@ -385,10 +509,12 @@ class Profiles:
                 secrets.pop(k)
                 changes.append(f"secret {k} removed")
         for sk in set(old.get("skills") or []) - set(new_manifest["skills"]):
-            sdir = cfg_dir / "skills" / sk
-            if (sdir / MANAGED_MARK).exists():
+            sdir = _delete_target(cfg_dir / "skills", sk, "", root)
+            if sdir is not None and sdir.is_dir() and (sdir / MANAGED_MARK).is_file():
                 shutil.rmtree(sdir, ignore_errors=True)
                 changes.append(f"skill {sk} removed")
+
+        self._apply_extension_permissions(pol, exts, admin_cfg, old, new_manifest, changes)
 
         # provider / model / mode defaults and allow-lists (spec 009: the team default model)
         allowed_p = [p for p in pol.get("allowed_providers") or [] if p != ANY]
@@ -445,8 +571,80 @@ class Profiles:
             changes.append("goose hints")
         if self._drop_legacy_hints(user):
             changes.append("old .goosehints removed (Goose Web now uses .goose-web-hints.md)")
-        _atomic_write(self._manifest_path(user), json.dumps(new_manifest, indent=1))
+        self._write_manifest(user, new_manifest)
         return changes
+
+    @staticmethod
+    def _apply_extension_permissions(pol: dict, exts: dict, admin_cfg: dict, old: dict, new_manifest: dict,
+                                     changes: list[str]) -> None:
+        """Shell-capable and extension-starting extensions follow the member's permissions, in both directions
+        (security assessment 2026-11-09, B-2/B-3).
+
+        Without the permission (policy.extension_needs: allow_shell; extensionmanager also extensions_edit) the key
+        is PINNED as `enabled: false`. It is not removed: Goose 1.57 enables a bundled platform extension that is
+        missing from config.yaml (measured: without a `developer` key the member's chats had `shell`, and every
+        member had `scheduler`). extensionmanager is pinned off too, so the model cannot switch developer back on.
+        With the permission again, what Goose Web pinned is restored (BASE_EXTENSIONS and developer on; others as
+        in the admin's config, or Goose's default).
+        Command extensions (stdio, inline_python) without allow_shell are PARKED in the gateway's manifest and taken
+        out of config.yaml (a disabled entry can be switched on); they come back when allow_shell is on again."""
+        admin_exts = admin_cfg.get("extensions") or {}
+        # Deny by default: every other bundled extension the admin's Goose lists is written disabled when the member
+        # has no entry for it, so a bundled extension Goose turns on by default (a new release may add one) is not
+        # silently on for members. Team items and the member's own entries win (only missing keys are added).
+        for key, src in admin_exts.items():
+            if key not in exts and key not in BASE_EXTENSIONS and ext_key(key) not in _GUARDED and \
+                    isinstance(src, dict) and src.get("bundled") and src.get("type") in ("platform", "builtin"):
+                exts[key] = {**copy.deepcopy(src), "enabled": False}
+        old_pinned = old.get("pinned") if isinstance(old.get("pinned"), dict) else {}
+        parked = dict(old.get("parked") or {}) if isinstance(old.get("parked"), dict) else {}
+        pinned: dict[str, bool] = {}
+        for key in sorted(GUARDED_EXTENSIONS):
+            cur = exts.get(key)
+            ours = key in old_pinned or (isinstance(cur, dict) and str(cur.get("description") or "")
+                                         .endswith(PINNED_SUFFIX))
+            if missing(pol, extension_needs(key)):
+                if isinstance(cur, dict):
+                    if cur.get("enabled") is not False:
+                        cur["enabled"] = False
+                        ours = True
+                        changes.append(f"extension {key} disabled (needs {' and '.join(extension_needs(key))})")
+                else:
+                    ours = True
+                    src = admin_exts.get(key)
+                    stub = copy.deepcopy(src) if isinstance(src, dict) and src.get("type") in ("platform", "builtin") \
+                        else {"type": "platform", "name": key, "display_name": key.replace("_", " ").title(),
+                              "bundled": True}
+                    stub.update(enabled=False, description=PINNED_DESCRIPTION)
+                    exts[key] = stub
+                    changes.append(f"extension {key} pinned off (needs {' and '.join(extension_needs(key))})")
+                if ours:
+                    pinned[key] = True
+                continue
+            if not ours or not isinstance(cur, dict) or cur.get("enabled"):
+                continue
+            src = admin_exts.get(key)
+            if key in BASE_EXTENSIONS or key == "developer":
+                base = copy.deepcopy(src) if isinstance(src, dict) and src.get("type") in ("platform", "builtin") \
+                    else {k: v for k, v in cur.items() if k != "description"}
+                exts[key] = {**base, "enabled": True}
+            elif isinstance(src, dict) and src.get("type") in ("platform", "builtin"):
+                exts[key] = copy.deepcopy(src)
+            else:
+                exts.pop(key)   # Goose's own default for this bundled extension applies again
+            changes.append(f"extension {key} restored (permission granted)")
+        if not pol.get("allow_shell"):
+            for key in [k for k, e in exts.items() if is_command_extension(e)]:
+                parked[key] = exts.pop(key)
+                changes.append(f"extension {key} parked (command extensions need allow_shell)")
+        else:
+            for key in list(parked):
+                e = parked.pop(key)
+                if key not in exts and isinstance(e, dict):
+                    exts[key] = e
+                    changes.append(f"extension {key} restored (allow_shell on)")
+        new_manifest["pinned"] = pinned
+        new_manifest["parked"] = parked
 
     def archive_profile(self, user: dict, purge: bool = False) -> str:
         if self.is_native(user):

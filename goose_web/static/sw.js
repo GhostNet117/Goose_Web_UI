@@ -1,5 +1,5 @@
 // Goose Web service worker: caches the app shell only. Never caches /api/* or /ws.
-const VERSION = 'gw-shell-v16';
+const VERSION = 'gw-shell-v17';
 const SHELL = [
   '/',
   '/manifest.webmanifest',
@@ -34,10 +34,13 @@ self.addEventListener('fetch', (event) => {
   if (isShell || url.pathname.startsWith('/static/js/') || url.pathname.startsWith('/static/css/')) {
     // network first so deployments show up immediately; cache as offline fallback
     // cache: 'no-cache' forces revalidation; otherwise heuristic HTTP caching can serve stale modules.
+    // The shell is cached under its path only: '/?profile=bob' and other query variants are the same
+    // index.html and must not leave one cache entry each (security assessment 2026-11-09 D-8).
+    const key = isShell ? (url.pathname === '/index.html' ? '/' : url.pathname) : req;
     event.respondWith(fetch(req.mode === 'navigate' ? req : new Request(req, { cache: 'no-cache' })).then((res) => {
-      if (res.ok) { const copy = res.clone(); caches.open(VERSION).then((c) => c.put(req, copy)); }
+      if (res.ok && !res.redirected) { const copy = res.clone(); caches.open(VERSION).then((c) => c.put(key, copy)); }
       return res;
-    }).catch(() => caches.match(req).then((r) => r || (isShell ? caches.match('/') : Response.error()))));
+    }).catch(() => caches.match(key).then((r) => r || (isShell ? caches.match('/') : Response.error()))));
     return;
   }
   // vendor + icons: cache first

@@ -127,6 +127,37 @@ def password_problems(password: str, min_length: int = PASSWORD_MIN_LENGTH, user
     return problems
 
 
+def parse_ip(value: str | None) -> str | None:
+    """The normalised IP address in one X-Forwarded-For entry, or None when it is not an address (A-7).
+
+    Accepts "a.b.c.d", "a.b.c.d:port", "v6", "[v6]" and "[v6]:port" (some proxies append the port)."""
+    import ipaddress
+    v = (value or "").strip()
+    if not v or len(v) > 64:
+        return None
+    if v.startswith("["):
+        end = v.find("]")
+        rest = v[end + 1:] if end > 0 else "x"
+        if end <= 1 or (rest and not (rest[0] == ":" and rest[1:].isdigit())):
+            return None
+        v = v[1:end]
+    elif v.count(":") == 1:
+        v, _, port = v.partition(":")
+        if not port.isdigit():
+            return None
+    try:
+        return str(ipaddress.ip_address(v))
+    except ValueError:
+        return None
+
+
+def is_unc_path(path: str | None) -> bool:
+    """True for UNC (\\\\server\\share) and Windows device-namespace (\\\\?\\, \\\\.\\) paths, in either slash style.
+    Opening such a path can make the gateway account connect to another machine over SMB (A-12)."""
+    p = str(path or "").strip()
+    return len(p) >= 2 and p[0] in "\\/" and p[1] in "\\/"
+
+
 def ip_in(ip: str, nets: list[str]) -> bool:
     """True when `ip` is inside any of the networks/addresses in `nets` (invalid entries are ignored)."""
     import ipaddress

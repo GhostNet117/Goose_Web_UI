@@ -18,7 +18,9 @@
   It shows a summary and asks before changing anything. Every question also has a parameter, so the same install
   can be scripted with -NonInteractive.
 
-  Steps after the questions: .venv with the hash-locked dependencies; <ProfilesRoot>\_system\config.yaml (kept if it
+  Steps after the questions: the install folder (this clone, incl. .venv and .git) is restricted to you, SYSTEM and
+  Administrators (read & execute for a service account; inheritance removed, so other local users cannot change the
+  code the gateway runs); .venv with the hash-locked dependencies; <ProfilesRoot>\_system\config.yaml (kept if it
   exists); permissions for the service account (if one runs the gateway); "goose-web init" (first admin with a random
   initial password, shown once at the end); "goose-web check"; the gateway task + firewall rule via
   register-service.ps1 (one elevation prompt; for a service account it asks for the account's password there).
@@ -87,6 +89,25 @@ function Find-Goose {
     foreach ($d in @("$env:LOCALAPPDATA\Programs\Goose", "$env:ProgramFiles\Goose", "$env:USERPROFILE\.local\bin")) {
         $g = Resolve-Goose $d; if ($g) { return $g }
     }
+    return ''
+}
+function Protect-InstallDir([string]$Dir, [string]$RunAs = '', [switch]$WhatIf) {
+    # The gateway runs the code, the .venv and (on upgrade) the git hooks in this folder as its own account. Only the
+    # installing account, SYSTEM and Administrators may change them; the account that runs the gateway, if another
+    # one, may read and execute. Inherited permissions are removed (C:\ gives Authenticated Users Modify).
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $grants = @("*$($me):(OI)(CI)F", '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
+    if ($RunAs) {
+        if ($RunAs.StartsWith('.\')) { $RunAs = "$env:COMPUTERNAME\" + $RunAs.Substring(2) }
+        $sid = if ($RunAs -match '^S-1-[0-9-]+$') { $RunAs } else {
+            $(try { (New-Object Security.Principal.NTAccount($RunAs)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { '' }) }
+        if ($sid -ne $me) { $grants += $(if ($sid) { "*$($sid):(OI)(CI)RX" } else { "$($RunAs):(OI)(CI)RX" }) }
+    }
+    if ($WhatIf) { return ((@('icacls', "`"$Dir`"", '/inheritance:r', '/grant:r') + $grants + '/Q') -join ' ') }
+    & icacls $Dir /inheritance:r /grant:r @grants /Q | Out-Null
+    if ($LASTEXITCODE) { throw "Could not restrict the permissions of $Dir (icacls exit $LASTEXITCODE). Any local user could change the code the gateway runs; fix the folder's permissions (you must own it) and run again." }
+    # explicit grants for Everyone, Authenticated Users, Users or Interactive, if someone added them
+    & icacls $Dir /remove:g '*S-1-1-0' '*S-1-5-11' '*S-1-5-32-545' '*S-1-5-4' /Q | Out-Null
     return ''
 }
 function Count-Chats([string]$root) {
@@ -241,7 +262,9 @@ Write-Host "     HTTPS              $(if ($tlsOn) { 'built-in certificate (local
 Write-Host "     Address            $($scheme)://$($BindHost):$Port$(if ($PublicUrl) { "  (public $PublicUrl)" })"
 if (-not $NonInteractive -and ((Ask 'Continue (Y/n)' 'Y') -match '^[nN]')) { Write-Host 'Nothing changed.'; exit 0 }
 
-# --- 2. virtualenv -------------------------------------------------------------
+# --- 2. install folder permissions + virtualenv ------------------------------------
+Protect-InstallDir -Dir $InstallDir -RunAs $(if ($service) { $RunAs } else { '' }) | Out-Null
+Say "Restricted $InstallDir to you, SYSTEM and Administrators$(if ($service) { " (read & execute for $RunAs)" })"
 $venvPy = Join-Path $InstallDir '.venv\Scripts\python.exe'
 $uv = (Get-Command uv -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 if (-not $uv) {   # Goose ships uv; use it when uv is not on PATH

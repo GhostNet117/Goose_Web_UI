@@ -9,6 +9,7 @@ from goose_web.profiles import Profiles
 
 def make(tmp_path, monkeypatch):
     monkeypatch.setenv("GOOSE_WEB__PATHS__PROFILES_ROOT", str(tmp_path / "profiles"))
+    (tmp_path / "none.yaml").write_text("", encoding="utf-8")   # GOOSE_WEB_CONFIG must exist (A-10)
     monkeypatch.setenv("GOOSE_WEB_CONFIG", str(tmp_path / "none.yaml"))
     s = load_settings()
     db = Database(tmp_path / "db.sqlite")
@@ -62,8 +63,8 @@ def test_team_items_and_secrets(tmp_path, monkeypatch):
     cfg = yaml.safe_load((root / "config.yaml").read_text())
     sec = yaml.safe_load((root / "secrets.yaml").read_text())
     assert cfg["GOOSE_PROVIDER"] == "p1"
-    assert sec == {"P1_KEY": "s1", "FETCH_KEY": "s2"}            # only referenced secrets
-    assert cfg["extensions"]["fetch"]["enabled"] is False          # stdio needs allow_shell
+    assert sec == {"P1_KEY": "s1"}                                # only referenced secrets; the stdio item's are not copied
+    assert "fetch" not in cfg["extensions"]                         # stdio team items need allow_shell (B-2, 1.12)
     assert (root / "skills" / "hello" / "SKILL.md").exists()
     assert "Be brief." in (root / ".goose-web-hints.md").read_text()
     assert not (root / ".goosehints").exists()

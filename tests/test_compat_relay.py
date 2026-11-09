@@ -142,8 +142,11 @@ def test_forward_ips_are_unique_loopback_addresses():
 def test_relay_specs_and_pipe_names():
     specs = rl.relay_specs("GooseWeb.ab12cd34.bob", 7, ["127.0.0.1:8317", "localhost:9000"])
     assert specs[0]["listen"] == rl.forward_ip(7) + ":8317" and specs[0]["target"] == "127.0.0.1:8317"
-    assert specs[0]["pipe"].startswith("\\\\.\\pipe\\goose-web-relay.GooseWeb.ab12cd34.bob.")
-    assert specs[0]["pipe"] != rl.relay_specs("GooseWeb.ab12cd34.eve", 8, ["127.0.0.1:8317"])[0]["pipe"]
+    assert specs == rl.relay_specs("GooseWeb.ab12cd34.bob", 7, ["127.0.0.1:8317", "localhost:9000"])  # stable spec
+    # C-1: the pipe name is chosen per worker start, random and unguessable (not derived from user or target)
+    names = {rl.new_pipe_name() for _ in range(50)}
+    assert len(names) == 50 and all(n.startswith("\\\\.\\pipe\\goose-web-relay.") for n in names)
+    assert all(len(n.rsplit(".", 1)[1]) == 32 for n in names)
     with pytest.raises(ValueError):
         rl.parse_target("8317")
 
@@ -199,9 +202,12 @@ def test_relay_carries_bytes_both_ways(tmp_path):
         port = probe.getsockname()[1]
     spec = rl.relay_specs(f"GooseWebTest.{os.getpid()}", 4242, [target])[0]
     listen = spec["listen"].rsplit(":", 1)[0] + f":{port}"
-    srv = rl.PipeRelayServer(spec["pipe"], "S-1-5-18", target).start()
+    pipe = rl.new_pipe_name()
+    srv = rl.PipeRelayServer(pipe, "S-1-5-18", target).start()
     fwd = rl.write_forwarder(str(tmp_path))
-    p = subprocess.Popen([sys.executable, "-I", fwd, listen, spec["pipe"]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # the forwarder's last argument: the pid of the process that serves the pipe (here this test process)
+    p = subprocess.Popen([sys.executable, "-I", fwd, listen, pipe, str(os.getpid())], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
     try:
         assert p.stdout.readline().strip() == b"listening"
         host, prt = listen.rsplit(":", 1)

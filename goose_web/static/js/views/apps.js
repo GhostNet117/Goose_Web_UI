@@ -120,9 +120,9 @@ function renderAppRunner(ctx, name) {
     if (app && app.resizable !== false) iframe.classList.add('resizable');
     frameWrap.replaceChildren(iframe);
     bridge = createAppBridge(iframe, {
-      // extensionName comes from app metadata (author-controlled), so tool calls into powerful
-      // built-in extensions need the user's OK each time (confirmSensitiveTools).
-      app, extensionName: (app && app.mcpServers && app.mcpServers[0]) || 'apps', ensureSession, confirmSensitiveTools: true,
+      // A grid/imported app is author-controlled (and so is the extension in its metadata): every tool call
+      // and resource read it requests needs the user's OK (confirmAppCalls, security assessment 2026-11-09 D-4).
+      app, extensionName: (app && app.mcpServers && app.mcpServers[0]) || 'apps', ensureSession, confirmAppCalls: true,
       onInitialized: () => { status.textContent = 'Running · sandboxed'; },
       onMessage: (text) => openChatWith(text),
     });
@@ -160,8 +160,9 @@ function renderAppRunner(ctx, name) {
 }
 
 // Built-in extensions whose tools can run commands, control the machine or spawn agents. A grid/imported
-// app picks its extension from its own metadata, so each call into one of these needs the user's OK.
-const SENSITIVE_EXTENSIONS = new Set(['developer', 'computercontroller', 'code_execution', 'orchestrator']);
+// app picks its extension from its own metadata; calls into one of these are confirmed every time (no
+// "allow until closed") and the dialog says so.
+const SENSITIVE_EXTENSIONS = new Set(['developer', 'computercontroller', 'code_execution', 'orchestrator', 'summon', 'scheduler', 'extensionmanager']);   // = policy.GUARDED_EXTENSIONS
 const MAX_APP_MESSAGE_BYTES = 8 * 1024;
 const APP_MESSAGE_INTERVAL_MS = 5000;
 
@@ -170,15 +171,18 @@ function truncate(s, max) { s = String(s); return s.length > max ? s.slice(0, ma
 
 // Confirmation dialog for app-initiated actions. Default is deny: Cancel has the focus, and closing
 // the dialog (Esc, overlay click, X, bridge destroyed) counts as Cancel. Returns { promise, close }.
-function appConsent({ title, body, confirmText }) {
+// With rememberLabel a checkbox (off by default) is shown; the promise then resolves to 'remember' when it
+// was ticked, true for a plain OK and false otherwise.
+function appConsent({ title, body, confirmText, rememberLabel = '' }) {
   let m;
   const promise = new Promise((resolve) => {
     const cancel = btn('Cancel', () => m.close(false), { variant: 'primary' });
+    const remember = rememberLabel ? h('input', { type: 'checkbox' }) : null;
     m = modal({
       title, size: 'md',
-      body: h('div', { class: 'confirm-body stack' }, body),
-      footer: [cancel, btn(confirmText, () => m.close(true), { variant: 'danger' })],
-      onClose: (r) => resolve(r === true),
+      body: h('div', { class: 'confirm-body stack' }, body, remember ? h('label', { class: 'chk' }, remember, h('span', null, rememberLabel)) : null),
+      footer: [cancel, btn(confirmText, () => m.close(remember && remember.checked ? 'remember' : true), { variant: 'danger' })],
+      onClose: (r) => resolve(r === true || r === 'remember' ? r : false),
     });
     setTimeout(() => cancel.focus(), 30);
   });
@@ -188,19 +192,35 @@ function appConsent({ title, body, confirmText }) {
 // MCP Apps host bridge (JSON-RPC 2.0 over postMessage). The frame has an opaque origin
 // ('null'), so we authenticate messages by event.source === iframe.contentWindow.
 // Security: an app may only call tools of its own extension (extensionName); any other prefix is
-// refused. With confirmSensitiveTools (grid/imported apps, extension taken from app metadata) calls into
-// SENSITIVE_EXTENSIONS need a per-call confirmation. ui/message (send a chat prompt as the user) always
+// refused. With confirmAppCalls (grid/imported apps, extension taken from app metadata) EVERY tools/call and
+// resources/read needs the user's OK, showing the app, the extension and the tool or resource; the user may
+// allow one tool / resource for this app until the app is closed or reloaded, except for
+// SENSITIVE_EXTENSIONS, which are confirmed every time. ui/message (send a chat prompt as the user) always
 // needs a confirmation, is capped at 8 KB and limited to one message per 5 s per bridge.
-export function createAppBridge(iframe, { app, extensionName, ensureSession, onInitialized, onMessage, toolInput, toolResult, confirmSensitiveTools = false }) {
+export function createAppBridge(iframe, { app, extensionName, ensureSession, onInitialized, onMessage, toolInput, toolResult, confirmAppCalls = false }) {
   let initialized = false;
   let autoHinted = false;
   let destroyed = false;
-  let toolConsent = null;   // open tool-call confirmation, if any
+  let callConsent = null;   // open tool-call / resource-read confirmation, if any
   let msgConsent = null;    // open ui/message confirmation, if any
   let lastMsgAt = 0;
   const ext = String(extensionName || '');
   const appLabel = String((app && app.name) || ext || 'This app');
-  const sensitive = !!confirmSensitiveTools && SENSITIVE_EXTENSIONS.has(ext.toLowerCase());
+  const confirmAll = !!confirmAppCalls;
+  const sensitive = SENSITIVE_EXTENSIONS.has(ext.toLowerCase());
+  const remembered = new Set(); // 'tool:<name>' / 'res:<uri>' the user allowed until this bridge is destroyed
+  // Ask the user before a tool call / resource read (confirmAll only). Throws if declined.
+  const consent = async (key, { title, confirmText, body }) => {
+    if (!confirmAll || remembered.has(key)) return;
+    if (callConsent) throw bridgeError(-32000, 'Another request from this app is waiting for the user to confirm');
+    callConsent = appConsent({ title, confirmText, body, rememberLabel: sensitive ? '' : 'Allow this again for this app until it is closed' });
+    let ok;
+    try { ok = await callConsent.promise; } finally { callConsent = null; }
+    if (!ok || destroyed) throw bridgeError(-32000, 'The user declined the request');
+    if (ok === 'remember' && !sensitive) remembered.add(key);
+  };
+  const extLine = () => h('div', { class: 'muted small' }, 'App: ', h('strong', null, appLabel), ' · Extension: ', h('code', null, ext || '?'),
+    sensitive ? h('span', null, ' · This extension can run commands or control this machine.') : null);
   const post = (msg) => { try { iframe.contentWindow && iframe.contentWindow.postMessage(msg, '*'); } catch (e) { console.warn('postMessage failed', e); } };
   const reply = (id, result) => post({ jsonrpc: '2.0', id, result });
   const fail = (id, code, message) => post({ jsonrpc: '2.0', id, error: { code, message } });
@@ -237,21 +257,16 @@ export function createAppBridge(iframe, { app, extensionName, ensureSession, onI
       if (toolName.toLowerCase().startsWith(ext.toLowerCase() + '__')) bareName = toolName.slice(ext.length + 2);
       if (!ext || !bareName || bareName.includes('__')) throw bridgeError(-32602, "tool not in this app's server: " + toolName);
       const args = p.arguments && typeof p.arguments === 'object' ? p.arguments : {};
-      if (sensitive) {
-        if (toolConsent) throw bridgeError(-32000, 'Another tool call is waiting for the user to confirm');
-        toolConsent = appConsent({
-          title: 'Allow app to run a tool?',
-          confirmText: 'Run tool',
-          body: [
-            h('p', null, h('strong', null, appLabel), ' wants to run ', h('code', null, ext + '__' + bareName), '. This extension can run commands or control this machine. Only allow it if you trust this app.'),
-            h('div', { class: 'muted small' }, 'Arguments'),
-            h('pre', { class: 'mono small', style: { whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '40vh', overflow: 'auto' } }, truncate(prettyJson(args), 2000)),
-          ],
-        });
-        let ok;
-        try { ok = await toolConsent.promise; } finally { toolConsent = null; }
-        if (!ok || destroyed) throw bridgeError(-32000, 'The user declined the tool call');
-      }
+      await consent('tool:' + bareName, {
+        title: 'Allow app to run a tool?',
+        confirmText: 'Run tool',
+        body: [
+          h('p', null, h('strong', null, appLabel), ' wants to run the tool ', h('code', null, ext + '__' + bareName), '. Only allow it if you trust this app.'),
+          extLine(),
+          h('div', { class: 'muted small' }, 'Arguments'),
+          h('pre', { class: 'mono small', style: { whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '40vh', overflow: 'auto' } }, truncate(prettyJson(args), 2000)),
+        ],
+      });
       const sessionId = await ensureSession();
       let r;
       try {
@@ -264,8 +279,19 @@ export function createAppBridge(iframe, { app, extensionName, ensureSession, onI
       return { content: r.content || [], isError: !!r.isError, structuredContent: r.structuredContent, _meta: r._meta };
     },
     'resources/read': async (p) => {
+      const uri = String((p && p.uri) || '');
+      if (!uri) throw bridgeError(-32602, 'uri is required');
+      await consent('res:' + uri, {
+        title: 'Allow app to read a resource?',
+        confirmText: 'Allow',
+        body: [
+          h('p', null, h('strong', null, appLabel), ' wants to read this resource from the extension ', h('code', null, ext || '?'), ':'),
+          h('pre', { class: 'mono small', style: { whiteSpace: 'pre-wrap', wordBreak: 'break-all' } }, truncate(uri, 500)),
+          extLine(),
+        ],
+      });
       const sessionId = await ensureSession();
-      const r = await rpc.call(G('resources/read'), { sessionId, uri: p.uri, extensionName });
+      const r = await rpc.call(G('resources/read'), { sessionId, uri, extensionName });
       return r.result || { contents: [] };
     },
     'ui/message': async (p) => {
@@ -334,7 +360,7 @@ export function createAppBridge(iframe, { app, extensionName, ensureSession, onI
     destroy() {
       destroyed = true;
       window.removeEventListener('message', onMsg); themeObs.disconnect();
-      if (toolConsent) toolConsent.close();
+      if (callConsent) callConsent.close();
       if (msgConsent) msgConsent.close();
     },
     sendToolInput(args) { post({ jsonrpc: '2.0', method: 'ui/notifications/tool-input', params: { arguments: args } }); },

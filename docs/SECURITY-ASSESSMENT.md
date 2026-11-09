@@ -483,3 +483,33 @@ all Windows apps stay readable.
   the database and in `activity.jsonl`. Prompt text is never logged.
 - **Log budget**: logs cannot fill the disk (`logs.max_disk_percent`, 0.5 %); the audit table is capped by age and
   rows.
+
+## 9. Addendum: independent assessment of 1.11.0 (2026-11-09), fixed in 1.12.0
+
+Four parallel adversarial reviews of 1.11.0 (web and sign-in; agent firewall, hub and profiles; Windows sandbox,
+relays, TLS, log janitor and install scripts; browser front end), each proving findings with working attacks against
+throwaway gateways. Everything below is fixed in 1.12.0 with regression tests (`tests/test_sec_web.py`,
+`test_sec_agent.py`, `test_sec_os.py`, `test_frontend_modules.py`), and every attack was re-run against the fixed code.
+
+| ID | Severity | Finding | Fix |
+|---|---|---|---|
+| B-1 | **Critical** | A member with every permission off ran any command at chat creation: `session/new` with `_meta.recipeDeeplink` started the recipe's extensions (stdio commands, `developer`). Also via `session/import` (crafted extension state), `schedules/create` with an inline recipe, and summon sub-recipes. | Member `_meta` is allow-listed; the gateway resolves every recipe (deeplink, id, schedule, import) and refuses extensions, sub-recipes and checks the member may not use; imports keep only harmless bundled extensions. |
+| B-2/B-3 | High | The model (or a direct tool call with `apps`) re-enabled the disabled `developer` through `extensionmanager`. | Command-capable extensions (incl. `summon`, `scheduler`) are pinned off without `allow_shell`; `extensionmanager` needs `extensions_edit` + `allow_shell`; tool calls to guarded extensions are refused. |
+| C-1 | High | Any local process could create a relay's named pipe first and read prompts / forge model answers. | Random pipe name per start, first-instance flag, forwarder verifies the server process. |
+| C-2 | High | Sandboxed workers inherited the gateway account's environment (API keys). | The environment is built from an allow-list. |
+| C-3 | High | The provisioning record sat in the user's writable profile; its ids drove deletes outside the profile. | Record moved to `<system_dir>/manifests/`; every delete is id-checked and confined, never through links. |
+| C-4 | High | `install.ps1` left the install folder writable by every local user (code that runs as the gateway account). | install/upgrade lock the folder down; `goose-web check` flags it. |
+| A-1/A-2 | High/Medium | Request bodies were read fully before the size check (memory exhaustion without signing in; chunked uploads past `max_upload_mb`). | A streaming body-limit middleware (413). |
+| A-6 / C-9 | High | The local CA could sign certificates for any domain, and an admin could download `ca.key` through the file browser. | The CA carries name constraints (this machine's names, loopback and private ranges; 1.11 CAs are replaced: clients must import the new CA once); key files are owner-only; the file API refuses `system_dir` for everyone. |
+| A-3 | Medium | Anyone could lock any account; the lock answer revealed user names and blocked the owner's address. | Locked accounts answer like a wrong password; only the correct password learns about the lock and does not count against the address. |
+| A-4/A-5 | Medium | OIDC sign-in was not tied to the browser (login CSRF), and unbound accounts could be claimed by user name. | Browser-bound state cookie; binding only by verified e-mail; `stripDomain` default off. |
+| C-5 | Medium | `jo.ann` and `joann` shared one AppContainer. | Container names include a hash of the exact user name; old containers are migrated. |
+| C-6 | Medium | A sparse "500 GB" log made the log janitor delete other logs. | Allocated size, per-owner budget. |
+| C-7 | Medium | Detached agent processes survived a worker stop. | One kill-on-close job per worker. |
+| D-1/D-2 | Medium | Model output could draw full-screen fake dialogs with the app's CSS classes; "Copy code" copied hidden text. | Sanitizer drops classes/ids/styles; markdown is contained; code blocks are reset to their plain text. |
+| A-7..A-14, B-4, C-8, C-10..C-12, D-3..D-10 | Low/Info | Forwarded-address parsing, admin two-factor not enforced, user-name timing, silent config fallback, secrets kept across endpoint changes, TLS file checks, error text, logout CSRF, janitor and junctions, audit of runtime extension starts, login error text, app-bridge confirmations, protocol-relative images, storage after sign-out, unattributed permission cards, dangerous team folders. | See CHANGELOG 1.12.0. |
+
+Still accepted: administrators and the native profile are trusted and unsandboxed; without the sandbox (Linux, or
+`sandbox.enabled: false`) every member's agent runs as the gateway's account, so `allow_shell: false` is only backed
+by an OS boundary when the sandbox is on; a member with `allow_shell` can run anything inside their sandbox;
+read-only extensions (`analyze`, `summarize`, `chatrecall`) can read what the worker can read (the sandbox limits it).

@@ -46,6 +46,21 @@ def ldap_transport_insecure(c: dict) -> bool:
     return not (url.startswith("ldaps://") or bool(c.get("startTls")) or c.get("allowInsecure") is True)
 
 
+def _same_endpoint(a: Any, b: Any) -> bool:
+    """True when two server URLs / issuers name the same endpoint (case and a trailing slash ignored)."""
+    def norm(v: Any) -> str:
+        return str(v or "").strip().rstrip("/").lower()
+    return norm(a) == norm(b)
+
+
+OIDC_STATE_CAP = 1000          # pending OIDC sign-ins kept at most (oldest dropped first, A-14)
+OIDC_STATE_SECONDS = 600
+MFA_PENDING_SECONDS = 300      # OIDC sign-in waiting for the TOTP code (A-8)
+MFA_MAX_ATTEMPTS = 5
+OIDC_UNLINKED_MESSAGE = ("An account with this name already exists but is not linked to your sign-in identity. "
+                         "Ask an administrator to link the account.")
+
+
 class AuthError(Exception):
     def __init__(self, code: str, message: str, status: int = 401, **extra: Any):
         super().__init__(message)
@@ -96,7 +111,10 @@ class AuthService:
         old = self.auth_config()
         ldap = {**old["ldap"], **(new.get("ldap") or {})}
         if ldap.get("bindPassword") == MASK:
-            ldap["bindPassword"] = old["ldap"].get("bindPassword", "")
+            # The stored secret is only kept for the same server: a new URL needs the password again, so the
+            # old one is never sent to a server it was not meant for (A-11).
+            same = _same_endpoint(ldap.get("url"), old["ldap"].get("url"))
+            ldap["bindPassword"] = old["ldap"].get("bindPassword", "") if same else ""
         ldap["allowInsecure"] = ldap.get("allowInsecure") is True  # strict bool; anything else = secure default
         if ldap.get("enabled") and ldap_transport_insecure(ldap):
             raise ValueError(LDAP_INSECURE_MESSAGE)
@@ -106,8 +124,15 @@ class AuthService:
             if not o.get("id"):
                 continue
             security.safe_name(o["id"])
+            prev = oidc_old.get(o["id"])
             if o.get("clientSecret") == MASK:
-                o["clientSecret"] = (oidc_old.get(o["id"]) or {}).get("clientSecret", "")
+                # kept only while the issuer is unchanged (A-11)
+                same = prev is not None and _same_endpoint(o.get("issuer"), prev.get("issuer"))
+                o["clientSecret"] = prev.get("clientSecret", "") if same else ""
+            if "stripDomain" not in o:
+                # A-5: a new provider keeps the whole e-mail address / user name; an existing one keeps the
+                # behaviour it had (the old default removed the domain).
+                o["stripDomain"] = bool(prev.get("stripDomain", True)) if prev is not None else False
             oidc.append(o)
         self.db.set_setting("auth", {"localEnabled": bool(new.get("localEnabled", old["localEnabled"])),
                                      "ldap": ldap, "oidc": oidc})
@@ -119,6 +144,31 @@ class AuthService:
         if self.ipblock.record_failure(ip, username):
             return AuthError("ip_blocked", BLOCKED_MESSAGE, 403)
         return AuthError(code, message, status)
+
+    def _refuse_locked(self, user: dict, username: str, password: str, ip: str, cfg: dict) -> AuthError:
+        """The answer for a sign-in to a locked account (A-3).
+
+        With a wrong password it is exactly the wrong-password answer (401 invalid_credentials after the same
+        scrypt work, counted toward the caller's IP block like any failure), so the lock is neither visible to
+        a guesser nor a user-name oracle. Only the correct password learns "temporarily locked" (423), and that
+        refusal is not counted toward the caller's address: the owner retrying cannot get their own network
+        blocked. The account's failure counter is not raised while it is locked, so the lock is not extended."""
+        right = False
+        if user["disabled"]:
+            security.verify_password(password, None)
+        elif user["auth_source"] == "local":
+            hashed = user["password_hash"] if (cfg["localEnabled"] or user["role"] == "admin") else None
+            right = security.verify_password(password, hashed) and hashed is not None
+        elif user["auth_source"] == "ldap" and cfg["ldap"].get("enabled") and not ldap_transport_insecure(cfg["ldap"]):
+            checked = self._ldap_login(username, password, user, cfg["ldap"])
+            right = bool(checked and checked["id"] == user["id"])
+        else:
+            security.verify_password(password, None)
+        self.db.audit("auth.login", user=user, ip=ip, target=username, ok=False,
+                      detail={"reason": "locked", "passwordCorrect": right})
+        if right:
+            return AuthError("locked", "Account temporarily locked after failed attempts. Try again later.", 423)
+        return self._fail(ip, username, "invalid_credentials", "Invalid username or password")
 
     def login(self, username: str, password: str, totp: str | None, ip: str) -> dict:
         username = (username or "").strip()
@@ -133,8 +183,7 @@ class AuthService:
         user = self.db.user_by_name(username)
         cfg = self.auth_config()
         if user and user["locked_until"] > time.time():
-            raise self._fail(ip, username, "locked",
-                             "Account temporarily locked after failed attempts. Try again later.", 423)
+            raise self._refuse_locked(user, username, password, ip, cfg)
         ok = False
         if user is None or user["auth_source"] == "ldap":
             if cfg["ldap"].get("enabled") and ldap_transport_insecure(cfg["ldap"]):
@@ -152,10 +201,17 @@ class AuthService:
                 security.verify_password(password, None)  # constant-ish time
         elif user["auth_source"] == "local":
             if not cfg["localEnabled"] and user["role"] != "admin":
-                raise self._fail(ip, username, "invalid_credentials", "Local sign-in is disabled")
+                # Same reply and the same scrypt cost as an unknown name (A-9): the name stays undisclosed.
+                security.verify_password(password, None)
+                self.db.audit("auth.login", user=user, ip=ip, target=username, ok=False,
+                              detail={"reason": "local sign-in disabled"})
+                raise self._fail(ip, username, "invalid_credentials", "Invalid username or password")
             ok = security.verify_password(password, user["password_hash"])
             if ok and security.needs_rehash(user["password_hash"]):
                 self.db.update_user(user["id"], password_hash=security.hash_password(password))
+        else:
+            # OIDC accounts have no password here: pay the same scrypt cost as every other refusal (A-9).
+            security.verify_password(password, None)
         if not ok or not user:
             if user:
                 self._record_failure(user)
@@ -307,24 +363,37 @@ class AuthService:
         self._oidc_meta[o["id"]] = (time.time(), meta)
         return meta
 
-    async def oidc_start(self, pid: str, redirect_uri: str) -> str:
+    async def oidc_start(self, pid: str, redirect_uri: str, binding: str = "") -> str:
+        """The IdP authorization URL for a new sign-in. `binding` is the random value of the pre-sign-in browser
+        cookie set by the API (A-4); its hash is kept with the state, and the callback must present it."""
         o = self._oidc_provider(pid)
         meta = await self._oidc_discovery(o)
         state, verifier, nonce = secrets.token_urlsafe(24), secrets.token_urlsafe(48), secrets.token_urlsafe(16)
-        self.db.execute("DELETE FROM oidc_states WHERE created_at < ?", (time.time() - 600,))
-        self.db.execute("INSERT INTO oidc_states(state, verifier, nonce, created_at) VALUES(?,?,?,?)",
-                        (state, verifier, f"{pid}|{nonce}", time.time()))
+        now = time.time()
+        self.db.execute("DELETE FROM oidc_states WHERE created_at < ?", (now - OIDC_STATE_SECONDS,))
+        # Anonymous callers create these rows: keep at most OIDC_STATE_CAP, the oldest go first (A-14).
+        self.db.execute("DELETE FROM oidc_states WHERE state IN (SELECT state FROM oidc_states "
+                        "ORDER BY created_at DESC LIMIT -1 OFFSET ?)", (OIDC_STATE_CAP - 1,))
+        self.db.execute("INSERT INTO oidc_states(state, verifier, nonce, created_at, binding) VALUES(?,?,?,?,?)",
+                        (state, verifier, f"{pid}|{nonce}", now, security.token_hash(binding) if binding else None))
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
         q = {"response_type": "code", "client_id": o["clientId"], "redirect_uri": redirect_uri,
              "scope": o.get("scopes") or "openid profile email", "state": state, "nonce": nonce,
              "code_challenge": challenge, "code_challenge_method": "S256"}
         return meta["authorization_endpoint"] + "?" + urllib.parse.urlencode(q)
 
-    async def oidc_callback(self, pid: str, code: str, state: str, redirect_uri: str, ip: str) -> dict:
+    async def oidc_callback(self, pid: str, code: str, state: str, redirect_uri: str, ip: str,
+                            binding: str | None = None) -> dict:
+        """Finish an OIDC sign-in. `binding` is the pre-sign-in cookie value (None only for internal callers
+        that never set one): when the state was bound to a browser, only that browser may finish it (A-4)."""
         row = self.db.one("SELECT * FROM oidc_states WHERE state=?", (state or "",))
         self.db.execute("DELETE FROM oidc_states WHERE state=?", (state or "",))
-        if not row or time.time() - row["created_at"] > 600:
+        if not row or time.time() - row["created_at"] > OIDC_STATE_SECONDS:
             raise AuthError("oidc_state", "Sign-in expired, try again", 400)
+        stored = row.get("binding") or ""
+        if (stored or binding is not None) and not (binding and security.consteq(security.token_hash(binding), stored)):
+            log.warning("OIDC callback refused: the state was not started by this browser (provider %s)", pid)
+            raise AuthError("oidc_browser", "This sign-in was started in another browser. Start it again here.", 400)
         rpid, nonce = row["nonce"].split("|", 1)
         if rpid != pid:
             raise AuthError("oidc_state", "Sign-in mismatch", 400)
@@ -389,6 +458,13 @@ class AuthService:
                 # same username, but bound to a different identity (other provider or other person)
                 log.warning("OIDC sign-in for %s refused: account is bound to a different identity", username)
                 raise AuthError("oidc_conflict", "This account is linked to a different sign-in identity", 409)
+            if existing and not _verified_email_matches(claims, existing.get("email")):
+                # A-5: an existing, unbound account (pre-provisioned, switched to OIDC, or created before GW-12) is
+                # never claimed by its name alone: only by the verified e-mail address an admin recorded on it.
+                log.warning("OIDC sign-in for %s refused: unbound account and no verified matching e-mail", username)
+                self.db.audit("auth.oidc.unlinked", ip=ip, target=existing["username"], ok=False,
+                              detail={"issuer": iss, "provider": pid})
+                raise AuthError("oidc_unlinked", OIDC_UNLINKED_MESSAGE, 409)
         user = self._upsert_external(existing, username, "oidc", claims.get("name") or username,
                                      claims.get("email") or "", role, teams, o.get("autoCreate", True))
         if not user or user["disabled"]:
@@ -404,8 +480,74 @@ class AuthService:
             if bound != 1:
                 raise AuthError("oidc_conflict", "This account is linked to a different sign-in identity", 409)
             self.db.audit("user.oidc.bind", user=user, target=user["username"], detail={"issuer": iss, "provider": pid})
-        self.db.update_user(user["id"], last_login_at=time.time())
+        if not user["totp_enabled"]:   # with two-factor, the sign-in completes in finish_mfa (A-8)
+            self.db.update_user(user["id"], last_login_at=time.time())
         return self.db.user_by_id(user["id"])
+
+    # ------------------------------------------------------------ second factor after OIDC (A-8)
+    def begin_mfa(self, user: dict, method: str) -> str:
+        """Park a sign-in that still needs the account's TOTP code; returns the token for the pending cookie."""
+        token = security.new_token()
+        now = time.time()
+        self.db.execute("DELETE FROM mfa_pending WHERE created_at < ? OR user_id=?", (now - MFA_PENDING_SECONDS, user["id"]))
+        self.db.execute("DELETE FROM mfa_pending WHERE token_hash IN (SELECT token_hash FROM mfa_pending "
+                        "ORDER BY created_at DESC LIMIT -1 OFFSET ?)", (OIDC_STATE_CAP - 1,))
+        self.db.execute("INSERT INTO mfa_pending(token_hash, user_id, method, created_at, attempts) VALUES(?,?,?,?,0)",
+                        (security.token_hash(token), user["id"], method[:64], now))
+        return token
+
+    def mfa_pending(self, token: str) -> dict | None:
+        """The pending row for a cookie value, if it is still valid."""
+        if not token or len(token) > 200:
+            return None
+        row = self.db.one("SELECT * FROM mfa_pending WHERE token_hash=?", (security.token_hash(token),))
+        if not row or time.time() - row["created_at"] > MFA_PENDING_SECONDS or row["attempts"] >= MFA_MAX_ATTEMPTS:
+            return None
+        return row
+
+    def finish_mfa(self, token: str, code: str, ip: str) -> tuple[dict, str]:
+        """Check the TOTP code of a pending OIDC sign-in; returns (user, method) or raises AuthError.
+        Wrong codes count toward the account lockout and the IP block, like a wrong code at password sign-in."""
+        if self.ipblock.is_blocked(ip):
+            raise AuthError("ip_blocked", BLOCKED_MESSAGE, 403)
+        if not self.ip_limiter.hit(ip):
+            raise AuthError("rate_limited", "Too many attempts. Wait a few minutes.", 429)
+        row = self.mfa_pending(token)
+        if row is None:
+            raise AuthError("mfa_expired", "This sign-in has expired. Sign in again.", 400)
+        user = self.db.user_by_id(row["user_id"])
+        if not user or user["disabled"] or not user["totp_enabled"]:
+            self.db.execute("DELETE FROM mfa_pending WHERE token_hash=?", (row["token_hash"],))
+            raise AuthError("mfa_expired", "This sign-in has expired. Sign in again.", 400)
+        if user["locked_until"] > time.time():
+            raise AuthError("locked", "Account temporarily locked after failed attempts. Try again later.", 423)
+        if not self.accept_totp(user, str(code or "").strip()):
+            self.db.execute("UPDATE mfa_pending SET attempts=attempts+1 WHERE token_hash=?", (row["token_hash"],))
+            self._record_failure(user)
+            self.db.audit("auth.totp", user=user, ip=ip, ok=False, detail={"method": row["method"]})
+            raise self._fail(ip, user["username"], "totp_invalid", "That code is not valid")
+        self.db.execute("DELETE FROM mfa_pending WHERE token_hash=?", (row["token_hash"],))
+        self.db.update_user(user["id"], failed_logins=0, locked_until=0, last_login_at=time.time())
+        self.ipblock.record_success(ip)
+        return self.db.user_by_id(user["id"]), row["method"]
+
+    def reauthenticate(self, user: dict, password: str, code: str = "") -> bool:
+        """Re-check who is at the keyboard before a sensitive change (turning two-factor off, A-8).
+
+        Local accounts: the current password. Directory (LDAP) accounts: a bind with the current password.
+        Accounts without a password here (OIDC): a current code from the authenticator app."""
+        password = str(password or "")
+        if user["auth_source"] == "local":
+            return bool(password) and security.verify_password(password, user["password_hash"])
+        if user["auth_source"] == "ldap":
+            cfg = self.auth_config()["ldap"]
+            if not password or not cfg.get("enabled") or ldap_transport_insecure(cfg):
+                security.verify_password(password, None)
+                return False
+            checked = self._ldap_login(user["username"], password, user, cfg)
+            return bool(checked and checked["id"] == user["id"])
+        code = str(code or password).strip()
+        return bool(user.get("totp_enabled")) and bool(code) and self.accept_totp(user, code)
 
     # ------------------------------------------------------------ sessions
     def session_seconds(self, remember: bool) -> float:
@@ -479,6 +621,15 @@ class AuthService:
             "INSERT INTO api_tokens(user_id, name, token_hash, prefix, created_at, expires_at) VALUES(?,?,?,?,?,?)",
             (user["id"], (name or "token")[:80], security.token_hash(token), token[:10], time.time(), exp))
         return tid, token
+
+
+def _verified_email_matches(claims: dict, stored: Any) -> bool:
+    """True when the IdP vouches for an e-mail address (email_verified true) equal to the account's stored one."""
+    verified = claims.get("email_verified")
+    if not (verified is True or str(verified).strip().lower() == "true"):
+        return False
+    email = str(claims.get("email") or "").strip().lower()
+    return bool(email) and "@" in email and email == str(stored or "").strip().lower()
 
 
 def _jwt_claims(jwt: str) -> dict:

@@ -49,9 +49,15 @@ def test_certificate_names_and_renewal(settings, monkeypatch):
     assert 85 <= cert["daysLeft"] <= 90 and st["ca"]["daysLeft"] > 3000
     ca_fp = st["ca"]["sha256"]
     assert not tls.ensure(settings)["renewed"]                                     # nothing to do
-    settings.data["server"]["tls_names"] = ["goose.lan", "10.20.30.40"]
+    settings.data["server"]["tls_names"] = ["10.20.30.40"]                         # private: inside the CA's constraints
     st2 = tls.ensure(settings)
-    assert st2["renewed"] and "goose.lan" in st2["reason"] and "10.20.30.40" in st2["cert"]["ips"]
+    assert st2["renewed"] and "10.20.30.40" in st2["reason"] and "10.20.30.40" in st2["cert"]["ips"]
+    assert st2["ca"]["sha256"] == ca_fp
+    settings.data["server"]["tls_names"] = ["goose.lan", "10.20.30.40"]           # a name the CA may not sign: new CA
+    st2 = tls.ensure(settings)
+    assert st2["renewed"] and "goose.lan" in st2["reason"] and st2["reason"].startswith("new CA")
+    assert st2["ca"]["sha256"] != ca_fp and "goose.lan" in st2["cert"]["dns"]
+    ca_fp = st2["ca"]["sha256"]
     monkeypatch.setattr(tls, "RENEW_DAYS", 120)                                    # now "about to expire"
     st3 = tls.ensure(settings)
     assert st3["renewed"] and st3["reason"].startswith("expires in")

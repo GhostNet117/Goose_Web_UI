@@ -72,6 +72,7 @@ def test_sandbox_spec_only_for_isolated_non_admins(tmp_path, monkeypatch):
     from goose_web.db import Database
     from goose_web.profiles import Profiles
     monkeypatch.setenv("GOOSE_WEB__PATHS__PROFILES_ROOT", str(tmp_path / "profiles"))
+    (tmp_path / "none.yaml").write_text("", encoding="utf-8")   # GOOSE_WEB_CONFIG must exist (A-10)
     monkeypatch.setenv("GOOSE_WEB_CONFIG", str(tmp_path / "none.yaml"))
     s = load_settings()
     db = Database(tmp_path / "gw.db")

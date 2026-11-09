@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import PurePath
 from typing import Any
 
 BOOL_KEYS = ["recipes_edit", "skills_edit", "extensions_edit", "providers_edit", "schedules", "apps",
@@ -40,8 +39,52 @@ ADMIN_POLICY: dict[str, Any] = {**{k: True for k in BOOL_KEYS}, **{k: [ANY] for 
 NO_TEAM_REASON = "You are not in a team yet, so you cannot chat. Ask your administrator to add you to a team."
 _LIST_LABELS = {"allowed_providers": "providers", "allowed_models": "models", "allowed_modes": "approval modes"}
 
-# Extensions that give the model a shell or arbitrary code execution.
-SHELL_EXTENSIONS = {"developer", "computercontroller", "code_execution", "orchestrator"}
+# Extensions that give the model a shell or arbitrary code execution, or that start other extensions / run recipes
+# (a recipe's extensions and retry checks are commands). Measured on Goose 1.57 (security assessment 2026-11-09):
+# summon's `delegate` runs any recipe it can find (a planted <cwd>/.goose/recipes/x.yaml with a stdio extension ran
+# its command), and `scheduler` creates scheduled recipe runs. Goose ENABLES bundled platform extensions that are
+# missing from config.yaml (developer, scheduler, ...), so profiles pin these as `enabled: false` (profiles.py).
+SHELL_EXTENSIONS = {"developer", "computercontroller", "code_execution", "orchestrator", "summon", "scheduler"}
+# extensionmanager turns any configured or bundled extension on from a tool call (developer included -> shell).
+EXTENSION_MANAGER = "extensionmanager"
+GUARDED_EXTENSIONS = SHELL_EXTENSIONS | {EXTENSION_MANAGER}
+# Extension types whose config is a command line or code (recipes, ACP extension configs, session exports).
+COMMAND_EXTENSION_TYPES = {"stdio", "inline_python"}
+# Keys a non-admin may send in session/new `_meta` (static/js/views/home.js); everything else is dropped.
+MEMBER_NEW_META_KEYS = {"recipeId", "recipeDeeplink", "enabledExtensions"}
+
+
+def ext_key(name: Any) -> str:
+    """Normalised extension name: 'Extension Manager', 'extension_manager' and 'extensionmanager' are the same."""
+    return "".join(ch for ch in str(name or "").lower() if ch.isalnum())
+
+
+_GUARDED_KEYS = {ext_key(n): n for n in GUARDED_EXTENSIONS}
+
+
+def extension_needs(name: Any) -> list[str]:
+    """The permissions a non-admin needs to turn the named extension on (beyond extensions_edit for adding it)."""
+    k = ext_key(name)
+    if k == ext_key(EXTENSION_MANAGER):
+        return ["extensions_edit", "allow_shell"]
+    if k in _GUARDED_KEYS:
+        return ["allow_shell"]
+    return []
+
+
+def missing(policy: dict, perms: list[str]) -> list[str]:
+    return [p for p in perms if not policy.get(p)]
+
+
+def is_command_extension(ext: Any) -> bool:
+    """True for an extension config that is a command line or code (stdio, inline_python, MCP server command)."""
+    if not isinstance(ext, dict):
+        return False
+    t = str(ext.get("type") or "").lower()
+    if t in COMMAND_EXTENSION_TYPES:
+        return True
+    server = ext.get("server") if isinstance(ext.get("server"), dict) else {}
+    return bool(ext.get("cmd") or ext.get("command") or ext.get("code") or server.get("command"))
 
 P = "_goose/unstable/"
 
@@ -246,6 +289,108 @@ def path_allowed(path: str, roots: list[str]) -> bool:
     return False
 
 
+def _plain_path(p: str) -> str:
+    """Drop the \\\\?\\ / \\\\?\\UNC\\ prefixes, normalise, lower-case on Windows."""
+    s = str(p or "").strip()
+    if s[:8].upper() == "\\\\?\\UNC\\":
+        s = "\\\\" + s[8:]
+    elif s[:4] in ("\\\\?\\", "//?/"):
+        s = s[4:]
+    s = os.path.normpath(s)
+    return s.lower() if sys.platform == "win32" else s
+
+
+def _is_drive_or_share_root(p: str) -> bool:
+    drive, rest = os.path.splitdrive(p)
+    return rest.strip("\\/") == ""
+
+
+def _same_or_inside(path: str, root: str) -> bool:
+    return bool(root) and _within(path, root)
+
+
+def folder_grant_problem(path: str, *, profiles_root: str, system_dir: str = "",
+                         native_roots: list[str] | None = None, users_root: str = "",
+                         own_home: str = "") -> str:
+    """Why `path` must not be a team's extra folder (allowed_roots) or shared folder (share_folder); "" = fine.
+
+    C-11 (security assessment 2026-11-09): members get these folders as chat roots and, with the sandbox, their
+    container gets recursive Modify on them. Refused: relative paths, device paths and alternate data streams,
+    drive and share roots, the profiles root, any folder inside it except the team folders (_teams) and any parent
+    of it, system_dir (inside or a parent of it), the native Goose roots (inside or a parent: %APPDATA%\\Block\\goose
+    and every native profile), %SystemRoot%, Program Files, ProgramData, the users folder (C:\\Users), any user's
+    profile folder itself, and anything inside another user's profile or inside AppData. Both the given path and
+    the path with junctions / symlinks resolved are checked."""
+    raw = str(path or "").strip()
+    if not raw or "\x00" in raw:
+        return "the folder is empty"
+    if raw[:4] in ("\\\\.\\", "//./"):
+        return "device paths are not allowed"
+    probe = raw[8:] if raw[:8].upper() == "\\\\?\\UNC\\" else raw[4:] if raw[:4] in ("\\\\?\\", "//?/") else raw
+    drive, rest = os.path.splitdrive(probe)
+    if ":" in rest:
+        return "the folder name contains ':' (alternate data stream)"
+    if not os.path.isabs(probe):
+        return "the folder must be an absolute path"
+    env = os.environ
+    home_drive = env.get("SystemDrive", "C:")
+    users = _plain_path(users_root or os.path.dirname(os.path.expanduser("~")) or home_drive + "\\Users")
+    own = _plain_path(own_home or os.path.expanduser("~"))
+    natives = [r for r in (native_roots or []) if r]
+    if env.get("APPDATA"):
+        natives.append(os.path.join(env["APPDATA"], "Block", "goose"))
+    system_dirs = [env.get("SystemRoot") or env.get("windir") or home_drive + "\\Windows"]
+    program = [env.get(k) for k in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData")
+               if env.get(k)] or [home_drive + "\\Program Files", home_drive + "\\Program Files (x86)",
+                                  home_drive + "\\ProgramData"]
+    profiles = _plain_path(profiles_root) if profiles_root else ""
+    teams = os.path.join(profiles, "_teams") if profiles else ""
+    cands = [_plain_path(probe)]
+    real = _real(probe)
+    if real:
+        cands.append(_plain_path(real))
+    for p in dict.fromkeys(cands):
+        if _is_drive_or_share_root(p):
+            return "a drive or share root cannot be shared"
+        if profiles and (_same_or_inside(profiles, p) or
+                         _same_or_inside(p, profiles) and not (p != teams and _same_or_inside(p, teams))):
+            return "the profiles root, a folder inside it (other than a team folder) or a parent of it " \
+                   "cannot be shared"
+        if system_dir and (_same_or_inside(p, _plain_path(system_dir)) or _same_or_inside(_plain_path(system_dir), p)):
+            return "the Goose Web system folder (or a parent of it) cannot be shared"
+        for n in natives:
+            n = _plain_path(n)
+            if _same_or_inside(p, n) or _same_or_inside(n, p):
+                return "a native Goose profile (or a parent of it) cannot be shared"
+        for s in system_dirs + program:
+            if _same_or_inside(p, _plain_path(s)) or _same_or_inside(_plain_path(s), p):
+                return "Windows and program folders cannot be shared"
+        if users and (p == users or os.path.dirname(p) == users):
+            return "the users folder or a user's profile folder cannot be shared"
+        if users and _same_or_inside(p, users):
+            if not _same_or_inside(p, own):
+                return "folders inside another user's profile cannot be shared"
+            if _same_or_inside(p, os.path.join(own, "appdata")):
+                return "AppData cannot be shared"
+    return ""
+
+
+def check_team_folders(policy: dict, **where: Any) -> None:
+    """Raise ValueError(reason) if the team policy's allowed_roots or share_folder is a dangerous folder
+    (folder_grant_problem). For the API's team policy normaliser (api._clean_policy)."""
+    for r in policy.get("allowed_roots") or []:
+        if r == ANY:
+            continue
+        why = folder_grant_problem(str(r), **where)
+        if why:
+            raise ValueError(f"{r}: {why}")
+    sf = str(policy.get("share_folder") or "").strip()
+    if sf:
+        why = folder_grant_problem(sf, **where)
+        if why:
+            raise ValueError(f"{sf}: {why}")
+
+
 def user_roots(policy: dict, workspace: str) -> list[str]:
     """Own workspace, the team's shared folder, then the team's extra folders ("*" is never a folder)."""
     extra = [r for r in policy.get("allowed_roots") or [] if r and r != ANY]
@@ -283,6 +428,172 @@ def check_tool_call_target(params: dict) -> None:
                          "only use tools of the extension it names")
 
 
+def enabled_extension_map(listing: Any, only_enabled: bool = True) -> dict[str, dict]:
+    """{ext_key(name): config entry} of the ENABLED (or all) extensions in a `config/extensions/list` result."""
+    out: dict[str, dict] = {}
+    items = listing.get("extensions") if isinstance(listing, dict) else None
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or only_enabled and not item.get("enabled"):
+            continue
+        e = item.get("extension") if isinstance(item.get("extension"), dict) else {}
+        for n in (item.get("configKey"), e.get("name")):
+            if n:
+                out[ext_key(n)] = e
+    return out
+
+
+def _same_command(a: dict, b: dict | None) -> bool:
+    if not isinstance(b, dict):
+        return False
+    keys = ("type", "cmd", "args", "code", "uri", "envs", "env_keys")
+    return all((a.get(k) or None) == (b.get(k) or None) for k in keys)
+
+
+def recipe_extension_names(recipe: Any) -> list[str]:
+    exts = recipe.get("extensions") if isinstance(recipe, dict) else None
+    return [str(e.get("name") or (e.get("server") or {}).get("name") or "?")[:100]
+            for e in exts or [] if isinstance(e, dict)][:50]
+
+
+def recipe_problems(recipe: Any, policy: dict, enabled: dict[str, dict] | None) -> list[str]:
+    """Why a non-admin may not run `recipe` (empty = allowed). B-1 (security assessment 2026-11-09): Goose starts
+    every entry of recipe.extensions when a session starts from a recipe (session/new `_meta.recipeId` /
+    `recipeDeeplink`, schedules), a stdio entry being any command line, so a recipe may only bring:
+    - extensions already enabled in the member's config (same type and command), or any non-command extension
+      with extensions_edit;
+    - command extensions (stdio, inline_python), shell-capable or extension-starting ones (GUARDED_EXTENSIONS)
+      only with allow_shell (and extensions_edit when not already enabled);
+    - sub_recipes (they run through summon) and retry checks / on_failure (shell commands) only with allow_shell;
+    - a provider / model the team allows.
+    `enabled` = enabled_extension_map(config/extensions/list); None = unknown: only the rules that do not depend on
+    the member's config apply (the hub repeats the check with the real map)."""
+    if not isinstance(recipe, dict):
+        return ["could not be read"]
+    out: list[str] = []
+    exts = recipe.get("extensions")
+    if exts is not None and not isinstance(exts, list):
+        return ["has an unreadable extensions list"]
+    for e in exts or []:
+        if not isinstance(e, dict):
+            out.append("has an unreadable extension entry")
+            continue
+        name = str(e.get("name") or (e.get("server") or {}).get("name") or "")
+        key = ext_key(name)
+        current = (enabled or {}).get(key)
+        label = f"extension '{name[:80]}'"
+        if is_command_extension(e):
+            need = ["allow_shell"] + ([] if _same_command(e, current) else ["extensions_edit"])
+            label = f"command extension '{name[:80]}'"
+        elif extension_needs(name):
+            need = extension_needs(name) + ([] if current is not None else ["extensions_edit"])
+        elif str(e.get("type") or "").lower() in ("platform", "builtin") and current is not None:
+            need = []
+        elif current is not None and _same_command(e, current):
+            need = []
+        else:
+            need = ["extensions_edit"] if enabled is not None else []
+        lack = missing(policy, need)
+        if lack:
+            out.append(f"starts the {label}, which needs the {' and '.join(lack)} permission")
+    if recipe.get("sub_recipes") and not policy.get("allow_shell"):
+        out.append("runs sub-recipes (through summon), which needs the allow_shell permission")
+    retry = recipe.get("retry")
+    if isinstance(retry, dict) and (retry.get("checks") or retry.get("on_failure")) and not policy.get("allow_shell"):
+        out.append("runs retry checks (shell commands), which needs the allow_shell permission")
+    settings = recipe.get("settings") if isinstance(recipe.get("settings"), dict) else {}
+    if settings.get("goose_provider") and not allows(policy, "allowed_providers", settings["goose_provider"]):
+        out.append(f"uses the provider '{str(settings['goose_provider'])[:80]}', which your team does not allow")
+    if settings.get("goose_model") and not allows(policy, "allowed_models", settings["goose_model"]):
+        out.append(f"uses the model '{str(settings['goose_model'])[:80]}', which your team does not allow")
+    return out
+
+
+def check_recipe(recipe: Any, policy: dict, enabled: dict[str, dict] | None, *, what: str = "this recipe") -> None:
+    probs = recipe_problems(recipe, policy, enabled)
+    if probs:
+        title = str((recipe or {}).get("title") or "") if isinstance(recipe, dict) else ""
+        raise Denied(f"{what}{' ' + repr(title[:80]) if title else ''} {probs[0]}"
+                     + (f" (and {len(probs) - 1} more problem(s))" if len(probs) > 1 else ""))
+
+
+def enabled_extensions_names(value: Any) -> list[str]:
+    """session/new `_meta.enabledExtensions`: a list of names / extension configs, or a {name: bool} map."""
+    if isinstance(value, dict):
+        return [str(k) for k, v in value.items() if v]
+    if isinstance(value, list):
+        out = []
+        for v in value:
+            if isinstance(v, dict):
+                out.append(str(v.get("name") or v.get("configKey") or v.get("key") or ""))
+            else:
+                out.append(str(v))
+        return out
+    return [str(value)] if value else []
+
+
+def check_enabled_extensions(value: Any, policy: dict, configured: dict[str, dict] | None = None) -> None:
+    """Members choosing session extensions (session/new `_meta.enabledExtensions`): extensions_edit, plus
+    allow_shell for shell-capable / extension-starting names and for command entries of the member's config."""
+    if not policy.get("extensions_edit"):
+        raise Denied("choosing session extensions needs the extensions_edit permission")
+    if isinstance(value, list) and any(isinstance(v, dict) and is_command_extension(v) for v in value):
+        if not policy.get("allow_shell"):
+            raise Denied("command-running extensions need the allow_shell permission")
+    for n in enabled_extensions_names(value):
+        lack = missing(policy, extension_needs(n))
+        entry = (configured or {}).get(ext_key(n))
+        if not lack and entry is not None and is_command_extension(entry):
+            lack = missing(policy, ["allow_shell"])
+        if lack:
+            raise Denied(f"the extension '{n[:80]}' needs the {' and '.join(lack)} permission")
+
+
+IMPORT_DROP_FOR_MEMBERS = ("container",)
+
+
+def sanitize_session_import(params: dict, policy: dict) -> dict | None:
+    """A non-admin's session/import: Goose restores `extension_data.enabled_extensions*` of an imported session on
+    session/load and starts every extension in it (a crafted stdio entry ran its command - measured on Goose 1.57).
+    Keep only the harmless bundled entries of that state (platform / builtin, not GUARDED_EXTENSIONS; Goose does not
+    fall back to the member's config for an imported session), drop a system-prompt override
+    without prompts_edit, and return the imported recipe (if any) for check_recipe. The input must be a JSON object."""
+    raw = params.get("input")
+    if not isinstance(raw, str):
+        raise Denied("session import needs the exported session JSON in 'input'")
+    try:
+        import json as _json
+        data = _json.loads(raw)
+    except ValueError:
+        raise Denied("only JSON session exports can be imported")
+    if not isinstance(data, dict):
+        raise Denied("only JSON session exports can be imported")
+    ed = data.get("extension_data")
+    if isinstance(ed, dict):
+        clean = {}
+        for k, v in ed.items():
+            if not str(k).lower().startswith("enabled_extensions"):
+                clean[k] = v
+                continue
+            # keep the harmless bundled ones (todo, skills, memory, ...) so the chat still has its tools
+            exts = v.get("extensions") if isinstance(v, dict) else None
+            keep = [e for e in exts or [] if isinstance(e, dict)
+                    and str(e.get("type") or "").lower() in ("platform", "builtin")
+                    and not is_command_extension(e) and not extension_needs(e.get("name"))]
+            clean[k] = {**v, "extensions": keep} if isinstance(v, dict) else {"extensions": keep}
+        data["extension_data"] = clean
+    elif ed is not None:
+        data["extension_data"] = {}
+    for k in IMPORT_DROP_FOR_MEMBERS:
+        data.pop(k, None)
+    if not policy.get("prompts_edit"):
+        data.pop("system_prompt_override", None)
+        data.pop("system_prompt_extras", None)
+    params["input"] = _json.dumps(data)
+    for k in [k for k in params if k not in ("input", "source")]:
+        params.pop(k, None)
+    return data.get("recipe") if isinstance(data.get("recipe"), dict) else None
+
+
 def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list[str]) -> None:
     """Raise Denied(reason) if the call is not allowed. May normalise params in place."""
     if not isinstance(method, str) or not method:
@@ -292,11 +603,19 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
         meta = params.get("_meta")
         if not isinstance(meta, dict):
             meta = {}
-        meta["client"] = "goose-web"
         meta.pop("hidden", None)
+        if not is_admin:
+            # B-1: only the keys the SPA sends; recipe keys are resolved and checked by the hub (Upstream).
+            meta = {k: v for k, v in meta.items() if k in MEMBER_NEW_META_KEYS}
+            if meta.get("enabledExtensions") is not None:
+                check_enabled_extensions(meta["enabledExtensions"], policy)
+            for k in ("recipeId", "recipeDeeplink"):
+                if k in meta and not isinstance(meta[k], str):
+                    raise Denied(f"{k} must be a string")
+        meta["client"] = "goose-web"
         params["_meta"] = meta
-        if not is_admin and meta.get("enabledExtensions") is not None and not policy.get("extensions_edit"):
-            raise Denied("choosing session extensions needs the extensions_edit permission")
+    if method in ("session/load", "session/resume") and not is_admin and "_meta" in params:
+        params.pop("_meta", None)   # the SPA sends none; nothing else reaches Goose from a non-admin (B-1)
     if method in ("session/new", "session/load", "session/fork", "session/resume"):
         # Goose persists per-session MCP servers given on ANY of these (prepare_session_for_activation), and a
         # stdio server is an arbitrary command: same rule for all four (1.7.0 security fix NEW-30; GW-32).
@@ -333,6 +652,8 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
     if method in (P + "config/upsert", P + "config/remove") and \
             str(params.get("key") or "").upper() in MANAGED_CONFIG_KEYS:
         raise Denied(f"{params.get('key')} is managed by Goose Web")
+    if method == P + "session/import":
+        sanitize_session_import(params, policy)   # the hub checks the imported recipe (if any)
     if method in ALWAYS:
         return
     if method in SOURCE_METHODS:
@@ -353,17 +674,40 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
             if method in (P + "session/extensions/add", P + "config/extensions/add"):
                 ext = params.get("extension") or {}
                 name = _ext_name(ext)
-                stdio = ext.get("type") == "mcp" and "command" in (ext.get("server") or {})
-                if (name in SHELL_EXTENSIONS or stdio) and not policy.get("allow_shell"):
+                if (extension_needs(name) or is_command_extension(ext)) and not policy.get("allow_shell"):
                     raise Denied("command-running extensions need the allow_shell permission")
-            if method == P + "config/extensions/set-enabled" and params.get("enabled") and \
-                    str(params.get("configKey") or "").lower() in SHELL_EXTENSIONS and not policy.get("allow_shell"):
-                raise Denied("shell extensions need the allow_shell permission")
-            tool_ext = str(params.get("extensionName") or "").lower()
-            tool_prefix = str(params.get("name") or params.get("toolName") or "").lower().split("__", 1)[0]
-            if method == P + "tools/call" and (tool_ext in SHELL_EXTENSIONS or tool_prefix in SHELL_EXTENSIONS) \
-                    and not policy.get("allow_shell"):
-                raise Denied("direct shell tool calls need the allow_shell permission")
+            if method == P + "config/extensions/set-enabled" and params.get("enabled"):
+                lack = missing(policy, extension_needs(params.get("configKey") or params.get("name")))
+                if lack:
+                    raise Denied(f"this extension needs the {' and '.join(lack)} permission")
+            if method == P + "config/extensions/remove":
+                # Goose enables a bundled platform extension that is missing from config.yaml (developer, scheduler,
+                # ...): removing the pinned `enabled: false` entry would turn it on (B-2).
+                key = params.get("configKey") or params.get("name") or params.get("key")
+                lack = missing(policy, extension_needs(key))
+                if lack:
+                    raise Denied(f"removing this extension would turn it on; it needs the {' and '.join(lack)} "
+                                 "permission")
+            if method == P + "tools/call":
+                tool_ext = ext_key(params.get("extensionName"))
+                name = str(params.get("name") or params.get("toolName") or "")
+                tool_prefix = ext_key(name.split("__", 1)[0]) if "__" in name else ""
+                if not tool_ext and not tool_prefix:
+                    raise Denied("a direct tool call must name its extension (extensionName)")
+                for k in {tool_ext, tool_prefix} - {""}:
+                    lack = missing(policy, extension_needs(k))
+                    if lack:   # B-3: extensionmanager enables developer; summon / scheduler run recipes
+                        raise Denied(f"direct calls to the {_GUARDED_KEYS.get(k, k)} extension need the "
+                                     f"{' and '.join(lack)} permission")
+            if method in (P + "config/upsert", P + "config/remove") and \
+                    str(params.get("key") or "").lower().split(".", 1)[0] == "extensions":
+                lack = missing(policy, ["extensions_edit", "allow_shell"])
+                if lack:   # the raw extensions map can hold stdio commands and re-enable developer
+                    raise Denied(f"editing the raw extensions config needs the {' and '.join(lack)} permission")
+            if method in (P + "schedules/create", P + "schedules/update") and "recipe" in params:
+                # a scheduled recipe starts its extensions (a stdio entry ran its command on run-now - measured);
+                # the hub repeats this check with the member's enabled extensions
+                check_recipe(params.get("recipe"), policy, None, what="the scheduled recipe")
             if method == P + "config/upsert":
                 key = CONFIG_LIST_KEYS.get(str(params.get("key")).upper())
                 if key and params.get("value") is not None and not allows(policy, key, params.get("value")):

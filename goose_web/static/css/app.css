@@ -278,6 +278,10 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .chk { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; font-size: .93em; }
 .chk input { margin: 0; width: 15px; height: 15px; }
 .chk-list { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.picker { max-height: 320px; overflow: auto; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; }
+.picker.chk-list { flex-direction: column; flex-wrap: nowrap; }
+.pick-group > summary { cursor: pointer; padding: 4px 0; }
+.pick-group .chk-list { flex-direction: column; padding-left: 12px; }
 
 /* ---------- Badges / chips / pills ---------- */
 .badge {
@@ -767,7 +771,10 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .plan-in_progress .plan-mark { color: var(--accent-2); }
 
 /* ---------- Markdown ---------- */
-.md { overflow-wrap: anywhere; line-height: 1.62; }
+/* Rendered markdown is untrusted (model, tool, repo content): contain it so nothing inside can be
+   positioned or painted outside its own box, e.g. over the app (security assessment 2026-11-09 D-1). */
+.md { overflow-wrap: anywhere; line-height: 1.62; position: relative; contain: layout paint; isolation: isolate; max-width: 100%; }
+.md img, .md video { max-width: 100%; height: auto; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
 .md p, .md ul, .md ol, .md blockquote, .md table, .md pre { margin: 0 0 .8em; }
@@ -791,7 +798,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .md .code-head, .md .codeblock-head { display: flex; align-items: center; justify-content: space-between; padding: 3px 6px 3px 12px; background: var(--bg-3); border-bottom: 1px solid var(--border); font: 500 11.5px var(--mono); color: var(--fg-3); }
 .md .code-head .btn-icon, .md .codeblock-head .btn-icon { width: 24px; height: 24px; }
 .md input[type="checkbox"] { margin: 0 6px 0 0; vertical-align: middle; }
-.md-inline { display: inline; } .md-inline p { display: inline; margin: 0; }
+.md-inline { display: inline-block; vertical-align: top; } .md-inline p { display: inline; margin: 0; }
 .md-preview { padding: 14px; border: 1px solid var(--border); border-radius: var(--r); background: var(--bg-2); min-height: 120px; overflow: auto; }
 .hljs { background: transparent !important; }
 
@@ -853,6 +860,12 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .ask-elicitation .ask-pulse, .ask-recipe_params .ask-pulse { background: var(--accent); }
 .ask-body { padding: 8px 12px 12px; display: flex; flex-direction: column; gap: 8px; }
 .ask-title { font-weight: 500; overflow-wrap: anywhere; }
+.ask-source { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; overflow-wrap: anywhere; }
+.ask-source code { font-size: .95em; }
+.ask-warn { display: flex; align-items: flex-start; gap: 6px; color: var(--fg-2); }
+.ask-warn .icw { flex: none; margin-top: 2px; color: var(--warn); }
+.ask-warn-strong { color: var(--warn); font-weight: 500; }
+.modal-body .ask-source, .modal-body .ask-warn { margin-bottom: 10px; }
 .ask-cmd { margin: 0; padding: 8px 10px; border-radius: var(--r-sm); background: var(--term-bg); color: var(--term-fg); border: 1px solid var(--border); font: 12.5px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow: auto; }
 .ask-raw > summary { font-size: .82em; color: var(--fg-3); padding: 2px 0; }
 .ask-raw > summary::before { content: "\25B8  "; }

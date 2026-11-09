@@ -42,6 +42,9 @@ command -v goose >/dev/null 2>&1 || {
 }
 
 cd "$ROOT"
+# The gateway runs the code and the venv in this folder: nobody but this user may change them
+# ("goose-web check" fails while the folder is writable by others).
+chmod -R go-w "$ROOT"
 if [ ! -x .venv/bin/python ]; then
   if command -v uv >/dev/null 2>&1; then uv venv --python 3.13 .venv || uv venv .venv
   else python3 -m venv .venv; fi
@@ -55,6 +58,7 @@ else
   .venv/bin/python -m pip install --require-hashes -r requirements.lock
   .venv/bin/python -m pip install --no-deps -e .
 fi
+chmod -R go-w "$ROOT/.venv"
 
 SYS="$PROFILES_ROOT/_system"
 CFG="$SYS/config.yaml"

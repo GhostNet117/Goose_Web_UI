@@ -11,7 +11,12 @@ class Router extends Emitter {
     let query = {};
     const qi = s.indexOf('?');
     if (qi >= 0) { query = Object.fromEntries(new URLSearchParams(s.slice(qi + 1))); s = s.slice(0, qi); }
-    const parts = s.split('/').filter(Boolean).map(decodeURIComponent);
+    let parts;
+    try { parts = s.split('/').filter(Boolean).map(decodeURIComponent); }
+    catch {
+      // malformed %-escape (e.g. #/chat/%): fall back to the home route, without the query (it only prefills)
+      return { view: '', args: [], query: {}, path: '/', malformed: true };
+    }
     return { view: parts[0] || '', args: parts.slice(1), query, path: '/' + parts.join('/') };
   }
   current() { return this.parse(); }

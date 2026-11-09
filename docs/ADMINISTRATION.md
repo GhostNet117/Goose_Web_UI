@@ -653,14 +653,22 @@ How it works:
 
 - Authorization code flow with PKCE, state and nonce (valid for 10 minutes). The ID token's issuer, audience,
   expiry and nonce are checked, and userinfo claims are merged when available.
-- The user name comes from `preferred_username`, else `email`, else `sub`. By default the domain part is removed
-  (`alice@example.org` becomes `alice`; the provider option `stripDomain: false`, settable through the API, keeps
-  it). Characters other than letters, digits, `.`, `_` and `-` become `-`.
+- The user name comes from `preferred_username`, else `email`, else `sub`. New providers keep the domain part
+  (`stripDomain` defaults to off since 1.12; providers saved before keep their setting). Characters other than
+  letters, digits, `.`, `_` and `-` become `-`.
 - The account is bound to the stable issuer + subject pair of its first sign-in. Later sign-ins must come from the
   same identity. A different identity for the same user name gets `oidc_conflict`, and a local or LDAP account with
   that name is never taken over.
-- To pre-create a user, add it in Admin > Users with sign-in "OIDC / SSO" and the expected user name; the first
-  sign-in binds it.
+- An existing account that is not bound yet (pre-created, or from an older version) is bound only when the identity
+  provider reports a **verified** e-mail (`email_verified: true`) equal to the account's e-mail. Otherwise sign-in is
+  refused with `oidc_unlinked` ("ask an administrator to link the account"): give the account its e-mail address in
+  Admin > Users first. A matching user name alone is never enough (1.12).
+- The sign-in is tied to the browser that started it (a short-lived `gw_oidc` cookie): a link to the callback
+  opened in another browser fails with `oidc_browser`.
+- Accounts with two-factor enabled must enter their code after the identity provider (a short server page) since
+  1.12.
+- To pre-create a user, add it in Admin > Users with sign-in "OIDC / SSO", the expected user name **and its e-mail
+  address**; the first sign-in with that verified e-mail binds it.
 - Role and team claims are applied at every sign-in (the native-profile admin is never demoted). A matching team
   replaces the user's previous team; if several team names match, the first one wins (audit
   `user.team.directory`). Without a match an existing user keeps their team, and a new user joins the default
@@ -713,9 +721,11 @@ docker compose -f docker/compose.yaml exec goose-web python -m goose_web user re
   cannot set up or enable two-factor (`403 totp_self_disabled`). Admins can always enrol.
 - Admin > Settings > "Require two-factor for administrators" (`require_totp_admins`, default off). It can only be
   switched on by an admin who already uses two-factor (`409 totp_needed_first`). While it is on, admins cannot turn
-  their two-factor off. Admins without two-factor are reported as `totpEnrolmentRequired` by the sign-in response
-  and `/api/me`; enrolment is not forced at sign-in, so check that every admin has enrolled (the user list shows a
-  "2FA" badge).
+  their two-factor off, and **an admin without two-factor can do nothing but enrol** (since 1.12): after signing in
+  they see a "Set up two-factor sign-in" screen, and every other API call, API token and the WebSocket answer
+  `403 totp_enrolment_required` until they have enrolled.
+- Turning two-factor off always asks for proof: the password (local accounts and LDAP) or a current code (OIDC
+  accounts).
 - **Lost authenticator.** Admin > Users > actions menu > "Reset two-factor" (or `user reset-totp NAME` on the
   gateway host, or `POST /api/admin/users/{id}/reset-totp`) removes the user's two-factor, clears the lock, ends
   all of their sessions and revokes their API tokens. It is audited as `user.totp.reset`. The user signs in with
@@ -831,7 +841,7 @@ grouped by topic:
 | Group | What you set there |
 |---|---|
 | Hints | **Team hints** (documents from the Hints library) and "Members may add personal hints" (`hints_edit`) |
-| Providers & models | **Allowed providers** and **Allowed models** (each with an **Any** switch), **Default provider**, **Default model**, "Edit providers & models" (`providers_edit`), provider library items |
+| Providers & models | **Allowed providers** and **Allowed models**, picked from lists (1.12): the providers your own Goose knows (configured ones first, "Show all" for the rest) and, per allowed provider, its models with their context size and All/None buttons; each list has an **Any** switch, and ids Goose does not list can be added by hand. **Default provider** and **Default model** are drop-downs of what is allowed. "Edit providers & models" (`providers_edit`), provider library items |
 | Approval modes | **Allowed approval modes**: Auto, Approve, Smart approve, Chat only, or **Any** |
 | Folders | **Team folder**, **Extra folders**, **Max concurrent runs** |
 | Extensions & tools | `allow_shell`, `extensions_edit`, `tools_permissions`, `apps`, extension library items |
@@ -1075,7 +1085,14 @@ Every non-native user gets `<profiles_root>/<username>/`, which is the `GOOSE_PA
 - The profile is created when the user is created in the admin UI or at their first sign-in.
 - The first provisioning copies the base platform extensions (`todo`, `skills`, `apps`, `chatrecall`, `summarize`,
   `extensionmanager`, `analyze`, `memory`, `summon`, `tom`) from the native admin's configuration when they exist
-  there, sets `GOOSE_MODE: approve`, and writes the `developer` extension as disabled unless `allow_shell` is on.
+  there and sets `GOOSE_MODE: approve`.
+- Members without `allow_shell` never get a command-running extension: `developer`, `computercontroller`,
+  `code_execution`, `orchestrator`, `summon` (it runs sub-recipes) and `scheduler` (it runs recipes) are written
+  **disabled** (removing them would let Goose turn them on by default), `extensionmanager` is disabled unless the
+  team has both `extensions_edit` and `allow_shell` (it can switch a disabled extension back on), and command
+  (stdio) extensions from team items are not written at all (their secrets are not copied). Other bundled
+  extensions that are not in the base set are written disabled. Granting the permission later restores them.
+  The provisioning record is kept in `<system_dir>/manifests/<user id>.json`, outside the user's reach (1.12).
   If the admin's provider is also provided to the user as a team item (and allowed), the admin's provider and model
   become the user's default.
 - Isolated workers get `GOOSE_DISABLE_KEYRING=1` (secrets stay in the profile's `secrets.yaml`), a

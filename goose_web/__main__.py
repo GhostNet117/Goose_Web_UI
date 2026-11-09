@@ -5,9 +5,11 @@ import argparse
 import logging
 import logging.handlers
 import os
+import re
 import socket
 import sys
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 
@@ -353,23 +355,57 @@ def cmd_sandbox(args, settings) -> int:
             print(f"  {st.get('name')}  {st.get('sid')}")
             for p, r in sorted((st.get("grants") or {}).items()):
                 print(f"      {r:6}  {p}")
+            for p, r in sorted((st.get("pending") or {}).items()):
+                print(f"      {r:6}  {p}  (folder missing now; revoked when it is back)")
         return 0
     from .db import Database
     db = Database(settings.system_dir / "goose-web.db")
-    u = db.user_by_name(args.user or "")
-    name = sb.container_name(str(settings.profiles_root), u["username"] if u else (args.user or ""))
     from . import relay as rl
     from .profiles import Profiles
-    restored = rl.undo_relays(state_dir, name, str(Profiles(settings, db).root_for(u)) if u else None)
-    if restored:
-        print(f"Restored the relayed service URLs in {len(restored)} file(s).")
-    st = sb.remove(state_dir, name)
-    if not st:
-        print(f"No sandbox recorded for {args.user!r} ({name}).")
+    prof = Profiles(settings, db)
+    pr = str(settings.profiles_root)
+    if getattr(args, "all", False):
+        # every recorded container (also those of deleted users and 1.11-named ones), e.g. before an uninstall
+        owners: dict[str, Any] = {}
+        for usr in db.users():
+            for n in (sb.container_name(pr, usr["username"]), sb.legacy_container_name(pr, usr["username"])):
+                owners.setdefault(n, usr)
+        names = [st.get("name") for st in sb.all_states(state_dir) if st.get("name")]
+        names += [f.name[:-len(".relays.json")] for f in sorted(Path(state_dir).glob("GooseWeb.*.relays.json"))]
+        done = 0
+        for name in dict.fromkeys(names):
+            usr = owners.get(name)
+            rl.undo_relays(state_dir, name, str(prof.root_for(usr)) if usr else None)
+            st = sb.remove(state_dir, name)
+            if st:
+                done += 1
+                kept = sb.load_state(state_dir, name).get("pending") or {}
+                print(f"Removed {name}{' (' + usr['username'] + ')' if usr else ''}: revoked "
+                      f"{len({**(st.get('pending') or {}), **(st.get('grants') or {})}) - len(kept)} grant(s)"
+                      + (f"; {len(kept)} on missing folders stay recorded" if kept else ""))
+        db.audit("sandbox.remove", target="*", detail={"containers": done, "via": "cli"})
+        print(f"Removed {done} sandbox container(s).")
+        return 0
+    if not args.user:
+        print("error: give a user name, or --all", file=sys.stderr)
+        return 2
+    u = db.user_by_name(args.user or "")
+    uname = u["username"] if u else (args.user or "")
+    removed = []
+    for name in (sb.container_name(pr, uname), sb.legacy_container_name(pr, uname)):
+        restored = rl.undo_relays(state_dir, name, str(prof.root_for(u)) if u else None)
+        if restored:
+            print(f"Restored the relayed service URLs in {len(restored)} file(s).")
+        st = sb.remove(state_dir, name)
+        if st:
+            removed.append(name)
+            print(f"Removed {name}: revoked {len(st.get('grants') or {})} grant(s), deleted the AppContainer profile.")
+    if not removed:
+        print(f"No sandbox recorded for {args.user!r} ({sb.container_name(pr, uname)}).")
         return 1
-    db.audit("sandbox.remove", target=args.user or "", detail={"container": name, "via": "cli"})
-    print(f"Removed {name}: revoked {len(st.get('grants') or {})} grant(s), deleted the AppContainer profile. "
-          "Stop the user's worker first if the gateway is running (Admin > System); a new start recreates it.")
+    db.audit("sandbox.remove", target=args.user or "", detail={"container": removed[0], "containers": removed,
+                                                               "via": "cli"})
+    print("Stop the user's worker first if the gateway is running (Admin > System); a new start recreates it.")
     return 0
 
 
@@ -488,6 +524,107 @@ def cmd_ip(args, settings) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ install folder permissions (C-4)
+# Principals every (or almost every) local account is part of: write access for them = any local user can change
+# the gateway's code and get it run as the gateway's account.
+BROAD_PRINCIPALS = {"WD": "Everyone", "S-1-1-0": "Everyone", "AU": "Authenticated Users", "S-1-5-11": "Authenticated Users",
+                    "BU": "Users", "S-1-5-32-545": "Users", "IU": "Interactive", "S-1-5-4": "Interactive"}
+_SDDL_RIGHTS = {"GA": 0x10000000, "GX": 0x20000000, "GW": 0x40000000, "GR": 0x80000000, "SD": 0x10000, "RC": 0x20000,
+                "WD": 0x40000, "WO": 0x80000, "FA": 0x1F01FF, "FR": 0x120089, "FW": 0x120116, "FX": 0x1200A0,
+                "CC": 0x1, "DC": 0x2, "LC": 0x4, "SW": 0x8, "RP": 0x10, "WP": 0x20, "DT": 0x40, "LO": 0x80,
+                "CR": 0x100, "KA": 0xF003F, "KR": 0x20019, "KW": 0x20006, "KX": 0x20019}
+# write data / add file, append / add subfolder, delete child, DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_WRITE/ALL
+_WRITE_MASK = 0x2 | 0x4 | 0x40 | 0x10000 | 0x40000 | 0x80000 | 0x40000000 | 0x10000000
+
+
+def _sddl_mask(rights: str) -> int:
+    if rights.lower().startswith("0x"):
+        return int(rights, 16)
+    mask = 0
+    for i in range(0, len(rights) - 1, 2):
+        mask |= _SDDL_RIGHTS.get(rights[i:i + 2].upper(), 0)
+    return mask
+
+
+def sddl_broad_writers(sddl: str) -> list[str]:
+    """Broad principals (Everyone, Authenticated Users, Users, Interactive) an SDDL's DACL lets write, delete or
+    change permissions - directly or for the folder's children (inherit-only ACEs count too)."""
+    dacl = sddl.split("D:", 1)[1].split("S:", 1)[0] if "D:" in sddl else ""
+    out: list[str] = []
+    for ace in re.findall(r"\(([^)]*)\)", dacl):
+        parts = ace.split(";")
+        if len(parts) < 6 or parts[0].upper() not in ("A", "OA"):
+            continue
+        who = BROAD_PRINCIPALS.get(parts[5].strip().upper())
+        if who and _sddl_mask(parts[2].strip()) & _WRITE_MASK and who not in out:
+            out.append(who)
+    return out
+
+
+def _path_sddl(path: str) -> str:
+    import ctypes
+    from ctypes import wintypes
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv.GetNamedSecurityInfoW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p,
+                                          ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                                          ctypes.POINTER(ctypes.c_void_p)]
+    adv.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    adv.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR), ctypes.c_void_p]
+    k32.LocalFree.argtypes = [ctypes.c_void_p]
+    dacl, sd = ctypes.c_void_p(), ctypes.c_void_p()
+    rc = adv.GetNamedSecurityInfoW(path, 1, 4, None, None, ctypes.byref(dacl), None, ctypes.byref(sd))  # FILE, DACL
+    if rc:
+        raise OSError(rc, f"GetNamedSecurityInfo({path}) failed")
+    try:
+        s = wintypes.LPWSTR()
+        if not adv.ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, 4, ctypes.byref(s), None):
+            raise OSError(ctypes.get_last_error(), "ConvertSecurityDescriptorToStringSecurityDescriptor failed")
+        try:
+            return s.value or ""
+        finally:
+            k32.LocalFree(s)
+    finally:
+        k32.LocalFree(sd)
+
+
+def broad_writers(path: str) -> list[str]:
+    """Who besides administrators/the owner may change `path` (Windows: broad principals in its DACL; POSIX: 'others'
+    when it is world-writable)."""
+    if os.name == "nt":
+        return sddl_broad_writers(_path_sddl(path))
+    import stat
+    return ["others"] if os.stat(path).st_mode & stat.S_IWOTH else []
+
+
+def install_paths() -> list[str]:
+    """The folders whose content the gateway runs: the install folder (git clone), its .git and goose_web, the venv."""
+    pkg = Path(__file__).resolve().parent
+    out = []
+    if (pkg.parent / "pyproject.toml").exists():
+        out += [pkg.parent, pkg.parent / ".git"]
+    out += [pkg, Path(sys.prefix), Path(sys.prefix) / ("Scripts" if os.name == "nt" else "bin")]
+    seen: dict[str, None] = {}
+    for p in out:
+        if p.exists():
+            seen.setdefault(str(p), None)
+    return list(seen)
+
+
+def install_acl_problems(paths: list[str] | None = None) -> list[tuple[str, list[str]]]:
+    out = []
+    for p in paths if paths is not None else install_paths():
+        try:
+            who = broad_writers(p)
+        except OSError as e:
+            out.append((p, [f"(cannot read its permissions: {e})"]))
+            continue
+        if who:
+            out.append((p, who))
+    return out
+
+
 def cmd_check(args, settings) -> int:
     from . import winsec
     from .workers import desktop_running, goose_version
@@ -520,6 +657,19 @@ def cmd_check(args, settings) -> int:
                     ". See docs/ADMINISTRATION.md 11.7.")
     line("running as", f"{winsec.current_user()} integrity={winsec.integrity_level()}", not winsec.is_elevated())
     line("profiles root", settings.profiles_root, settings.profiles_root.exists())
+    bad = install_acl_problems()
+    line("install folder permissions",
+         "only the installing account, administrators and SYSTEM can change the code" if not bad else
+         "; ".join(f"{p} is writable by {', '.join(w)}" for p, w in bad) +
+         " - any local user could change the code the gateway runs. Restrict it (scripts/install.ps1 does: "
+         "icacls <folder> /inheritance:r /grant:r <you>:(OI)(CI)F *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F "
+         "[<run-as account>:(OI)(CI)RX]; POSIX: chmod -R go-w)", not bad)
+    # Programs the gateway also runs but that are not its own folders: reported, not failed (install.ps1 does not
+    # change their permissions).
+    others = [str(Path(sys.base_prefix))] + ([os.path.dirname(gb)] if gb and os.path.isabs(gb) else [])
+    for p, w in install_acl_problems([p for p in dict.fromkeys(others) if os.path.isdir(p)]):
+        print(f"[--] program folder {p} is writable by {', '.join(w)}: any local user could change a program the "
+              "gateway runs; restrict it")
     if os.name == "nt":
         line("goose desktop running", desktop_running(gb))
     port = int(settings.get("server", "port"))
@@ -605,9 +755,11 @@ def main(argv: list[str] | None = None) -> int:
     nh.add_argument("--adopt", action="store_true",
                     help="enable: keep the current .goosehints as a hints document (on --team, else on the user)")
     nh.add_argument("--doc-name", help="name for the adopted document (default '<user> goose hints')")
-    sbx = sub.add_parser("sandbox", help="per-user AppContainer sandbox: status, or remove one user's")
+    sbx = sub.add_parser("sandbox", help="per-user AppContainer sandbox: status, or remove one user's (or all)")
     sbx.add_argument("action", choices=["status", "remove"])
     sbx.add_argument("user", nargs="?")
+    sbx.add_argument("--all", action="store_true",
+                     help="remove: every recorded container, its folder grants and relay rewrites (before an uninstall)")
     tl = sub.add_parser("tls", help="built-in HTTPS certificate: status, renew, export-ca PATH, trust")
     tl.add_argument("action", choices=["status", "renew", "export-ca", "trust"])
     tl.add_argument("path", nargs="?")

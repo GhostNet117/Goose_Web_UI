@@ -1,12 +1,12 @@
 // Goose Web SPA entry: auth flow, app shell, router, RPC wiring, command palette, shortcuts.
-import { h, btn, iconBtn, modal, toast, closeTopModal, closeMenu, topModal, kbd, copyBtn, empty, errMsg, banner, debounce } from './ui.js';
+import { h, btn, iconBtn, modal, toast, closeTopModal, closeMenu, isMenuOpen, topModal, kbd, copyBtn, empty, errMsg, banner, debounce } from './ui.js';
 import { icon, logo } from './icons.js';
 import { GET, POST, setCsrf } from './api.js';
 import { rpc, G } from './rpc.js';
 import { store, bus } from './store.js';
 import { router } from './router.js';
 import { loadPrefs, applyTheme, setPref, prefs, resolvedTheme } from './prefs.js';
-import { addAsk, resetAsks, resolvedElsewhere, ASK_METHODS, gotoAsk } from './asks.js';
+import { addAsk, resetAsks, resolvedElsewhere, ASK_METHODS, gotoAsk, noteToolCallSource } from './asks.js';
 import { setHerd, upsertAgent, setMyProfile, refreshBadges, browserNotify, chime, setBaseTitle } from './herd.js';
 import { loadSessions, sessionsState, sessionTitle, activityTime, isArchived, refreshSessionsSoon } from './sessions.js';
 import { routeNotification, allChats, currentChat, sessionChangedElsewhere, promptCreated } from './chatsession.js';
@@ -22,6 +22,7 @@ import { renderApps } from './views/apps.js';
 import { renderExtensions } from './views/extensions.js';
 import { renderSettings } from './views/settings.js';
 import { renderAdmin } from './views/admin.js';
+import qrcode from '../vendor/qrcode.esm.js';
 
 const root = document.getElementById('app');
 let shell = null;          // {el, main, sidebar}
@@ -42,9 +43,11 @@ async function boot() {
   try {
     const me = await GET('/api/me', { quiet: true });
     if (me && me.user && me.user.mustChangePassword) { showChangePassword(me); return; }
+    if (me && me.totpEnrolmentRequired) { showTotpEnrol(me); return; }
     await startApp(me);
   } catch (e) {
     if (e.status === 403 && e.code === 'password_change_required') { showChangePassword(null); return; }
+    if (e.status === 403 && e.code === 'totp_enrolment_required') { showTotpEnrol(null); return; }
     if (e.status === 401 || e.status === 403) { showLogin(); return; }
     root.replaceChildren(h('div', { class: 'auth-screen' }, h('div', { class: 'auth-card' }, logo(40), h('h1', null, 'Gateway unreachable'), h('p', { class: 'muted' }, errMsg(e)), btn('Retry', () => boot(), { variant: 'primary', icon: 'refresh' }))));
   }
@@ -58,8 +61,15 @@ function showLogin() {
     onLoggedIn: async (res) => {
       if (res && res.csrf) setCsrf(res.csrf);
       if (res && res.mustChangePassword) { showChangePassword({ user: res.user || {} }); return; }
-      try { await startApp(await GET('/api/me', { quiet: true })); }
-      catch (e) { if (e.code === 'password_change_required') showChangePassword({ user: res.user || {} }); else toast(errMsg(e), { kind: 'error' }); }
+      try {
+        const me = await GET('/api/me', { quiet: true });
+        if (me && me.totpEnrolmentRequired) { showTotpEnrol(me); return; }
+        await startApp(me);
+      } catch (e) {
+        if (e.code === 'password_change_required') showChangePassword({ user: res.user || {} });
+        else if (e.code === 'totp_enrolment_required') showTotpEnrol(null);
+        else toast(errMsg(e), { kind: 'error' });
+      }
     },
   });
 }
@@ -75,11 +85,61 @@ function showChangePassword(me) {
   });
 }
 
+// Two-factor is required for this account (Admin > Auth: require it for administrators) and not set up yet: the
+// server allows only enrolment until it is (security assessment 2026-11-09 A-8). Same steps as Settings > Two-factor.
+async function showTotpEnrol(me) {
+  teardown();
+  if (me && me.csrf) setCsrf(me.csrf);
+  setBaseTitle('Set up two-factor - Goose');
+  const card = h('div', { class: 'auth-card' }, logo(40), h('h1', null, 'Set up two-factor sign-in'), h('div', { class: 'spinner' }));
+  root.replaceChildren(h('div', { class: 'auth-screen' }, card));
+  let r;
+  try { r = await POST('/api/me/totp/setup', {}, { quiet: true }); }
+  catch (e) { card.replaceChildren(logo(40), h('h1', null, 'Two-factor setup failed'), h('p', { class: 'muted' }, errMsg(e)), btn('Sign out', () => logout())); return; }
+  const qr = qrcode(0, 'M'); qr.addData(r.uri); qr.make();
+  const code = h('input', { class: 'inp totp-inp', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '6', placeholder: '123456', 'aria-label': 'Six-digit code' });
+  const err = h('div', { class: 'field-error' });
+  const verify = async () => {
+    err.textContent = '';
+    try { await POST('/api/me/totp/enable', { code: code.value.trim() }, { quiet: true }); toast('Two-factor enabled', { kind: 'success' }); boot(); }
+    catch (e) { err.textContent = e.status === 400 || e.code === 'invalid_code' ? 'That code is not valid - try the next one.' : errMsg(e); }
+  };
+  code.addEventListener('keydown', (e) => { if (e.key === 'Enter') verify(); });
+  card.replaceChildren(logo(40), h('h1', null, 'Set up two-factor sign-in'),
+    h('p', { class: 'muted' }, 'Your administrator requires an authenticator app for this account. Scan the code with Microsoft Authenticator, Google Authenticator or 1Password, then enter the 6-digit code.'),
+    h('img', { class: 'qr', alt: 'QR code for your authenticator app', src: qr.createDataURL(5, 8), width: 220, height: 220 }),
+    h('div', { class: 'row' }, h('code', { class: 'mono small' }, r.secret), copyBtn(r.secret, 'Copy secret')),
+    code, err,
+    h('div', { class: 'row' }, btn('Verify & continue', verify, { variant: 'primary' }), btn('Sign out', () => logout())));
+  code.focus();
+}
+
 async function logout() {
   try { await POST('/api/auth/logout', {}, { quiet: true }); } catch { /* */ }
   teardown();
   store.set('me', null);
-  showLogin();
+  await clearClientState();
+  // a fresh page load also drops everything held in memory (chat caches, drafts, asks, ?profile=)
+  location.replace('/');
+}
+
+// Sign-out on a shared browser: forget folder paths, last folder, pinned chats, effort cache and the
+// service-worker shell cache. Only the cosmetic theme settings survive (avoids a flash of the wrong theme).
+// Security assessment 2026-11-09 D-8.
+const KEEP_PREFS = ['theme', 'accent', 'density', 'fontSize', 'codeTheme', 'reduceMotion'];
+async function clearClientState() {
+  try {
+    let keep = {};
+    try { const p = JSON.parse(localStorage.getItem('gw.prefs') || '{}') || {}; for (const k of KEEP_PREFS) if (k in p) keep[k] = p[k]; } catch { keep = {}; }
+    const keys = [];
+    for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && /^gw[.\-_]/.test(k)) keys.push(k); }
+    for (const k of keys) localStorage.removeItem(k);
+    if (Object.keys(keep).length) localStorage.setItem('gw.prefs', JSON.stringify(keep));
+  } catch { /* storage disabled */ }
+  try { sessionStorage.clear(); } catch { /* */ }
+  try {
+    if (window.caches) { const names = await caches.keys(); await Promise.all(names.filter((n) => n.startsWith('gw-')).map((n) => caches.delete(n))); }
+  } catch { /* */ }
 }
 
 function teardown() {
@@ -176,7 +236,7 @@ router.on('route', async (r) => {
     if (view && view.destroy) { try { view.destroy(); } catch (e) { console.error(e); } }
     view = null;
     closeMenu();
-    const fn = ROUTES[r.view];
+    const fn = Object.prototype.hasOwnProperty.call(ROUTES, r.view) ? ROUTES[r.view] : null;
     let v;
     try {
       v = fn ? fn(r) : { el: h('div', { class: 'view view-page' }, h('div', { class: 'page-body' }, empty('alert', 'Page not found', 'Nothing lives at ' + r.path, btn('New chat', () => router.go('/new'), { variant: 'primary' })))) };
@@ -229,7 +289,7 @@ rpc.on('request', (msg) => {
   if (ASK_METHODS[msg.method]) { addAsk(msg); return; }
   rpc.respondError(msg.id, -32601, 'Goose Web does not support ' + msg.method);
 });
-rpc.on('session/update', (p) => routeNotification('session/update', p));
+rpc.on('session/update', (p) => { noteToolCallSource(p); routeNotification('session/update', p); });
 rpc.on(G('session/update'), (p) => routeNotification(G('session/update'), p));
 rpc.on('_gw/ask_resolved', (p) => resolvedElsewhere(p || {}));
 rpc.on('_gw/session_changed', (p) => sessionChangedElsewhere(p || {}));
@@ -290,6 +350,7 @@ bus.on('unauthorized', () => {
   setTimeout(() => { authLost = false; }, 1500);
 });
 bus.on('password-change-required', () => { showChangePassword(store.get('me')); });
+bus.on('totp-enrolment-required', () => { showTotpEnrol(null); });
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
@@ -302,9 +363,13 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ------------------------------------------------------------------ command palette
+// Open palette / shortcuts dialogs are tracked by reference, never found with document.querySelector:
+// untrusted markup could carry the same class names (security assessment 2026-11-09 D-7).
+let paletteModal = null;
+let shortcutsModal = null;
 function openPalette(initial = '') {
   if (!started) return;
-  if (document.querySelector('.palette')) return;
+  if (paletteModal) return;
   const inp = h('input', { class: 'palette-input', type: 'text', placeholder: 'Jump to a chat, page or action…', 'aria-label': 'Command palette', autocomplete: 'off', spellcheck: 'false', value: initial });
   const list = h('div', { class: 'palette-list', role: 'listbox' });
   let items = []; let sel = 0; let recipes = null;
@@ -358,7 +423,8 @@ function openPalette(initial = '') {
     else if (e.key === 'ArrowUp') { e.preventDefault(); sel = Math.max(0, sel - 1); mark(); }
     else if (e.key === 'Enter') { e.preventDefault(); choose(sel); }
   });
-  const m = modal({ body: h('div', { class: 'palette' }, h('div', { class: 'palette-head' }, icon('search', 16), inp, kbd('Esc')), list), size: 'md', className: 'palette-modal' });
+  const m = modal({ body: h('div', { class: 'palette' }, h('div', { class: 'palette-head' }, icon('search', 16), inp, kbd('Esc')), list), size: 'md', className: 'palette-modal', onClose: () => { if (paletteModal === m) paletteModal = null; } });
+  paletteModal = m;
   draw();
   setTimeout(() => inp.focus(), 0);
   rpc.call(G('recipes/list'), {}).then((r) => { recipes = r.recipes || []; if (document.body.contains(list)) draw(); }).catch(() => {});
@@ -372,8 +438,8 @@ const SHORTCUTS = [
   ['Editors', [[['Ctrl', 'S'], 'Save recipe']]],
 ];
 function showShortcuts() {
-  if (document.querySelector('.shortcuts')) return;
-  const m = modal({ title: 'Keyboard shortcuts', size: 'lg', body: h('div', { class: 'shortcuts grid2' }, ...SHORTCUTS.map(([g, rows]) => h('div', { class: 'sc-group' }, h('h4', null, g), ...rows.map(([keys, label]) => h('div', { class: 'sc-row' }, h('span', null, label), kbd(...keys)))))), footer: [btn('Close', () => m.close())] });
+  if (shortcutsModal) return;
+  const m = shortcutsModal = modal({ onClose: () => { shortcutsModal = null; }, title: 'Keyboard shortcuts', size: 'lg', body: h('div', { class: 'shortcuts grid2' }, ...SHORTCUTS.map(([g, rows]) => h('div', { class: 'sc-group' }, h('h4', null, g), ...rows.map(([keys, label]) => h('div', { class: 'sc-row' }, h('span', null, label), kbd(...keys)))))), footer: [btn('Close', () => m.close())] });
 }
 
 const isTyping = (t) => t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
@@ -381,9 +447,9 @@ let gPending = 0;
 document.addEventListener('keydown', (e) => {
   if (!started) return;
   const mod = e.ctrlKey || e.metaKey;
-  if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') { e.preventDefault(); if (document.querySelector('.palette')) closeTopModal(); else openPalette(); return; }
+  if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') { e.preventDefault(); if (paletteModal) paletteModal.close(); else openPalette(); return; }
   if (e.key === 'Escape') {
-    if (document.querySelector('.menu')) { closeMenu(); e.preventDefault(); return; }
+    if (isMenuOpen()) { closeMenu(); e.preventDefault(); return; }
     if (topModal()) { if (closeTopModal()) e.preventDefault(); return; }
     if (shell && shell.el.classList.contains('drawer-open')) { shell.el.classList.remove('drawer-open'); return; }
     return;
@@ -392,7 +458,7 @@ document.addEventListener('keydown', (e) => {
   if (e.altKey && !mod && (e.key === 'n' || e.key === 'N' || e.code === 'KeyN')) { e.preventDefault(); router.go('/new'); return; }
   if (mod && !e.shiftKey && e.key.toLowerCase() === 'b') { e.preventDefault(); ctx.toggleSidebar(); return; }
   if (e.altKey && !mod && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
-    const rows = [...document.querySelectorAll('.sidebar .srow')];
+    const rows = shell && shell.sidebar && shell.sidebar.el ? [...shell.sidebar.el.querySelectorAll('.srow')] : [];
     if (!rows.length) return;
     e.preventDefault();
     let i = rows.findIndex((r) => r.classList.contains('active'));

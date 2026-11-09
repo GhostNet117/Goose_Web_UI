@@ -88,6 +88,54 @@ CHAT_ACTIVITY = {"session/new": "chat.new", "session/load": "chat.open", "sessio
 
 EXT_ADD = "_goose/unstable/session/extensions/add"
 EXT_REMOVE = "_goose/unstable/session/extensions/remove"
+# Recipes the gateway resolves and checks before Goose runs them (B-1, security assessment 2026-11-09).
+P_CFG_EXT_LIST = "_goose/unstable/config/extensions/list"
+P_RECIPE_DECODE = "_goose/unstable/recipes/decode"
+P_RECIPE_LIST = "_goose/unstable/recipes/list"
+P_RECIPE_SCHEDULE = "_goose/unstable/recipes/schedule"
+P_SCHEDULE_CREATE = "_goose/unstable/schedules/create"
+P_SCHEDULE_UPDATE = "_goose/unstable/schedules/update"
+P_SESSION_IMPORT = "_goose/unstable/session/import"
+RECIPE_METHODS = {"session/new", P_RECIPE_SCHEDULE, P_SCHEDULE_CREATE, P_SCHEDULE_UPDATE, P_SESSION_IMPORT}
+# Tool calls the model makes that start extensions or agents, audited when the hub forwards them (B-4).
+AGENT_TOOL_AUDIT = {"manage_extensions": "agent.extension", "delegate": "agent.delegate",
+                    "manage_schedule": "agent.schedule"}
+
+
+def agent_tool_event(update: dict) -> tuple[str, dict] | None:
+    """(audit action, detail) for a `tool_call` session update whose tool starts extensions, sub-agents or
+    schedules (extensionmanager__manage_extensions, summon's delegate, scheduler__manage_schedule); else None."""
+    if not isinstance(update, dict):
+        return None
+    goose = ((update.get("_meta") or {}).get("goose") or {}) if isinstance(update.get("_meta"), dict) else {}
+    tc = goose.get("toolCall") if isinstance(goose.get("toolCall"), dict) else {}
+    # the title is "<tool> · <argument preview>" or "<extension>: <tool words>": only the head names the tool
+    cands = [str(tc.get("toolName") or ""), str(update.get("title") or "").split("\u00b7", 1)[0][:120]]
+    action = None
+    for c in cands:
+        short = c.split("__", 1)[-1].split(" ", 1)[0].split(":", 1)[0].strip().lower()
+        flat = "".join(ch for ch in c.lower() if ch.isalnum())
+        for tool, act in AGENT_TOOL_AUDIT.items():
+            if short == tool or tool.replace("_", "") in flat:
+                action = act
+                break
+        if action:
+            break
+    if action is None:
+        return None
+    args = update.get("rawInput") if isinstance(update.get("rawInput"), dict) else {}
+    detail: dict = {"tool": (cands[0] or cands[1])[:200]}
+    if tc.get("extensionName"):
+        detail["extension"] = str(tc["extensionName"])[:100]
+    if action == "agent.extension":
+        detail.update(action=str(args.get("action") or "")[:20], extensionName=str(args.get("extension_name") or "")[:100])
+    elif action == "agent.delegate":
+        detail.update(source=str(args.get("source") or "")[:200],
+                      extensions=[str(x)[:100] for x in args.get("extensions") or []][:30]
+                      if isinstance(args.get("extensions"), list) else None)
+    else:
+        detail.update({k: str(args.get(k))[:200] for k in ("action", "recipe_path", "recipe", "job_id") if k in args})
+    return action, detail
 
 
 def _ext_norm(name: Any) -> str:
@@ -411,6 +459,8 @@ class Upstream:
             params = {}
         try:
             pol.check(method, params, is_admin=client.is_admin, policy=client.policy, roots=client.roots)
+            if method in RECIPE_METHODS:
+                await self._guard_recipes(client, method, params)
             if method in CHAT_ACTIVITY:
                 self.hub.audit_activity(client, self, method, params)
             if method == "initialize":
@@ -540,6 +590,106 @@ class Upstream:
         running = sum(1 for s in self.sessions.values() if s.running() and s.sid != sid)
         if running >= limit:
             raise pol.Denied(f"you already have {running} agents running (limit {limit})")
+
+    # ------------------------------------------------------------ recipes (B-1)
+    async def _guard_recipes(self, client: Client, method: str, params: dict) -> None:
+        """Resolve every recipe a call would run and check it before Goose sees the call (security assessment
+        2026-11-09, B-1): Goose starts recipe.extensions (a stdio entry is any command line) on session/new with
+        `_meta.recipeId` / `recipeDeeplink`, on a scheduled run, and keeps an imported session's recipe. Members:
+        pol.check_recipe against their enabled extensions, sub-recipes recursively; anything that cannot be
+        resolved is refused (fail closed). Admins: never refused, but every recipe use is audited (B-4)."""
+        found = await self._resolve_recipes(client, method, params)
+        choose = method == "session/new" and not client.is_admin and \
+            (params.get("_meta") or {}).get("enabledExtensions") is not None
+        if not found and not choose:
+            return
+        enabled = configured = None
+        if not client.is_admin:
+            try:
+                listing = await self.request(P_CFG_EXT_LIST, {}, timeout=30)
+            except Exception as e:
+                raise pol.Denied(f"your extensions could not be read to check the recipe ({e})")
+            enabled = pol.enabled_extension_map(listing)
+            configured = pol.enabled_extension_map(listing, only_enabled=False)
+        for recipe, via, base in found:
+            names = pol.recipe_extension_names(recipe)
+            if client.is_admin:
+                self.hub.audit_recipe(client, self, method, recipe, via, names, True)
+                continue
+            try:
+                if recipe is None:
+                    raise pol.Denied("the recipe could not be found or read, so it cannot be checked")
+                pol.check_recipe(recipe, client.policy, enabled or {})
+                await asyncio.to_thread(self._check_sub_recipes, recipe, client.policy, enabled or {}, base, 0, [0])
+            except pol.Denied:
+                self.hub.audit_recipe(client, self, method, recipe, via, names, False)
+                raise
+            self.hub.audit_recipe(client, self, method, recipe, via, names, True)
+        if choose:
+            pol.check_enabled_extensions(params["_meta"]["enabledExtensions"], client.policy, configured)
+
+    async def _resolve_recipes(self, client: Client, method: str, params: dict) -> list[tuple]:
+        """[(recipe dict or None if unresolvable, via, base folder for relative sub-recipe paths)]."""
+        out: list[tuple] = []
+        cwd = str(params.get("cwd") or "")
+        if method == "session/new":
+            meta = params.get("_meta") or {}
+            if meta.get("recipeDeeplink"):
+                try:
+                    res = await self.request(P_RECIPE_DECODE, {"deeplink": str(meta["recipeDeeplink"])}, timeout=30)
+                    recipe = (res or {}).get("recipe")
+                except Exception:
+                    recipe = None
+                out.append((recipe if isinstance(recipe, dict) else None, "deeplink", cwd))
+            if meta.get("recipeId"):
+                out.append(await self._recipe_by_id(str(meta["recipeId"])))
+        elif method in (P_SCHEDULE_CREATE, P_SCHEDULE_UPDATE) and "recipe" in params:
+            recipe = params.get("recipe")
+            out.append((recipe if isinstance(recipe, dict) else None, "schedule", ""))
+        elif method == P_RECIPE_SCHEDULE and params.get("cron_schedule"):
+            out.append(await self._recipe_by_id(str(params.get("id") or "")))
+        elif method == P_SESSION_IMPORT:
+            try:
+                data = json.loads(str(params.get("input") or ""))
+            except ValueError:
+                data = None
+            recipe = data.get("recipe") if isinstance(data, dict) else None
+            if isinstance(recipe, dict):
+                out.append((recipe, "import", ""))
+        return out
+
+    async def _recipe_by_id(self, rid: str) -> tuple:
+        try:
+            res = await self.request(P_RECIPE_LIST, {}, timeout=60)
+        except Exception:
+            return (None, "recipeId", "")
+        for r in (res or {}).get("recipes") or []:
+            if isinstance(r, dict) and str(r.get("id")) == rid and isinstance(r.get("recipe"), dict):
+                fp = str(r.get("file_path") or "")
+                fp = fp[4:] if fp.startswith("\\\\?\\") else fp
+                return (r["recipe"], "recipeId", os.path.dirname(fp))
+        return (None, "recipeId", "")
+
+    def _check_sub_recipes(self, recipe: dict, policy: dict, enabled: dict, base: str, depth: int,
+                           count: list) -> None:
+        """Every sub-recipe file must be readable and pass check_recipe too (members; fail closed)."""
+        for sr in recipe.get("sub_recipes") or []:
+            count[0] += 1
+            if depth >= 5 or count[0] > 50:
+                raise pol.Denied("the recipe nests too many sub-recipes to check")
+            path = str((sr or {}).get("path") or "") if isinstance(sr, dict) else ""
+            if not path or "\x00" in path:
+                raise pol.Denied("a sub-recipe of this recipe has no readable path")
+            p = path if os.path.isabs(path) else os.path.join(base or "", path)
+            try:
+                import yaml
+                data = yaml.safe_load(Path(p).read_text(encoding="utf-8"))
+            except Exception:
+                raise pol.Denied(f"the sub-recipe '{path[:120]}' cannot be read, so it cannot be checked")
+            if isinstance(data, dict) and isinstance(data.get("recipe"), dict) and "title" not in data:
+                data = data["recipe"]
+            pol.check_recipe(data, policy, enabled, what="the sub-recipe")
+            self._check_sub_recipes(data, policy, enabled, os.path.dirname(p), depth + 1, count)
 
     async def _guard_recipe_delete(self, params: dict) -> None:
         res = await self.request("_goose/unstable/recipes/list", {})
@@ -915,6 +1065,9 @@ class Upstream:
         elif kind == "tool_call" and not replaying:
             s.last_text = f"🔧 {u.get('title') or 'tool'}"[:300]
             self._herd_dirty.add(s.sid)
+            ev = agent_tool_event(u)
+            if ev:   # B-4: the model starting extensions / sub-agents / schedules leaves a trace
+                self.hub.audit_agent(self, s.sid, ev[0], ev[1])
         elif kind == "usage_update":
             cost = u.get("cost") or {}
             s.usage = {"used": u.get("used"), "contextLimit": u.get("size"), "cost": cost.get("amount")}
@@ -1106,6 +1259,12 @@ class Hub:
             for k in ("sessionId", "key", "id", "name", "configKey", "scheduleId", "providerId", "extensionName"):
                 if k in params:
                     detail[k] = params[k]
+            args = params.get("arguments")
+            if method == pol.TOOLS_CALL and isinstance(args, dict):   # B-4: which extension / recipe it starts
+                picked = {k: str(args[k])[:200] for k in ("action", "extension_name", "source", "extensions")
+                          if k in args}
+                if picked:
+                    detail["arguments"] = picked
             self.on_audit(client, "acp." + method.replace("_goose/unstable/", ""), method, detail, True)
 
     def audit_activity(self, client: Client, up: Upstream, method: str, params: dict) -> None:
@@ -1126,6 +1285,32 @@ class Hub:
             self.on_audit(client, CHAT_ACTIVITY[method], str(params.get("sessionId") or ""), detail, True)
         except Exception:
             log.exception("activity record")
+
+    def audit_recipe(self, client: Client, up: Upstream, method: str, recipe: Any, via: str, names: list[str],
+                     ok: bool) -> None:
+        """B-4: a recipe a session / schedule / import would run, with the extensions it declares."""
+        if not self.on_audit:
+            return
+        r = recipe if isinstance(recipe, dict) else {}
+        detail = {"profile": up.key, "via": via, "title": str(r.get("title") or "")[:200], "extensions": names,
+                  "subRecipes": len(r.get("sub_recipes") or []) if isinstance(r.get("sub_recipes"), list) else 0,
+                  "resolved": isinstance(recipe, dict)}
+        try:
+            self.on_audit(client, "agent.recipe", method, detail, ok)
+        except Exception:
+            log.exception("recipe audit")
+
+    def audit_agent(self, up: Upstream, sid: str, action: str, detail: dict) -> None:
+        """B-4: a tool call of the model that starts extensions / sub-agents / schedules (no browser sent it: the
+        record is attributed to the profile owner's connected socket, or to the profile name)."""
+        if not self.on_audit:
+            return
+        owner = next((c for c in up.clients if _ukey(c.user) == up.key), None)
+        actor = owner or _AgentActor({"id": None, "username": up.username})
+        try:
+            self.on_audit(actor, action, sid, {"profile": up.key, "sessionId": sid, **detail}, True)
+        except Exception:
+            log.exception("agent audit")
 
     def audit_ask(self, client: Client, up: Upstream, ask: dict, answer: dict) -> None:
         if self.on_audit:
@@ -1148,3 +1333,10 @@ class Hub:
 
 def _ukey(user: dict) -> str:
     return str(user.get("username", "")).lower()
+
+
+class _AgentActor:
+    """Stands in for a browser socket in audit records the agent itself causes (Hub.audit_agent)."""
+
+    def __init__(self, user: dict):
+        self.user, self.ip, self.is_admin = user, "", False

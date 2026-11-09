@@ -12,6 +12,9 @@
     1. Finds the gateway's scheduled task (any task folder) and its config.yaml from the task's arguments.
     2. Refuses while a worker is busy (an agent is running), unless -Force.
     3. Backs up the database (SQLite online backup) and config.yaml to <profiles_root>\backups\upgrade-<time>\.
+    3b. Restricts the install folder (code, .venv, .git) to you, SYSTEM and Administrators, read & execute for the
+       task's account if it is another one (as install.ps1 does); "goose-web check" fails while other local users
+       can change it.
     4. Updates the code: "git pull --ff-only" (default), "git checkout <Ref>" with -Ref, or nothing with -NoGit
        (you already replaced the files, e.g. from a release zip).
     5. Installs the locked dependencies (uv when available - Goose ships it - else pip) and the package itself.
@@ -47,6 +50,8 @@ $venvPyw = Join-Path $InstallDir '.venv\Scripts\pythonw.exe'
 if (-not $Log) { $Log = Join-Path $env:TEMP ('goose-web-upgrade-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss')) }
 # -Ref is passed to git: only a plain tag/branch/commit name (no option-like or shell-special values).
 if ($Ref -and $Ref -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$') { throw "Invalid -Ref '$Ref' (use a tag, branch or commit id)." }
+# -TaskName and -Log are put on the -Detached command line inside "...": no quotes or line breaks.
+if ("$TaskName$Log" -match '["\r\n]') { throw "-TaskName and -Log must not contain double quotes or line breaks." }
 
 if ($Detached) {
     # WMI starts the process outside the caller's process tree and job, so a gateway restart cannot kill it.
@@ -71,6 +76,24 @@ function Run($exe, [string[]]$a) {
     try { $out = & $exe @a 2>&1 | ForEach-Object { "$_" }; $code = $LASTEXITCODE } finally { $ErrorActionPreference = $prev }
     $out | ForEach-Object { Add-Content -Path $Log -Value "    $_" -Encoding UTF8 }
     return @{ code = $code; out = $out }
+}
+function Protect-InstallDir([string]$Dir, [string]$RunAs = '', [switch]$WhatIf) {
+    # Same as install.ps1: the gateway runs the code, the .venv and the git hooks in this folder as its own account.
+    # Only the installing account, SYSTEM and Administrators may change them; the account that runs the gateway, if
+    # another one, may read and execute. Inherited permissions are removed (C:\ gives Authenticated Users Modify).
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $grants = @("*$($me):(OI)(CI)F", '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
+    if ($RunAs) {
+        if ($RunAs.StartsWith('.\')) { $RunAs = "$env:COMPUTERNAME\" + $RunAs.Substring(2) }
+        $sid = if ($RunAs -match '^S-1-[0-9-]+$') { $RunAs } else {
+            $(try { (New-Object Security.Principal.NTAccount($RunAs)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { '' }) }
+        if ($sid -ne $me) { $grants += $(if ($sid) { "*$($sid):(OI)(CI)RX" } else { "$($RunAs):(OI)(CI)RX" }) }
+    }
+    if ($WhatIf) { return ((@('icacls', "`"$Dir`"", '/inheritance:r', '/grant:r') + $grants + '/Q') -join ' ') }
+    & icacls $Dir /inheritance:r /grant:r @grants /Q | Out-Null
+    if ($LASTEXITCODE) { throw "Could not restrict the permissions of $Dir (icacls exit $LASTEXITCODE). Any local user could change the code the gateway runs; fix the folder's permissions (you must own it) and run again." }
+    & icacls $Dir /remove:g '*S-1-1-0' '*S-1-5-11' '*S-1-5-32-545' '*S-1-5-4' /Q | Out-Null
+    return ''
 }
 try {
     Say "goose-web upgrade in $InstallDir (log $Log)"
@@ -148,6 +171,11 @@ try {
     Get-ChildItem (Join-Path $root 'backups') -Directory -Filter 'upgrade-*' | Sort-Object Name -Descending |
         Select-Object -Skip 10 | ForEach-Object { Remove-Item $_.FullName -Recurse -Force; Say "Removed old backup $($_.Name)" }
 
+    # 3b. install folder permissions: before git runs its hooks/config from .git and before "goose-web check",
+    # which fails while other local users can change the code
+    Protect-InstallDir -Dir $InstallDir -RunAs "$($task.Principal.UserId)" | Out-Null
+    Say "Install folder restricted to $($id.Name), SYSTEM and Administrators (read & execute for the task's account if another)"
+
     # 4. code
     if (-not $NoGit) {
         if (-not (Test-Path (Join-Path $InstallDir '.git'))) { throw "$InstallDir is not a git clone. Replace the files yourself and run again with -NoGit." }
@@ -191,9 +219,13 @@ try {
     } catch {
         # A task that runs as a service account usually needs administrator rights to stop/start: ask once (UAC).
         Say "Restarting $taskFull needs administrator rights (it runs as $($task.Principal.UserId)); asking once."
-        $restart = "Stop-ScheduledTask -TaskPath '$($task.TaskPath)' -TaskName '$($task.TaskName)'; Start-Sleep 3; " +
-                   "Start-ScheduledTask -TaskPath '$($task.TaskPath)' -TaskName '$($task.TaskName)'"
-        $p = Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile', '-Command', $restart) -Wait -PassThru
+        # Task names are data: quoted for PowerShell ('' inside '...') and passed Base64-encoded, never parsed as
+        # part of a command line.
+        $q = { param($s) "'" + ("$s" -replace "'", "''") + "'" }
+        $restart = "Stop-ScheduledTask -TaskPath $(& $q $task.TaskPath) -TaskName $(& $q $task.TaskName); Start-Sleep 3; " +
+                   "Start-ScheduledTask -TaskPath $(& $q $task.TaskPath) -TaskName $(& $q $task.TaskName)"
+        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($restart))
+        $p = Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile', '-EncodedCommand', $enc) -Wait -PassThru
         if ($p.ExitCode) { throw "The restart was refused. The new version is installed; restart the task as an administrator: $restart" }
     }
     $ok = $false

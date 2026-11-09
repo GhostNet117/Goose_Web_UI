@@ -527,7 +527,7 @@ function accountTab(body) {
     code.addEventListener('keydown', (e) => { if (e.key === 'Enter') m.el.querySelector('.modal-foot .btn-primary').click(); });
   };
   const disableTotp = async () => {
-    const pw = await promptDialog({ title: 'Disable two-factor', label: 'Confirm with your password', confirmText: 'Disable', validate: (v) => v ? '' : 'Required' });
+    const pw = await promptDialog({ title: 'Disable two-factor', label: 'Confirm with your password', confirmText: 'Disable', type: 'password', autocomplete: 'current-password', validate: (v) => v ? '' : 'Required' });
     if (pw === null) return;
     try { await POST('/api/me/totp/disable', { password: pw }, { quiet: true }); u.totpEnabled = false; store.set('me', { ...me, user: u }); toast('Two-factor disabled', { kind: 'success' }); drawTotp(); } catch (e) { toastError(e); }
   };

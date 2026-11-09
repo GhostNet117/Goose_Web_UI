@@ -32,6 +32,7 @@ export async function api(method, path, body, { quiet = false, raw = false, head
     if (!quiet) {
       if (res.status === 401 && !path.startsWith('/api/auth/')) bus.emit('unauthorized', err);
       if (res.status === 403 && code === 'password_change_required') bus.emit('password-change-required', err);
+      if (res.status === 403 && code === 'totp_enrolment_required') bus.emit('totp-enrolment-required', err);
     }
     throw err;
   }

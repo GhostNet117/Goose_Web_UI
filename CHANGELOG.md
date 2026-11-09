@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.12.0 - 2026-11-09
+
+**Security release - upgrade if you have non-admin users.** An independent adversarial assessment of 1.11.0 found one
+Critical and eight High issues; all are fixed (SECURITY-ASSESSMENT 9). Most important: a member with every permission
+off could run commands through a recipe deeplink at chat creation (B-1), and the model could switch the disabled
+shell extension back on through `extensionmanager` (B-2).
+
+- **Agent firewall:** recipes (deeplink, id, schedules, imports, sub-recipes) are resolved and checked by the gateway;
+  members' `_meta` is allow-listed; `developer`, `computercontroller`, `code_execution`, `orchestrator`, `summon` and
+  `scheduler` are pinned off without `allow_shell` (members without it lose sub-agents and schedules) and
+  `extensionmanager` needs `extensions_edit` + `allow_shell`; runtime extension starts and delegations are audited.
+- **Sandbox and relays:** allow-listed worker environment (no more inherited API keys), unguessable relay pipes that
+  cannot be squatted, per-user container names that cannot collide, one kill-on-close job per worker, provisioning
+  records moved out of the user's profile, dangerous team folders refused.
+- **Sign-in:** request bodies capped while streaming; lockouts no longer a denial-of-service or user-name oracle;
+  OIDC tied to the browser, no account binding by user name, `stripDomain` default off, two-factor asked after
+  OIDC; "Require two-factor for administrators" is enforced (enrolment screen); logout needs the CSRF token.
+- **TLS:** the local CA is name-constrained to this machine (**clients must import the new CA once**: a 1.11 CA is
+  replaced at the first start), keys are owner-only, and the file browser can no longer open `<system_dir>`.
+- **Install:** `install.ps1` / `upgrade.ps1` lock the install folder down (it was writable by every local user);
+  `goose-web check` reports it; `goose-web sandbox remove --all`; uninstall removes the containers. A missing
+  `--config` / `GOOSE_WEB_CONFIG` file is now an error.
+- **Front end:** model output can no longer style itself as app dialogs; "Copy code" copies what you see; app tool
+  calls and resource reads always ask first; the login page shows only known error texts; sign-out clears local data.
+- **Admin > Teams:** allowed providers and models are picked from lists of what your Goose knows (with model context
+  sizes, All/None per provider), and the default provider and model are drop-downs.
+
 ## 1.11.0 - 2026-11-09
 
 - **Built-in HTTPS:** Goose Web creates its own local certificate authority and a server certificate for every name

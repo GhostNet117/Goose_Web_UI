@@ -40,12 +40,29 @@ class SandboxError(RuntimeError):
     pass
 
 
+def _root_hash(profiles_root: str) -> str:
+    return hashlib.sha256(os.path.normcase(os.path.abspath(profiles_root)).encode()).hexdigest()[:8]
+
+
 def container_name(profiles_root: str, username: str) -> str:
     """Deterministic AppContainer name (max 64 chars): same name -> same SID across restarts and upgrades. The hash
-    of the profiles root keeps two gateways on one account apart."""
-    h = hashlib.sha256(os.path.normcase(os.path.abspath(profiles_root)).encode()).hexdigest()[:8]
+    of the profiles root keeps two gateways on one account apart.
+
+    GooseWeb.<root hash>.<readable prefix>.<hash of the exact user name>: the readable part drops characters an
+    AppContainer name cannot hold and is shortened, so it alone is not unique (jo.ann / joann); the 10-hex hash of
+    the full (case-folded: user names are unique case-insensitively) name keeps every user in a container of
+    their own. At most 9 + 8 + 1 + 32 + 1 + 10 = 61 characters."""
+    exact = str(username).lower()
+    tag = hashlib.sha256(exact.encode("utf-8")).hexdigest()[:10]
+    user = "".join(ch for ch in exact if (ch.isascii() and ch.isalnum()) or ch in "-_")[:32] or "user"
+    return f"GooseWeb.{_root_hash(profiles_root)}.{user}.{tag}"
+
+
+def legacy_container_name(profiles_root: str, username: str) -> str:
+    """The container name Goose Web 1.11.0 and earlier used (dots dropped, 40 characters): two users could share
+    it. Only used to find and remove those containers (migrate_legacy)."""
     user = "".join(ch for ch in username.lower() if ch.isalnum() or ch in "-_")[:40] or "user"
-    return f"GooseWeb.{h}.{user}"
+    return f"GooseWeb.{_root_hash(profiles_root)}.{user}"
 
 
 def desired_grants(profile_root: str, roots: list[str], read_dirs: list[str], goose_binary: str) -> dict[str, str]:
@@ -213,7 +230,9 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
               job=None) -> ContainedProcess:
         """Start args inside the AppContainer `sid` with the given capability SIDs. stdin/stdout are pipes to the
         caller; stderr goes to stderr_file. Only these three handles are inherited (PROC_THREAD_ATTRIBUTE_HANDLE_LIST).
-        Started suspended, put in `job` (kill-on-close), then resumed, so no child can escape the job."""
+        Started suspended, put in `job` (kill-on-close), then resumed, so no child can escape the job. `job` may be
+        a list: the process joins each in order (gateway job first, then the worker's own job, which so becomes a
+        job nested in the gateway's)."""
         in_r, in_w = _pipe()
         out_r, out_w = _pipe()
         _k32.SetHandleInformation(in_w, 1, 0)      # parent ends: not inheritable
@@ -258,9 +277,10 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
             _k32.CloseHandle(in_r)
             _k32.CloseHandle(out_w)
             os.set_handle_inheritable(err_h, False)
-        if job is not None and getattr(job, "handle", None):
-            if not _k32.AssignProcessToJobObject(job.handle, pi.hProcess):
-                log.warning("could not put the sandboxed worker in the job object (%s)", ctypes.get_last_error())
+        for j in (job if isinstance(job, (list, tuple)) else [job]):
+            if j is not None and getattr(j, "handle", None):
+                if not _k32.AssignProcessToJobObject(j.handle, pi.hProcess):
+                    log.warning("could not put the sandboxed worker in the job object (%s)", ctypes.get_last_error())
         _k32.ResumeThread(pi.hThread)
         _k32.CloseHandle(pi.hThread)
         stdin = os.fdopen(msvcrt.open_osfhandle(in_w, os.O_WRONLY | os.O_BINARY), "wb", buffering=0)
@@ -308,15 +328,29 @@ def load_state(state_dir: str, name: str) -> dict:
         return {}
 
 
+def _save_state(state_dir: str, name: str, state: dict) -> None:
+    sp = _state_path(state_dir, name)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+
+
 def prepare(name: str, state_dir: str, grants: dict[str, str]) -> dict:
     """Ensure the container exists and the folder grants match `grants` (only changes are applied; folders that
     do not exist yet are skipped and retried at the next start). Returns the saved state
-    {name, sid, grants, updatedAt} (<system_dir>/sandbox/<name>.json)."""
+    {name, sid, grants, pending, updatedAt} (<system_dir>/sandbox/<name>.json).
+
+    `pending` keeps grants that were applied earlier on a folder that is missing right now (renamed away, a
+    disconnected drive): its ACE cannot be checked or revoked, so the record is kept until the folder is back and
+    the grant is either confirmed (still wanted) or revoked (no longer wanted). Dropping it would leave an ACE
+    nobody tracks."""
     sid = ensure_container(name)
     old = load_state(state_dir, name)
-    old_grants = old.get("grants", {}) if old.get("sid") == sid else {}
+    same = old.get("sid") == sid
+    recorded = {**(old.get("pending", {}) if same else {}), **(old.get("grants", {}) if same else {})}
+    have = {p: r for p, r in recorded.items() if os.path.isdir(p)}
+    missing = {p: r for p, r in recorded.items() if not os.path.isdir(p)}
     present = {p: r for p, r in grants.items() if os.path.isdir(p)}
-    apply, revoke_list = diff_grants(old_grants, present)
+    apply, revoke_list = diff_grants(have, present)
     for p in revoke_list:
         try:
             revoke(p, sid)
@@ -324,40 +358,79 @@ def prepare(name: str, state_dir: str, grants: dict[str, str]) -> dict:
             log.warning("sandbox %s: %s", name, e)
     for p, right in apply.items():
         grant(p, sid, right)
-    state = {"name": name, "sid": sid, "grants": present, "updatedAt": time.time()}
-    sp = _state_path(state_dir, name)
-    sp.parent.mkdir(parents=True, exist_ok=True)
-    sp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+    state = {"name": name, "sid": sid, "grants": present, "pending": missing, "updatedAt": time.time()}
+    _save_state(state_dir, name, state)
     if apply or revoke_list:
         log.info("sandbox %s: granted %s, revoked %s", name, sorted(apply), sorted(revoke_list))
+    if missing:
+        log.info("sandbox %s: %d earlier grant(s) on missing folders kept for a later revoke: %s", name,
+                 len(missing), sorted(missing))
     return state
 
 
 def remove(state_dir: str, name: str) -> dict:
-    """Revoke every recorded grant and delete the container profile (user deleted, made admin, or sandbox off)."""
+    """Revoke every recorded grant and delete the container profile (user deleted, made admin, or sandbox off).
+    Grants on folders that are missing now stay recorded (a record with only `pending` grants), so a later
+    remove (`goose-web sandbox remove --all`) or a new container of the same name revokes them when they are back."""
     st = load_state(state_dir, name)
     if not st.get("sid"):
         return {}
-    for p in st.get("grants", {}):
+    left: dict[str, str] = {}
+    for p, r in {**st.get("pending", {}), **st.get("grants", {})}.items():
+        if not os.path.isdir(p):
+            left[p] = r
+            continue
         try:
             revoke(p, st["sid"])
         except SandboxError as e:
             log.warning("sandbox remove: %s", e)
+            left[p] = r
     delete_container(name)
+    if left:
+        _save_state(state_dir, name, {"name": name, "sid": st["sid"], "grants": {}, "pending": left,
+                                      "removed": True, "updatedAt": time.time()})
+        log.warning("sandbox %s removed; %d grant(s) on missing folders stay recorded for a later revoke: %s",
+                    name, len(left), sorted(left))
+    else:
+        try:
+            _state_path(state_dir, name).unlink()
+        except OSError:
+            pass
+    return st
+
+
+def migrate_legacy(state_dir: str, profiles_root: str, username: str) -> dict:
+    """Before a user's worker starts in its (1.12+) container: if a container recorded under the 1.11.0 name
+    (legacy_container_name, which two users could share) exists, revoke its grants and delete it, and keep its
+    relay record (relay.py) under the new name. Returns the removed state ({} if there was none)."""
+    old = legacy_container_name(profiles_root, username)
+    new = container_name(profiles_root, username)
+    if old == new:
+        return {}
+    rel_old, rel_new = Path(state_dir) / f"{old}.relays.json", Path(state_dir) / f"{new}.relays.json"
     try:
-        _state_path(state_dir, name).unlink()
-    except OSError:
-        pass
+        if rel_old.exists() and not rel_new.exists():
+            os.replace(rel_old, rel_new)
+    except OSError as e:
+        log.warning("sandbox: could not move %s: %s", rel_old, e)
+    if not load_state(state_dir, old):
+        return {}
+    st = remove(state_dir, old)
+    log.info("sandbox: removed the 1.11 container %s of %s (replaced by %s)", old, username, new)
     return st
 
 
 def all_states(state_dir: str) -> list[dict]:
     out = []
     for f in sorted(Path(state_dir).glob("GooseWeb.*.json")) if Path(state_dir).is_dir() else []:
+        if f.name.endswith(".relays.json"):     # relay records (relay.py), not container states
+            continue
         try:
-            out.append(json.loads(f.read_text(encoding="utf-8")))
+            st = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            pass
+            continue
+        if isinstance(st, dict) and st.get("sid"):
+            out.append(st)
     return out
 
 

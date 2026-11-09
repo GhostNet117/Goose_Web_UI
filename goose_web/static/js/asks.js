@@ -81,6 +81,59 @@ function resolvedText(result) {
   return 'Answered';
 }
 
+// Which extension (MCP server) / tool is asking. Goose reports it in different places depending on the
+// version: _meta on the request or on the tool call, or an "<extension>__<tool>" tool name or title.
+// Security assessment 2026-11-09 D-10: a form or permission request must be attributable.
+const SRC_EXT_KEYS = ['extensionName', 'extension', 'serverName', 'server', 'mcpServer', 'mcpServerName', 'source'];
+const SRC_TOOL_KEYS = ['toolName', 'tool'];
+const pickStr = (o, keys) => { for (const k of keys) { const v = o && o[k]; if (typeof v === 'string' && v.trim()) return v.trim().slice(0, 80); } return ''; };
+// Goose (1.57) puts the extension only on the tool_call session/update (_meta.goose.toolCall
+// {extensionName, toolName}), not on the permission request that follows it; remember it per tool call.
+const toolSources = new Map(); // sessionId + '\n' + toolCallId -> { ext, tool }
+export function noteToolCallSource(params) {
+  const u = params && params.update;
+  if (!u || u.toolCallId === undefined || u.toolCallId === null) return;
+  const g = u._meta && u._meta.goose && u._meta.goose.toolCall;
+  if (!g || typeof g !== 'object') return;
+  const ext = pickStr(g, SRC_EXT_KEYS), tool = pickStr(g, SRC_TOOL_KEYS);
+  if (!ext && !tool) return;
+  toolSources.set((params.sessionId || '') + '\n' + u.toolCallId, { ext, tool });
+  if (toolSources.size > 1000) toolSources.delete(toolSources.keys().next().value);
+}
+export function askSource(ask) {
+  const p = (ask && ask.params) || {};
+  const tc = p.toolCall && typeof p.toolCall === 'object' ? p.toolCall : {};
+  let ext = '', tool = '';
+  const known = tc.toolCallId !== undefined ? toolSources.get((ask.sessionId || p.sessionId || '') + '\n' + tc.toolCallId) : null;
+  if (known) { ext = known.ext; tool = known.tool; }
+  for (const m of [p._meta, tc._meta, p.meta]) {
+    if (!m || typeof m !== 'object') continue;
+    for (const o of [m, m.goose, m.goose && m.goose.toolCall, m.gooseWeb, m.server].filter((x) => x && typeof x === 'object')) {
+      ext = ext || pickStr(o, SRC_EXT_KEYS);
+      tool = tool || pickStr(o, SRC_TOOL_KEYS);
+    }
+  }
+  for (const n of [tc.name, tc.toolName, p.toolName, tc.title]) {
+    const m = typeof n === 'string' && /^\s*([A-Za-z0-9_.-]+?)__([A-Za-z0-9_.-]+)/.exec(n);
+    if (m) { ext = ext || m[1]; tool = tool || m[2]; break; }
+  }
+  return { ext, tool };
+}
+function sourceLine(ask) {
+  const { ext, tool } = askSource(ask);
+  const who = ext ? h('span', null, 'From extension ', h('code', null, ext), tool ? ', tool ' : null, tool ? h('code', null, tool) : null)
+    : h('span', null, ask.kind === 'elicitation' ? 'Sent by an extension (Goose did not say which one)' : 'Extension not reported by Goose');
+  return h('div', { class: 'ask-source muted small' }, icon('ext', 12), who);
+}
+const SECRET_FIELD = /password|passphrase|passwd|secret|token|api[\s_-]?key|credential|\b(otp|2fa|mfa|pin)\b/i;
+function elicitationWarning(ask) {
+  const props = ((ask.params.requestedSchema || {}).properties) || {};
+  const secret = Object.entries(props).some(([k, s]) => SECRET_FIELD.test(k + ' ' + ((s && s.title) || '') + ' ' + ((s && s.description) || '')));
+  return h('div', { class: ['ask-warn', 'small', secret ? 'ask-warn-strong' : ''] }, icon('alert', 12),
+    secret ? 'This form asks for a secret. Never enter your Goose Web password or sign-in codes here; only continue if you trust the extension named above.'
+      : 'Never enter your Goose Web password or sign-in codes in a form like this.');
+}
+
 export function askCard(ask, { compact = false, showSession = false } = {}) {
   const el = h('div', { class: ['ask', 'ask-' + ask.kind, compact ? 'ask-compact' : ''], dataset: { askId: String(ask.id) } });
   const body = h('div', { class: 'ask-body' });
@@ -102,6 +155,7 @@ export function askCard(ask, { compact = false, showSession = false } = {}) {
     const tc = ask.params.toolCall || {};
     const raw = tc.rawInput;
     body.appendChild(h('div', { class: 'ask-title' }, tc.title || 'Tool call'));
+    body.appendChild(sourceLine(ask));
     if (raw !== undefined && raw !== null) {
       const cmd = raw && typeof raw === 'object' && typeof raw.command === 'string' ? raw.command : null;
       if (cmd) body.appendChild(h('pre', { class: 'ask-cmd' }, cmd));
@@ -119,6 +173,8 @@ export function askCard(ask, { compact = false, showSession = false } = {}) {
     }, { variant: OPTION_VARIANT[o.kind] || '', size: compact ? 'sm' : '', icon: o.kind && o.kind.startsWith('allow') ? 'check' : 'x' }))));
   } else if (ask.kind === 'elicitation') {
     body.appendChild(h('div', { class: 'ask-title' }, ask.params.message || 'Goose needs some information'));
+    body.appendChild(sourceLine(ask));
+    if (!compact) body.appendChild(elicitationWarning(ask));
     if (compact) {
       body.appendChild(h('div', { class: 'ask-actions' }, btn('Answer…', () => openElicitationModal(ask), { variant: 'primary', size: 'sm' }), btn('Decline', () => answerAsk(ask.id, { action: 'decline' }), { size: 'sm' })));
     } else {
@@ -195,7 +251,7 @@ export function openElicitationModal(ask) {
   const off = bus.on('ask:resolved', (ev) => { if (ev.id === ask.id) { off(); m && m.close(); } });
   m = modal({
     title: 'Goose needs information',
-    body: h('div', null, h('p', { class: 'lead' }, ask.params.message || ''), form.el),
+    body: h('div', null, h('p', { class: 'lead' }, ask.params.message || ''), sourceLine(ask), elicitationWarning(ask), form.el),
     footer: [btn('Cancel', () => { answerAsk(ask.id, { action: 'cancel' }); }), btn('Decline', () => answerAsk(ask.id, { action: 'decline' })),
       btn('Submit', () => { const v = form.values(); if (v) answerAsk(ask.id, { action: 'accept', content: v }); }, { variant: 'primary' })],
     onClose: () => off(),

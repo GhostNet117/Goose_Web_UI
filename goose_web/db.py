@@ -21,10 +21,12 @@ AUDIT_RETENTION_DAYS = 365
 # pick them up. Only ever ADD nullable columns here; never rename or drop.
 #   v2: users.totp_last_counter - last accepted TOTP time step (replay protection, GW-14)
 #       users.oidc_issuer / users.oidc_subject - OIDC identity binding by (iss, sub) (GW-12)
+#   v3: oidc_states.binding - hash of the pre-sign-in browser cookie the OIDC state is bound to (A-4)
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("users", "totp_last_counter", "INTEGER"),
     ("users", "oidc_issuer", "TEXT"),
     ("users", "oidc_subject", "TEXT"),
+    ("oidc_states", "binding", "TEXT"),
 )
 POST_MIGRATION_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_oidc ON users(oidc_issuer, oidc_subject)"
@@ -133,6 +135,14 @@ CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit(ts);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS oidc_states (
   state TEXT PRIMARY KEY, verifier TEXT NOT NULL, nonce TEXT NOT NULL, created_at REAL NOT NULL
+);
+-- OIDC sign-ins of accounts with two-factor, waiting for the TOTP code (auth.begin_mfa, A-8)
+CREATE TABLE IF NOT EXISTS mfa_pending (
+  token_hash TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  method TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0
 );
 -- failed sign-ins per client address (IPv4, or IPv6 /64) and blocks (ipblock.py, spec 007)
 CREATE TABLE IF NOT EXISTS ip_blocks (

@@ -2,6 +2,7 @@
 import { h, btn, iconBtn, pageHeader, toast, toastError, confirmDialog, modal, empty, skeleton, banner, errMsg, input, textarea, field, tabs, toggle, select, checkbox, table, section, debounce, prettyJson, relTime, fmtDateTime, copyBtn, spinner, actionBtn, menu, badge } from '../ui.js';
 import { icon } from '../icons.js';
 import { GET, POST, PUT, PATCH, DEL, qs } from '../api.js';
+import { rpc, G } from '../rpc.js';
 import { store } from '../store.js';
 import { setBaseTitle } from '../herd.js';
 import { router } from '../router.js';
@@ -196,6 +197,102 @@ function anyList(label, values, hint, modes) {
   return { el: field(label, h('div', { class: 'stack-sm' }, tg, box), hint), get: () => (any ? ['*'] : modes ? [...sel] : ta.value.split(/[,\n]/).map((s) => s.trim()).filter(Boolean)) };
 }
 
+// Providers and models a team may use, picked from the providers and models Goose knows (the admin's own Goose
+// configuration: providers/list), instead of typing ids. "Any" keeps the old wildcard; ids that Goose does not list
+// (a provider configured only in team library items, a renamed model) stay selectable and can be added by hand.
+let providerCatalog = null;
+async function loadProviderCatalog(force = false) {
+  if (providerCatalog && !force) return providerCatalog;
+  try {
+    const r = await rpc.call(G('providers/list'), {});
+    providerCatalog = (r.entries || []).map((e) => ({ id: e.providerId, name: e.providerName || e.providerId, configured: !!e.configured,
+      defaultModel: e.defaultModel || '', models: (e.models || []).map((m) => ({ id: m.id, name: m.name || m.id, ctx: m.contextLimit || 0 })) }))
+      .sort((a, b) => (b.configured - a.configured) || a.name.localeCompare(b.name));
+  } catch (e) { providerCatalog = { error: errMsg(e) }; }
+  return providerCatalog;
+}
+
+function providerModelPicker(pol, catalog) {
+  const bad = !Array.isArray(catalog);
+  const cat = bad ? [] : catalog;
+  let anyP = (pol.allowed_providers || []).includes('*');
+  let anyM = (pol.allowed_models || []).includes('*');
+  const selP = new Set(anyP ? [] : pol.allowed_providers || []);
+  const selM = new Set(anyM ? [] : pol.allowed_models || []);
+  let showAll = false;
+  const known = new Set(cat.map((c) => c.id));
+  const modelOwner = new Map(); cat.forEach((c) => c.models.forEach((m) => { if (!modelOwner.has(m.id)) modelOwner.set(m.id, c.id); }));
+  const pBox = h('div', { class: 'chk-list picker' });
+  const mBox = h('div', { class: 'stack-sm picker' });
+  const dProv = select([], '', { class: 'inp' });
+  const dModel = select([], '', { class: 'inp' });
+  const extraP = input({ placeholder: 'other provider id', class: 'inp inp-sm' });
+  const extraM = input({ placeholder: 'other model id', class: 'inp inp-sm' });
+  const chk = (checked, onchange, label, sub) => h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked, onchange: (e) => onchange(e.target.checked) }), h('span', null, label, sub ? h('span', { class: 'muted small mono' }, ' ' + sub) : null));
+  const provName = (id) => (cat.find((c) => c.id === id) || {}).name || id;
+  const allowedProviders = () => (anyP ? cat.filter((c) => c.configured || selP.has(c.id)).map((c) => c.id) : [...selP]);
+
+  const drawP = () => {
+    const rows = cat.filter((c) => showAll || c.configured || selP.has(c.id));
+    const unknown = [...selP].filter((id) => !known.has(id));
+    pBox.hidden = anyP;
+    pBox.replaceChildren(
+      ...rows.map((c) => chk(selP.has(c.id), (v) => { if (v) selP.add(c.id); else selP.delete(c.id); drawM(); drawDefaults(); }, c.name, c.id + (c.configured ? '' : ' (not configured)'))),
+      ...unknown.map((id) => chk(true, (v) => { if (!v) selP.delete(id); drawP(); drawM(); drawDefaults(); }, id, '(not listed by Goose)')),
+      cat.some((c) => !c.configured) ? h('div', null, toggle(showAll, (v) => { showAll = v; drawP(); }, { text: 'Show all ' + cat.length + ' providers' })) : null,
+      h('div', { class: 'row' }, extraP, btn('Add', () => { const v = extraP.value.trim(); if (v) { selP.add(v); extraP.value = ''; drawP(); drawM(); drawDefaults(); } }, { size: 'sm' })));
+  };
+  const drawM = () => {
+    mBox.hidden = anyM;
+    const groups = allowedProviders().map((id) => cat.find((c) => c.id === id)).filter((c) => c && c.models.length);
+    const listed = new Set(groups.flatMap((g) => g.models.map((m) => m.id)));
+    const unknown = [...selM].filter((id) => !listed.has(id));
+    mBox.replaceChildren(
+      groups.length ? null : h('div', { class: 'muted small' }, 'Choose providers first (their models are listed here).'),
+      ...groups.map((g) => {
+        const count = h('span', { class: 'muted small' });
+        const setCount = () => { count.textContent = ' ' + g.models.filter((m) => selM.has(m.id)).length + ' of ' + g.models.length + ' selected'; };
+        setCount();
+        return h('details', { class: 'pick-group', open: g.models.some((m) => selM.has(m.id)) || groups.length <= 2 },
+          h('summary', null, h('span', { class: 'strong' }, g.name), count,
+            h('span', { class: 'row', style: { display: 'inline-flex', marginLeft: '8px' } },
+              btn('All', (ev) => { ev.preventDefault(); g.models.forEach((m) => selM.add(m.id)); drawM(); drawDefaults(); }, { size: 'sm', variant: 'ghost' }),
+              btn('None', (ev) => { ev.preventDefault(); g.models.forEach((m) => selM.delete(m.id)); drawM(); drawDefaults(); }, { size: 'sm', variant: 'ghost' }))),
+          h('div', { class: 'chk-list' }, ...g.models.map((m) => chk(selM.has(m.id), (v) => { if (v) selM.add(m.id); else selM.delete(m.id); setCount(); drawDefaults(); }, m.name, (m.name !== m.id ? m.id : '') + (m.ctx ? ' ' + Math.round(m.ctx / 1000) + 'k' : '')))));
+      }),
+      unknown.length ? h('div', { class: 'chk-list' }, ...unknown.map((id) => chk(true, (v) => { if (!v) { selM.delete(id); drawM(); drawDefaults(); } }, id, '(not listed for these providers)'))) : null,
+      h('div', { class: 'row' }, extraM, btn('Add', () => { const v = extraM.value.trim(); if (v) { selM.add(v); extraM.value = ''; drawM(); drawDefaults(); } }, { size: 'sm' })));
+  };
+  const drawDefaults = () => {
+    const curP = dProv.value || pol.default_provider || '';
+    const provs = allowedProviders();
+    dProv.replaceChildren(h('option', { value: '' }, '- none (keep each member\'s choice) -'),
+      ...[...new Set([...provs, ...(curP && !provs.includes(curP) ? [curP] : [])])].map((id) => h('option', { value: id }, provName(id) + (provs.includes(id) ? '' : ' (not allowed above)'))));
+    dProv.value = curP;
+    const c = cat.find((x) => x.id === dProv.value);
+    const curM = dModel.value || pol.default_model || '';
+    const models = c ? c.models.filter((m) => anyM || selM.has(m.id)) : [];
+    dModel.replaceChildren(h('option', { value: '' }, c ? 'Provider default (' + (c.defaultModel || '?') + ')' : '-'),
+      ...models.map((m) => h('option', { value: m.id }, m.name)),
+      ...(curM && !models.some((m) => m.id === curM) ? [h('option', { value: curM }, curM + ' (not in the list)')] : []));
+    dModel.value = curM;
+  };
+  dProv.addEventListener('change', () => { dModel.value = ''; drawDefaults(); });
+  const tgP = toggle(anyP, (v) => { anyP = v; drawP(); drawM(); drawDefaults(); }, { text: 'Any provider' });
+  const tgM = toggle(anyM, (v) => { anyM = v; drawM(); drawDefaults(); }, { text: 'Any model' });
+  drawP(); drawM(); drawDefaults();
+  const el = h('div', { class: 'stack' },
+    bad ? banner('warn', 'Could not list your providers (' + ((catalog && catalog.error) || 'no answer') + '). You can still add ids by hand.') : null,
+    h('div', { class: 'grid2' },
+      field('Allowed providers', h('div', { class: 'stack-sm' }, tgP, pBox), 'Listed from your Goose configuration. Members get these providers\' settings through team library items or their own keys.'),
+      field('Allowed models', h('div', { class: 'stack-sm' }, tgM, mBox), 'Grouped by the providers allowed on the left.')),
+    h('div', { class: 'grid2' }, field('Default provider', dProv, 'New chats start here.'), field('Default model', dModel, 'Members\' profile default follows this.')));
+  return {
+    el,
+    get: () => ({ providers: anyP ? ['*'] : [...selP], models: anyM ? ['*'] : [...selM], defaultProvider: dProv.value, defaultModel: dModel.value }),
+  };
+}
+
 function teamsTab(body) {
   let teams = [], users = [], hints = [], selId = null;
   const listEl = h('div', { class: 'split-list' }, skeleton(4));
@@ -217,11 +314,8 @@ function teamsTab(body) {
     const pol = { ...(t.policy || {}) };
     const name = input({ value: t.name }); const desc = input({ value: t.description || '' });
     const flagRow = (k) => h('div', { class: 'set-row' }, h('div', { class: 'grow' }, h('div', null, FLAG_LABEL[k]), h('div', { class: 'muted small mono' }, k)), toggle(!!pol[k], (v) => { pol[k] = v; }));
-    const providers = anyList('Allowed providers', pol.allowed_providers, 'Provider ids, e.g. openai, anthropic, or a custom provider id.');
-    const models = anyList('Allowed models', pol.allowed_models, 'Model ids, e.g. gpt-4o-mini.');
+    const pm = providerModelPicker(pol, providerCatalog);
     const modes = anyList('Allowed approval modes', pol.allowed_modes, 'Chat only = no tool calls; Approve = ask before every tool call.', MODE_CHOICES);
-    const dProv = input({ value: pol.default_provider || '', placeholder: 'e.g. openai' });
-    const dModel = input({ value: pol.default_model || '', placeholder: 'e.g. gpt-4o-mini' });
     const share = input({ value: pol.share_folder || '', placeholder: t.teamFolder || '' });
     const roots = textarea({ rows: 3, class: 'inp mono', value: (pol.allowed_roots || []).join('\n'), placeholder: 'none - one absolute path per line' });
     const maxRuns = input({ type: 'number', min: '0', value: pol.max_concurrent_runs ?? '', placeholder: '3', class: 'inp inp-sm' });
@@ -231,7 +325,7 @@ function teamsTab(body) {
     const groupBody = (g) => {
       const parts = g.flags.map(flagRow);
       if (g.id === 'hints') parts.unshift(field('Team hints', hp.el, 'Team hints come last in every member\'s hints and take precedence over personal hints.'));
-      if (g.id === 'models') parts.unshift(h('div', { class: 'grid2' }, providers.el, models.el, field('Default provider', dProv, 'New chats start here. Must be allowed above.'), field('Default model', dModel, 'Members\' profile default follows this.')));
+      if (g.id === 'models') parts.unshift(pm.el);
       if (g.id === 'modes') parts.push(modes.el);
       if (g.id === 'folders') parts.push(h('div', { class: 'stack-sm' }, h('div', { class: 'muted small' }, 'Members can always reach their own workspace and the team folder. Nothing else unless listed here.'), field('Team folder', share, 'Shared by all members. Leave empty for the default: ' + (t.teamFolder || '')), field('Extra folders', roots, 'Absolute paths, one per line.'), field('Max concurrent runs', maxRuns, 'Per user. Empty = the default (3). 0 = unlimited.')));
       if (g.kinds) {
@@ -243,9 +337,10 @@ function teamsTab(body) {
     detail.replaceChildren(
       h('div', { class: 'detail-head' }, h('h2', null, t.name), h('div', { class: 'row' },
         actionBtn('Save team', async () => {
-          const p = { ...pol, allowed_providers: providers.get(), allowed_models: models.get(), allowed_modes: modes.get(),
+          const sel = pm.get();
+          const p = { ...pol, allowed_providers: sel.providers, allowed_models: sel.models, allowed_modes: modes.get(),
             allowed_roots: roots.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
-            default_provider: dProv.value.trim(), default_model: dModel.value.trim(), share_folder: share.value.trim(),
+            default_provider: sel.defaultProvider, default_model: sel.defaultModel, share_folder: share.value.trim(),
             max_concurrent_runs: maxRuns.value === '' ? null : Number(maxRuns.value) };
           const r = await PATCH('/api/admin/teams/' + encodeURIComponent(t.id), { name: name.value.trim(), description: desc.value.trim(), policy: p, members: members.get(), hints: hp.get() });
           if (r && (r.moved || []).length) toast('Moved to ' + t.name + ': ' + r.moved.join(', '), { kind: 'info', timeout: 8000 });
@@ -298,7 +393,7 @@ function teamsTab(body) {
   };
   async function load() {
     try {
-      [teams, users, hints] = await Promise.all([loadTeams(), loadUsers().catch(() => []), loadHints().catch(() => [])]);
+      [teams, users, hints] = await Promise.all([loadTeams(), loadUsers().catch(() => []), loadHints().catch(() => []), loadProviderCatalog()]);
       if (!selId && teams.length) selId = teams[0].id;
       drawList(); drawDetail();
     } catch (e) { listEl.replaceChildren(banner('error', errMsg(e))); }

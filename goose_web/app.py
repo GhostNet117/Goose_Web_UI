@@ -6,6 +6,7 @@ import contextlib
 import ipaddress
 import json
 import logging
+import re
 import socket
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ from urllib.parse import urlsplit
 import httpx
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import HTTPConnection, Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
@@ -25,7 +27,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from . import __version__, activity, api, logjanitor, tls
 from .auth import AuthService
 from .config import Settings
-from .context import Ctx, HTTPError, _ip_in
+from .context import DEFAULT_BODY_LIMIT, BodyTooLarge, Ctx, HTTPError, _ip_in
 from .db import Database
 from .hub import Client, Hub
 from .ipblock import BLOCKED_MESSAGE
@@ -56,22 +58,94 @@ class SecurityHeaders:
         async def wrapped(message):
             if message["type"] == "http.response.start":
                 headers = message.setdefault("headers", [])
-                have = {k.lower() for k, _ in headers}
-                add = [(b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"same-origin"),
+                have = {bytes(k).lower() for k, _ in headers}
+                # A header the route already set (the apps frame sends Referrer-Policy: no-referrer) is never
+                # given a second value: browsers would use the last one (D-9).
+                add = [(k, v) for k, v in (
+                       (b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"same-origin"),
                        (b"cross-origin-opener-policy", b"same-origin"),
                        (b"cross-origin-resource-policy", b"same-origin"),
-                       (b"permissions-policy", b"camera=(), geolocation=(), payment=(), usb=(), microphone=(self)")]
+                       (b"permissions-policy", b"camera=(), geolocation=(), payment=(), usb=(), microphone=(self)"))
+                       if k not in have]
                 if b"content-security-policy" not in have:
                     add.append((b"content-security-policy", SPA_CSP.encode()))
                 if b"x-frame-options" not in have:
                     add.append((b"x-frame-options", b"DENY"))
                 if path.startswith("/api/") and b"cache-control" not in have:
                     add.append((b"cache-control", b"no-store"))
-                if self.hsts:
+                if self.hsts and b"strict-transport-security" not in have:
                     add.append((b"strict-transport-security", b"max-age=31536000"))
                 headers.extend(add)
             await send(message)
         await self.app(scope, receive, wrapped)
+
+
+# ---------------------------------------------------------------------- request body cap (A-1, A-2)
+# Routes that take more than DEFAULT_BODY_LIMIT: (path pattern, bytes). /api/fs/upload follows server.max_upload_mb.
+_LARGE_BODY_ROUTES = ((re.compile(r"^/api/admin/teams/\d+/items$"), 8 * 1024 * 1024),)
+_MULTIPART_SLACK = 64 * 1024   # multipart boundaries and part headers on top of the file bytes
+
+
+def upload_limit_mb(settings: Settings) -> int:
+    return int(settings.get("server", "max_upload_mb") or 25)
+
+
+class BodyLimit:
+    """Caps every HTTP request body before anything buffers it (A-1, A-2).
+
+    A Content-Length above the route's cap is refused with 413 at once. Bodies without one (chunked transfer
+    encoding) are counted while the route receives them; the receive call raises BodyTooLarge (413) as soon as
+    the running total passes the cap, so neither memory (body_json) nor the temp files of a multipart form
+    (request.form) ever hold more than the cap. Caps: /api/fs/upload = server.max_upload_mb (+ multipart
+    overhead), a few large admin routes per _LARGE_BODY_ROUTES, everything else DEFAULT_BODY_LIMIT (2 MB).
+    """
+
+    def __init__(self, app: ASGIApp, settings: Settings):
+        self.app = app
+        self.settings = settings
+
+    def limit_for(self, path: str) -> tuple[int, str]:
+        if path == "/api/fs/upload":
+            mb = upload_limit_mb(self.settings)
+            return mb * 1024 * 1024 + _MULTIPART_SLACK, f"Uploads are limited to {mb} MB"
+        for pattern, limit in _LARGE_BODY_ROUTES:
+            if pattern.match(path):
+                return limit, "Request body too large"
+        return DEFAULT_BODY_LIMIT, "Request body too large"
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        limit, message = self.limit_for(str(scope.get("path") or ""))
+        try:
+            declared = int(Headers(scope=scope).get("content-length") or 0)
+        except ValueError:
+            return await HTTPError(400, "bad_request", "Invalid Content-Length").response()(scope, receive, send)
+        if declared > limit:
+            return await BodyTooLarge(message).response()(scope, receive, send)
+        received = 0
+        started = False
+
+        async def counted_receive():
+            nonlocal received
+            msg = await receive()
+            if msg["type"] == "http.request":
+                received += len(msg.get("body") or b"")
+                if received > limit:
+                    raise BodyTooLarge(message)
+            return msg
+
+        async def tracked_send(msg):
+            nonlocal started
+            if msg["type"] == "http.response.start":
+                started = True
+            await send(msg)
+
+        try:
+            await self.app(scope, counted_receive, tracked_send)
+        except BodyTooLarge as e:   # normally answered by the HTTPError handler; this covers everything else
+            if not started:
+                await e.response()(scope, receive, send)
 
 
 # ---------------------------------------------------------------------- Host allow-list (NEW-04)
@@ -208,6 +282,9 @@ async def manifest(request: Request):
 
 class Static(StaticFiles):
     async def get_response(self, path: str, scope):
+        # Windows aliases of the same file (index.html::$DATA, index~1.htm, "index.html.") are not served (A-14).
+        if ":" in path or "~" in path or any(seg.endswith((".", " ")) for seg in re.split(r"[\\/]", path) if seg):
+            raise StarletteHTTPException(status_code=404)
         resp = await super().get_response(path, scope)
         resp.headers.setdefault("Cache-Control", "no-cache")  # revalidate (ETag) so updates apply at once
         return resp
@@ -262,7 +339,7 @@ async def ws_endpoint(websocket: WebSocket):
             ident = c.auth.resolve_token(authz[7:].strip())
     elif origin and origin in c.allowed_origins(websocket):
         ident = c.identity(websocket)
-    if ident is None or ident.user["must_change_pw"]:
+    if ident is None or c.must_enrol_or_change(ident.user):   # password change / two-factor enrolment first (A-8)
         await websocket.close(code=4401)  # before accept -> HTTP 403 for the browser
         return
     user = ident.user
@@ -306,7 +383,10 @@ async def ws_endpoint(websocket: WebSocket):
             except Exception as e:  # never let one bad frame kill the socket
                 log.exception("ws frame error")
                 if msg.get("id") is not None and msg.get("method"):
-                    client.send({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32603, "message": str(e)}})
+                    # internal detail stays in the gateway log (A-13)
+                    client.send({"jsonrpc": "2.0", "id": msg["id"],
+                                 "error": {"code": -32603, "message": f"Internal error ({e.__class__.__name__}, "
+                                                                     "see the gateway log)"}})
             if client.closed:
                 break
     except WebSocketDisconnect:
@@ -507,7 +587,8 @@ def create_app(settings: Settings) -> Starlette:
     app = Starlette(routes=routes, lifespan=lifespan,
                     exception_handlers={HTTPError: http_error, 404: not_found, 500: server_error,
                                         ValueError: _bad_request})
-    app.add_middleware(IPBlockGuard)                   # innermost: blocked addresses (spec 007), after the Host check
+    app.add_middleware(BodyLimit, settings=settings)   # innermost: request body cap while streaming (A-1, A-2)
+    app.add_middleware(IPBlockGuard)                   # blocked addresses (spec 007), after the Host check
     app.add_middleware(HostGuard, settings=settings)   # inner: its 400 still gets the security headers
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
     app.add_middleware(SecurityHeaders, hsts=settings.public_url.startswith("https://"))
@@ -515,4 +596,7 @@ def create_app(settings: Settings) -> Starlette:
 
 
 async def _bad_request(request: Request, exc: ValueError):
-    return JSONResponse({"error": "bad_request", "message": str(exc)}, status_code=400)
+    # The exception text can describe internals (A-13): it goes to the gateway log, the client gets a generic reply.
+    log.info("bad request on %s: %s", request.url.path, exc)
+    return JSONResponse({"error": "bad_request", "message": "The request is not valid (see the gateway log)"},
+                        status_code=400)
