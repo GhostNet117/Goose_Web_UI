@@ -97,15 +97,20 @@ def test_gateway_serves_https_on_localhost(tmp_path):
     port = _free_port()
     root = tmp_path / "profiles"
     cfg = tmp_path / "config.yaml"
-    cfg.write_text(f'server:\n  host: "127.0.0.1"\n  port: {port}\n  tls: self-signed\npaths:\n  profiles_root: "{root.as_posix()}"\n'
+    # allow_elevated: CI's Windows runners are elevated, and the gateway refuses to run elevated by default.
+    cfg.write_text(f'server:\n  host: "127.0.0.1"\n  port: {port}\n  tls: self-signed\n  allow_elevated: true\n'
+                   f'paths:\n  profiles_root: "{root.as_posix()}"\n'
                    'goose:\n  binary: ""\nsandbox:\n  enabled: false\n', encoding="utf-8")
     run = [sys.executable, "-m", "goose_web", "--config", str(cfg)]
     pw = "Tls-Test-Password-2468!"
     subprocess.run(run + ["init", "--admin", "boss", "--password", pw], check=True, capture_output=True)
-    p = subprocess.Popen(run + ["serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    out = tmp_path / "serve.out"
+    p = subprocess.Popen(run + ["serve"], stdout=open(out, "wb"), stderr=subprocess.STDOUT)
     ca = root / "_system" / "tls" / "ca.crt"
     try:
-        for _ in range(100):
+        for _ in range(150):
+            if p.poll() is not None:
+                pytest.fail("gateway exited: " + out.read_text(errors="replace")[-2000:])
             if ca.exists():
                 try:
                     if httpx.get(f"https://localhost:{port}/healthz", verify=str(ca), timeout=2).status_code == 200:
