@@ -591,7 +591,10 @@ def test_private_keys_are_owner_only(settings):
             sddl = _path_sddl(str(p))
             assert "D:P" in sddl                                              # inheritance removed
             sids = set(re.findall(r"\([^;]*;[^;]*;[^;]*;[^;]*;[^;]*;([^)]*)\)", sddl.split("D:", 1)[1]))
-            assert sids <= {winsec.current_user_sid(), "SY"}, sids
+            me = winsec.current_user_sid()
+            # SDDL abbreviates the built-in Administrator account (RID 500, e.g. GitHub's Windows runner) as LA
+            allowed = {me, "SY"} | ({"LA"} if str(me).endswith("-500") else set())
+            assert sids <= allowed, sids
         else:
             assert p.stat().st_mode & 0o077 == 0
     assert not list(d.glob("*.tmp"))
