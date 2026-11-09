@@ -526,7 +526,8 @@ def test_file_api_refuses_system_dir_for_admins(gw, tmp_path):
     r = client.post("/api/fs/upload", params={"dir": str(sysd / "backups")}, headers=h, files=[("f", ("x.txt", b"x"))])
     assert r.status_code == 403 and not (sysd / "backups").exists()
     for unc in (r"\\127.0.0.1\C$\Windows\win.ini", "//127.0.0.1/c$/x", r"\\?\C:\Windows\win.ini"):
-        assert client.get("/api/fs/read", params={"path": unc}).status_code == 403
+        # Windows: UNC/device paths are refused (403). POSIX has no UNC paths: these are just missing files (404).
+        assert client.get("/api/fs/read", params={"path": unc}).status_code in ((403,) if os.name == "nt" else (403, 404))
     # the rest of the machine is still open to administrators
     r = client.get("/api/fs/read", params={"path": str(elsewhere / "ok.txt")})
     assert r.status_code == 200 and r.json()["content"] == "fine"
