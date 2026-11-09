@@ -16,7 +16,9 @@ def _setup_logging(settings) -> None:
     logdir = settings.system_dir / "logs"
     logdir.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    fh = logging.handlers.RotatingFileHandler(logdir / "gateway.log", maxBytes=5 * 1024 * 1024, backupCount=5,
+    mb = float(settings.get("logs", "gateway_file_mb") or 10)
+    fh = logging.handlers.RotatingFileHandler(logdir / "gateway.log", maxBytes=int(mb * 1024 * 1024),
+                                              backupCount=max(1, int(settings.get("logs", "gateway_files") or 5)),
                                               encoding="utf-8")
     fh.setFormatter(fmt)
     root = logging.getLogger()
@@ -28,6 +30,23 @@ def _setup_logging(settings) -> None:
     root.setLevel(os.environ.get("GOOSE_WEB_LOG_LEVEL", "INFO").upper())
     for noisy in ("httpx", "httpcore", "websockets", "uvicorn.access"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    from . import activity
+    activity.setup(logdir, float(settings.get("logs", "activity_file_mb") or 20),
+                   int(settings.get("logs", "activity_files") or 10), bool(settings.get("logs", "activity")))
+
+
+def _tls_override(settings) -> dict | None:
+    """The Admin UI's HTTPS choice (settings table), if the database exists already."""
+    dbp = settings.system_dir / "goose-web.db"
+    if not dbp.exists():
+        return None
+    from .db import Database
+    db = Database(dbp)
+    try:
+        v = db.get_setting("tls")
+    finally:
+        db.close()
+    return v if isinstance(v, dict) else None
 
 
 def cmd_serve(args, settings) -> int:
@@ -39,12 +58,63 @@ def cmd_serve(args, settings) -> int:
     host = args.host or settings.get("server", "host")
     port = int(args.port or settings.get("server", "port"))
     settings.data.setdefault("server", {})["host"] = host  # a --host override joins the Host allow-list too
-    logging.getLogger("goose_web").info("starting on %s:%s as %s (integrity %s), profiles %s", host, port,
-                                        winsec.current_user(), winsec.integrity_level(), settings.profiles_root)
-    uvicorn.run(create_app(settings), host=host, port=port, log_config=None, proxy_headers=False,
-                ws_max_size=64 * 1024 * 1024, ws_ping_interval=25, ws_ping_timeout=60, timeout_keep_alive=30,
-                server_header=False, date_header=True, timeout_graceful_shutdown=10)
+    from . import tls
+    mode, certfile, keyfile = tls.server_files(settings, _tls_override(settings))
+    logging.getLogger("goose_web").info("starting on %s://%s:%s as %s (integrity %s), profiles %s",
+                                        "https" if certfile else "http", host, port, winsec.current_user(),
+                                        winsec.integrity_level(), settings.profiles_root)
+    config = uvicorn.Config(create_app(settings), host=host, port=port, log_config=None, proxy_headers=False,
+                            ws_max_size=64 * 1024 * 1024, ws_ping_interval=25, ws_ping_timeout=60,
+                            timeout_keep_alive=30, server_header=False, date_header=True,
+                            timeout_graceful_shutdown=10, ssl_certfile=certfile or None, ssl_keyfile=keyfile or None)
+    config.load()                       # builds the SSL context now, so renewals can load new certificates into it
+    tls.activate(config.ssl if certfile else None, mode, certfile, keyfile)
+    uvicorn.Server(config).run()
     return 0
+
+
+def cmd_tls(args, settings) -> int:
+    """Spec 015: built-in HTTPS certificate - status, renew now, export the CA, or trust it (Windows, this user)."""
+    from . import tls
+    override = _tls_override(settings)
+    if args.action in ("status", "renew"):
+        if args.action == "renew" or tls.configured(settings, override)["effective"] == "self-signed":
+            st = tls.ensure(settings, force=args.action == "renew")
+            if st.get("renewed"):
+                print(f"Certificate {'renewed' if args.action == 'renew' else 'created/renewed'}: {st['reason']}. "
+                      "A running gateway loads it within its next check (or restart it).")
+        st = tls.status(settings, override)
+        print(f"HTTPS mode: {st['mode']} (effective: {st['effective']}, from {st.get('source', 'config')})")
+        for label, key in (("Server certificate", "cert"), ("Local CA", "ca")):
+            c = st.get(key)
+            if c and not c.get("error"):
+                print(f"{label}: {c['subject']}; valid until {c['notAfter'][:10]} ({c['daysLeft']} days); "
+                      f"SHA-256 {c['sha256']}")
+                if c.get("dns") or c.get("ips"):
+                    print("  names: " + ", ".join(c["dns"] + c["ips"]))
+        print("Names this machine needs: " + ", ".join(st["wantedNames"]))
+        if (tls.tls_dir(settings) / "ca.crt").exists():
+            print(f"CA file to trust on client machines: {tls.tls_dir(settings) / 'ca.crt'} (also served at /tls/ca.crt)")
+        return 0
+    ca = tls.tls_dir(settings) / "ca.crt"
+    if not ca.exists():
+        tls.ensure(settings)
+    if args.action == "export-ca":
+        out = Path(args.path or "goose-web-ca.crt")
+        out.write_bytes(ca.read_bytes())
+        print(f"Wrote {out}")
+        return 0
+    if args.action == "trust":
+        if os.name != "nt":
+            print(f"Add {ca} to the system trust store (e.g. /usr/local/share/ca-certificates + update-ca-certificates).")
+            return 1
+        import subprocess
+        # Current user's Trusted Root store: no admin rights needed; Windows asks for confirmation once.
+        certutil = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "certutil.exe")
+        r = subprocess.run([certutil, "-user", "-addstore", "Root", str(ca)], capture_output=True, text=True)
+        print(r.stdout.strip() or r.stderr.strip())
+        return r.returncode
+    return 2
 
 
 def _resolve_native_root(value: str | None, settings) -> str:
@@ -461,6 +531,18 @@ def cmd_check(args, settings) -> int:
         from . import sandbox as sb
         line("sandbox", "on: isolated non-admin workers run in their own AppContainer" if sb.IS_WINDOWS else
              "on, but this system is not Windows: isolated non-admin workers will not start", sb.IS_WINDOWS)
+    from . import logjanitor, tls
+    try:
+        st = tls.status(settings, _tls_override(settings))
+        cert = st.get("cert") or {}
+        line("https", f"{st['effective']} (mode {st['mode']}, from {st.get('source', 'config')})"
+             + (f"; certificate valid {cert.get('daysLeft')} more days" if cert.get("daysLeft") is not None else ""),
+             not st.get("error") and (st["effective"] != "files" or not cert.get("error")))
+    except Exception as e:
+        line("https", f"cannot read the TLS settings: {e}", False)
+    u = logjanitor.usage(settings)
+    print(f"[OK] logs: {u['bytes'] / 2**20:.1f} MB of {u['budget'] / 2**20:.0f} MB "
+          f"({u['percent']}% of the disk) in {u['files']} file(s)")
     if os.name == "nt":
         # Information only (a fresh install runs check before it registers the task): autostart at logon.
         tasks = _gateway_tasks()
@@ -526,6 +608,9 @@ def main(argv: list[str] | None = None) -> int:
     sbx = sub.add_parser("sandbox", help="per-user AppContainer sandbox: status, or remove one user's")
     sbx.add_argument("action", choices=["status", "remove"])
     sbx.add_argument("user", nargs="?")
+    tl = sub.add_parser("tls", help="built-in HTTPS certificate: status, renew, export-ca PATH, trust")
+    tl.add_argument("action", choices=["status", "renew", "export-ca", "trust"])
+    tl.add_argument("path", nargs="?")
     sub.add_parser("check", help="diagnostics")
     sub.add_parser("version")
     args = p.parse_args(argv)
@@ -537,7 +622,7 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "serve" and not hasattr(args, "host"):
         args.host, args.port = None, None
     return {"serve": cmd_serve, "init": cmd_init, "user": cmd_user, "ip": cmd_ip, "check": cmd_check,
-            "native-root": cmd_native_root, "native-hints": cmd_native_hints, "sandbox": cmd_sandbox}[cmd](args, settings)
+            "native-root": cmd_native_root, "native-hints": cmd_native_hints, "sandbox": cmd_sandbox, "tls": cmd_tls}[cmd](args, settings)
 
 
 if __name__ == "__main__":

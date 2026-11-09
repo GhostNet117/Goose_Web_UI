@@ -41,6 +41,8 @@ param(
     [string]$GooseBinary = '',               # goose.exe, or the folder Goose is installed in; '' = auto-detect
     [string]$RunAs = '',                     # Windows account for the gateway: '' = you (at logon); DOMAIN\svc or DOMAIN\gmsa$ = at boot
     [ValidateSet('on', 'off', '')] [string]$Sandbox = '',   # sandbox non-admin users' agents ('' = on)
+    [ValidateSet('auto', 'self-signed', 'off', '')] [string]$Tls = '',   # HTTPS: built-in certificate, or off behind a proxy ('' = auto)
+    [switch]$TrustCert,                      # trust the built-in certificate's CA on this computer (current user)
     [string]$BindHost = '127.0.0.1',         # use the LAN IP (or 0.0.0.0) when a reverse proxy on another host connects
     [int]$Port = 8710,
     [string]$PublicUrl = '',                 # e.g. https://goose.example.org (enables Secure cookies + HSTS)
@@ -232,7 +234,11 @@ Write-Host "     First admin        $Admin (Goose Web user, bound to that Goose 
 Write-Host "     Goose Web data     $ProfilesRoot"
 Write-Host "     Gateway runs as    $RunAs, $(if ($service) { 'at boot (service account)' } else { 'when you sign in' })"
 Write-Host "     Sandbox            $Sandbox for non-admin users"
-Write-Host "     Address            http://$($BindHost):$Port$(if ($PublicUrl) { "  (public $PublicUrl)" })"
+if (-not $Tls) { $Tls = 'auto' }
+$tlsOn = $Tls -eq 'self-signed' -or ($Tls -eq 'auto' -and -not $PublicUrl)
+$scheme = if ($tlsOn) { 'https' } else { 'http' }
+Write-Host "     HTTPS              $(if ($tlsOn) { 'built-in certificate (local CA, renewed automatically)' } else { 'off - TLS at your reverse proxy' }) (Admin > System > HTTPS)"
+Write-Host "     Address            $($scheme)://$($BindHost):$Port$(if ($PublicUrl) { "  (public $PublicUrl)" })"
 if (-not $NonInteractive -and ((Ask 'Continue (Y/n)' 'Y') -match '^[nN]')) { Write-Host 'Nothing changed.'; exit 0 }
 
 # --- 2. virtualenv -------------------------------------------------------------
@@ -309,6 +315,7 @@ if (-not (Test-Path $cfg)) {
         "  host: `"$BindHost`"",
         "  port: $Port",
         "  public_url: `"$PublicUrl`"",
+        "  tls: `"$Tls`"            # auto | self-signed | files | off (Admin > System > HTTPS overrides it)",
         '  trusted_proxies:'
     ) + ($proxies | ForEach-Object { "    - `"$_`"" }) + @(
         'paths:',
@@ -365,7 +372,13 @@ if ($existingTask.Count -and -not $Reregister) {
     }
 }
 
-$url = if ($PublicUrl) { $PublicUrl } else { "http://$(if ($BindHost -eq '0.0.0.0') { 'localhost' } else { $BindHost }):$Port" }
+if ($tlsOn) {   # create the certificate now (the gateway renews it itself) and show what it covers
+    & $venvPy -m goose_web --config $cfg tls status | ForEach-Object { Write-Host "     $_" }
+    $trust = $TrustCert -or (-not $NonInteractive -and ((Ask 'Trust the built-in certificate in your browsers on this computer (Y/n)' 'Y') -notmatch '^[nN]'))
+    if ($trust) { & $venvPy -m goose_web --config $cfg tls trust | ForEach-Object { Write-Host "     $_" } }
+    Write-Host "     Other computers: import $sys\tls\ca.crt (or download it from Admin > System > HTTPS) as a trusted root." -ForegroundColor Yellow
+}
+$url = if ($PublicUrl) { $PublicUrl } else { "$($scheme)://$(if ($BindHost -eq '0.0.0.0') { 'localhost' } else { $BindHost }):$Port" }
 Write-Host ""
 if ($service) {
     Write-Host "Done. The gateway starts at boot as $RunAs; start it now with: Start-ScheduledTask -TaskPath '$TaskPath' -TaskName GooseWeb_Gateway" -ForegroundColor Green

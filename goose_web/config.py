@@ -68,6 +68,25 @@ DEFAULTS: dict[str, Any] = {
         "allowed_hosts": [],
         "max_upload_mb": 25,
         "allow_elevated": False,          # Windows: refuse to run with an admin token (ownership guarantee)
+        # HTTPS (tls.py, spec 015): auto | self-signed | files | off. auto = self-signed unless public_url is set
+        # (then a reverse proxy terminates TLS). Admin > System > HTTPS overrides this. Applies at the next start.
+        "tls": "auto",
+        "tls_cert_file": "",              # mode files: PEM certificate (chain) and key, e.g. from a company CA
+        "tls_key_file": "",
+        "tls_names": [],                  # extra names/addresses for the self-signed certificate
+    },
+    # Logs (spec 015): every log Goose Web writes stays under max_disk_percent of the disk volume (logjanitor.py).
+    "logs": {
+        "max_disk_percent": 0.5,
+        "check_minutes": 30,
+        "activity": True,                 # user activity log, <system_dir>/logs/activity.jsonl (activity.py)
+        "activity_file_mb": 20,
+        "activity_files": 10,
+        "gateway_file_mb": 10,
+        "gateway_files": 5,
+        "include_native_goose_logs": False,   # also trim the native profile's Goose logs (shared with Desktop)
+        "audit_days": 365,                # audit table in the database
+        "audit_max_rows": 500000,
     },
     "paths": {
         "profiles_root": _default_profiles_root(),

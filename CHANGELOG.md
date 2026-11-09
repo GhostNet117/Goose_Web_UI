@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.11.0 - 2026-11-09
+
+- **Built-in HTTPS:** Goose Web creates its own local certificate authority and a server certificate for every name
+  and address of the machine (localhost, 127.0.0.1, ::1, host name, FQDN, IP addresses, bind address, public URL,
+  allowed hosts, `server.tls_names`), renews it automatically (30 days before expiry, or when a new name/address
+  appears) and loads it without a restart. **Admin > System > HTTPS** switches between the built-in certificate, your
+  own certificate files, and off (TLS at a reverse proxy); `goose-web tls status|renew|export-ca|trust`;
+  `install.ps1 -Tls`, `-TrustCert`. **Upgrade note:** the default `server.tls: auto` turns HTTPS on for installs
+  without `server.public_url`: `http://` URLs, bookmarks and proxies pointing at `http://` must change, or set
+  `server.tls: off` before upgrading (ADMINISTRATION 6.3).
+- **User activity log:** who did what, when and from where - every audit event plus opening, starting, prompting
+  (length only, never the text), stopping and forking chats, mode changes and browser connections - in the audit
+  log and in `<system_dir>/logs/activity.jsonl` (JSON lines for log shippers).
+- **Log budget:** all logs (gateway, activity, workers, the isolated profiles' Goose logs) stay under 0.5 % of the
+  disk volume (`logs.max_disk_percent`); the oldest unused files are deleted, a long-running worker's log is rotated
+  in place, and the audit table is capped (`logs.audit_days`, `logs.audit_max_rows`). Admin > System shows usage.
+- New dependency: `cryptography` (hash-locked).
+
 ## 1.10.1 - 2026-11-08
 
 - **Every Goose release from 1.50.0 to 1.57.0 tested end to end** (administrator on `goose serve`, sandboxed member on

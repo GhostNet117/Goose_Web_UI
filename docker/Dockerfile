@@ -82,7 +82,7 @@ ENV HOME=/home/goose \
 VOLUME ["/data"]
 EXPOSE 8710
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8710/healthz || exit 1
+  CMD curl -fsSk https://127.0.0.1:8710/healthz || curl -fsS http://127.0.0.1:8710/healthz || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--", "goose-web-entrypoint"]
 CMD ["serve"]

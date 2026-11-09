@@ -468,3 +468,18 @@ all Windows apps stay readable.
 - **Goose 1.50.x `tools/call`** ignores `extensionName` (fixed in Goose 1.51) and resolves a tool by name across the chat, so a policy that
   allows direct calls for one extension could reach another extension's tool. The gateway now checks every direct
   tool call against `tools/list` of the named extension and refuses a mismatch (on all Goose versions).
+
+### 8.4 1.11.0: built-in HTTPS, activity log, log budget
+
+- **Built-in HTTPS** (`server.tls`, default `auto` = on unless a public URL / proxy is configured): a local CA
+  (EC P-256, 10 years, `pathlen 0`) signs a 90-day server certificate for the machine's own names and addresses; it is
+  renewed automatically and hot-loaded. The CA key stays in `<system_dir>/tls/` (same protection as the database);
+  whoever can read it can mint certificates trusted by clients that imported the CA - accepted, the same people can
+  already read every session. Clients must verify the CA fingerprint when importing it. HSTS is not sent for the
+  built-in certificate. Verified by `tests/test_tls_logs.py` (a real gateway over HTTPS: localhost and 127.0.0.1 verify
+  against the CA, `__Host-gw` cookie `Secure`, plain HTTP refused, renewal hot reload).
+- **User activity** is attributable: every audit event and everyday chat action (open, new, prompt length, cancel,
+  fork, mode) and every browser connection carries the user and the real client address (trusted proxies only), in
+  the database and in `activity.jsonl`. Prompt text is never logged.
+- **Log budget**: logs cannot fill the disk (`logs.max_disk_percent`, 0.5 %); the audit table is capped by age and
+  rows.

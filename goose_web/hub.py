@@ -82,6 +82,10 @@ def goose_caps(init_result: dict | None) -> dict:
     return caps
 
 
+# Everyday chat activity recorded per user (spec 015, Hub.audit_activity).
+CHAT_ACTIVITY = {"session/new": "chat.new", "session/load": "chat.open", "session/prompt": "chat.prompt",
+                 "session/cancel": "chat.cancel", "session/fork": "chat.fork", "session/set_mode": "chat.mode"}
+
 EXT_ADD = "_goose/unstable/session/extensions/add"
 EXT_REMOVE = "_goose/unstable/session/extensions/remove"
 
@@ -407,6 +411,8 @@ class Upstream:
             params = {}
         try:
             pol.check(method, params, is_admin=client.is_admin, policy=client.policy, roots=client.roots)
+            if method in CHAT_ACTIVITY:
+                self.hub.audit_activity(client, self, method, params)
             if method == "initialize":
                 await self.ensure()
                 return self._reply(client, mid, self.init_result)
@@ -1101,6 +1107,25 @@ class Hub:
                 if k in params:
                     detail[k] = params[k]
             self.on_audit(client, "acp." + method.replace("_goose/unstable/", ""), method, detail, True)
+
+    def audit_activity(self, client: Client, up: Upstream, method: str, params: dict) -> None:
+        """Everyday chat activity (spec 015): who opened, started, prompted, stopped or forked which chat.
+        Prompt text is never recorded - only its length and the number of attachments."""
+        if not self.on_audit:
+            return
+        detail: dict = {"profile": up.key}
+        if method == "session/prompt":
+            blocks = [b for b in (params.get("prompt") or []) if isinstance(b, dict)]
+            detail["chars"] = sum(len(str(b.get("text") or "")) for b in blocks if b.get("type") in (None, "text"))
+            detail["attachments"] = sum(1 for b in blocks if b.get("type") not in (None, "text"))
+        elif method == "session/new":
+            detail["cwd"] = str(params.get("cwd") or "")[:300]
+        elif method == "session/set_mode":
+            detail["mode"] = str(params.get("modeId") or "")
+        try:
+            self.on_audit(client, CHAT_ACTIVITY[method], str(params.get("sessionId") or ""), detail, True)
+        except Exception:
+            log.exception("activity record")
 
     def audit_ask(self, client: Client, up: Upstream, ask: dict, answer: dict) -> None:
         if self.on_audit:

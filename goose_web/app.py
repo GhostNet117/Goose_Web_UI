@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import socket
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -21,7 +22,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import __version__, api
+from . import __version__, activity, api, logjanitor, tls
 from .auth import AuthService
 from .config import Settings
 from .context import Ctx, HTTPError, _ip_in
@@ -213,6 +214,41 @@ class Static(StaticFiles):
 
 
 # ---------------------------------------------------------------------- websocket
+async def _maintenance_loop(c: Ctx) -> None:
+    """Spec 015: keep logs under the disk budget, prune the audit table, renew the built-in certificate."""
+    minutes = max(1.0, float(c.settings.get("logs", "check_minutes") or 30))
+    while True:
+        try:
+            native = c.db.get_setting("native_root") or ""
+            in_use = {str(c.settings.system_dir / "logs" / f"worker-{k}.log")
+                      for k, w in c.workers.workers.items() if w.proc and w.proc.poll() is None}
+            rep = await asyncio.to_thread(logjanitor.enforce, c.settings, native, in_use)
+            c.log_report = dict(rep, at=time.time())
+            pruned = await asyncio.to_thread(logjanitor.prune_audit, c.settings, c.db)
+            if pruned:
+                log.info("audit: pruned %d old row(s)", pruned)
+            if tls.is_active() and tls.ACTIVE.get("mode") == "self-signed":
+                st = await asyncio.to_thread(tls.ensure, c.settings)
+                if st.get("renewed"):
+                    tls.reload_active()
+                    c.db.audit("tls.renewed", detail={"reason": st.get("reason"),
+                                                      "until": (st.get("cert") or {}).get("notAfter")})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("maintenance")
+        await asyncio.sleep(minutes * 60)
+
+
+async def ca_cert(request: Request):
+    """The built-in local CA certificate (public), so users can trust the self-signed HTTPS certificate."""
+    p = tls.tls_dir(request.app.state.ctx.settings) / "ca.crt"
+    if not p.exists():
+        raise HTTPError(404, "not_found", "No local CA (built-in HTTPS is not in use)")
+    return Response(p.read_bytes(), media_type="application/x-x509-ca-cert",
+                    headers={"Content-Disposition": 'attachment; filename="goose-web-ca.crt"', "Cache-Control": "no-cache"})
+
+
 async def ws_endpoint(websocket: WebSocket):
     c: Ctx = websocket.app.state.ctx
     origin = websocket.headers.get("origin")
@@ -252,6 +288,8 @@ async def ws_endpoint(websocket: WebSocket):
     client = Client(websocket.send_text, user, policy, roots, ip)
     client.start()
     c.hub.attach(up, client)
+    opened = time.time()
+    activity.record("ws.connect", user=user, ip=ip, target=target["username"])
     try:
         while True:
             raw = await websocket.receive_text()
@@ -277,6 +315,8 @@ async def ws_endpoint(websocket: WebSocket):
         pass
     finally:
         c.hub.detach(up, client)
+        activity.record("ws.disconnect", user=user, ip=ip, target=target["username"],
+                        detail={"seconds": round(time.time() - opened)})
 
 
 # ---------------------------------------------------------------------- notifications (webhooks)
@@ -429,11 +469,14 @@ def create_app(settings: Settings) -> Starlette:
                 c.upstream_for(u)
             except Exception:
                 log.exception("register %s", u["username"])
-        db.audit("system.start", detail={"version": __version__, "goose": c.goose_version})
+        db.audit("system.start", detail={"version": __version__, "goose": c.goose_version,
+                                          "https": tls.ACTIVE.get("mode") if tls.is_active() else "off"})
+        maintenance = asyncio.create_task(_maintenance_loop(c))
         log.info("Goose Web %s ready (goose %s)", __version__, c.goose_version or "?")
         try:
             yield
         finally:
+            maintenance.cancel()
             await workers.shutdown()
             db.audit("system.stop")
             db.close()
@@ -456,6 +499,7 @@ def create_app(settings: Settings) -> Starlette:
         Route("/index.html", index),
         Route("/sw.js", sw),
         Route("/manifest.webmanifest", manifest),
+        Route("/tls/ca.crt", ca_cert),
         *api.routes,
         WebSocketRoute("/ws", ws_endpoint),
         Mount("/static", Static(directory=str(STATIC)), name="static"),

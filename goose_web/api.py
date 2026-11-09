@@ -17,7 +17,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from . import hosttasks, security, winsec
+from . import hosttasks, logjanitor, security, tls, winsec
 from . import policy as acp_policy
 from .auth import AuthError
 from .context import Ctx, HTTPError, body_json
@@ -1322,7 +1322,47 @@ async def admin_system(request: Request):
                "profilesRoot": str(c.settings.profiles_root), "nativeRoot": native,
                "desktopRunning": c.workers.desktop_running(), "nativeScheduler": c.settings.get("goose", "native_scheduler"),
                "uptime": time.time() - c.started_at, "pid": os.getpid(), "workers": workers,
-               "bufferBytes": c.hub.total_buffer, "configFile": c.settings.source})
+               "bufferBytes": c.hub.total_buffer, "configFile": c.settings.source,
+               "logs": dict(await asyncio.to_thread(logjanitor.usage, c.settings, native),
+                            lastCheck=getattr(c, "log_report", None),
+                            activity=str(c.settings.system_dir / "logs" / "activity.jsonl")
+                            if c.settings.get("logs", "activity") else "")})
+
+
+async def admin_tls(request: Request):
+    """Spec 015: built-in HTTPS - status (GET), choose the mode (PUT), renew now (POST)."""
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    if request.method == "PUT":
+        b = await body_json(request)
+        mode = str(b.get("mode") or "").strip().lower()
+        if mode in ("", "config"):
+            c.db.set_setting(tls.SETTING_KEY, None)          # back to config.yaml / environment
+            new = None
+        else:
+            if mode not in tls.MODES:
+                raise HTTPError(400, "bad_mode", "mode must be one of " + ", ".join(tls.MODES))
+            new = {"mode": mode, "certFile": str(b.get("certFile") or "").strip(),
+                   "keyFile": str(b.get("keyFile") or "").strip()}
+            if mode == "files":
+                for k in ("certFile", "keyFile"):
+                    if not new[k] or not Path(new[k]).is_file():
+                        raise HTTPError(400, "bad_file", f"{k}: file not found on the gateway machine")
+                if (tls.describe_cert(new["certFile"]) or {}).get("error"):
+                    raise HTTPError(400, "bad_cert", "certFile is not a PEM certificate")
+            c.db.set_setting(tls.SETTING_KEY, new)
+        c.audit(request, "settings.tls", admin, detail={"mode": mode or "config"})
+    elif request.method == "POST":
+        if tls.configured(c.settings, c.db.get_setting(tls.SETTING_KEY))["effective"] != "self-signed":
+            raise HTTPError(400, "not_self_signed", "Renewal applies to the built-in certificate only")
+        st = await asyncio.to_thread(tls.ensure, c.settings, True)
+        live = tls.ACTIVE.get("mode") == "self-signed" and tls.reload_active()
+        c.audit(request, "tls.renewed", admin, detail={"reason": "admin", "live": bool(live)})
+    st = await asyncio.to_thread(tls.status, c.settings, c.db.get_setting(tls.SETTING_KEY))
+    st["restartRequired"] = st.get("effective") != (tls.ACTIVE.get("mode") if tls.is_active() else "off") or (
+        st.get("effective") == "files" and tls.ACTIVE.get("cert") != st.get("certFile"))
+    st["caUrl"] = "/tls/ca.crt"
+    return ok(st)
 
 
 async def admin_worker_action(request: Request):
@@ -1459,6 +1499,7 @@ routes = [
     Route("/api/admin/audit", admin_audit),
     Route("/api/admin/system", admin_system),
     Route("/api/admin/system/workers/{key}/{action}", admin_worker_action, methods=["POST"]),
+    Route("/api/admin/tls", admin_tls, methods=["GET", "PUT", "POST"]),
     Route("/api/admin/ownership", admin_ownership),
     Route("/api/admin/hosttasks", admin_hosttasks),
     Route("/api/admin/hosttasks/action", admin_hosttask_action, methods=["POST"]),

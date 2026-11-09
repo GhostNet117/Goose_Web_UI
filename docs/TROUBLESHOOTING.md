@@ -37,8 +37,9 @@ Replace them with your own values.
 12. [Schedules not running](#12-schedules-not-running)
 13. [Webhooks refused or not delivered](#13-webhooks-refused-or-not-delivered)
 14. [Old user interface after an upgrade](#14-old-user-interface-after-an-upgrade)
-15. [Other common errors](#15-other-common-errors)
-16. [Reporting security issues](#16-reporting-security-issues)
+15. [HTTPS and certificates](#15-https-and-certificates)
+16. [Other common errors](#16-other-common-errors)
+17. [Reporting security issues](#17-reporting-security-issues)
 
 ---
 
@@ -157,11 +158,16 @@ are larger and rotate sooner.
 
 | Log | File | Rotation | Notes |
 | --- | --- | --- | --- |
-| Gateway | `<system_dir>/logs/gateway.log` | 5 MB, 5 old files | Also written to stderr when there is a console. |
+| Gateway | `<system_dir>/logs/gateway.log` | 10 MB, 5 old files | Also written to stderr when there is a console. |
+| User activity | `<system_dir>/logs/activity.jsonl` | 20 MB, 10 old files | One JSON line per user action (sign-ins, admin changes, agent calls, chats opened/started/prompted, connections). |
 | Worker (one per user) | `<system_dir>/logs/worker-<username>.log` (lower-case user name) | checked before each worker start: above 10 MB it is rotated, 3 old files | Each start writes `==== <time> start serve ... root=<profile or (default)>`. Contains everything `goose serve` prints. |
 | Goose's own logs | `<profile root>/data/logs/` for each profile | managed by Goose | Provider/LLM and extension errors often only appear here. |
 | Service output | Windows logon task: none (runs `pythonw.exe` without a console). Linux: `journalctl --user -u goose-web -f`. Docker: `docker compose -f docker/compose.yaml logs -f goose-web`. | | |
-| Audit log | `audit` table in `<system_dir>/goose-web.db`, viewed in Admin > Audit log | entries older than 365 days are purged when the database is opened | |
+| Audit log | `audit` table in `<system_dir>/goose-web.db`, viewed in Admin > Audit log | `logs.audit_days` (365) and `logs.audit_max_rows` | |
+
+All logs together are kept under `logs.max_disk_percent` (0.5 %) of the disk: the oldest unused files are deleted
+(gateway log line `log budget ... deleted N file(s)`). If logs you need disappear, raise the percentage or copy them
+off the machine (ADMINISTRATION 18).
 
 Useful gateway log lines:
 
@@ -710,7 +716,17 @@ The gateway sends these files with `Cache-Control: no-cache`.
 
 ---
 
-## 15. Other common errors
+## 15. HTTPS and certificates
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| The browser says "Your connection is not private" / `NET::ERR_CERT_AUTHORITY_INVALID` | Built-in certificate (`server.tls: self-signed` or `auto` without `public_url`); the local CA is not trusted on this computer. | Import the CA from Admin > System > HTTPS or `https://<host>:<port>/tls/ca.crt` as a trusted root (ADMINISTRATION 6.3), or `goose-web tls trust` on the gateway machine. Check its fingerprint first. |
+| `ERR_CERT_COMMON_NAME_INVALID` for a new name or address | The certificate does not list that name yet. | Add it to `server.tls_names` (or `allowed_hosts`) and run `goose-web tls renew`; new IP addresses of the machine are picked up at the next check. |
+| `http://host:8710` stopped answering after an upgrade | HTTPS is now on (`auto` without `public_url`). | Use `https://`, or set `server.tls: off` (Admin > System > HTTPS) if a proxy terminates TLS, then restart. |
+| The reverse proxy reports 502 after the upgrade | The proxy connects with `http://` to a gateway that now speaks HTTPS. | Set `server.public_url` (then `auto` = off) or `server.tls: off`, restart; or point the proxy at `https://` and give it the CA. |
+| The gateway does not start: `server.tls is 'files' but ...` | The certificate or key path is wrong or unreadable for the gateway's account. | Fix the paths in Admin > System > HTTPS or `config.yaml`. |
+
+## 16. Other common errors
 
 | Message | Cause | Fix |
 | --- | --- | --- |
@@ -758,7 +774,7 @@ The gateway sends these files with `Cache-Control: no-cache`.
 
 ---
 
-## 16. Reporting security issues
+## 17. Reporting security issues
 
 Do not report security vulnerabilities in public issues, pull requests or discussions. Follow
 [SECURITY.md](../SECURITY.md): use GitHub Security Advisories (the **Report a vulnerability** button on the

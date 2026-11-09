@@ -491,12 +491,46 @@ Then limit the gateway port in the host firewall to the proxy (`register-service
 
 ### 6.3 TLS
 
-- TLS is terminated by the proxy. Use a certificate that browsers trust; the PWA and service worker need a secure
-  context (HTTPS, or `http://localhost`).
+Goose Web can serve HTTPS itself, or leave TLS to a reverse proxy. Choose in **Admin > System > HTTPS** (stored in
+the database, wins over the file) or with `server.tls` in `config.yaml`; a change applies when the gateway restarts.
+
+| Mode | What it does |
+|---|---|
+| `auto` (default) | `self-signed`, unless `server.public_url` is set: then a proxy in front terminates TLS and the gateway speaks plain HTTP (`off`). |
+| `self-signed` | **Built-in certificate.** Goose Web creates its own local certificate authority (`<system_dir>/tls/ca.crt`, 10 years) and a server certificate signed by it (90 days) for every name and address of the machine: `localhost`, `127.0.0.1`, `::1`, the host name and FQDN, the machine's IP addresses, the bind address, the `public_url` host, `server.allowed_hosts` and `server.tls_names`. The gateway renews it by itself 30 days before it expires and whenever a new name or address appears (checked every `logs.check_minutes`), and loads the new certificate without a restart. |
+| `files` | Your own certificate and key in PEM format (`server.tls_cert_file`, `server.tls_key_file`), for example from a company CA. Replace the files and restart to renew. |
+| `off` | Plain HTTP. Use it behind a reverse proxy (Caddy, nginx, IIS) that terminates TLS (6.2). |
+
+**Trusting the built-in certificate.** Browsers warn about it until the local CA is trusted. On the gateway machine,
+`goose-web tls trust` adds it to the current user's trusted roots (Windows asks once to confirm; `install.ps1`
+offers this, or pass `-TrustCert`). On other computers, download the CA from **Admin > System > HTTPS** or from
+`https://<host>:<port>/tls/ca.crt`, compare its SHA-256 fingerprint with the one shown there or by
+`goose-web tls status`, and import it as a trusted root (Windows: open the file > Install certificate > Trusted Root
+Certification Authorities; macOS: Keychain Access, "Always Trust"; Linux: `/usr/local/share/ca-certificates` +
+`update-ca-certificates`; Firefox uses its own store unless `security.enterprise_roots.enabled` is on). Renewals do
+not change the CA, so a client trusts every later certificate too. The CA key (`ca.key`) never leaves the
+`_system` folder; anyone who can read that folder could issue certificates trusted by those clients, so keep its
+permissions as tight as the database's.
+
+Commands: `goose-web tls status` (mode, certificate, names, fingerprints), `goose-web tls renew` (new server
+certificate now; the running gateway picks it up at its next check, or use **Renew certificate now** in the admin
+page, which loads it at once), `goose-web tls export-ca FILE`, `goose-web tls trust`.
+
+With HTTPS on (built-in or files), the session cookie is the `Secure` `__Host-gw` cookie; HSTS is sent only when
+`public_url` is an `https://` URL. Plain `http://` to the port no longer answers: update bookmarks, monitoring and
+health checks (`scripts\upgrade.ps1` and the Docker health check try `https` first).
+
+Behind a reverse proxy:
+
+- Use a certificate that browsers trust; the PWA and service worker need a secure context (HTTPS, or
+  `http://localhost`).
 - Set `public_url` to an `https://` URL only when TLS is permanent for that host name: browsers remember the HSTS
   header for one year.
 - With an `https://` public URL the cookie is `Secure`, so signing in over plain `http://` under another address
   does not keep you signed in. Use the public URL.
+- If the proxy should talk HTTPS to the gateway as well, keep the built-in certificate and give the proxy the CA
+  (for example Caddy `transport http { tls_trust_pool file <ca.crt> }`), or set `server.tls: off` and keep the hop on
+  a trusted network.
 
 ### 6.4 Uploads and other fixed limits
 
@@ -1360,10 +1394,13 @@ Recorded actions:
 | Operations | `worker.restart`, `worker.stop`, `hosttask.<action>`, `fs.upload` |
 | Agent calls | `acp.denied` (policy denials, with the reason), `acp.<method>` for sensitive methods (configuration, providers and secrets, recipes save/delete, schedules create/delete, apps import/delete, sources, tool permissions, direct tool calls, adding session extensions, defaults, session delete) and for every call on another user's profile, `acp.answer` (answers to permission prompts and forms, with the choice) |
 | Admin access | `ws.impersonate` |
+| Everyday use (1.11) | `chat.new` (with the folder), `chat.open`, `chat.prompt` (length and number of attachments - never the text), `chat.cancel`, `chat.fork`, `chat.mode`; `settings.tls`, `tls.renewed` |
 
-Retention: entries older than 365 days are deleted whenever the database is opened (at gateway start, and by console
-commands). There is no export button; for longer retention, copy entries out regularly through
-`GET /api/admin/audit?limit=500&before=<id>` (admin token) or from your database backups.
+Retention: entries older than `logs.audit_days` (365) are deleted, and the table is kept to `logs.audit_max_rows`
+(500,000) newest rows; both are applied at start and every `logs.check_minutes`. There is no export button; for
+longer retention, copy entries out regularly through
+`GET /api/admin/audit?limit=500&before=<id>` (admin token), from your database backups, or from the activity log
+file (section 18), which a log shipper can collect.
 
 The client IP is the proxy-reported address only for requests from `server.trusted_proxies`; otherwise it is the
 TCP peer.
@@ -1390,10 +1427,20 @@ host_tasks:
 
 | Log | Location | Rotation |
 |---|---|---|
-| Gateway | `<system_dir>/logs/gateway.log`, and stderr when there is a console (systemd journal, `docker logs`; not under the Windows logon task, which uses `pythonw.exe`) | 5 MB, 5 old files (`gateway.log.1` ... `.5`) |
-| Worker (Goose stdout/stderr) | `<system_dir>/logs/worker-<username>.log`; each start writes a `==== <time> start serve ... root=<profile>` line | checked before each worker start: above 10 MB it is rotated, 3 old files (`.1` ... `.3`). A worker that runs for a long time is not rotated until it restarts. |
-| Goose's own logs | `<profile>/data/logs/` (isolated profiles), or the native profile's log folder | managed by Goose |
-| Audit | in the database (section 16) | 365 days |
+| Gateway | `<system_dir>/logs/gateway.log`, and stderr when there is a console (systemd journal, `docker logs`; not under the Windows logon task, which uses `pythonw.exe`) | `logs.gateway_file_mb` (10 MB) x `logs.gateway_files` (5) |
+| User activity | `<system_dir>/logs/activity.jsonl`: one JSON line per event - `ts` (UTC), `user`, `uid`, `ip`, `action`, `target`, `ok`, `detail`. Every audit event (section 16) plus browser connections (`ws.connect`, `ws.disconnect` with the duration). Prompt text is never logged. `logs.activity: false` turns it off. | `logs.activity_file_mb` (20 MB) x `logs.activity_files` (10) |
+| Worker (Goose stdout/stderr) | `<system_dir>/logs/worker-<username>.log`; each start writes a `==== <time> start serve ... root=<profile>` line | above 10 MB at a worker start it is rotated (3 old files); a running worker's log that passes a tenth of the budget is copied to `.1` and emptied in place |
+| Goose's own logs | `<profile>/state/logs/` (or `data/logs/`) of every isolated profile, or the native profile's log folder | Goose; and the disk budget below |
+| Audit | in the database (section 16) | `logs.audit_days`, `logs.audit_max_rows` |
+
+**Disk budget.** All of these together stay under `logs.max_disk_percent` (0.5 %) of the disk volume that holds
+`<system_dir>` - for example 2.4 GB on a 476 GB disk. At start and every `logs.check_minutes` (30) the gateway adds
+up the gateway logs, the activity log, the worker logs and the Goose logs of the isolated profiles; above the budget
+it deletes the oldest files that are not in use (never the current `gateway.log` / `activity.jsonl`, never a file
+written in the last five minutes) until the total is under 90 % of the budget. The native profile's Goose logs are
+shared with Goose Desktop and the CLI and are left alone unless `logs.include_native_goose_logs: true`. Files that do
+not look like logs are never touched. **Admin > System > Logs & activity** shows the usage, the budget and the last
+cleanup; `goose-web check` prints it too.
 
 **Admin > Logs** shows the tail of the gateway log or any worker log (200 to 2000 lines, filter, auto-refresh,
 copy). Set the log level with the environment variable `GOOSE_WEB_LOG_LEVEL` (for example `DEBUG`; default

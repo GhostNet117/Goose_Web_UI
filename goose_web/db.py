@@ -371,6 +371,8 @@ class Database:
 
     def audit(self, action: str, *, user: dict | None = None, ip: str = "", target: str = "",
               detail: dict | None = None, ok: bool = True) -> None:
+        from . import activity
+        activity.record(action, user=user, ip=ip, target=target, detail=detail, ok=ok)   # activity.jsonl too
         self.execute(
             "INSERT INTO audit(ts, user_id, username, ip, action, target, detail, ok) VALUES(?,?,?,?,?,?,?,?)",
             (time.time(), user["id"] if user else None, user["username"] if user else "", ip, action, target,

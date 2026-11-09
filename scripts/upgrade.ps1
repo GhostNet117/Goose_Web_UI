@@ -98,8 +98,21 @@ try {
     $bindHost = if ($cfgText -match '(?m)^\s*host:\s*"?([^"\s#]+)') { $Matches[1] } else { '127.0.0.1' }
     if ($bindHost -eq '0.0.0.0' -or $bindHost -eq '::') { $bindHost = '127.0.0.1' }
     $port = if ($cfgText -match '(?m)^\s*port:\s*(\d+)') { $Matches[1] } else { '8710' }
+    function GwGet($path) {   # the local gateway over https (built-in certificate, spec 015) or http; $null if no answer
+        $prev = [Net.ServicePointManager]::ServerCertificateValidationCallback
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }   # local health check only
+            foreach ($scheme in 'https', 'http') {
+                try { return Invoke-WebRequest -UseBasicParsing "${scheme}://${bindHost}:${port}$path" -TimeoutSec 5 } catch { }
+            }
+            return $null
+        } finally { [Net.ServicePointManager]::ServerCertificateValidationCallback = $prev }
+    }
     function RunningVersion() {   # the version the running gateway reports (public endpoint), '' if it does not answer
-        try { return (Invoke-RestMethod "http://${bindHost}:${port}/api/auth/config" -TimeoutSec 5).version } catch { return '' }
+        $r = GwGet '/api/auth/config'
+        if ($r) { try { return ($r.Content | ConvertFrom-Json).version } catch { } }
+        return ''
     }
     $oldVer = RunningVersion
     if (-not $oldVer) { $oldVer = '(not running)' }
@@ -186,10 +199,11 @@ try {
     $ok = $false
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep 2
-        try { if ((Invoke-WebRequest -UseBasicParsing "http://${bindHost}:${port}/healthz" -TimeoutSec 5).StatusCode -eq 200) { $ok = $true; break } } catch { }
+        $r = GwGet '/healthz'
+        if ($r -and $r.StatusCode -eq 200) { $ok = $true; break }
     }
     $newVer = RunningVersion
-    if (-not $ok) { throw "The gateway did not answer http://${bindHost}:${port}/healthz within 60 s. Check $sysDir\logs\gateway.log. Backup: $bdir" }
+    if (-not $ok) { throw "The gateway did not answer https:// or http://${bindHost}:${port}/healthz within 60 s. Check $sysDir\logs\gateway.log. Backup: $bdir" }
     Say "Upgraded $oldVer -> $newVer; healthz OK; backup $bdir"
     exit 0
 } catch {

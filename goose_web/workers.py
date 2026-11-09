@@ -133,6 +133,24 @@ def desktop_running(cli_binary: str = "") -> bool:
 
 
 WORKER_LOG_MAX_BYTES = 10 * 1024 * 1024
+
+
+def open_append_log(path: Path):
+    """A log file for a child process's stdout/stderr whose writes always land at the end of the file.
+
+    On Windows the handle gets FILE_APPEND_DATA without FILE_WRITE_DATA, so the log janitor can copy and empty a
+    log that goose still writes to (copytruncate, logjanitor.py) without the next write leaving a gap; it is also
+    shared for delete. Elsewhere O_APPEND does the same."""
+    if not IS_WINDOWS:
+        return open(path, "ab", buffering=0)
+    import _winapi
+    import msvcrt
+    FILE_APPEND_DATA, SYNCHRONIZE, READ_ATTRS = 0x0004, 0x00100000, 0x0080
+    SHARE_ALL, OPEN_ALWAYS = 0x1 | 0x2 | 0x4, 4
+    h = _winapi.CreateFile(str(path), FILE_APPEND_DATA | SYNCHRONIZE | READ_ATTRS, SHARE_ALL, _winapi.NULL,
+                           OPEN_ALWAYS, 0x80, _winapi.NULL)
+    fd = msvcrt.open_osfhandle(h, os.O_WRONLY | os.O_APPEND)
+    return os.fdopen(fd, "ab", buffering=0)
 WORKER_LOG_BACKUPS = 3
 
 
@@ -344,7 +362,7 @@ class WorkerManager:
         if w.scheduler:
             args.append("--enable-scheduler")
         rotate_log(self.log_dir / f"worker-{w.key}.log")
-        logf = open(self.log_dir / f"worker-{w.key}.log", "ab", buffering=0)
+        logf = open_append_log(self.log_dir / f"worker-{w.key}.log")
         logf.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} start {' '.join(args[1:])} "
                    f"root={w.path_root or '(default)'}\n".encode())
         flags = 0
@@ -405,7 +423,7 @@ class WorkerManager:
         if w.scheduler:
             args.append("--enable-scheduler")
         rotate_log(self.log_dir / f"worker-{w.key}.log")
-        logf = open(self.log_dir / f"worker-{w.key}.log", "ab", buffering=0)
+        logf = open_append_log(self.log_dir / f"worker-{w.key}.log")
         logf.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} start {' '.join(args[1:])} (sandbox {spec['name']}, "
                    f"{state['sid']}) root={w.path_root}\n".encode())
         cwd = os.path.join(spec["profile_root"], "workspace")
@@ -457,7 +475,7 @@ class WorkerManager:
             return
         py, _ = rl.python_for_container()
         fwd = rl.write_forwarder(root)
-        logf = open(self.log_dir / f"worker-{w.key}.log", "ab", buffering=0)
+        logf = open_append_log(self.log_dir / f"worker-{w.key}.log")
         try:
             for r in spec["relays"]:
                 w.relay_servers.append(rl.PipeRelayServer(r["pipe"], sid, r["target"]).start())

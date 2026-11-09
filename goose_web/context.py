@@ -47,7 +47,8 @@ class Ctx:
     # ---------------------------------------------------------- cookies / origin
     @property
     def secure(self) -> bool:
-        return self.settings.public_url.startswith("https://")
+        from . import tls
+        return self.settings.public_url.startswith("https://") or tls.is_active()
 
     @property
     def cookie_name(self) -> str:

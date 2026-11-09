@@ -13,7 +13,7 @@ it, on a desktop or a phone.
   `%APPDATA%\Block\goose`) with all of its chats, recipes and settings. Nothing gets copied around, and Goose
   Desktop keeps working on the same profile.
 
-`goose-web 1.10.1` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
+`goose-web 1.11.0` - Python 3.11+ - Windows, Linux, macOS, Docker - Apache-2.0
 
 ## Features
 
@@ -216,6 +216,10 @@ Every key, the CLI, policies, profile layout, scheduler rules and scripts are de
   (accounts bound to issuer + subject) are supported. API tokens are sent only in the `Authorization` header.
 - Non-admins go through a default-deny ACP firewall with folder confinement (symlinks resolved). Shell extensions
   are off unless `allow_shell` is set. MCP Apps can only call tools of their own extension.
+- HTTPS out of the box: a built-in local CA and server certificate for every local name and address, renewed
+  automatically; or your own certificate; or off behind a reverse proxy (Admin > System > HTTPS).
+- Every user action is attributable (user, client address, time): sign-ins, admin changes, agent calls and everyday
+  chat activity, in the audit log and a JSON-lines activity log. All logs stay under 0.5 % of the disk.
 - Workers listen on loopback only, each with its own secret. The gateway never runs elevated.
 - Personal webhooks cannot reach internal addresses unless `notify.allow_private_targets` is turned on.
 - Dependencies are installed from a hash-locked `requirements.lock`. The Docker base image and the goose CLI are

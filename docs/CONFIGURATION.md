@@ -53,6 +53,10 @@ server:
   allowed_hosts: []
   max_upload_mb: 25
   allow_elevated: false
+  tls: auto                                 # auto | self-signed | files | off (ADMINISTRATION 6.3)
+  tls_cert_file: ""
+  tls_key_file: ""
+  tls_names: []
 paths:
   profiles_root: C:\Goose_Web_Profiles      # Linux/macOS: $GOOSE_WEB_PROFILES or /var/lib/goose-web/profiles
   system_dir: ""                            # "" = <profiles_root>/_system
@@ -91,7 +95,17 @@ host_tasks:
 | `server.max_upload_mb` | `25` | Size limit per uploaded file (`/api/fs/upload`, at most 20 files per request). |
 | `server.allow_elevated` | `false` | If true, the gateway runs with an elevated token (Windows) or as root (POSIX) instead of refusing. Leave it false. |
 | `paths.profiles_root` | `C:\Goose_Web_Profiles` (Windows), `$GOOSE_WEB_PROFILES` or `/var/lib/goose-web/profiles` | Parent of all isolated profiles and of `_system`. |
-| `paths.system_dir` | `""` (= `<profiles_root>/_system`) | Database, logs, team library, backups. |
+| `paths.system_dir` | `""` (= `<profiles_root>/_system`) | Database, logs, team library, backups, built-in TLS files (`tls/`). |
+| `server.tls` | `auto` | HTTPS: `self-signed` (built-in local CA + server certificate, renewed automatically), `files` (your PEM certificate and key), `off` (plain HTTP behind a reverse proxy). `auto` = `self-signed` unless `public_url` is set. Admin > System > HTTPS overrides it (stored in the database). Applies at the next start (ADMINISTRATION 6.3). |
+| `server.tls_cert_file`, `server.tls_key_file` | `""` | PEM certificate (chain) and private key for `tls: files`. |
+| `server.tls_names` | `[]` | Extra DNS names or IP addresses for the built-in certificate (it already covers localhost, 127.0.0.1, ::1, the host name, FQDN, the machine's addresses, the bind address, the public_url host and `allowed_hosts`). |
+| `logs.max_disk_percent` | `0.5` | All Goose Web logs (gateway, activity, workers, isolated profiles' Goose logs) stay under this share of the disk volume; the oldest unused files are deleted (ADMINISTRATION 18). |
+| `logs.check_minutes` | `30` | How often the log budget, the audit retention and the built-in certificate are checked. |
+| `logs.activity` | `true` | User activity log `<system_dir>/logs/activity.jsonl` (JSON lines). |
+| `logs.activity_file_mb`, `logs.activity_files` | `20`, `10` | Rotation of the activity log. |
+| `logs.gateway_file_mb`, `logs.gateway_files` | `10`, `5` | Rotation of `gateway.log`. |
+| `logs.include_native_goose_logs` | `false` | Also trim the native profile's Goose logs (shared with Goose Desktop and the CLI). |
+| `logs.audit_days`, `logs.audit_max_rows` | `365`, `500000` | Audit table retention in the database. |
 | `sandbox.enabled` | `auto` | `auto` = on for Windows (off elsewhere); `true` / `false`. Windows: run every isolated non-admin user's worker in its own AppContainer, connected over stdio; file access only to the user's profile, the team folder and the team's extra folders (ADMINISTRATION 11.6). Fail closed on other systems. |
 | `sandbox.network` | `internet` | Network capabilities of sandboxed workers: `none`, `internet` (outbound internet) or `internet+lan` (also the local network). Loopback is never reachable. |
 | `sandbox.relays` | `[]` | Local services (`host:port` on this machine, for example a model proxy on `127.0.0.1:8317`) that sandboxed workers may reach through a per-user forwarder and a named pipe; their provider URLs are rewritten to the forwarder (ADMINISTRATION 11.6). Everything else on loopback stays closed. |
@@ -139,6 +153,7 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 | `ip list` | | Lists client addresses blocked after failed sign-ins and addresses that are collecting failures (count, last user name tried, end of the block). |
 | `ip unblock ADDRESS` | `--all` | Ends the block of ADDRESS (an IPv6 address unblocks its /64) and clears its count, or with `--all` every block and count; audited as `auth.ip.unblocked`. Works while the gateway runs (it re-reads the blocks within 15 seconds), so it is the way back in when the admin's own address is blocked. |
 | `check` | | Diagnostics: version, config file, goose binary and version, OS user and integrity (fails if elevated), profiles root, Goose Desktop running (Windows), whether the port is free, and (Windows, information only) the logon task that autostarts this install. Exit code 1 if something is wrong. |
+| `tls` | `status \| renew \| export-ca FILE \| trust` | Built-in HTTPS (ADMINISTRATION 6.3): show the mode, certificate, names and fingerprints (creates the certificate when the mode is self-signed); renew the server certificate now; copy the local CA certificate to FILE; trust the CA for the current Windows user. |
 | `sandbox` | `status \| remove USER` | Sandbox (ADMINISTRATION 11.6): list every user's AppContainer, SID and folder grants; or revoke one user's grants and delete the container. |
 | `native-hints` | `status \| enable USER [--team NAME] [--adopt] [--doc-name NAME] \| disable` | Managed native hints (ADMINISTRATION 10.1): Goose Web writes the native admin's composed hints (personal, assigned, team documents) into the native profile's `config/.goosehints`, which Goose Desktop, the CLI and schedules on that account load too. `--team` puts the user in that team (created if missing); `--adopt` keeps the current file as a library document. Audit `hints.native.managed` / `hints.native.unmanaged`. |
 | `native-root` | `[PATH]` | Without PATH: show the native Goose profile (Goose appdata folder). With PATH: move the native profile to that folder (must contain `config\`), update every native user that used the old one, audit `system.native_root`. Files are not copied. Restart the gateway afterwards. |

@@ -423,9 +423,12 @@ function settingsTab(body) {
 // ===================================================================== System
 function systemTab(body) {
   let timer = null;
+  let httpsEl = null;   // kept between the 10 s refreshes so a half-made HTTPS choice is not reset
+  const reloadTls = () => { httpsEl = null; load(); };
   const load = async () => {
     try {
-      const s = await GET('/api/admin/system');
+      const [s, t] = await Promise.all([GET('/api/admin/system'), httpsEl ? null : GET('/api/admin/tls').catch((e) => ({ error: errMsg(e) }))]);
+      if (!httpsEl) httpsEl = httpsSection(t, reloadTls);
       const kv = (k, v) => h('div', { class: 'kv-row2' }, h('div', { class: 'muted small' }, k), h('div', { class: 'mono small' }, v ?? '—'));
       body.replaceChildren(
         s.integrity && String(s.integrity).toLowerCase() !== 'medium' ? banner('warn', 'The gateway runs at ' + s.integrity + ' integrity' + (s.elevated ? ' (elevated)' : '') + '. Files it creates may be owned by Administrators and lock out the normal user. Run it un-elevated at medium integrity.') : null,
@@ -445,13 +448,60 @@ function systemTab(body) {
           { label: '', class: 'right', render: (w) => h('span', { class: 'row' },
             btn('Restart', async () => { if (w.activeRuns && !(await confirmDialog({ title: 'Restart ' + (w.username || w.key) + '?', message: w.activeRuns + ' run(s) are active and will be interrupted.', confirmText: 'Restart', danger: true }))) return; try { await POST('/api/admin/system/workers/' + encodeURIComponent(w.key) + '/restart', {}); toast('Restarting', { kind: 'success' }); setTimeout(load, 1500); } catch (e) { toastError(e); } }, { size: 'sm' }),
             btn('Stop', async () => { if (!(await confirmDialog({ title: 'Stop worker ' + (w.username || w.key) + '?', message: 'It starts again when the user connects.', confirmText: 'Stop', danger: true }))) return; try { await POST('/api/admin/system/workers/' + encodeURIComponent(w.key) + '/stop', {}); toast('Stopped', { kind: 'success' }); setTimeout(load, 800); } catch (e) { toastError(e); } }, { size: 'sm', variant: 'danger-soft' })) },
-        ], s.workers || [], { empty: 'No workers running' })));
+        ], s.workers || [], { empty: 'No workers running' })),
+        httpsEl,
+        logsSection(s.logs));
     } catch (e) { body.replaceChildren(banner('error', errMsg(e))); }
   };
   body.replaceChildren(skeleton(6));
   load();
   timer = setInterval(() => { if (document.visibilityState === 'visible') load(); }, 10000);
   return { destroy() { clearInterval(timer); } };
+}
+
+// HTTPS (spec 015): built-in self-signed certificate (local CA, renewed automatically), own files, or off (proxy).
+const TLS_MODES = [
+  { value: 'config', label: 'As in config.yaml' },
+  { value: 'auto', label: 'Automatic (built-in unless a public URL is set)' },
+  { value: 'self-signed', label: 'Built-in certificate (self-signed, renewed automatically)' },
+  { value: 'files', label: 'Certificate files (for example from a company CA)' },
+  { value: 'off', label: 'Off - plain HTTP behind a reverse proxy (Caddy, nginx, IIS)' },
+];
+function httpsSection(t, reload) {
+  if (!t || t.error) return section('HTTPS', null, banner('error', (t && t.error) || 'HTTPS status unavailable'));
+  const fmt = (c) => c && !c.error ? h('div', { class: 'small' }, h('div', null, c.subject), h('div', { class: 'muted' }, 'Valid until ' + String(c.notAfter).slice(0, 10) + ' (' + c.daysLeft + ' days)'), (c.dns || []).length || (c.ips || []).length ? h('div', { class: 'muted mono' }, [...(c.dns || []), ...(c.ips || [])].join(', ')) : null, h('div', { class: 'muted mono small', title: 'SHA-256 fingerprint' }, c.sha256)) : (c && c.error ? h('span', { class: 'err' }, c.error) : '-');
+  const modeSel = select(TLS_MODES, t.source === 'admin' ? t.mode : 'config', { class: 'inp inp-sm' });
+  const cert = input({ value: t.source === 'admin' ? t.certFile || '' : '', placeholder: 'C:\\certs\\goose.pem', class: 'inp inp-sm' });
+  const key = input({ value: t.source === 'admin' ? t.keyFile || '' : '', placeholder: 'C:\\certs\\goose.key', class: 'inp inp-sm' });
+  const files = h('div', { class: 'row wrap', hidden: modeSel.value !== 'files' }, field('Certificate (PEM)', cert), field('Key (PEM)', key));
+  modeSel.addEventListener('change', () => { files.hidden = modeSel.value !== 'files'; });
+  const kv = (k, v) => h('div', { class: 'kv-row2' }, h('div', { class: 'muted small' }, k), h('div', null, v ?? '-'));
+  return section('HTTPS', null,
+    t.restartRequired ? banner('warn', 'The saved HTTPS setting (' + t.effective + ') differs from what the running gateway uses (' + (t.active ? t.activeMode : 'off') + '). It takes effect when the gateway restarts.') : null,
+    h('div', { class: 'card kv-grid' },
+      kv('In use now', h('span', null, badge(t.active ? 'HTTPS (' + t.activeMode + ')' : 'HTTP', t.active ? 'ok' : ''), t.active ? null : h('span', { class: 'muted small' }, ' - TLS is expected to be terminated by a reverse proxy'))),
+      kv('Setting', t.mode + (t.mode === 'auto' ? ' -> ' + t.effective : '') + ' (from ' + (t.source === 'admin' ? 'this page' : 'config.yaml') + ')'),
+      t.cert ? kv('Server certificate', fmt(t.cert)) : null,
+      t.ca ? kv('Local CA', h('div', null, fmt(t.ca), h('a', { href: t.caUrl, download: 'goose-web-ca.crt', class: 'small' }, 'Download the CA certificate'), h('div', { class: 'muted small' }, 'Import it as a trusted root on the computers that use Goose Web (Windows: double-click > Install > Local Machine or Current User > Trusted Root Certification Authorities; on the gateway machine: goose-web tls trust).'))) : null,
+      kv('Names covered when created', h('span', { class: 'mono small' }, (t.wantedNames || []).join(', ')))),
+    h('div', { class: 'row wrap' }, field('Mode', modeSel), files,
+      btn('Save', async () => {
+        try { const r = await PUT('/api/admin/tls', { mode: modeSel.value, certFile: cert.value.trim(), keyFile: key.value.trim() }); toast(r.restartRequired ? 'Saved - restart the gateway to apply' : 'Saved', { kind: 'success' }); reload(); } catch (e) { toastError(e, 'HTTPS'); }
+      }, { variant: 'primary', size: 'sm' }),
+      t.effective === 'self-signed' ? btn('Renew certificate now', async () => { try { await POST('/api/admin/tls', {}); toast('Certificate renewed', { kind: 'success' }); reload(); } catch (e) { toastError(e, 'Renew'); } }, { size: 'sm', icon: 'refresh' }) : null));
+}
+
+function logsSection(l) {
+  if (!l) return null;
+  const mb = (b) => (b / 1048576).toFixed(b < 10485760 ? 1 : 0) + ' MB';
+  const pct = l.budget ? Math.min(100, Math.round((l.bytes / l.budget) * 100)) : 0;
+  const last = l.lastCheck;
+  return section('Logs & activity', null, h('div', { class: 'card kv-grid' },
+    h('div', { class: 'kv-row2' }, h('div', { class: 'muted small' }, 'Disk budget'), h('div', null, mb(l.bytes) + ' of ' + mb(l.budget) + ' (' + pct + '%) - ' + l.percent + '% of the disk, ' + l.files + ' files')),
+    h('div', { class: 'kv-row2' }, h('div', { class: 'muted small' }, 'Last cleanup'), h('div', { class: 'small' }, last ? relTime(last.at * 1000) + ': deleted ' + last.deleted + ' file(s), ' + mb(last.freed || 0) + ' freed' + (last.truncated ? ', ' + last.truncated + ' truncated' : '') : 'not yet')),
+    h('div', { class: 'kv-row2' }, h('div', { class: 'muted small' }, 'User activity log'), h('div', { class: 'mono small' }, l.activity || 'off (logs.activity)')),
+    h('div', { class: 'kv-row2' }, h('div', { class: 'muted small' }, 'Covered folders'), h('div', { class: 'mono small' }, (l.roots || []).join('\n') || '-'))),
+    h('p', { class: 'muted small' }, 'Sign-ins, admin changes, agent calls and everyday chat activity (open, new, prompt - length only, never the text - stop, fork) are recorded per user with the client address; see Audit log. The oldest unused logs are deleted when the total passes the budget.'));
 }
 
 // ===================================================================== Ownership
