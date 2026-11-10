@@ -579,8 +579,19 @@ async def fs_mkdir(request: Request):
     b = await body_json(request)
     p = _check_path(c, u, os.path.abspath(str(b.get("path") or "")))
     _refuse_hint_name(u, p.name)
+    _refuse_agents_dir(u, p)
     p.mkdir(parents=True, exist_ok=True)
     return ok({"path": str(p)})
+
+
+def _refuse_agents_dir(u: dict, path) -> None:
+    """NEW-36: a non-admin may not create or write into a `.agents` folder (any component of the path, also as an
+    8.3 short name or an NTFS stream name). Goose starts the MCP servers of every plugin in <cwd>/.agents/plugins
+    when a chat starts there, i.e. runs their commands, and also reads skills and agent definitions from .agents."""
+    if u["role"] != "admin" and acp_policy.has_agents_component(str(path)):
+        raise HTTPError(403, "agents_folder_refused",
+                        "'.agents' folders hold Goose plugins and agent settings, which can run programs; they "
+                        "cannot be created or changed from the file browser. Ask your administrator.")
 
 
 def _refuse_hint_name(u: dict, name: str) -> None:
@@ -655,8 +666,10 @@ async def fs_upload(request: Request):
     try:
         files = [(f, safe_upload_name(f.filename)) for _, f in form.multi_items()
                  if hasattr(f, "filename") and f.filename]
+        _refuse_agents_dir(u, d)
         for _, name in files:   # every name is checked before anything is written (A-14)
             _refuse_hint_name(u, name)
+            _refuse_agents_dir(u, d / name)
         d.mkdir(parents=True, exist_ok=True)
         for f, name in files:
             target, out = _create_exclusive(d, name)

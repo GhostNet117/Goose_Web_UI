@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 1.13.1 - 2026-11-10
+
+**Security fix - upgrade if you have non-admin users.**
+
+- **Goose plugins in a chat folder (NEW-36, High).** Goose 1.50-1.57 loads every folder under
+  `<chat folder>\.agents\plugins` as an enabled plugin when a chat starts and runs its MCP servers (commands), with
+  no setting to turn that off. A member with `allow_shell` off could upload such a folder with the file browser
+  (workspace or team folder) and run commands in their sandbox, or in the worker of anyone who opened a chat there.
+  Now non-admins cannot create or upload into a `.agents` folder (`403 agents_folder_refused`; case, trailing
+  dots, NTFS stream and 8.3 short names included), and a member without `allow_shell` cannot start a chat in a
+  folder whose `.agents\plugins` holds a plugin. Admins and the native profile are unchanged (SECURITY-ASSESSMENT
+  10, ADMINISTRATION 9.7, TROUBLESHOOTING).
 
 - **Docs: forwarding logs to Splunk or another SIEM** (ADMINISTRATION 18.1): which files in
   `<system_dir>\logs` to monitor (`activity.jsonl*` = security feed with every audit event, `gateway.log*`,

@@ -264,6 +264,55 @@ def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("\\/") + os.sep)
 
 
+# Goose (1.50-1.57: plugins/discovery.rs, acp/server.rs initial_session_extensions) treats every folder under
+# <cwd>/.agents/plugins of a new chat as an enabled plugin and starts its MCP servers (.mcp.json or the plugin
+# manifest: any command line) during session/new. No Goose setting turns this off (NEW-36).
+AGENTS_DIR = ".agents"
+
+
+def is_agents_name(name: Any) -> bool:
+    """True for a path component Windows opens as the `.agents` folder: any case, trailing dots/spaces, or an NTFS
+    stream suffix (creating `.agents::$INDEX_ALLOCATION` creates the folder `.agents`)."""
+    return str(name or "").split(":", 1)[0].strip().rstrip(". ").lower() == AGENTS_DIR
+
+
+def has_agents_component(path: str) -> bool:
+    """True if `path` has a `.agents` component, as written or resolved (realpath expands 8.3 short names such as
+    AGENTS~1 and links of the parts that exist). Fails closed when the path cannot be resolved."""
+    cands = [str(path or "")]
+    try:
+        cands.append(os.path.realpath(cands[0]))
+    except (OSError, ValueError, RuntimeError):
+        return True
+    for c in cands:
+        rest = os.path.splitdrive(c)[1]
+        if any(is_agents_name(part) for part in rest.replace("/", "\\").split("\\")):
+            return True
+    return False
+
+
+def project_plugins(cwd: Any) -> list[str]:
+    """The plugin folders Goose would load from <cwd>/.agents/plugins at session/new (sub-folders, links followed;
+    Goose ignores files there). A plugins folder that exists but cannot be listed counts as one (fail closed)."""
+    if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
+        return []
+    d = os.path.join(os.path.expanduser(cwd), AGENTS_DIR, "plugins")
+    out = []
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                try:
+                    if e.is_dir():
+                        out.append(e.name)
+                except OSError:
+                    out.append(e.name)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except (OSError, ValueError):
+        return ["(unreadable)"]
+    return sorted(out)
+
+
 def path_allowed(path: str, roots: list[str]) -> bool:
     """True if `path` lies inside one of `roots`.
 
@@ -640,6 +689,13 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
         for d in params.get("additionalDirectories") or []:
             if not path_allowed(str(d), roots):
                 raise Denied(f"folder not allowed: {d}")
+    if method == "session/new" and not policy.get("allow_shell"):
+        # NEW-36: Goose would start the MCP servers (commands) of every plugin in <cwd>/.agents/plugins.
+        found = project_plugins(params.get("cwd"))
+        if found:
+            names = ", ".join(n[:40] for n in found[:3]) + (", ..." if len(found) > 3 else "")
+            raise Denied(f"this folder has Goose plugins in .agents/plugins ({names}); plugins run programs, so "
+                         "chats in this folder need the allow_shell permission")
     if method == P + "session/working-dir/update" and not path_allowed(str(params.get("workingDir") or ""), roots):
         raise Denied("folder not allowed")
     if method == "session/set_mode" and not allows(policy, "allowed_modes", params.get("modeId")):

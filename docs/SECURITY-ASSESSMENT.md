@@ -516,3 +516,14 @@ Still accepted: administrators and the native profile are trusted and unsandboxe
 `sandbox.enabled: false`) every member's agent runs as the gateway's account, so `allow_shell: false` is only backed
 by an OS boundary when the sandbox is on; a member with `allow_shell` can run anything inside their sandbox;
 read-only extensions (`analyze`, `summarize`, `chatrecall`) can read what the worker can read (the sandbox limits it).
+
+## 10. Addendum: Goose plugins in a chat folder (2026-11-10), fixed in 1.13.1
+
+| ID | Finding | Severity | Status | Where | Notes |
+|---|---|---|---|---|---|
+| NEW-36 | Goose auto-loads plugins from `<cwd>/.agents/plugins`: a member without `allow_shell` ran commands | High | **Fixed in 1.13.1** | `policy.py: check`, `project_plugins`, `has_agents_component`; `api.py: _refuse_agents_dir` (`fs_mkdir`, `fs_upload`) | Goose 1.50-1.57 treats every folder under `<cwd>/.agents/plugins` of a new chat as an enabled plugin (`plugins/discovery.rs`; unknown plugins are added to config as enabled) and starts its MCP servers (`.mcp.json` or the plugin manifest: any command line) during `session/new` (`acp/server.rs: initial_session_extensions`). No Goose setting or environment variable turns discovery off. A member with every permission off created `.agents/plugins/x/.mcp.json` with the file browser in their workspace or the team folder, started a chat there, and the command ran in their sandbox (measured on Goose 1.50.0 and 1.57.0, sandbox on). In the team folder it would run in every member's worker that opens a chat there, and unsandboxed in an administrator's native worker. Now: non-admins cannot create or upload into any `.agents` folder (any case, trailing dots/spaces, NTFS stream names, 8.3 short names via the resolved path; `403 agents_folder_refused`), and a member without `allow_shell` cannot start a chat in a folder whose `.agents/plugins` has a plugin folder (an unreadable one counts). Goose rediscovers plugins only on `session/new`; `session/load`, `fork`, `resume` and working-folder changes do not, and recipe chats skip plugins. Plugin hooks and scheduled jobs use the worker's own folder (the profile root), which members cannot reach through the file API. Tests: `tests/test_agents_plugins.py`. **Upgrade if you have non-admin users.** |
+
+Still accepted: administrators are trusted; Goose loads plugins for them like Goose Desktop does, so an admin chat in
+a folder that a member with `allow_shell` can write (a team folder) runs that member's plugins unsandboxed. Members
+with `allow_shell` can create `.agents` folders with their shell (they can run commands anyway). Plugin `skills`
+folders are still read as instructions where the folder already exists.

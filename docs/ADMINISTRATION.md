@@ -855,6 +855,13 @@ WebSocket connection of the user.
 - Deleting a team keeps its folder on disk. The team's members are left without a team (and cannot chat) until you
   add them to another team.
 - The folder is protected by the gateway's checks, not by Windows permissions: see the known risk in section 11.3.
+- **Goose plugins (since 1.13.1).** Goose loads every folder under `<chat folder>\.agents\plugins` as a plugin when
+  a chat starts there and runs the plugin's MCP servers, which are commands; Goose has no setting to turn this off.
+  So non-admins cannot create or upload into any folder named `.agents` through the file browser
+  (`403 agents_folder_refused`), and a member without `allow_shell` cannot start a chat in a folder whose
+  `.agents\plugins` holds a plugin folder. Members with `allow_shell` and administrators are not limited: an
+  administrator who starts a chat in a team folder runs, unsandboxed, any plugin a member with `allow_shell` has put
+  there. Check a team folder for `.agents\plugins` before you start a chat in it (SECURITY-ASSESSMENT 10).
 
 ### 9.8 Upgrading from 1.4: the policy migration
 

@@ -669,7 +669,7 @@ chat link) and `Priority` (`high` for "needs you", otherwise `default`). Other U
 
 ## 14. Old user interface after an upgrade
 
-The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v10`). The
+The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v18`). The
 page, scripts and styles are fetched from the network first, and the cache is used only when the gateway cannot
 be reached; `/api/` and `/ws` are never cached. Third-party libraries and icons are served from the cache first.
 The gateway sends these files with `Cache-Control: no-cache`.
@@ -726,6 +726,8 @@ The gateway sends these files with `Cache-Control: no-cache`.
 | `forbidden: this chat uses the model '<model>', which your team does not allow. ...` | The chat's provider, model or mode was allowed when the chat started, but not any more. | The user picks an allowed value in the chat header, or an administrator allows it. |
 | `forbidden: GOOSE_MODEL value not allowed by your team` / `provider not allowed` / `model not allowed` | A change of the profile default (`defaults/save`) or of the raw config outside the team's lists. | Pick an allowed value. |
 | `forbidden: CONTEXT_FILE_NAMES is managed by Goose Web` | Non-admins cannot change which hints files Goose loads. | Nothing to fix: team hints are set by an administrator. |
+| `'.agents' folders hold Goose plugins and agent settings, which can run programs; ...` (403 `agents_folder_refused`) | Since 1.13.1 non-admins cannot create, or upload into, a folder named `.agents` (any case) in the file browser: Goose runs the plugins it finds in `.agents\plugins` (SECURITY-ASSESSMENT 10). | Add skills through the Skills page; ask an administrator to put a project's `.agents` folder in place if the team really needs it. |
+| New chat: `this folder has Goose plugins in .agents/plugins (...); plugins run programs, so chats in this folder need the allow_shell permission` | The chat folder holds a `.agents\plugins\<name>` folder, and Goose would start that plugin's commands; your team does not have `allow_shell`. | Start the chat in another folder, or ask an administrator to remove the plugin folder (or to grant `allow_shell` if the plugin is wanted). |
 | `'AGENTS.md' is a Goose hints file name. ...` (403 `hint_file_refused`) | Non-admins cannot upload or create anything named `AGENTS.md`, `.goosehints` or `.goose-web-hints.md`. | Rename the file (for example `AGENTS.txt`), or ask an administrator to put the content in the Hints library. |
 | Goose ignores an `AGENTS.md` or `.goosehints` in the project folder (isolated profiles) | Since 1.5.0 isolated workers load only the composed `config/.goose-web-hints.md` (`CONTEXT_FILE_NAMES`). | Put shared instructions in the Hints library and assign them to the team. Check the result with Admin > Users > View effective hints. |
 | Personal hints are not used (warning in Settings > Goose hints) | The team does not allow personal hints (`hints_edit` off, the default for new teams). | An administrator switches on "Members may add personal hints", or moves the content into team hints. |

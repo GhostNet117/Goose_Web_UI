@@ -155,7 +155,7 @@ def test_signout_clears_client_state_and_sw_ignores_query():
     clear = app.split("async function clearClientState()", 1)[1].split("\n}", 1)[0]
     assert "localStorage.removeItem" in clear and "sessionStorage.clear()" in clear and "caches.delete" in clear
     sw = (JS.parent / "sw.js").read_text(encoding="utf-8")
-    assert "const VERSION = 'gw-shell-v17';" in sw
+    assert "const VERSION = 'gw-shell-v18';" in sw
     assert "c.put(key, copy)" in sw and "url.pathname === '/index.html' ? '/' : url.pathname" in sw
 
 
