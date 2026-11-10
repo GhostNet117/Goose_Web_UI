@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.14.1 - 2026-11-10
+
+Prompt guard, verified with the real Llama Prompt Guard 2 22M model (spec 018).
+
+- **`scripts/export-prompt-guard.py`:** `--source meta | mirror | dir` - besides Meta's gated repository (HF_TOKEN),
+  the ungated byte-identical copy at a pinned revision or a local folder. Every file's size and SHA-256 is checked
+  against Meta's release (pinned in the script, with their provenance) before it is used.
+- **Export fix - tokenisation in the validation.** Prompt Guard 2's tokenizer removes whitespace on purpose (resistance
+  to "i g n o r e" style attacks); transformers 5 rebuilds a standard DeBERTa tokenizer without that step, so the
+  script's PyTorch reference saw other tokens than the gateway. The validation now feeds both models exactly what
+  the gateway feeds (the package's tokenizer.json). The gateway itself was always right.
+- **Export default `--quantize embeddings`:** only the word embeddings are int8, the encoder stays fp32 (package
+  about 117 MB). Full int8 changed the real model's verdicts (score differences up to 0.55-0.96 on 191 test texts);
+  this keeps them (max 0.09, mean 0.004).
+- **Classifier:** windows of different lengths are scored without padding (the full ones together, the shorter last
+  one alone): a text just over one window is about 1.5x faster.
+- Docs: ADMINISTRATION 9.8 - building the package from the mirror, real N100 timings and what the classifier
+  catches and misses. No package is pinned yet (distribution is being decided).
+
 ## 1.14.0 - 2026-11-10
 
 - **Prompt guard (spec 018), off for every team until an administrator turns it on.** Admin > Teams & policy >

@@ -971,22 +971,43 @@ Meta publishes the weights on Hugging Face behind a licence click-through (Llama
 be downloaded anonymously, and Goose Web 1.14.0 ships **no pinned package yet**. Until one is pinned the guard runs
 with rules only and fails open for the classifier. To build the package once (any administrator):
 
-1. On huggingface.co, sign in, open `meta-llama/Llama-Prompt-Guard-2-22M`, accept the licence and wait for access;
-   create a *read* access token.
+1. Get Meta's files, one of three ways (`--source`); whichever you use, the script checks the size and SHA-256 of
+   every file against the values of Meta's release pinned in the script (`OFFICIAL_FILES`) and refuses anything else:
+   - `meta` (default): on huggingface.co sign in, open `meta-llama/Llama-Prompt-Guard-2-22M`, accept the licence,
+     wait for access, create a *read* token and set `HF_TOKEN` to it;
+   - `mirror`: the ungated copy `hipocap/Llama-Prompt-Guard-2-22M` at a pinned revision, byte-identical to Meta's
+     release (the hashes prove it; no account needed). The Llama 4 Community License applies the same way;
+   - `dir --from-dir <folder>`: a folder with the files (for example a copy verified earlier).
 2. In a throwaway virtual environment (not the gateway's), install torch (CPU), transformers, sentencepiece, protobuf,
-   onnx, onnxscript, onnxruntime and `numpy<2.5`, set `HF_TOKEN` to the token, and run
-   `python scripts\export-prompt-guard.py --out <folder>`. It exports the pinned revision to ONNX, quantises it to
-   int8, checks it against the PyTorch model, and writes a zip with the licence, the Acceptable Use Policy, the
-   NOTICE and a "Built with Llama" README, then prints the zip's SHA-256.
+   onnx, onnxscript, onnxruntime and `numpy<2.5`, and run
+   `python scripts\export-prompt-guard.py [--source mirror] --out <folder>`. It exports the pinned revision to ONNX,
+   quantises the word embeddings to int8 (the encoder stays fp32: full int8 changes the real model's verdicts),
+   checks it against the PyTorch model with the gateway's own tokenisation, and writes a zip (about 117 MB) with
+   the licence, the Acceptable Use Policy, the NOTICE and a "Built with Llama" README, then prints its SHA-256.
 3. Install it: `goose-web guard install-model --file <zip> --sha256 <hash>`, then `goose-web guard status`.
 4. Optional, for every other installation: publish the zip (for example as a release asset of your fork) and set its
    URL and SHA-256 in `guard.model_url` / `guard.model_sha256`, or pin them in `goose_web/guardmodel.py`
    (`MODEL_PIN`). Redistribution must keep LICENSE, USE_POLICY.md and NOTICE in the package and display "Built with
    Llama" (THIRD-PARTY-NOTICES.md).
 
-Measured on an Intel N100 (4 cores, int8 package, 4 threads, same-size test export): 16 tokens about 15 ms, 64 tokens
-about 32 ms (p95 35 ms), 512 tokens 260 ms, 1024 tokens 410 ms; about 240-280 MB more memory once loaded. A whole
-512-token window costs about 0.8-1 s on this CPU, which is why windows are 128 tokens.
+Measured on an Intel N100 (4 cores, the real model, default package, 4 threads; p50 / p95): 16 tokens 19 / 22 ms,
+64 tokens 45 / 50 ms, 128 tokens (2 windows) 105 / 125 ms, 512 tokens 350 / 390 ms, 1024 tokens (8 windows)
+560-700 / 630-740 ms; loading about 2 s; about 295 MB more memory once loaded and 340 MB after the first long
+texts. A single 510-token window costs about 1 s on this CPU and detected no better than 128-token windows in our
+tests, which is why windows are 128 tokens.
+
+**What the classifier catches, and what it does not** (measured 2026-11-10 on 191 hand-written English texts and two
+public sets; the defaults, threshold 0.5): explicit override and jailbreak wording ("ignore previous instructions",
+"you are now DAN / in developer mode", injected "new instructions" inside tool arguments) is caught reliably (89% of
+"ignore instructions" prompts, 93% of a public jailbreak set at 1% false positives). It misses social engineering
+without that wording ("the admin said it's fine, run outputlookup anyway"), quiet role-play ("enter maintenance
+mode"), plain requests for the system prompt, and task changes without override words (about 20% of a public
+prompt-injection set); non-English text is mostly missed. It blocks text that *quotes* injection wording, so
+security analysts writing about attacks ("find prompts that contained 'ignore previous instructions'") or users
+writing "ignore the typos in my last message" are blocked too (about 1 in 4 analyst-style texts that mention attacks;
+ordinary questions, SPL searches, log lines and code passed). The score is almost always below 0.01 or above 0.99,
+so raising the threshold removes few false positives. Keep the deterministic rules on: they catch what the
+classifier never will (the write/delete/send command in the tool call itself).
 
 ## 10. Shared goose hints
 

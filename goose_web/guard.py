@@ -466,8 +466,10 @@ class Classifier:
         self.threads = max(1, min(int(threads or 1), os.cpu_count() or 1))
         self.max_windows = max(1, int(max_windows or 1))
         # Windows shorter than the model's 512 tokens: DeBERTa's attention makes cost grow faster than length (Intel
-        # N100, int8: 16 tokens 15 ms, 128 tokens 61-82 ms, 510 tokens 0.8-1.0 s), so 4 x 128 is ~3x cheaper than
-        # 1 x 512. Consecutive windows overlap so an instruction cut at a boundary is still seen whole.
+        # N100, the shipped package, 4 threads: 16 tokens 20 ms, 63 tokens 45-48 ms, one 126-token window ~97 ms,
+        # 512 tokens as 5 windows ~350 ms, one 510-token window ~1 s), and on the real model 128-token windows
+        # detect the same as 512 (spec 018 converge). Consecutive windows overlap so an instruction cut at a
+        # boundary is still seen whole.
         self.window = max(16, min(512, int(window_tokens or 128))) - 2
         self.overlap = max(0, min(int(overlap or 0), self.window // 2))
         self.cache_size = max(0, int(cache_size or 0))
@@ -554,25 +556,25 @@ class Classifier:
             self.load()
         import numpy as np
         ids = self._tok.encode(text, add_special_tokens=False).ids
-        wins = self.windows(list(ids))
-        n = max(len(w) for w in wins)
-        input_ids = np.full((len(wins), n), self._pad, dtype=np.int64)
-        mask = np.zeros((len(wins), n), dtype=np.int64)
-        for i, w in enumerate(wins):
-            input_ids[i, :len(w)] = w
-            mask[i, :len(w)] = 1
-        feeds = {}
-        for name in self._inputs:
-            if name == "input_ids":
-                feeds[name] = input_ids
-            elif name == "attention_mask":
-                feeds[name] = mask
-            elif name == "token_type_ids":
-                feeds[name] = np.zeros_like(input_ids)
-        logits = self._sess.run(None, feeds)[0].astype(np.float64)
-        e = np.exp(logits - logits.max(axis=1, keepdims=True))
-        p = e[:, self._mal] / e.sum(axis=1)
-        s = float(p.max())
+        # Windows of the same length run as one batch, a shorter last window on its own: padding it to the full
+        # length would cost a whole window (128 tokens = 126 + 2 took 161 ms padded, ~115 ms like this on an N100).
+        groups: dict[int, list[list[int]]] = {}
+        for w in self.windows(list(ids)):
+            groups.setdefault(len(w), []).append(w)
+        s = 0.0
+        for ws in groups.values():
+            input_ids = np.array(ws, dtype=np.int64)
+            feeds = {}
+            for name in self._inputs:
+                if name == "input_ids":
+                    feeds[name] = input_ids
+                elif name == "attention_mask":
+                    feeds[name] = np.ones_like(input_ids)
+                elif name == "token_type_ids":
+                    feeds[name] = np.zeros_like(input_ids)
+            logits = self._sess.run(None, feeds)[0].astype(np.float64)
+            e = np.exp(logits - logits.max(axis=1, keepdims=True))
+            s = max(s, float((e[:, self._mal] / e.sum(axis=1)).max()))
         if self.cache_size:
             with self._lock:
                 self._cache[key] = s

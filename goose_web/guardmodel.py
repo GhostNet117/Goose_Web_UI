@@ -32,7 +32,7 @@ HF_REVISION = "11614a155199674a0a95e6602d6ab0417b790ed0"
 MODEL_PIN: dict[str, str] = {"url": "", "sha256": ""}
 REQUIRED = ("model.onnx", "tokenizer.json", "config.json", "LICENSE", "NOTICE", "export.json")
 MAX_ZIP_BYTES = 1024 * 1024 * 1024        # 1 GiB download/zip cap
-MAX_MEMBER_BYTES = 900 * 1024 * 1024      # model.onnx fp32 is ~290 MB; int8 ~85 MB
+MAX_MEMBER_BYTES = 900 * 1024 * 1024      # model.onnx fp32 is ~284 MB; the default (int8 embeddings) ~137 MB
 ALLOWED_MEMBERS = set(REQUIRED) | {"USE_POLICY.md", "README.md", "MODEL_CARD.md"}
 
 
