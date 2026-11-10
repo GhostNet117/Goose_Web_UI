@@ -128,7 +128,7 @@ The main ideas:
 | `workers.py` | `WorkerManager` and `Worker`: spawns, health-checks, restarts and idles out `goose serve`; scheduler ownership; worker logs; Windows Job Object; Goose Desktop detection. |
 | `policy.py` | Least-privilege default, legacy (1.4) and admin policies, `effective_policy` (one team + overrides), chat gating (`chat_block`, `check_session_choice`), team warnings (`team_warnings`), roots (`user_roots`), path containment (`path_allowed`), and the ACP method firewall (`check`). |
 | `guard.py` | Prompt guard (spec 018): rule sets (validation, SPL-aware pipeline parser, globs, defaults), `GuardContext` per user (team or admin guard), `Classifier` (Prompt Guard 2 22M on ONNX Runtime: windows, cache, lazy load), `GuardService` (contexts cached per user, `check_prompt`, `check_tool`, health, fail open, `guard.unavailable`). |
-| `guardmodel.py` | The model package: folder, pin (`MODEL_PIN`, `guard.model_url/sha256`), SHA-256-verified install from a URL or a local zip (safe extract, integrity check against `export.json`), remove. |
+| `guardmodel.py` | The model package: folder, pin (`MODEL_PIN` = the GitHub release asset, or `guard.model_url/sha256`), download (proxy environment, retries, size cap, progress), SHA-256-verified install from the pin or a local zip (safe extract, integrity check against `export.json`), remove. |
 | `auth.py` | `AuthService`: local passwords, LDAP/Active Directory, OIDC (authorization code with PKCE), TOTP, lockout and rate limits, cookie sessions, API tokens. |
 | `ipblock.py` | `IPBlocker`: counts failed sign-ins per client address (IPv4, or IPv6 /64) in the `ip_blocks` table, blocks after `auth.ip_block_threshold` in a row within the window, expiry, unblock, listing; in-memory cache of blocked keys refreshed every 15 s. |
 | `security.py` | Stdlib-only primitives: scrypt password hashing, strong-password rules, `ip_in`, tokens, constant-time compare, TOTP, `RateLimiter`, `safe_name`. |
@@ -143,7 +143,7 @@ The main ideas:
 |---|---|
 | `index.html` | Shell page: theme stylesheets, `modulepreload` of `js/app.js`, boot spinner. |
 | `manifest.webmanifest` | PWA manifest. |
-| `sw.js` | Service worker (`gw-shell-v19`): offline shell, network-first for app code, cache-first for vendor files. |
+| `sw.js` | Service worker (`gw-shell-v20`): offline shell, network-first for app code, cache-first for vendor files. |
 | `css/app.css` | All styles and themes. |
 | `icons/` | `goose.svg`, `goose-maskable.svg`. |
 | `vendor/` | Vendored libraries (marked, DOMPurify, highlight.js, qrcode-generator) with `README.md` and `SHA256SUMS`. |
@@ -1060,7 +1060,7 @@ data:
 - **Install** pre-caches the shell list on a best-effort basis and calls
   `skipWaiting()`.
 - **Activate** deletes every cache whose name is not the current `VERSION`
-  (`gw-shell-v19`) and claims open clients.
+  (`gw-shell-v20`) and claims open clients.
 - **notificationclick** focuses an open window, or opens one, at
   `/#/chat/<sessionId>` or `/#/herd`.
 
@@ -1621,6 +1621,13 @@ position, so they are guarded:
 - **Model.** `<system_dir>/models/prompt-guard-2-22m/`: `model.onnx`, `tokenizer.json`, `config.json`
   (`malicious_index`), LICENSE, NOTICE, USE_POLICY.md, README.md, `export.json` (per-file SHA-256). `verify_dir`
   checks sizes at load and hashes at install/status. Built by `scripts/export-prompt-guard.py`.
+- **Distribution (1.14.2).** The package is the asset of the GitHub release `MODEL_RELEASE`
+  (`prompt-guard-2-22m-onnx-1`, not tied to app versions); `MODEL_PIN` holds its URL, SHA-256, size and Meta's
+  revision. `guardmodel.download` (httpx, `trust_env` for `HTTPS_PROXY`/`NO_PROXY`, redirects followed but https
+  only, 60 s read timeout, 3 attempts on transport errors / 5xx / 429 / a short transfer, progress through `log`,
+  capped at the pinned size) runs only from `goose-web guard install-model` and the installers, never in the
+  gateway. Tests inject `guardmodel._TRANSPORT` (an `httpx.MockTransport`); `tests/conftest.py` makes any other
+  download fail the test.
 
 ## 13. Configuration loading
 

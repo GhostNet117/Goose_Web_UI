@@ -962,14 +962,47 @@ see a banner on every page until it is healthy again (*Check now* on Admin > Pro
 classifier score, mode) and `guard.unavailable` go to the audit log and `activity.jsonl` (section 18.1). The text of
 the message or the arguments is never recorded.
 
-**The model.** `goose-web guard status` shows the runtime, the model and a self-test; `goose-web guard install-model`
-installs it into `<system_dir>\models\prompt-guard-2-22m\`; `goose-web check` reports it; `install.ps1`, `upgrade.ps1`
-run `guard install-model --if-missing` (a warning, not a failure). The package is installed only after its SHA-256 is
-verified (the pinned package, `guard.model_url` + `guard.model_sha256` in config.yaml, or `--file X.zip --sha256 HEX`).
+**The model.** `goose-web guard status` shows the runtime, the model, the package source and a self-test;
+`goose-web guard install-model` installs it into `<system_dir>\models\prompt-guard-2-22m\`; `goose-web check`
+reports it. `install.ps1` and `upgrade.ps1` run `guard install-model --if-missing`: it downloads and installs the model
+when it is missing and leaves a valid installed model alone. A failed download is a warning, not a failure: the guard
+then runs with rules only and fails open for the classifier until the model is installed. Nothing is installed unless
+its SHA-256 matches (the pinned package, `guard.model_url` + `guard.model_sha256` in config.yaml, or `--file X.zip
+--sha256 HEX` for a package of your own), and every file is checked once more against `export.json` in the package.
 
-Meta publishes the weights on Hugging Face behind a licence click-through (Llama 4 Community License), so they cannot
-be downloaded anonymously, and Goose Web 1.14.0 ships **no pinned package yet**. Until one is pinned the guard runs
-with rules only and fails open for the classifier. To build the package once (any administrator):
+**Where the model comes from (since 1.14.2).** Meta publishes the weights on Hugging Face behind a licence
+click-through, so Goose Web does not download from there. This project publishes the converted model as the asset of
+a dedicated GitHub release, separate from the app versions so that its address never changes:
+
+| | |
+|---|---|
+| Release | [`prompt-guard-2-22m-onnx-1`](https://github.com/GhostNet117/Goose_Web_UI/releases/tag/prompt-guard-2-22m-onnx-1) |
+| File | `https://github.com/GhostNet117/Goose_Web_UI/releases/download/prompt-guard-2-22m-onnx-1/Llama-Prompt-Guard-2-22M-onnx-int8emb-11614a15.zip` |
+| SHA-256 | `76d04f9014c82fbf28e51645272c974ca9273ad93512a36b9ef858e4e851eab3` |
+| Size | 116,747,849 bytes (about 146 MB unpacked) |
+| Contents | Meta's Llama Prompt Guard 2 22M at revision `11614a155199674a0a95e6602d6ab0417b790ed0` as ONNX (word embeddings int8, encoder fp32), Meta's `tokenizer.json` unchanged, `config.json`, `LICENSE`, `USE_POLICY.md`, `NOTICE`, `README.md` ("Built with Llama"), `export.json` (provenance and the SHA-256 of every file) |
+
+Every source file was checked against the SHA-256 of Meta's release before the conversion
+(`scripts/export-prompt-guard.py`, `OFFICIAL_FILES`). The pin (URL, SHA-256, size, revision) is `MODEL_PIN` in
+`goose_web/guardmodel.py`. The download uses HTTPS only (github.com redirects to its file host
+`release-assets.githubusercontent.com`), honours the standard proxy variables (`HTTPS_PROXY`, `NO_PROXY`), gives up on a
+connection that sends no data for 60 seconds, tries three times (waiting 5 and 15 seconds) on network errors and
+server errors, prints its progress, and stops if the file is larger than the pinned size.
+
+**Offline install, or a proxy/firewall that blocks the download.** Behind a proxy, set it for the command
+(`set HTTPS_PROXY=http://proxy.example:8080` in the same `cmd` window, then run the command again). Without internet
+access: download the file above on another computer, check it (`Get-FileHash <zip> -Algorithm SHA256` must show the
+SHA-256 above), copy it to the server and run `goose-web guard install-model --file <zip>` (the pinned SHA-256
+applies; `--sha256` is only needed for a package of your own), then `goose-web guard status`. An internal mirror of
+the zip works too: `guard.model_url` (https) and `guard.model_sha256` in config.yaml (set both).
+
+**Licence.** Built with Llama. Llama Prompt Guard 2 is licensed under the **Llama 4 Community License**, Copyright (c)
+Meta Platforms, Inc. All Rights Reserved; its use is subject to that licence and the **Llama 4 Acceptable Use Policy**.
+Both are in the package and are installed with the model (`LICENSE`, `USE_POLICY.md`, `NOTICE`); Goose Web's own
+Apache-2.0 licence does not cover the model. If you redistribute the package (for example an internal mirror), keep
+those files in it and display "Built with Llama" (THIRD-PARTY-NOTICES.md).
+
+**Building a package yourself** (maintainers of a new model revision, or forks that prefer their own build):
 
 1. Get Meta's files, one of three ways (`--source`); whichever you use, the script checks the size and SHA-256 of
    every file against the values of Meta's release pinned in the script (`OFFICIAL_FILES`) and refuses anything else:
@@ -985,10 +1018,10 @@ with rules only and fails open for the classifier. To build the package once (an
    checks it against the PyTorch model with the gateway's own tokenisation, and writes a zip (about 117 MB) with
    the licence, the Acceptable Use Policy, the NOTICE and a "Built with Llama" README, then prints its SHA-256.
 3. Install it: `goose-web guard install-model --file <zip> --sha256 <hash>`, then `goose-web guard status`.
-4. Optional, for every other installation: publish the zip (for example as a release asset of your fork) and set its
-   URL and SHA-256 in `guard.model_url` / `guard.model_sha256`, or pin them in `goose_web/guardmodel.py`
-   (`MODEL_PIN`). Redistribution must keep LICENSE, USE_POLICY.md and NOTICE in the package and display "Built with
-   Llama" (THIRD-PARTY-NOTICES.md).
+4. To make it the default for every installation: publish the zip as the asset of a **new** release (tag
+   `prompt-guard-2-22m-onnx-<n>`, not marked latest; never replace the file of an existing tag, installed gateways pin
+   its SHA-256) and pin its URL, SHA-256 and size in `MODEL_RELEASE` / `MODEL_PIN` (`goose_web/guardmodel.py`) in
+   the next app release. A fork can set `guard.model_url` / `guard.model_sha256` instead.
 
 Measured on an Intel N100 (4 cores, the real model, default package, 4 threads; p50 / p95): 16 tokens 19 / 22 ms,
 64 tokens 45 / 50 ms, 128 tokens (2 windows) 105 / 125 ms, 512 tokens 350 / 390 ms, 1024 tokens (8 windows)

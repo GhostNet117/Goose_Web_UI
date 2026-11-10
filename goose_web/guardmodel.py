@@ -1,14 +1,19 @@
 """Prompt Guard 2 22M model package: where it lives, where it comes from, and how it is installed (spec 018 R2).
 
-The package is a zip built by scripts/export-prompt-guard.py from the official, gated Hugging Face repository
-meta-llama/Llama-Prompt-Guard-2-22M (pinned revision): model.onnx, tokenizer.json, config.json, LICENSE (Llama 4
-Community License), USE_POLICY.md, NOTICE, README.md ("Built with Llama") and export.json (provenance and the SHA-256
-of every file). It is installed into <system_dir>/models/prompt-guard-2-22m/.
+The package is a zip built by scripts/export-prompt-guard.py from Meta's release of
+meta-llama/Llama-Prompt-Guard-2-22M (pinned revision, every source file checked against Meta's SHA-256): model.onnx,
+tokenizer.json, config.json, LICENSE (Llama 4 Community License), USE_POLICY.md, NOTICE, README.md ("Built with
+Llama") and export.json (provenance and the SHA-256 of every file). It is installed into
+<system_dir>/models/prompt-guard-2-22m/.
 
-The download source is pinned in MODEL_PIN (URL + SHA-256 of the zip) and can be overridden with guard.model_url /
-guard.model_sha256 in config.yaml. Nothing is installed without a trusted SHA-256: the pin, the config value, or a
-hash the administrator types for a local file (`goose-web guard install-model --file X.zip --sha256 HEX`).
-The gateway never downloads anything at run time; only the install command (and the installers that call it) does.
+The package is published as an asset of a dedicated GitHub release of the Goose Web repository (tag MODEL_RELEASE,
+independent of app versions, so the URL does not change) and pinned in MODEL_PIN (URL, SHA-256, size). It can be
+overridden with guard.model_url / guard.model_sha256 in config.yaml. Nothing is installed without a trusted SHA-256:
+the pin, the config value, or a hash the administrator types for a local file (`goose-web guard install-model --file
+X.zip [--sha256 HEX]`; without --sha256 the pinned hash applies, so the published zip copied by hand works offline).
+The download honours the standard proxy environment (HTTPS_PROXY / NO_PROXY), retries transient failures and is
+cut off at the pinned size. The gateway never downloads anything at run time; only the install command (and the
+installers that call it) does.
 """
 from __future__ import annotations
 
@@ -26,10 +31,20 @@ from typing import Any
 MODEL_DIR_NAME = "prompt-guard-2-22m"
 HF_REPO = "meta-llama/Llama-Prompt-Guard-2-22M"
 HF_REVISION = "11614a155199674a0a95e6602d6ab0417b790ed0"
-# The published package (a release asset of the Goose Web repository, see docs/ADMINISTRATION.md "Prompt guard").
-# Empty until the maintainer has exported and published it: the official weights are gated, so there is no
-# anonymous, licence-compliant source to pin yet. guard.model_url / guard.model_sha256 in config.yaml override this.
-MODEL_PIN: dict[str, str] = {"url": "", "sha256": ""}
+# The published package: an asset of the release MODEL_RELEASE of the Goose Web repository (see
+# docs/ADMINISTRATION.md "Prompt guard"; published 2026-11-10, spec 018). guard.model_url / guard.model_sha256 in
+# config.yaml override it (then the size is not known in advance). A new package = a new release tag + a new pin.
+MODEL_RELEASE = "prompt-guard-2-22m-onnx-1"
+MODEL_PIN: dict[str, Any] = {
+    "url": "https://github.com/GhostNet117/Goose_Web_UI/releases/download/" + MODEL_RELEASE +
+           "/Llama-Prompt-Guard-2-22M-onnx-int8emb-11614a15.zip",
+    "sha256": "76d04f9014c82fbf28e51645272c974ca9273ad93512a36b9ef858e4e851eab3",
+    "size": 116_747_849,
+    "revision": HF_REVISION,
+}
+DOWNLOAD_ATTEMPTS = 3                     # network errors and HTTP 5xx/429 are retried
+DOWNLOAD_RETRY_WAIT = (5.0, 15.0)         # seconds before the 2nd and 3rd attempt
+_TRANSPORT = None                         # tests inject an httpx.MockTransport (no network in tests)
 REQUIRED = ("model.onnx", "tokenizer.json", "config.json", "LICENSE", "NOTICE", "export.json")
 MAX_ZIP_BYTES = 1024 * 1024 * 1024        # 1 GiB download/zip cap
 MAX_MEMBER_BYTES = 900 * 1024 * 1024      # model.onnx fp32 is ~284 MB; the default (int8 embeddings) ~137 MB
@@ -46,9 +61,13 @@ def model_dir(settings) -> Path:
 
 
 def pin(settings) -> dict:
-    url = str(settings.get("guard", "model_url") or "").strip() or MODEL_PIN["url"]
-    sha = str(settings.get("guard", "model_sha256") or "").strip().lower() or MODEL_PIN["sha256"]
-    return {"url": url, "sha256": sha}
+    """The package source: config.yaml guard.model_url (+ model_sha256) if set, else MODEL_PIN."""
+    url = str(settings.get("guard", "model_url") or "").strip()
+    sha = str(settings.get("guard", "model_sha256") or "").strip().lower()
+    if url or sha:
+        return {"url": url, "sha256": sha, "size": 0, "revision": "", "source": "config"}
+    return {"url": MODEL_PIN["url"], "sha256": MODEL_PIN["sha256"], "size": int(MODEL_PIN.get("size") or 0),
+            "revision": MODEL_PIN.get("revision") or "", "source": "pinned"}
 
 
 def sha256_file(p: Path) -> str:
@@ -101,13 +120,15 @@ def describe(settings) -> dict:
     try:
         meta = json.loads((d / "export.json").read_text(encoding="utf-8"))
         info.update(model=meta.get("model"), revision=meta.get("revision"), quantization=meta.get("quantization"),
-                    exported=meta.get("exported"), parameters=meta.get("parameters"))
+                    exported=meta.get("exported"), parameters=meta.get("parameters"),
+                    package_sha256=meta.get("package_sha256"))
         cfg = json.loads((d / "config.json").read_text(encoding="utf-8"))
         info["proxy"] = bool(cfg.get("proxy"))
     except (OSError, ValueError):
         pass
     p = pin(settings)
-    info["pin"] = {"url": p["url"], "sha256": p["sha256"], "published": bool(p["url"] and p["sha256"])}
+    info["pin"] = {"url": p["url"], "sha256": p["sha256"], "size": p["size"], "revision": p["revision"],
+                   "source": p["source"], "published": bool(p["url"] and p["sha256"])}
     return info
 
 
@@ -129,21 +150,79 @@ def _safe_extract(zpath: Path, dest: Path) -> None:
                 shutil.copyfileobj(src, out, 1 << 20)
 
 
-def download(url: str, dest: Path, *, timeout: float = 120) -> None:
-    """HTTPS download with a size cap (installers / CLI only; never at gateway run time)."""
+class _Retry(Exception):
+    """A transient download failure (HTTP 5xx/429, a cut-off transfer): try again."""
+
+
+BLOCKED_HINT = ("If a proxy or firewall blocks the download, set HTTPS_PROXY (for example "
+                "http://proxy.example:8080) for this command, or download the zip on another computer and run "
+                "goose-web guard install-model --file <zip> (docs/ADMINISTRATION.md, Prompt guard).")
+
+
+def _mb(n: int) -> str:
+    return f"{n / 1e6:.1f} MB"
+
+
+def _download_once(url: str, dest: Path, *, expected_size: int, timeout: float, log) -> None:
+    import httpx
+    from . import __version__
+    cap = expected_size or MAX_ZIP_BYTES
+    n = 0
+    # trust_env (the default) = HTTPS_PROXY / ALL_PROXY / NO_PROXY and the system CA settings apply.
+    with httpx.Client(transport=_TRANSPORT, follow_redirects=True, trust_env=True,
+                      timeout=httpx.Timeout(timeout, connect=30.0),
+                      headers={"User-Agent": f"goose-web/{__version__} (prompt guard model install)"}) as client:
+        with client.stream("GET", url) as r:          # GitHub release assets redirect to a CDN
+            if r.url.scheme != "https":
+                raise InstallError("the download was redirected to a non-https address; refused")
+            if r.status_code == 429 or r.status_code >= 500:
+                raise _Retry(f"HTTP {r.status_code}")
+            if r.status_code != 200:
+                raise InstallError(f"download failed: HTTP {r.status_code} from {url}")
+            try:
+                announced = int(r.headers.get("content-length") or 0)
+            except ValueError:
+                announced = 0
+            if expected_size and announced and announced != expected_size:
+                raise InstallError(f"the server offers {announced:,} bytes, the pinned package has {expected_size:,} "
+                                   "bytes; nothing was installed")
+            total = expected_size or announced
+            step = max(total // 10, 1) if total else 20_000_000
+            next_report = step
+            with open(dest, "wb") as f:
+                for chunk in r.iter_bytes(1 << 20):
+                    n += len(chunk)
+                    if n > cap:
+                        raise InstallError("the download is larger than the pinned package; nothing was installed")
+                    f.write(chunk)
+                    if n >= next_report:
+                        log(f"  {_mb(n)}" + (f" of {_mb(total)} ({100 * n // total}%)" if total else ""))
+                        next_report += step
+    if expected_size and n != expected_size:
+        raise _Retry(f"the transfer stopped after {n:,} of {expected_size:,} bytes")
+
+
+def download(url: str, dest: Path, *, expected_size: int = 0, timeout: float = 60, log=print,
+             attempts: int = DOWNLOAD_ATTEMPTS) -> None:
+    """HTTPS download with a size cap, retries and progress (installers / CLI only; never at gateway run time).
+    `timeout` applies to each read (no data for that long = a failed attempt), not to the whole transfer."""
     import httpx
     if not url.lower().startswith("https://"):
         raise InstallError("the model URL must be https://")
-    n = 0
-    with httpx.stream("GET", url, follow_redirects=True, timeout=timeout) as r:   # GitHub assets redirect to a CDN
-        if r.status_code != 200:
-            raise InstallError(f"download failed: HTTP {r.status_code}")
-        with open(dest, "wb") as f:
-            for chunk in r.iter_bytes(1 << 20):
-                n += len(chunk)
-                if n > MAX_ZIP_BYTES:
-                    raise InstallError("the download is larger than expected")
-                f.write(chunk)
+    last = ""
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            _download_once(url, dest, expected_size=expected_size, timeout=timeout, log=log)
+            return
+        except _Retry as e:
+            last = str(e)
+        except httpx.TransportError as e:            # DNS, connect, TLS, proxy, timeouts, a dropped connection
+            last = f"{e.__class__.__name__}: {e}" if str(e) else e.__class__.__name__
+        if attempt < attempts:
+            wait = DOWNLOAD_RETRY_WAIT[min(attempt - 1, len(DOWNLOAD_RETRY_WAIT) - 1)]
+            log(f"Download attempt {attempt} of {attempts} failed ({last}); trying again in {wait:.0f} s.")
+            time.sleep(wait)
+    raise InstallError(f"the download failed after {attempts} attempt(s) ({last}). {BLOCKED_HINT}")
 
 
 def _rmtree(p: Path) -> None:
@@ -171,14 +250,14 @@ def install(settings, *, file: str | None = None, sha256: str | None = None, for
     if file:
         expected = _hex(sha256) if sha256 else p["sha256"]
         if not expected:
-            raise InstallError("give the package's SHA-256 with --sha256 (no published package is pinned yet)")
+            raise InstallError("give the package's SHA-256 with --sha256 (guard.model_url is set without "
+                               "guard.model_sha256 in config.yaml)")
     else:
         if not (p["url"] and p["sha256"]):
             raise InstallError(
-                "no published Prompt Guard package is pinned yet: the official weights are gated on Hugging Face "
-                "(Llama 4 Community License). An administrator who accepted the licence can build the package with "
-                "scripts/export-prompt-guard.py and install it with --file and --sha256, or set guard.model_url and "
-                "guard.model_sha256 in config.yaml. See docs/ADMINISTRATION.md, Prompt guard.")
+                "no package source: guard.model_url and guard.model_sha256 in config.yaml must be set together "
+                "(or remove both to use the published package), or install a local zip with --file. See "
+                "docs/ADMINISTRATION.md, Prompt guard.")
         expected = _hex(p["sha256"])
     if not force and not verify_dir(d):
         try:
@@ -200,8 +279,10 @@ def install(settings, *, file: str | None = None, sha256: str | None = None, for
                 raise InstallError("the package is too large")
             shutil.copyfile(src, zpath)
         else:
-            log(f"Downloading the Prompt Guard model package from {p['url']}")
-            download(p["url"], zpath)
+            log("Downloading the Prompt Guard model package" + (f" ({_mb(p['size'])})" if p["size"] else "") +
+                f" from {p['url']}")
+            download(p["url"], zpath, expected_size=p["size"], log=log)
+            log("Downloaded; checking its SHA-256.")
         got = sha256_file(zpath)
         if got != expected:
             raise InstallError(f"SHA-256 mismatch: expected {expected}, got {got}. Nothing was installed.")

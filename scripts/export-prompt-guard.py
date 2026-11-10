@@ -1,8 +1,9 @@
 """Maintainer tool: build the Prompt Guard 2 22M model package that Goose Web installs (spec 018).
 
-Goose Web runs meta-llama/Llama-Prompt-Guard-2-22M on the CPU with ONNX Runtime. The official weights are gated on
-Hugging Face (Llama 4 Community License click-through), so a gateway cannot download them anonymously. A maintainer
-runs this script ONCE per model revision; it
+Goose Web runs meta-llama/Llama-Prompt-Guard-2-22M on the CPU with ONNX Runtime. Meta's repository is gated on
+Hugging Face (Llama 4 Community License click-through), so gateways do not download from it: they install the package
+this script builds, published as a GitHub release asset of the project (goose_web/guardmodel.py MODEL_PIN). A
+maintainer runs this script ONCE per model revision; it
 
 1. gets the files of the pinned official revision from one of three sources (--source) and checks EVERY file's size
    and SHA-256 against OFFICIAL_FILES (Meta's release) before using it - whatever the source, only Meta's bytes are
@@ -19,8 +20,10 @@ runs this script ONCE per model revision; it
    and export.json (provenance, tool versions, validation results, SHA-256 of every file),
 5. prints the SHA-256 of the zip.
 
-Publish the zip as a release asset of the Goose Web repository and pin its URL and SHA-256 in goose_web/guardmodel.py
-(MODEL_PIN), or set guard.model_url / guard.model_sha256 in config.yaml. See docs/ADMINISTRATION.md (Prompt guard).
+Publish a new package as the asset of a NEW dedicated release (tag prompt-guard-2-22m-onnx-<n>, not marked latest;
+never replace the asset of an existing tag - installed gateways pin its SHA-256), then pin its URL, SHA-256 and size
+in goose_web/guardmodel.py (MODEL_RELEASE, MODEL_PIN). A fork can instead set guard.model_url / guard.model_sha256 in
+config.yaml. See docs/ADMINISTRATION.md (Prompt guard).
 
 Run it in a throwaway virtual environment, never in the gateway's:
     python -m venv C:\\temp\\pg-export && C:\\temp\\pg-export\\Scripts\\activate

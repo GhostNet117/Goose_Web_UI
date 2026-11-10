@@ -5,6 +5,20 @@ the last lines of the failure), so a CI failure can be read from the public chec
 the job log."""
 import os
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_model_download(monkeypatch):
+    """No test downloads the Prompt Guard package from the network (spec 018): the download path fails loudly unless
+    a test injects its own httpx.MockTransport into goose_web.guardmodel._TRANSPORT."""
+    import httpx
+    from goose_web import guardmodel
+
+    def refuse(request):
+        raise AssertionError(f"network access in a test: {request.url}")
+    monkeypatch.setattr(guardmodel, "_TRANSPORT", httpx.MockTransport(refuse))
+
 
 def pytest_runtest_logreport(report):
     if not os.environ.get("GITHUB_ACTIONS") or not report.failed:

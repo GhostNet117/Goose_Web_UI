@@ -670,7 +670,7 @@ chat link) and `Priority` (`high` for "needs you", otherwise `default`). Other U
 
 ## 14. Old user interface after an upgrade
 
-The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v19`). The
+The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v20`). The
 page, scripts and styles are fetched from the network first, and the cache is used only when the gateway cannot
 be reached; `/api/` and `/ws` are never cached. Third-party libraries and icons are served from the cache first.
 The gateway sends these files with `Cache-Control: no-cache`.
@@ -767,10 +767,12 @@ user names and host names removed.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Admin banner *Prompt guard: the classifier is unavailable (... not installed ...)* | A team or the admins have the guard on but the model is not installed (1.14.0 ships no pinned package: the official weights are gated). | Build and install it once (ADMINISTRATION 9.8), then *Check now* on Admin > Prompt guard. Until then rules still apply and the classifier fails open. |
+| Admin banner *Prompt guard: the classifier is unavailable (... not installed ...)* | A team or the admins have the guard on but the model is not installed (the download during install/upgrade failed, or the model was removed). | `goose-web guard install-model`, then *Check now* on Admin > Prompt guard. Until then rules still apply and the classifier fails open. |
+| `guard install-model`: *the download failed after 3 attempt(s) (ConnectError / ConnectTimeout / ProxyError / HTTP 403 ...)* | A proxy or firewall blocks `github.com` / `release-assets.githubusercontent.com`, or there is no internet access. | Behind a proxy: `set HTTPS_PROXY=http://<proxy>:<port>` in the same window and run it again. Otherwise download the zip from the release `prompt-guard-2-22m-onnx-1` on another computer, check its SHA-256 (ADMINISTRATION 9.8), copy it over and run `goose-web guard install-model --file <zip>`. |
+| *the server offers N bytes, the pinned package has M* / *larger than the pinned package* | A proxy returned something else (a block page) or the file was changed. | Nothing was installed; use `--file` with the published zip, or ask your proxy team to allow the download. |
 | Banner *... took longer than N ms* | The CPU is busy or the text is long. | Raise `guard.timeout_ms`, lower `guard.max_windows`, or check `goose-web guard status`. |
-| `goose-web guard install-model`: *no published Prompt Guard package is pinned yet* | No URL/SHA-256 configured. | Use `--file <zip> --sha256 <hash>` or set `guard.model_url` + `guard.model_sha256`. |
-| *SHA-256 mismatch* / *does not match its SHA-256 in export.json* | Wrong or damaged package. | Rebuild or download again; nothing was installed. |
+| `goose-web guard install-model`: *no package source* | `guard.model_url` or `guard.model_sha256` is set without the other in config.yaml. | Set both, or remove both to use the published package; or `--file <zip>`. |
+| *SHA-256 mismatch* / *does not match its SHA-256 in export.json* | Wrong or damaged package (with `--file`: not the published zip; a package of your own needs `--sha256`). | Download again or use the right file; nothing was installed. |
 | *forbidden: the prompt guard blocked this message* | The classifier flagged the message (or a prompt rule matched). | Rephrase; an admin can test it in Admin > Prompt guard > Test. A false positive on legitimate security content: lower the impact with *Check what members type* off for that team. |
 | *The prompt guard blocked a call to ... (rule ...)* | A rule matched the tool's arguments. | Intended; edit the rule set if it is too broad (Test box). |
 | *this chat uses the approval mode 'auto'* for a guarded member | Guarded teams use Approve. | Pick Approve for the chat; the team can turn on *Guarded auto*. |

@@ -548,4 +548,6 @@ Spec 018 adds an optional, per-team **prompt guard** (ADMINISTRATION 9.8, ARCHIT
   recipe checks started through shell extensions are not guarded; administrators' existing *always allow* tools are
   not guarded; the 22M model is weak on non-English text. New dependencies (onnxruntime, tokenizers and their
   dependencies, numpy < 2.5) are hash-locked; the model package is installed only with a verified SHA-256 and its
-  zip is extracted with a fixed file list (no paths).
+  zip is extracted with a fixed file list (no paths). Since 1.14.2 the package is downloaded from this project's
+  GitHub release `prompt-guard-2-22m-onnx-1` (https only, size-capped, SHA-256 pinned in the code): a changed or
+  replaced asset is refused, so trust rests on the pinned hash, not on the release page.

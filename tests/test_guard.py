@@ -297,13 +297,15 @@ def test_service_fail_open_and_health(env, tmp_path):
     asyncio.run(go())
 
 
-def test_install_model_checks(env, tmp_path):
+def test_install_model_checks(env, tmp_path, monkeypatch):
     s, db, pr, c = env
-    with pytest.raises(GM.InstallError, match="no published"):
-        GM.install(s, log=lambda m: 0)                              # nothing pinned in 1.14.0
+    s.data.setdefault("guard", {})["model_url"] = "https://example.invalid/pkg.zip"   # URL without its SHA-256
+    with pytest.raises(GM.InstallError, match="no package source"):
+        GM.install(s, log=lambda m: 0)
+    s.data["guard"]["model_url"] = ""
     z = make_package(tmp_path)
-    with pytest.raises(GM.InstallError, match="SHA-256"):
-        GM.install(s, file=str(z), log=lambda m: 0)                 # local file needs a hash
+    with pytest.raises(GM.InstallError, match="SHA-256 mismatch"):
+        GM.install(s, file=str(z), log=lambda m: 0)                 # a local file is checked against the pin
     with pytest.raises(GM.InstallError, match="mismatch"):
         GM.install(s, file=str(z), sha256="0" * 64, log=lambda m: 0)
     bad = make_package(tmp_path / "t", tamper=True)
@@ -327,15 +329,157 @@ def test_cli_guard_status_and_install(env, tmp_path, capsys):
     s, db, pr, c = env
     from goose_web.__main__ import main
     assert main(["guard", "status"]) == 1
-    assert "not installed" in capsys.readouterr().out
-    assert main(["guard", "install-model"]) == 3
+    out = capsys.readouterr().out
+    assert "not installed" in out and "package source (pinned): " + GM.MODEL_PIN["url"] in out
     z = make_package(tmp_path)
+    assert main(["guard", "install-model", "--file", str(z)]) == 3      # not the pinned package: refused
+    assert "SHA-256 mismatch" in capsys.readouterr().err
     assert main(["guard", "install-model", "--file", str(z), "--sha256", GM.sha256_file(z)]) == 0
-    assert main(["guard", "install-model", "--if-missing"]) == 0
-    capsys.readouterr()
+    assert main(["guard", "install-model", "--if-missing"]) == 0         # valid model: no download (none is mocked)
+    assert "nothing to do" in capsys.readouterr().out
     assert main(["guard", "status"]) == 0
     out = capsys.readouterr().out
     assert "self-test" in out and "TEST PROXY" in out and "Built with Llama" in out
+    assert "not the one pinned above" in out                             # installed from another package
+    assert main(["check"]) in (0, 1)
+    assert "prompt guard package source (pinned): " + GM.MODEL_PIN["url"] in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ pinned download (HTTP mocked, no network)
+GH = "https://github.com/GhostNet117/Goose_Web_UI/releases/download/t/pkg.zip"
+CDN = "https://release-assets.example/pkg.zip?sig=x"
+
+
+@pytest.fixture
+def served(tmp_path, monkeypatch):
+    """A test package pinned like the real one and served by a mocked GitHub (302 to a CDN). Returns a dict whose
+    'body' / 'status' / 'chunked' can be changed and whose 'requests' records the URLs asked for."""
+    import httpx
+    z = make_package(tmp_path / "srv")
+    data = z.read_bytes()
+    st = {"zip": z, "data": data, "body": data, "status": [], "requests": [], "chunked": False, "redirect": CDN}
+    monkeypatch.setattr(GM, "MODEL_PIN", {"url": GH, "sha256": GM.sha256_file(z), "size": len(data),
+                                          "revision": GM.HF_REVISION})
+    monkeypatch.setattr(GM.time, "sleep", lambda s: st.setdefault("slept", []).append(s))
+
+    def handler(req):
+        st["requests"].append(str(req.url))
+        if req.url.host == "github.com":
+            return httpx.Response(302, headers={"location": st["redirect"]})
+        if st["status"]:
+            code = st["status"].pop(0)
+            if code == "connect":
+                raise httpx.ConnectError("connection refused", request=req)
+            return httpx.Response(code)
+        if st["chunked"]:
+            return httpx.Response(200, content=iter([st["body"][i:i + 4096] for i in range(0, len(st["body"]), 4096)]))
+        return httpx.Response(200, content=st["body"])
+    monkeypatch.setattr(GM, "_TRANSPORT", httpx.MockTransport(handler))
+    return st
+
+
+def test_pinned_pin_is_the_published_release():
+    assert GM.MODEL_PIN["url"] == ("https://github.com/GhostNet117/Goose_Web_UI/releases/download/"
+                                   "prompt-guard-2-22m-onnx-1/Llama-Prompt-Guard-2-22M-onnx-int8emb-11614a15.zip")
+    assert GM._hex(GM.MODEL_PIN["sha256"]) == "76d04f9014c82fbf28e51645272c974ca9273ad93512a36b9ef858e4e851eab3"
+    assert GM.MODEL_PIN["size"] == 116_747_849 and GM.MODEL_PIN["revision"] == GM.HF_REVISION
+    assert GM.MODEL_RELEASE in GM.MODEL_PIN["url"]
+
+
+def test_install_downloads_the_pin_follows_redirect_and_verifies(env, served):
+    s, db, pr, c = env
+    logs = []
+    info = GM.install(s, log=logs.append)
+    assert info["installed"] and info["package_sha256"] == GM.MODEL_PIN["sha256"]
+    assert info["pin"] == {**{k: GM.MODEL_PIN[k] for k in ("url", "sha256", "size", "revision")},
+                           "source": "pinned", "published": True}
+    assert served["requests"] == [GH, CDN]
+    assert GM.verify_dir(GM.model_dir(s), deep=True) == ""
+    assert any(GH in m for m in logs) and any("(100%)" in m for m in logs)
+    GM.install(s, log=logs.append)                                       # same package: no second download
+    assert len(served["requests"]) == 2 and "already installed" in logs[-1]
+
+
+def test_cli_install_model_if_missing_downloads_once(env, served, capsys):
+    from goose_web.__main__ import main
+    assert main(["guard", "install-model", "--if-missing"]) == 0
+    assert "Installed the Prompt Guard model" in capsys.readouterr().out and len(served["requests"]) == 2
+    assert main(["guard", "install-model", "--if-missing"]) == 0
+    assert "nothing to do" in capsys.readouterr().out and len(served["requests"]) == 2
+
+
+def test_tampered_download_is_refused(env, served):
+    s, db, pr, c = env
+    body = bytearray(served["data"])
+    body[len(body) // 2] ^= 0xFF                                         # same size, one byte changed
+    served["body"] = bytes(body)
+    with pytest.raises(GM.InstallError, match="SHA-256 mismatch"):
+        GM.install(s, log=lambda m: 0)
+    assert not GM.model_dir(s).exists() and not list(GM.model_dir(s).parent.glob(".pg-install-*"))
+    served["body"] = served["data"] + b"x"                               # announced size differs from the pin
+    with pytest.raises(GM.InstallError, match="pinned package has"):
+        GM.install(s, log=lambda m: 0)
+    served["chunked"] = True                                             # no Content-Length, too long
+    with pytest.raises(GM.InstallError, match="larger than the pinned package"):
+        GM.install(s, log=lambda m: 0)
+    assert not GM.model_dir(s).exists()
+
+
+def test_download_retries_then_succeeds(env, served):
+    s, db, pr, c = env
+    served["status"] = [503, "connect"]
+    logs = []
+    GM.install(s, log=logs.append)
+    assert GM.verify_dir(GM.model_dir(s)) == "" and served["slept"] == list(GM.DOWNLOAD_RETRY_WAIT)
+    assert sum("trying again" in m for m in logs) == 2
+
+
+def test_download_gives_up_with_offline_hint(env, served):
+    s, db, pr, c = env
+    served["status"] = [502, 502, 502]
+    with pytest.raises(GM.InstallError) as e:
+        GM.install(s, log=lambda m: 0)
+    assert "after 3 attempt(s)" in str(e.value) and "HTTPS_PROXY" in str(e.value) and "--file" in str(e.value)
+    served["chunked"], served["body"] = True, served["data"][:1000]      # cut-off transfer is retried, then fails
+    with pytest.raises(GM.InstallError, match="stopped after 1,000"):
+        GM.install(s, log=lambda m: 0)
+    n = len(served["requests"])
+    served["status"] = [404]                                             # not transient: no retry
+    with pytest.raises(GM.InstallError, match="HTTP 404"):
+        GM.install(s, log=lambda m: 0)
+    assert len(served["requests"]) == n + 2                              # GitHub + CDN once
+    served["redirect"] = "http://release-assets.example/pkg.zip"         # downgrade to http refused
+    with pytest.raises(GM.InstallError, match="non-https"):
+        GM.install(s, log=lambda m: 0)
+    assert not GM.model_dir(s).exists()
+
+
+def test_offline_file_uses_pinned_hash_and_config_override(env, served, monkeypatch):
+    s, db, pr, c = env
+    GM.install(s, file=str(served["zip"]), log=lambda m: 0)               # the published zip, copied by hand
+    assert served["requests"] == [] and GM.verify_dir(GM.model_dir(s)) == ""
+    s.data.setdefault("guard", {}).update(model_url="http://mirror.example/pkg.zip", model_sha256="A" * 64)
+    p = GM.pin(s)
+    assert p["source"] == "config" and p["size"] == 0 and p["sha256"] == "a" * 64
+    with pytest.raises(GM.InstallError, match="https"):
+        GM.install(s, force=True, log=lambda m: 0)
+    assert GM.verify_dir(GM.model_dir(s)) == ""                          # the installed model is untouched
+
+
+def test_download_uses_the_proxy_environment(monkeypatch, tmp_path):
+    """No transport injected = httpx's own, with trust_env: HTTPS_PROXY is used (here: a closed local port)."""
+    import httpx
+    monkeypatch.setattr(GM, "_TRANSPORT", None)
+    seen = {}
+    real = httpx.Client
+
+    def spy(*a, **k):
+        seen.update(k)
+        return real(*a, **{**k, "transport": httpx.MockTransport(lambda r: httpx.Response(503))})
+    monkeypatch.setattr(httpx, "Client", spy)
+    with pytest.raises(GM.InstallError):
+        GM.download(GH, tmp_path / "x.zip", attempts=1, log=lambda m: 0)
+    assert seen["trust_env"] is True and seen["follow_redirects"] is True and seen["transport"] is None
 
 
 # ------------------------------------------------------------------ API
@@ -348,7 +492,8 @@ def test_api_rulesets_admin_guard_team_guard_and_me(env, tmp_path):
         h = sign_in(tc, c, admin)
         g = tc.get("/api/admin/guard").json()
         assert {r["name"] for r in g["rulesets"]} == {"Splunk read-only", "Destructive shell"}
-        assert g["health"]["inUse"] is False and g["model"]["pin"]["published"] is False
+        assert g["health"]["inUse"] is False and g["model"]["pin"]["published"] is True
+        assert g["model"]["pin"]["url"] == GM.MODEL_PIN["url"] and g["model"]["pin"]["source"] == "pinned"
         assert g["hfRepo"] == "meta-llama/Llama-Prompt-Guard-2-22M"
         spl = next(r for r in g["rulesets"] if r["builtin"] == "splunk-read-only")
         r = tc.post("/api/admin/guard/rulesets", json={"name": "Bad", "rules": [{"kind": "regex", "patterns": ["("]}]},

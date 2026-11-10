@@ -372,10 +372,13 @@ Say "Initialising (admin '$Admin'; a random initial password is generated and sh
 # init prints the generated password (first install only); keep its output and show it once, at the end.
 $initOut = @(& $venvPy -m goose_web --config $cfg init --admin $Admin --native-root $native)
 if ($LASTEXITCODE) { $initOut | ForEach-Object { Write-Host $_ }; throw "goose-web init failed." }
-# Prompt guard model (spec 018): the pinned package, SHA-256 checked, when one is published. Not fatal: without the
-# model the guard fails open (rules still apply) and administrators see a banner while a team uses the guard.
-& $venvPy -m goose_web --config $cfg guard install-model --if-missing
-if ($LASTEXITCODE) { Warn "The Prompt Guard model is not installed (see above); the prompt guard fails open until it is: goose-web guard install-model (docs/ADMINISTRATION.md, Prompt guard)." }
+# Prompt guard model (spec 018): downloads the pinned package (a GitHub release asset of this project, about 117 MB;
+# HTTPS_PROXY is honoured) and checks its SHA-256. Not fatal: without the model the guard fails open (rules still
+# apply) and administrators see a banner while a team uses the guard. Offline: guard install-model --file <zip>.
+$prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'   # its messages on stderr must not stop setup
+try { & $venvPy -m goose_web --config $cfg guard install-model --if-missing; $guardRc = $LASTEXITCODE }
+finally { $ErrorActionPreference = $prevEap }
+if ($guardRc) { Warn "The Prompt Guard model is not installed (see above); the prompt guard fails open until it is. Run goose-web guard install-model later, or --file <zip> without internet access (docs/ADMINISTRATION.md, Prompt guard)." }
 & $venvPy -m goose_web --config $cfg check
 if ($LASTEXITCODE) {
     throw "goose-web check failed (see the [!!] lines above). If the goose CLI was not found, re-run with -GooseBinary <path to goose.exe>."

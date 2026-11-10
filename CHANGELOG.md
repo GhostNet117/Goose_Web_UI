@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.14.2 - 2026-11-10
+
+The Prompt Guard model is installed automatically (spec 018).
+
+- **Model package published and pinned.** The Llama Prompt Guard 2 22M package (ONNX, int8 word embeddings, Meta's
+  revision `11614a15`, every source file checked against Meta's release) is the asset of the dedicated GitHub release
+  `prompt-guard-2-22m-onnx-1` (independent of app versions, so the address stays the same). `MODEL_PIN` in
+  `goose_web/guardmodel.py` pins its URL, SHA-256 (`76d04f90...eab3`) and size (116,747,849 bytes). Fresh installs
+  (`install.ps1`), upgrades (`upgrade.ps1`) and `goose-web guard install-model [--if-missing]` now download and verify
+  it with no manual step; a valid installed model is left alone; a failure stays a warning (the guard fails open).
+- **Download:** HTTPS only (a redirect to http is refused), the standard proxy variables (`HTTPS_PROXY`, `NO_PROXY`),
+  60 s read timeout, three attempts on network/server errors, progress messages, stopped at the pinned size, then the
+  SHA-256 and every file in `export.json` are checked. Offline: `goose-web guard install-model --file <zip>` (the
+  pinned SHA-256 applies; `--sha256` only for a package of your own).
+- `goose-web guard status` and `goose-web check` show the package source; Admin > Prompt guard shows it and the
+  offline command. Removed the "official weights are gated, nothing pinned" messages.
+- Tests: the pinned download path with mocked HTTP (redirect, progress, no second download, tampered or oversized
+  download refused, retries, proxy environment, offline file); no test reaches the network (`tests/conftest.py`).
+- Docs: ADMINISTRATION 9.8 (where the model comes from, offline install, licence), README, CONFIGURATION,
+  TROUBLESHOOTING 18, THIRD-PARTY-NOTICES.md. Service worker cache `gw-shell-v20`.
+
 ## 1.14.1 - 2026-11-10
 
 Prompt guard, verified with the real Llama Prompt Guard 2 22M model (spec 018).

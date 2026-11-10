@@ -13,7 +13,7 @@ it, on a desktop or a phone.
   `%APPDATA%\Block\goose`) with all of its chats, recipes and settings. Nothing gets copied around, and Goose
   Desktop keeps working on the same profile.
 
-`goose-web 1.14.1` - Python 3.11+ - Windows 10/11 and Windows Server 2019+ - Apache-2.0
+`goose-web 1.14.2` - Python 3.11+ - Windows 10/11 and Windows Server 2019+ - Apache-2.0
 
 ## Windows only
 
@@ -36,7 +36,10 @@ contain the Linux/macOS installer and the Docker files, but they are unsupported
   workspace.
 - **Prompt guard** (optional, per team): editable rule sets on tool-call arguments (shipped: *Splunk read-only*,
   *Destructive shell*) and Meta's Llama Prompt Guard 2 22M classifier on what users type, run locally on the CPU;
-  blocks are audited without content. Built with Llama (see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)).
+  blocks are audited without content. The installers download the model (about 117 MB, SHA-256 checked) from this
+  project's [release `prompt-guard-2-22m-onnx-1`](https://github.com/GhostNet117/Goose_Web_UI/releases/tag/prompt-guard-2-22m-onnx-1);
+  offline: `goose-web guard install-model --file <zip>`. Built with Llama (Llama 4 Community License, see
+  [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)).
 - **Live activity** (as in Goose Desktop): the model's thinking, every tool call with its input, live output
   and result, and a live bar with the current step, tool-call count and elapsed time. How much stays open is a
   per-user preference.

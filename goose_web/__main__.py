@@ -657,10 +657,11 @@ def cmd_guard(args, settings) -> int:
     from . import guardmodel
     if args.action == "install-model":
         if args.if_missing and not guardmodel.verify_dir(guardmodel.model_dir(settings)):
-            print(f"The Prompt Guard model is installed ({guardmodel.model_dir(settings)}).")
+            print(f"The Prompt Guard model is installed ({guardmodel.model_dir(settings)}); nothing to do.")
             return 0
         try:
-            guardmodel.install(settings, file=args.file, sha256=args.sha256, force=args.force)
+            guardmodel.install(settings, file=args.file, sha256=args.sha256, force=args.force,
+                               log=lambda m: print(m, flush=True))
         except guardmodel.InstallError as e:
             print(f"Prompt Guard model not installed: {e}", file=sys.stderr)
             return 3
@@ -681,9 +682,15 @@ def cmd_guard(args, settings) -> int:
           f"{info.get('model')} @ {str(info.get('revision') or '')[:12]} ({info.get('quantization')}, "
           f"exported {info.get('exported')})" + (" - TEST PROXY, NOT PROMPT GUARD" if info.get("proxy") else "")))
     pin = info["pin"]
-    print(f"[{'OK' if pin['published'] else '--'}] package source: " +
-          (f"{pin['url']} (sha256 {pin['sha256'][:16]}...)" if pin["published"] else
-           "none pinned yet (the official weights are gated; see docs/ADMINISTRATION.md, Prompt guard)"))
+    print(f"[{'OK' if pin['published'] else '--'}] package source ({pin['source']}): " +
+          (f"{pin['url']} sha256 {pin['sha256']}" + (f", {pin['size']:,} bytes" if pin["size"] else "")
+           if pin["published"] else
+           "none (guard.model_url and guard.model_sha256 in config.yaml must be set together; see "
+           "docs/ADMINISTRATION.md, Prompt guard)"))
+    if info["installed"] and pin["published"] and info.get("package_sha256") \
+            and info["package_sha256"] != pin["sha256"]:
+        print("[--] the installed package is not the one pinned above (goose-web guard install-model --force "
+              "replaces it)")
     healthy = ok_rt and not problem
     if healthy:
         from .db import Database
@@ -780,6 +787,10 @@ def cmd_check(args, settings) -> int:
     line("prompt guard runtime", rt, ok_rt)
     print(f"[{'OK' if not gproblem else '--'}] prompt guard model: " + (f"installed in {gd}" if not gproblem else
           f"{gproblem}; the guard fails open without it (goose-web guard install-model, goose-web guard status)"))
+    gpin = guardmodel.pin(settings)
+    print(f"[{'OK' if gpin['url'] and gpin['sha256'] else '--'}] prompt guard package source ({gpin['source']}): "
+          + (f"{gpin['url']} sha256 {gpin['sha256'][:16]}..." if gpin["url"] and gpin["sha256"] else
+             "none; set guard.model_url and guard.model_sha256 together, or install with --file"))
     u = logjanitor.usage(settings)
     print(f"[OK] logs: {u['bytes'] / 2**20:.1f} MB of {u['budget'] / 2**20:.0f} MB "
           f"({u['percent']}% of the disk) in {u['files']} file(s)")
@@ -855,8 +866,9 @@ def main(argv: list[str] | None = None) -> int:
     tl.add_argument("path", nargs="?")
     gd = sub.add_parser("guard", help="prompt guard model: status, install-model, remove-model")
     gd.add_argument("action", choices=["status", "install-model", "remove-model"])
-    gd.add_argument("--file", help="install-model: a local package zip (from scripts/export-prompt-guard.py)")
-    gd.add_argument("--sha256", help="install-model --file: the package's SHA-256 (required unless it is pinned)")
+    gd.add_argument("--file", help="install-model: a local package zip instead of the download (offline install: the "
+                                   "published zip copied by hand, or one from scripts/export-prompt-guard.py)")
+    gd.add_argument("--sha256", help="install-model --file: the package's SHA-256 (default: the pinned one)")
     gd.add_argument("--if-missing", action="store_true", help="install-model: do nothing if a valid model is there")
     gd.add_argument("--force", action="store_true", help="install-model: reinstall even if the same package is there")
     sub.add_parser("check", help="diagnostics")
