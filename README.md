@@ -188,6 +188,9 @@ Every key, the CLI, policies, profile layout, scheduler rules and scripts are de
   automatically; or your own certificate; or off behind a reverse proxy (Admin > System > HTTPS).
 - Every user action is attributable (user, client address, time): sign-ins, admin changes, agent calls and everyday
   chat activity, in the audit log and a JSON-lines activity log. All logs stay under 0.5 % of the disk.
+  To feed a SIEM (for example a Splunk Universal Forwarder), monitor `<system_dir>\logs`
+  (default `<profiles_root>\_system\logs`): [ADMINISTRATION 18.1](docs/ADMINISTRATION.md) has the files,
+  inputs.conf/props.conf and the read permission the forwarder needs.
 - Workers listen on loopback only, each with its own secret. The gateway never runs elevated.
 - Personal webhooks cannot reach internal addresses unless `notify.allow_private_targets` is turned on.
 - Dependencies are installed from a hash-locked `requirements.lock`.

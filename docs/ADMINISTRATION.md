@@ -40,7 +40,7 @@ and the default profiles root `C:\Goose_Web_Profiles`. Replace them with your ow
 15. [Herd view, peers and viewing another user's chats](#15-herd-view-peers-and-viewing-another-users-chats)
 16. [Audit log](#16-audit-log)
 17. [Windows tools: ownership check and host tasks](#17-windows-tools-ownership-check-and-host-tasks)
-18. [Logs](#18-logs)
+18. [Logs](#18-logs) (18.1 [Forwarding to Splunk or another SIEM](#181-forwarding-logs-to-splunk-universal-forwarder-or-another-siem))
 19. [Backups and restore](#19-backups-and-restore)
 20. [Upgrades](#20-upgrades)
 21. [Uninstalling](#21-uninstalling)
@@ -1357,6 +1357,106 @@ cleanup; `goose-web check` prints it too.
 **Admin > Logs** shows the tail of the gateway log or any worker log (200 to 2000 lines, filter, auto-refresh,
 copy). Set the log level with the environment variable `GOOSE_WEB_LOG_LEVEL` (for example `DEBUG`; default
 `INFO`). Logs can contain user names, IP addresses, folder paths and error text; protect them like the database.
+
+### 18.1 Forwarding logs to Splunk (Universal Forwarder) or another SIEM
+
+**Where:** everything worth forwarding is in one folder, `<system_dir>\logs`. By default that is
+`<profiles_root>\_system\logs`; with the installer's default profiles root that is
+`C:\Goose_Web_Profiles\_system\logs`. `goose-web check` prints
+`profiles root`. The path can be changed with `paths.system_dir`. Forward from the gateway machine itself: the
+gateway writes plain files, with no syslog or HTTP output.
+
+| File (in `<system_dir>\logs`) | Forward? | Suggested sourcetype | What it is for |
+|---|---|---|---|
+| `activity.jsonl` and `activity.jsonl.1` ... `.10` | **Yes - the security feed** | `goose_web:activity` | One JSON object per line: who did what, when, from where. Every audit event (sign-ins, failed sign-ins, IP blocks, admin and security changes, refused agent calls `acp.denied`) plus chat activity and browser connections. Prompt text is never in it. |
+| `gateway.log` and `gateway.log.1` ... `.5` | Yes - operations | `goose_web:gateway` | Gateway start/stop (`Goose Web <version> ready`), warnings, errors with Python tracebacks (multi-line), log-budget runs. |
+| `worker-<user>.log` | Optional | `goose_web:worker` | Each agent worker's start line (`==== <time> start ...`) and Goose's stdout/stderr - crashes and failed extension starts. |
+| `worker-<user>.log.1`, `.2`, `.3` | No | - | Copies made when a worker log is rotated; their content was already read from the live file. |
+
+**Do not forward** Goose's own logs inside the profiles (`<profiles_root>\<user>\state\logs`, `...\data\logs`) or
+the native profile's Goose logs: they can contain conversation content, model replies and tool output, and they
+live in the users' (sandboxed) folders. Do not read the database for the audit trail: `activity.jsonl` already
+carries every audit event.
+
+**Permissions.** The log folder inherits a narrow ACL: administrators, SYSTEM and the gateway's account. A Universal
+Forwarder running as Local System can read it as is. Splunk UF 9.1 and later installs by default as the
+least-privileged virtual account `NT SERVICE\SplunkForwarder`, which cannot. Grant it read on the **log folder
+only** (run as the gateway's account or an administrator):
+
+```powershell
+icacls "C:\Goose_Web_Profiles\_system\logs" /grant "NT SERVICE\SplunkForwarder:(OI)(CI)RX"
+```
+
+Never grant the forwarder `<system_dir>` itself (it holds the database and keys) or `<profiles_root>`. Goose Web
+does not rewrite the log folder's ACL, so the grant survives upgrades and restarts.
+
+**inputs.conf** (on the Universal Forwarder; replace the folder and the index):
+
+```ini
+[monitor://C:\Goose_Web_Profiles\_system\logs\activity.jsonl*]
+sourcetype = goose_web:activity
+index = goose_web
+
+[monitor://C:\Goose_Web_Profiles\_system\logs\gateway.log*]
+sourcetype = goose_web:gateway
+index = goose_web
+
+[monitor://C:\Goose_Web_Profiles\_system\logs\worker-*.log]
+sourcetype = goose_web:worker
+index = goose_web
+```
+
+**props.conf.** `activity.jsonl` is structured, so its stanza must be on the **forwarder**. The line-breaking and
+timestamp rules for the other two belong on the **indexers** (or a heavy forwarder). The search-time lines go on
+the search heads.
+
+```ini
+# Universal Forwarder (and the search heads, for KV_MODE/AUTO_KV_JSON)
+[goose_web:activity]
+INDEXED_EXTRACTIONS = json
+TIMESTAMP_FIELDS = ts
+TIME_FORMAT = %Y-%m-%dT%H:%M:%S.%3N%:z
+KV_MODE = none
+AUTO_KV_JSON = false
+
+# Indexers / heavy forwarder
+[goose_web:gateway]
+SHOULD_LINEMERGE = false
+LINE_BREAKER = ([\r\n]+)(?=\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} )
+TIME_PREFIX = ^
+TIME_FORMAT = %Y-%m-%d %H:%M:%S,%3N
+MAX_TIMESTAMP_LOOKAHEAD = 23
+# gateway.log uses the gateway machine's LOCAL time without an offset: set its zone, for example
+TZ = America/New_York
+
+[goose_web:worker]
+SHOULD_LINEMERGE = false
+LINE_BREAKER = ([\r\n]+)
+TRUNCATE = 20000
+```
+
+**Time zones.** `activity.jsonl` `ts` is UTC with an explicit offset. `gateway.log` is the gateway machine's
+local time without an offset, hence the `TZ` line. Worker logs mix Goose's own timestamps with the start lines.
+
+**Rotation and the disk budget.** `gateway.log` and `activity.jsonl` rotate by renaming (`.1` is the newest copy),
+which the trailing `*` in the monitor stanzas covers. The forwarder recognises a renamed file by its content and
+does not index it twice. Worker logs are copied to `.1` and emptied in place, so only the live `worker-*.log` is
+monitored. The log budget (section 18) deletes the oldest rotated files when all logs together pass
+`logs.max_disk_percent`. A forwarder that has been stopped longer than the logs take to fill the budget loses what
+was deleted in the meantime. Keep it running, or raise `logs.activity_files` / `logs.max_disk_percent`.
+
+**Fields and example searches** (`activity`): `ts`, `user`, `uid`, `ip` (the real client address behind a trusted
+proxy), `action`, `target`, `ok`, `detail`.
+
+```
+index=goose_web sourcetype=goose_web:activity action=auth.login ok=false | stats count by ip, user
+index=goose_web sourcetype=goose_web:activity action IN (auth.ip.blocked, auth.ip.unblocked, acp.denied)
+index=goose_web sourcetype=goose_web:activity action=user.* OR action=team.* OR action=sandbox.*
+index=goose_web sourcetype=goose_web:gateway (ERROR OR WARNING OR Traceback)
+```
+
+Other SIEMs: forward the same three file patterns with any file-tailing agent. `activity.jsonl` is newline-delimited
+JSON, and the gateway log is one line per event plus traceback continuation lines.
 
 ## 19. Backups and restore
 

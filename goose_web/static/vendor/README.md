@@ -25,11 +25,7 @@ file name; this README and `SHA256SUMS` itself are not listed). `tests/test_plat
 file is changed, added or removed without updating it, so a tampered or accidentally edited library is caught
 in CI.
 
-Verify (from this folder):
-
-```sh
-sha256sum -c SHA256SUMS                    # Linux / macOS (macOS: shasum -a 256 -c SHA256SUMS)
-```
+Verify (from this folder). Goose Web runs on Windows only (README), so PowerShell is the normal way:
 
 ```powershell
 # Windows PowerShell
@@ -37,7 +33,13 @@ Get-Content SHA256SUMS | ForEach-Object { $h, $f = $_ -split '\s+', 2
   if ((Get-FileHash $f -Algorithm SHA256).Hash -ne $h.ToUpper()) { "MISMATCH $f" } else { "OK $f" } }
 ```
 
-Update after changing a vendored file (from this folder, then review the diff):
+To check a clone on another system (Git Bash on Windows has `sha256sum` too):
+
+```sh
+sha256sum -c SHA256SUMS                    # macOS: shasum -a 256 -c SHA256SUMS
+```
+
+Update after changing a vendored file (from this folder, in Git Bash or another POSIX shell, then review the diff):
 
 ```sh
 LC_ALL=C sha256sum $(LC_ALL=C ls | grep -v -e '^README.md$' -e '^SHA256SUMS$') > SHA256SUMS

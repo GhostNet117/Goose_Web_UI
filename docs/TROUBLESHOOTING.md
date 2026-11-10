@@ -154,6 +154,15 @@ All logs together are kept under `logs.max_disk_percent` (0.5 %) of the disk: th
 (gateway log line `log budget ... deleted N file(s)`). If logs you need disappear, raise the percentage or copy them
 off the machine (ADMINISTRATION 18).
 
+**Monitoring with Splunk or another SIEM:** forward `activity.jsonl*` (security feed, every audit event),
+`gateway.log*` and optionally `worker-*.log` from `<system_dir>\logs`. Configuration examples are in
+ADMINISTRATION 18.1.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Splunk UF shows no Goose Web events; `splunkd.log` on the forwarder reports `Access is denied` or the files are not found | Splunk UF 9.1+ runs as `NT SERVICE\SplunkForwarder`, which the log folder's ACL (administrators, SYSTEM, the gateway account) does not include; or the monitor path points at the profiles root instead of `<system_dir>\logs` | `icacls "<system_dir>\logs" /grant "NT SERVICE\SplunkForwarder:(OI)(CI)RX"` (the log folder only), check the path with `goose-web check` (`profiles root`), restart the forwarder |
+| Gateway events appear hours off in Splunk | `gateway.log` is in local time without an offset | Set `TZ` for `goose_web:gateway` in props.conf on the indexers (ADMINISTRATION 18.1) |
+
 Useful gateway log lines:
 
 | Line | Meaning |

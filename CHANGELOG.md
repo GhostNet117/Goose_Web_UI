@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Docs: forwarding logs to Splunk or another SIEM** (ADMINISTRATION 18.1): which files in
+  `<system_dir>\logs` to monitor (`activity.jsonl*` = security feed with every audit event, `gateway.log*`,
+  `worker-*.log`), which not to (Goose's own per-profile logs hold conversation content), inputs.conf and
+  props.conf examples, time zones, rotation and the disk budget, and the read grant a Splunk UF 9.1+ running as
+  `NT SERVICE\SplunkForwarder` needs. TROUBLESHOOTING has a row for a forwarder that reads nothing.
+
 ## 1.13.0 - 2026-11-09
 
 - **Windows only for now.** Linux, macOS and Docker are no longer shipped or supported: Goose Web has no per-user
