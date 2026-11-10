@@ -10,7 +10,8 @@ from typing import Any, Iterable
 
 from .policy import ANY, CHAT_LISTS, LEGACY_DEFAULT_POLICY
 
-SCHEMA_VERSION = 4   # v3 (1.3.0): ip_blocks table; v4 (1.5.0): one team per user, least-privilege policies
+SCHEMA_VERSION = 5   # v3 (1.3.0): ip_blocks table; v4 (1.5.0): one team per user, least-privilege policies;
+#                      v5 (1.14.0): guard_rulesets table (prompt guard, spec 018)
 POLICY_MODEL = 2     # meta 'policy_model': 2 = spec 009 semantics (empty list = nothing, "*" = any)
 
 # Audit rows older than this are deleted when the database is opened (GW-23).
@@ -153,9 +154,18 @@ CREATE TABLE IF NOT EXISTS ip_blocks (
   blocked_until REAL NOT NULL DEFAULT 0,    -- 0 while blocked = until an administrator unblocks it
   updated_at REAL NOT NULL
 );
+-- prompt guard rule sets (guard.py, spec 018); builtin = key of a shipped default ('' = made by an admin)
+CREATE TABLE IF NOT EXISTS guard_rulesets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  description TEXT NOT NULL DEFAULT '',
+  rules TEXT NOT NULL DEFAULT '[]',
+  builtin TEXT NOT NULL DEFAULT '',
+  updated_at REAL NOT NULL
+);
 """
 
-JSON_COLUMNS = {"prefs", "policy_overrides", "policy", "payload", "detail", "value", "failures"}
+JSON_COLUMNS = {"prefs", "policy_overrides", "policy", "payload", "detail", "value", "failures", "rules"}
 
 
 class Database:
@@ -191,6 +201,7 @@ class Database:
             for sql in POST_MIGRATION_SQL:
                 self._conn.execute(sql)
             self._migrate_policy_model()
+            self._seed_guard()
             self._conn.execute("UPDATE meta SET value=? WHERE key='schema_version' AND CAST(value AS INTEGER) < ?",
                                (str(SCHEMA_VERSION), SCHEMA_VERSION))
             self._user_columns = frozenset(self._table_columns("users"))
@@ -251,6 +262,18 @@ class Database:
         except Exception:
             self._conn.execute("ROLLBACK")
             raise
+
+    def _seed_guard(self) -> None:
+        """Spec 018: insert the shipped prompt-guard rule sets once (an admin may delete or edit them later; Admin >
+        Prompt guard can restore them). Teams are not touched: their guard stays off until an admin turns it on."""
+        if self._conn.execute("SELECT 1 FROM meta WHERE key='guard_seeded'").fetchone():
+            return
+        from .guard import DEFAULT_RULESETS
+        now = time.time()
+        for key, rs in DEFAULT_RULESETS.items():
+            self._conn.execute("INSERT OR IGNORE INTO guard_rulesets(name, description, rules, builtin, updated_at) "
+                               "VALUES(?,?,?,?,?)", (rs["name"], rs["description"], json.dumps(rs["rules"]), key, now))
+        self._conn.execute("INSERT INTO meta(key, value) VALUES('guard_seeded', '1')")
 
     # -- helpers -----------------------------------------------------------------
     @staticmethod

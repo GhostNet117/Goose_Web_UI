@@ -94,6 +94,13 @@ is a number.
 
 | Method | Path | Notes |
 |---|---|---|
+| GET/PUT | `/api/admin/guard` | Prompt guard (1.14.0): `{health, admin, settings, model, hfRepo, hfRevision, rulesets, defaults}`. PUT `{admin: {enabled, check_input, rulesets:[id], on_block}}` sets the administrators' guard (audit `guard.admin.update`) |
+| POST | `/api/admin/guard/check` | Loads the model if needed and scores a benign and an injection sample → `{benign, injection, health}` (audit `guard.check`) |
+| POST | `/api/admin/guard/test` | Dry run, nothing audited: `{rulesets:[id], tool?, extension?, args?: object or JSON text, text?, classify?}` → `{tool?, prompt?, classifier?}` with `blocked`, `rule`, `ruleset`, `message` |
+| GET/POST | `/api/admin/guard/rulesets` | List (`id, name, description, builtin, ruleCount, teams, admins`); POST `{name, description, rules:[{id, tool, args, kind: pipeline\|regex\|words, patterns, applies: tool\|prompt\|both, message}]}` (`400 bad_rules`, `409 exists`) |
+| GET/PUT/DELETE | `/api/admin/guard/rulesets/{id}` | One rule set with its rules; PUT any of name/description/rules |
+| POST | `/api/admin/guard/rulesets/{id}/reset` | A shipped rule set back to its default (`400 not_builtin`) |
+| POST | `/api/admin/guard/rulesets/restore-defaults` | Re-creates deleted shipped rule sets → `{restored}` |
 | GET/POST | `/api/admin/users` | POST `{username, displayName?, email?, role:"user"\|"admin", password?, team?:id\|null, hints:[id], profileMode:"isolated"\|"native", authSource:"local"\|"ldap"\|"oidc"}` → `{user, tempPassword?}`. `team` is the user's one team; without it the user joins the default team, and `team:null` creates a user without a team (can sign in, cannot chat). The older `teams:[id]` is still accepted with at most one entry (`400 one_team` otherwise). An unknown team id, or a value that is not a number, gives `400 bad_team`. GET returns users with `team` (id or `null`), `teams` (0 or 1 ids), `hints`, `policyOverrides` and `profilePath` |
 | GET/PATCH/DELETE | `/api/admin/users/{id}` | PATCH accepts any of the POST fields plus `disabled`, `policyOverrides` → `{user, changes}`. Setting `team` (or `teams`) replaces the user's membership (one team per user) and re-provisions the profile. A password set here (or in POST) must meet the password rules (`400 weak_password {problems}`) and must always be changed at the user's next sign-in (`mustChangePassword` is ignored since 1.3.0). Disabling a user or setting a password revokes the user's sessions and API tokens. DELETE `?purgeProfile=1` deletes the profile folder; otherwise the folder is renamed to `_deleted/<name>-<ts>` |
 | POST | `/api/admin/users/{id}/reset-password` | → `{tempPassword}` (the user must change it at next login). Revokes the user's sessions and API tokens |
@@ -142,7 +149,11 @@ Team and policy errors:
 | `400 bad_folder` | a team's `share_folder` or an `allowed_roots` entry is not an absolute path, or `allowed_roots` contains `*` |
 | `403 hint_file_refused` | a non-admin uploads or creates something named `AGENTS.md`, `.goosehints` or `.goose-web-hints.md` |
 
+Team policies accept `guard` (see CONFIGURATION 5). `GET /api/me` returns `guard` (classifier health) for administrators while a prompt guard is on, else `null`.
+
 ## Real-time channel: `GET /ws` (WebSocket)
+
+Prompt guard (1.14.0): `_gw/hello` carries `guard` (classifier health) for administrators while a guard is on; `_gw/guard` (params = health) is sent to administrators when it changes; `_gw/notice` (`kind: "guard"`, `sessionId`) tells the tabs of a chat that a tool call was blocked. A blocked prompt is answered with error `-32003` (`forbidden: the prompt guard blocked this message ...`) or, when the team drops blocks silently, with `{stopReason: "refusal"}`.
 
 Browsers authenticate the socket with the session cookie, and the `Origin` header must be an allowed
 origin (the `server.public_url` origin plus `server.allowed_origins`; without `public_url`, the request's

@@ -188,7 +188,9 @@ function buildShell() {
   const upstream = h('div', { class: 'upstream-bar', hidden: true, role: 'status' });
   const backdrop = h('div', { class: 'backdrop', onclick: () => ctx.toggleSidebar(false) });
   const profileBar = rpc.profileParam ? h('div', { class: 'impersonate-bar' }, icon('shield', 14), ' Admin view of ', h('strong', null, rpc.profileParam), '’s profile – actions are audited. ', h('a', { href: '/#/herd' }, 'Back to my profile')) : null;
-  const el = h('div', { class: 'shell' }, h('div', { class: 'side-wrap' }, sidebar.el), backdrop, h('div', { class: 'main-wrap' }, profileBar, upstream, main));
+  // Spec 018: administrators see this bar on every page while a prompt guard is on and its classifier is down.
+  const guardBar = h('div', { class: 'upstream-bar warn guard-bar', hidden: true, role: 'status' });
+  const el = h('div', { class: 'shell' }, h('div', { class: 'side-wrap' }, sidebar.el), backdrop, h('div', { class: 'main-wrap' }, profileBar, upstream, guardBar, main));
   root.replaceChildren(el);
   shell = { el, main, sidebar, upstream };
   const renderUp = () => {
@@ -202,6 +204,13 @@ function buildShell() {
     upstream.className = 'upstream-bar ' + (st === 'starting' ? 'info' : 'warn');
   };
   store.on('change:upstream', renderUp); store.on('change:conn', renderUp); renderUp();
+  const renderGuard = () => {
+    const g = store.get('guardHealth'); const me = store.get('me');
+    const show = !!(me && me.isAdmin && g && g.inUse && !g.healthy);
+    guardBar.hidden = !show;
+    guardBar.replaceChildren(...(show ? [icon('shield', 14), ' Prompt guard: the classifier is unavailable' + (g.reason ? ' (' + String(g.reason).replace(/\.+$/, '') + ')' : '') + '. Prompts and tool calls are allowed without it (fail open); rules still apply. ', h('a', { href: '#/admin/guard' }, 'Admin > Prompt guard')] : []));
+  };
+  store.on('change:guardHealth', renderGuard); store.on('change:me', renderGuard); renderGuard();
 }
 
 // ------------------------------------------------------------------ routing
@@ -265,6 +274,7 @@ window.addEventListener('beforeunload', (e) => {
 rpc.on('hello', (hello) => {
   if (!hello) return;
   if (hello.profile) setMyProfile(hello.profile);
+  store.set('guardHealth', hello.guard || null);
   resetAsks(hello.asks || []);
   setHerd(hello.herd || []);
   loadSessions({ reset: true });
@@ -302,6 +312,7 @@ rpc.on('_gw/upstream', (p) => {
   if (p && p.state === 'down' && p.error) toast('Goose agent stopped: ' + p.error, { kind: 'error', timeout: 8000 });
   if (p && p.state === 'ready' && prev === 'down') toast('Goose agent is back', { kind: 'success' });
 });
+rpc.on('_gw/guard', (p) => store.set('guardHealth', p || null));
 rpc.on('_gw/notice', (p) => {
   const lvl = (p && p.level) || 'info';
   toast((p && p.message) || '', { kind: lvl === 'warning' ? 'warn' : lvl === 'error' ? 'error' : lvl === 'success' ? 'success' : 'info', timeout: lvl === 'error' ? 10000 : 6000 });

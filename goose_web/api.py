@@ -21,7 +21,8 @@ from starlette.responses import (FileResponse, HTMLResponse, JSONResponse, Plain
                                  Response)
 from starlette.routing import Route
 
-from . import hosttasks, logjanitor, security, tls, winsec
+from . import guard as guardmod
+from . import guardmodel, hosttasks, logjanitor, security, tls, winsec
 from . import policy as acp_policy
 from .auth import AuthError
 from .context import Ctx, HTTPError, body_json, read_body
@@ -303,7 +304,10 @@ async def me(request: Request):
                "team": (policy.get("team") if u["role"] != "admin" else
                         next(({"id": t["id"], "name": t["name"]} for t in c.db.user_teams(u["id"])), None)),
                "scheduler": {"enabled": sched_on, "owner": "gateway" if sched_on else "desktop", "reason": reason},
-               "workspace": str(c.profiles.workspace(u)), "version": c.version, "gooseVersion": c.goose_version})
+               "workspace": str(c.profiles.workspace(u)), "version": c.version, "gooseVersion": c.goose_version,
+               # spec 018: classifier health for the admin banner while some prompt guard is on
+               "guard": c.guard.health() if c.guard is not None and u["role"] == "admin" and c.guard.in_use()
+               else None})
 
 
 async def me_password(request: Request):
@@ -860,6 +864,7 @@ def _admin_user_view(c: Ctx, u: dict) -> dict:
 
 async def _reprovision(c: Ctx, users: list[dict]) -> dict:
     out = {}
+    _guard_changed(c)   # team / user / policy changes can switch someone's prompt guard on or off
     for u in users:
         if c.profiles.is_native(u):
             await asyncio.to_thread(c.profiles.write_hints, u)   # managed native hints only (spec 011)
@@ -1200,6 +1205,8 @@ def _clean_policy_fields(p: dict) -> dict:
         if not os.path.isabs(sf):
             raise HTTPError(400, "bad_folder", "The team folder must be an absolute path")
         out["share_folder"] = sf
+    if isinstance(p.get("guard"), dict):
+        out["guard"] = guardmod.clean_team_guard(p["guard"])   # spec 018
     return out
 
 
@@ -1233,6 +1240,7 @@ async def admin_teams(request: Request):
     tid = c.db.execute("INSERT INTO teams(name, description, policy, created_at) VALUES(?,?,?,?)",
                        (name, str(b.get("description") or "")[:500], _json.dumps(_clean_policy(b.get("policy") or {}, c)),
                         time.time()))
+    _guard_changed(c)
     c.audit(request, "team.create", admin, target=name)
     return ok({"id": tid, "team": _team_view(c, c.db.one("SELECT * FROM teams WHERE id=?", (tid,)))})
 
@@ -1399,6 +1407,165 @@ async def admin_hint(request: Request):
     for u in users:
         await asyncio.to_thread(c.profiles.write_hints, c.db.user_by_id(u["id"]) or u)
     return ok({"updatedUsers": [u["username"] for u in users]})
+
+
+# ====================================================================== admin: prompt guard (spec 018)
+def _guard_changed(c: Ctx) -> None:
+    """Rule sets, a team's guard or the admin guard changed: contexts are rebuilt on next use, and the model is
+    loaded in the background if a guard is on now (warm-up)."""
+    if c.guard is None:
+        return
+    c.guard.invalidate()
+    if c.settings.get("guard", "warm_up"):
+        try:
+            asyncio.get_running_loop().create_task(c.guard.warm_up())
+        except RuntimeError:
+            pass
+
+
+def _ruleset_view(c: Ctx, r: dict, full: bool = False) -> dict:
+    rules = r.get("rules") if isinstance(r.get("rules"), list) else []
+    teams = [t["name"] for t in c.db.query("SELECT name, policy FROM teams ORDER BY name")
+             if r["id"] in guardmod.clean_team_guard((t.get("policy") or {}).get("guard"))["rulesets"]]
+    out = {"id": r["id"], "name": r["name"], "description": r["description"], "builtin": r["builtin"] or "",
+           "ruleCount": len(rules), "updatedAt": r["updated_at"], "teams": teams,
+           "admins": r["id"] in (c.guard.admin_config()["rulesets"] if c.guard else [])}
+    if full:
+        out["rules"] = rules
+    return out
+
+
+def _ruleset_body(b: dict, stored: dict | None = None) -> dict:
+    try:
+        return guardmod.clean_ruleset(b, partial_of=stored)
+    except guardmod.RuleError as e:
+        raise HTTPError(400, "bad_rules", str(e))
+
+
+async def admin_guard(request: Request):
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    if request.method == "PUT":
+        b = await body_json(request)
+        if isinstance(b.get("admin"), dict):
+            cfg = guardmod.clean_admin_guard(b["admin"])
+            c.db.set_setting("guard_admin", cfg)
+            c.audit(request, "guard.admin.update", admin, detail=cfg)
+            _guard_changed(c)
+    g = c.guard
+    s = c.settings
+    return ok({"health": g.health() if g else None, "admin": g.admin_config() if g else {},
+               "settings": {k: s.get("guard", k) for k in ("threshold", "min_chars", "window_tokens", "max_windows",
+                                                            "timeout_ms", "threads", "cache_size", "warm_up")},
+               "model": guardmodel.describe(s), "hfRepo": guardmodel.HF_REPO, "hfRevision": guardmodel.HF_REVISION,
+               "rulesets": [_ruleset_view(c, r) for r in c.db.query("SELECT * FROM guard_rulesets ORDER BY name")],
+               "defaults": [{"key": k, "name": v["name"]} for k, v in guardmod.DEFAULT_RULESETS.items()]})
+
+
+async def admin_guard_check(request: Request):
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    if c.guard is None:
+        raise HTTPError(503, "unavailable", "The prompt guard is not available")
+    res = await c.guard.self_test()
+    c.audit(request, "guard.check", admin, detail={"state": res["health"]["state"]}, ok=res["health"]["healthy"])
+    return ok(res)
+
+
+async def admin_guard_test(request: Request):
+    c = ctx(request)
+    c.require(request, admin=True)
+    b = await body_json(request, 512 * 1024)
+    ids = [int(x) for x in b.get("rulesets") or [] if str(x).lstrip("-").isdigit()]
+    args = b.get("args")
+    if isinstance(args, str) and args.strip():
+        import json as _json
+        try:
+            args = _json.loads(args)
+        except ValueError:
+            raise HTTPError(400, "bad_json", "Arguments must be JSON (an object)")
+    if args is not None and not isinstance(args, (dict, str)):
+        raise HTTPError(400, "bad_json", "Arguments must be a JSON object")
+    out = c.guard.dry_run(ids, text=str(b.get("text") or "")[:100_000], tool=str(b.get("tool") or "")[:200],
+                          ext=str(b.get("extension") or "")[:100], args=args if args not in ("", None) else None)
+    if b.get("classify") and b.get("text"):
+        s, st = await c.guard.classify(str(b["text"])[:100_000], point="test")
+        out["classifier"] = {"score": None if s is None else round(s, 4), "status": st,
+                             "blocked": s is not None and s >= c.guard.threshold, "threshold": c.guard.threshold}
+    return ok(out)
+
+
+async def admin_guard_rulesets(request: Request):
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    if request.method == "GET":
+        return ok([_ruleset_view(c, r) for r in c.db.query("SELECT * FROM guard_rulesets ORDER BY name")])
+    b = await body_json(request, 1024 * 1024)
+    rs = _ruleset_body(b)
+    if c.db.one("SELECT id FROM guard_rulesets WHERE name=?", (rs["name"],)):
+        raise HTTPError(409, "exists", "A rule set with that name exists")
+    import json as _json
+    rid = c.db.execute("INSERT INTO guard_rulesets(name, description, rules, builtin, updated_at) VALUES(?,?,?,?,?)",
+                       (rs["name"], rs["description"], _json.dumps(rs["rules"]), "", time.time()))
+    c.audit(request, "guard.ruleset.create", admin, target=rs["name"], detail={"rules": len(rs["rules"])})
+    _guard_changed(c)
+    return ok({"id": rid, "ruleset": _ruleset_view(c, c.db.one("SELECT * FROM guard_rulesets WHERE id=?", (rid,)), True)})
+
+
+async def admin_guard_ruleset(request: Request):
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    rid = int(request.path_params["rid"])
+    r = c.db.one("SELECT * FROM guard_rulesets WHERE id=?", (rid,))
+    if not r:
+        raise HTTPError(404, "not_found", "Rule set not found")
+    if request.method == "GET":
+        return ok(_ruleset_view(c, r, True))
+    if request.method == "DELETE":
+        c.db.execute("DELETE FROM guard_rulesets WHERE id=?", (rid,))
+        c.audit(request, "guard.ruleset.delete", admin, target=r["name"])
+        _guard_changed(c)
+        return ok()
+    b = await body_json(request, 1024 * 1024)
+    rs = _ruleset_body(b, r)
+    other = c.db.one("SELECT id FROM guard_rulesets WHERE name=? AND id<>?", (rs["name"], rid))
+    if other:
+        raise HTTPError(409, "exists", "A rule set with that name exists")
+    import json as _json
+    c.db.execute("UPDATE guard_rulesets SET name=?, description=?, rules=?, updated_at=? WHERE id=?",
+                 (rs["name"], rs["description"], _json.dumps(rs["rules"]), time.time(), rid))
+    c.audit(request, "guard.ruleset.update", admin, target=rs["name"], detail={"rules": len(rs["rules"])})
+    _guard_changed(c)
+    return ok({"ruleset": _ruleset_view(c, c.db.one("SELECT * FROM guard_rulesets WHERE id=?", (rid,)), True)})
+
+
+async def admin_guard_ruleset_reset(request: Request):
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    rid = int(request.path_params["rid"])
+    r = c.db.one("SELECT * FROM guard_rulesets WHERE id=?", (rid,))
+    if not r:
+        raise HTTPError(404, "not_found", "Rule set not found")
+    if r["builtin"] not in guardmod.DEFAULT_RULESETS:
+        raise HTTPError(400, "not_builtin", "Only a shipped rule set can be reset to its default")
+    clash = c.db.one("SELECT id FROM guard_rulesets WHERE name=? AND id<>?",
+                     (guardmod.DEFAULT_RULESETS[r["builtin"]]["name"], rid))
+    if clash:
+        raise HTTPError(409, "exists", "Another rule set uses the default name; rename it first")
+    guardmod.seed_defaults(c.db, only=r["builtin"], overwrite=True)
+    c.audit(request, "guard.ruleset.reset", admin, target=r["name"])
+    _guard_changed(c)
+    return ok({"ruleset": _ruleset_view(c, c.db.one("SELECT * FROM guard_rulesets WHERE id=?", (rid,)), True)})
+
+
+async def admin_guard_restore_defaults(request: Request):
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    names = guardmod.seed_defaults(c.db)
+    if names:
+        c.audit(request, "guard.ruleset.restore", admin, detail={"restored": names})
+        _guard_changed(c)
+    return ok({"restored": names})
 
 
 # ====================================================================== admin: auth, settings
@@ -1704,6 +1871,13 @@ routes = [
     Route("/api/admin/library", admin_library),
     Route("/api/admin/hints", admin_hints, methods=["GET", "POST"]),
     Route("/api/admin/hints/{hid:int}", admin_hint, methods=["GET", "PUT", "DELETE"]),
+    Route("/api/admin/guard", admin_guard, methods=["GET", "PUT"]),
+    Route("/api/admin/guard/check", admin_guard_check, methods=["POST"]),
+    Route("/api/admin/guard/test", admin_guard_test, methods=["POST"]),
+    Route("/api/admin/guard/rulesets", admin_guard_rulesets, methods=["GET", "POST"]),
+    Route("/api/admin/guard/rulesets/restore-defaults", admin_guard_restore_defaults, methods=["POST"]),
+    Route("/api/admin/guard/rulesets/{rid:int}", admin_guard_ruleset, methods=["GET", "PUT", "DELETE"]),
+    Route("/api/admin/guard/rulesets/{rid:int}/reset", admin_guard_ruleset_reset, methods=["POST"]),
     Route("/api/admin/auth", admin_auth, methods=["GET", "PUT"]),
     Route("/api/admin/settings", admin_settings, methods=["GET", "PUT"]),
     Route("/api/admin/audit", admin_audit),

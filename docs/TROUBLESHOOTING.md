@@ -39,6 +39,7 @@ Examples in this guide use the address `https://goose.example.org`, the LAN addr
 15. [HTTPS and certificates](#15-https-and-certificates)
 16. [Other common errors](#16-other-common-errors)
 17. [Reporting security issues](#17-reporting-security-issues)
+18. [Prompt guard](#18-prompt-guard)
 
 ---
 
@@ -669,7 +670,7 @@ chat link) and `Priority` (`high` for "needs you", otherwise `default`). Other U
 
 ## 14. Old user interface after an upgrade
 
-The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v18`). The
+The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v19`). The
 page, scripts and styles are fetched from the network first, and the cache is used only when the gateway cannot
 be reached; `/api/` and `/ws` are never cached. Third-party libraries and icons are served from the cache first.
 The gateway sends these files with `Cache-Control: no-cache`.
@@ -761,3 +762,17 @@ Include:
 Supported versions and what is in and out of scope are listed in [SECURITY.md](../SECURITY.md). For ordinary bugs,
 open a normal issue with the relevant lines from `gateway.log` and `worker-<user>.log`, again with secrets,
 user names and host names removed.
+
+## 18. Prompt guard
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Admin banner *Prompt guard: the classifier is unavailable (... not installed ...)* | A team or the admins have the guard on but the model is not installed (1.14.0 ships no pinned package: the official weights are gated). | Build and install it once (ADMINISTRATION 9.8), then *Check now* on Admin > Prompt guard. Until then rules still apply and the classifier fails open. |
+| Banner *... took longer than N ms* | The CPU is busy or the text is long. | Raise `guard.timeout_ms`, lower `guard.max_windows`, or check `goose-web guard status`. |
+| `goose-web guard install-model`: *no published Prompt Guard package is pinned yet* | No URL/SHA-256 configured. | Use `--file <zip> --sha256 <hash>` or set `guard.model_url` + `guard.model_sha256`. |
+| *SHA-256 mismatch* / *does not match its SHA-256 in export.json* | Wrong or damaged package. | Rebuild or download again; nothing was installed. |
+| *forbidden: the prompt guard blocked this message* | The classifier flagged the message (or a prompt rule matched). | Rephrase; an admin can test it in Admin > Prompt guard > Test. A false positive on legitimate security content: lower the impact with *Check what members type* off for that team. |
+| *The prompt guard blocked a call to ... (rule ...)* | A rule matched the tool's arguments. | Intended; edit the rule set if it is too broad (Test box). |
+| *this chat uses the approval mode 'auto'* for a guarded member | Guarded teams use Approve. | Pick Approve for the chat; the team can turn on *Guarded auto*. |
+| Admin: *use Approve (guarded) or Auto (not guarded)* | The admins' guard is on and the chat is in Smart approve. | Switch the chat's mode. |
+| `guard.unavailable` lines in activity.jsonl | Classifier down (repeated at most every 10 min). | As above. |

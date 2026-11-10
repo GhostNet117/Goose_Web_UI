@@ -6,3 +6,4 @@
 # Vendored third-party files are checked against SHA256SUMS: keep them byte-exact (no EOL conversion).
 goose_web/static/vendor/* -text
 goose_web/static/vendor/SHA256SUMS -text
+*.onnx binary 

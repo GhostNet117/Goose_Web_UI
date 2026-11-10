@@ -20,7 +20,7 @@ import logging
 import os
 import re
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -28,6 +28,7 @@ from typing import Any, Callable
 import websockets
 
 from . import __version__
+from . import guard as guardmod
 from . import policy as pol
 from .workers import Worker, WorkerManager
 
@@ -316,6 +317,9 @@ class Upstream:
         self._herd_dirty: set[str] = set()
         self._watcher: asyncio.Task | None = None
         self._bg: set[asyncio.Task] = set()
+        # spec 018: toolCallId -> (toolName, extensionName) from tool_call notifications, for permission requests
+        # (which carry only a title); bounded, filled only while some prompt guard is in use
+        self.tool_meta: OrderedDict[str, tuple[str, str]] = OrderedDict()
 
     # ------------------------------------------------------------ connection
     @property
@@ -490,6 +494,8 @@ class Upstream:
                 if not client.is_admin:
                     s0 = self.sessions.get(str(params.get("sessionId") or ""))
                     pol.check_session_choice(client.policy, s0.load_result if s0 else None)
+                if self.hub.guard is not None and await self._guard_prompt(client, mid, params):
+                    return
             await self.ensure()
             if method == "session/load":
                 sid = str(params.get("sessionId") or "")
@@ -590,6 +596,105 @@ class Upstream:
         running = sum(1 for s in self.sessions.values() if s.running() and s.sid != sid)
         if running >= limit:
             raise pol.Denied(f"you already have {running} agents running (limit {limit})")
+
+    # ------------------------------------------------------------ prompt guard (spec 018)
+    async def _guard_prompt(self, client: Client, mid: Any, params: dict) -> bool:
+        """Check a prompt against the typing user's guard. True = refused (the reply is sent here); False = go on.
+        Administrators: an Auto chat bypasses; a Smart approve chat is refused while the admin guard is on (its
+        read-only skip would hide tool calls from the guard)."""
+        ctx = self.hub.guard_ctx(client.user.get("username") or "")
+        if ctx is None:
+            return False
+        sid = str(params.get("sessionId") or "")
+        s0 = self.sessions.get(sid)
+        mode = guardmod.session_mode(s0.load_result if s0 else None)
+        if ctx.kind == "admin":
+            if mode == "auto":
+                return False
+            if mode == "smart_approve":
+                raise pol.Denied("the prompt guard for administrators is on: use Approve (guarded) or Auto (not "
+                                 "guarded) for this chat; Smart approve would skip tools the guard must see")
+        d = await self.hub.guard.check_prompt(ctx, params)
+        if not d.blocked:
+            return False
+        self.hub.audit_guard(self, sid, ctx, d, mode=mode, actor=client)
+        if ctx.on_block == "silent":
+            self._reply(client, mid, {"stopReason": "refusal"})
+        elif mid is not None:
+            why = f"rule {d.rule} ({d.ruleset})" if d.rule else "prompt-injection classifier"
+            client.send({"jsonrpc": "2.0", "id": mid, "error": {
+                "code": RPC_FORBIDDEN, "message": f"forbidden: the prompt guard blocked this message ({why}). "
+                                                  f"{d.message}".strip()}})
+        return True
+
+    def _remember_tool(self, u: dict) -> None:
+        tid = str(u.get("toolCallId") or "")
+        goose = ((u.get("_meta") or {}).get("goose") or {}) if isinstance(u.get("_meta"), dict) else {}
+        tc = goose.get("toolCall") if isinstance(goose.get("toolCall"), dict) else {}
+        if tid and tc.get("toolName"):
+            self.tool_meta[tid] = (str(tc["toolName"]), str(tc.get("extensionName") or ""))
+            self.tool_meta.move_to_end(tid)
+            while len(self.tool_meta) > 1000:
+                self.tool_meta.popitem(last=False)
+
+    async def _guarded_permission(self, msg: dict, raw: str, ctx: Any) -> None:
+        """A tool-permission request of a guarded profile: block (the gateway answers reject_once), auto-allow
+        (guarded auto: allow_once) or show the card without 'always allow'. Fails open to the normal card."""
+        params = msg.get("params") or {}
+        sid = str(params.get("sessionId") or "")
+        tc = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
+        tool, ext = guardmod.tool_identity(tc, self.tool_meta.get(str(tc.get("toolCallId") or "")))
+        try:
+            d = await self.hub.guard.check_tool(ctx, tool, ext, tc.get("rawInput"))
+        except Exception:
+            log.exception("prompt guard tool check")
+            d = guardmod.Decision(False, "tool", classifier="unavailable")
+        answer = None
+        if d.blocked:
+            answer = "reject_once"
+        elif ctx.auto_approve and ctx.kind == "team":
+            answer = "allow_once"
+        if answer:
+            try:
+                await self._send({"jsonrpc": "2.0", "id": msg["id"],
+                                  "result": {"outcome": {"outcome": "selected", "optionId": answer}}})
+            except RpcError:
+                return
+            if d.blocked:
+                s = self.sessions.get(sid)
+                self.hub.audit_guard(self, sid, ctx, d, tool=tool, ext=ext,
+                                     mode=guardmod.session_mode(s.load_result if s else None))
+                if ctx.on_block == "notify":
+                    note = {"jsonrpc": "2.0", "method": "_gw/notice", "params": {
+                        "level": "warning", "sessionId": sid, "kind": "guard",
+                        "message": f"The prompt guard blocked a call to {tool[:120]}"
+                                   + (f" (rule {d.rule})" if d.rule else " (prompt-injection classifier)")
+                                   + (f": {d.message}" if d.message else ".")}}
+                    for c in list(self.clients):
+                        if sid in c.watch or not sid:
+                            c.send(note)
+            return
+        opts = params.get("options")
+        if isinstance(opts, list):
+            keep = [o for o in opts if not (isinstance(o, dict) and
+                                            (o.get("kind") == "allow_always" or o.get("optionId") == "allow_always"))]
+            msg = {**msg, "params": {**params, "options": keep}}
+            raw = json.dumps(msg, separators=(",", ":"))
+        self._register_ask(msg, raw, guarded=True)
+
+    def _register_ask(self, msg: dict, raw: str, guarded: bool = False) -> None:
+        method = msg.get("method")
+        params = msg.get("params") or {}
+        sid = params.get("sessionId") or ""
+        self.asks[json.dumps(msg["id"])] = {"msg": msg, "sessionId": sid, "ts": time.time(), "guarded": guarded}
+        if sid:
+            s = self.sess(sid)
+            tc = params.get("toolCall") or {}
+            s.last_text = (f"Needs approval: {tc.get('title')}" if method == "session/request_permission"
+                           else str(params.get("message") or "Needs your input"))[:300]
+            self._set_status(s, "needs_you")
+        self.broadcast(raw)
+        self.hub.notify_event(self, sid, "needs_you")
 
     # ------------------------------------------------------------ recipes (B-1)
     async def _guard_recipes(self, client: Client, method: str, params: dict) -> None:
@@ -835,6 +940,12 @@ class Upstream:
             out["error"] = msg["error"]
         else:
             out["result"] = msg.get("result")
+            res = out["result"] if isinstance(out["result"], dict) else {}
+            oc = res.get("outcome") if isinstance(res.get("outcome"), dict) else {}
+            if ask.get("guarded") and oc.get("optionId") == "allow_always":
+                # spec 018: a guarded profile never persists "always allow" (Goose would stop asking)
+                out["result"] = {**res, "outcome": {**oc, "optionId": "allow_once"}}
+                msg = {**msg, "result": out["result"]}
         await self._send(out)
         self.hub.audit_ask(client, self, ask, msg)
         self.broadcast({"jsonrpc": "2.0", "method": "_gw/ask_resolved",
@@ -873,16 +984,12 @@ class Upstream:
         method = msg.get("method")
         params = msg.get("params") or {}
         if method in AGENT_REQUESTS and "id" in msg:
-            sid = params.get("sessionId") or ""
-            self.asks[json.dumps(msg["id"])] = {"msg": msg, "sessionId": sid, "ts": time.time()}
-            if sid:
-                s = self.sess(sid)
-                tc = params.get("toolCall") or {}
-                s.last_text = (f"Needs approval: {tc.get('title')}" if method == "session/request_permission"
-                               else str(params.get("message") or "Needs your input"))[:300]
-                self._set_status(s, "needs_you")
-            self.broadcast(raw)
-            self.hub.notify_event(self, sid, "needs_you")
+            if method == "session/request_permission" and self.hub.guard is not None:
+                ctx = self.hub.guard_ctx(self.username)   # the profile owner's guard; None = unguarded
+                if ctx is not None:
+                    self._spawn(self._guarded_permission(msg, raw, ctx))
+                    return
+            self._register_ask(msg, raw)
             return
         if method in SESSION_NOTIFICATIONS:
             sid = str(params.get("sessionId") or "")
@@ -1019,6 +1126,8 @@ class Upstream:
     # ------------------------------------------------------------ herd
     def _herd_from_update(self, s: SessionState, method: str, u: dict, replaying: bool) -> None:
         kind = u.get("sessionUpdate")
+        if kind == "tool_call" and self.hub.guard is not None and self.hub.guard_active():
+            self._remember_tool(u)
         if method == "_goose/unstable/session/update":
             # SessionUsageUpdate / MessageUsageUpdate / StatusMessageUpdate
             if "contextLimit" in u:
@@ -1131,6 +1240,7 @@ class Hub:
         self.on_event: Callable[..., None] | None = None
         self.on_schedules: Callable[[str], None] | None = None
         self.profile_root_for: Callable[[str], str] = lambda u: ""
+        self.guard: Any = None          # guard.GuardService (spec 018), wired by the app; None = no prompt guard
         self._flusher: asyncio.Task | None = None
         workers.activity = self._activity
         workers.on_restart = self._on_restart
@@ -1160,6 +1270,50 @@ class Hub:
                     await up.ensure()
                 except RpcError:
                     pass
+
+    # ------------------------------------------------------------ prompt guard (spec 018)
+    def guard_ctx(self, username: str):
+        return self.guard.context_for(username) if self.guard is not None else None
+
+    def guard_active(self) -> bool:
+        return self.guard is not None and self.guard.in_use()
+
+    def guard_health_for(self, client: Client) -> dict | None:
+        """Classifier health for administrators while some guard is on (banner), else None."""
+        if self.guard is None or not client.is_admin or not self.guard.in_use():
+            return None
+        return self.guard.health()
+
+    def broadcast_admins(self, obj: dict) -> None:
+        raw = json.dumps(obj, separators=(",", ":"))
+        seen: set[int] = set()
+        for up in self.upstreams.values():
+            for c in list(up.clients):
+                if c.is_admin and id(c) not in seen:
+                    seen.add(id(c))
+                    c.send(raw)
+
+    def audit_guard(self, up: "Upstream", sid: str, ctx: Any, d: Any, *, tool: str = "", ext: str = "",
+                    mode: str = "", actor: Any = None) -> None:
+        """guard.blocked: who, where, which rule or score - never the prompt or the arguments (R6)."""
+        if not self.on_audit:
+            return
+        detail = {"profile": up.key, "sessionId": sid, "guard": ctx.kind, **d.audit_detail()}
+        if ctx.team:
+            detail["team"] = ctx.team
+        if tool:
+            detail["tool"] = tool[:200]
+        if ext:
+            detail["extension"] = ext[:100]
+        if mode:
+            detail["mode"] = mode
+        if actor is None:
+            owner = next((c for c in up.clients if _ukey(c.user) == up.key), None)
+            actor = owner or _AgentActor({"id": None, "username": up.username})
+        try:
+            self.on_audit(actor, "guard.blocked", tool[:200] if tool else sid, detail, False)
+        except Exception:
+            log.exception("guard audit")
 
     def upstream(self, key: str, username: str) -> Upstream:
         up = self.upstreams.get(key)
@@ -1212,6 +1366,9 @@ class Hub:
                       "profile": up.key, "agent": up.init_result, "gooseCaps": up.caps(),
                       "asks": [a["msg"] for a in up.asks.values()], "herd": up.herd(),
                       "upstream": {"state": up.state, "error": err}}
+            gh = self.guard_health_for(client)
+            if gh is not None:
+                result["guard"] = gh
         elif method == "_gw/watch":
             client.watch = {str(x) for x in (params.get("sessionIds") or [])[:200]}
             result = {"ok": True}

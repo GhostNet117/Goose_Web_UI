@@ -18,6 +18,8 @@
     4. Updates the code: "git pull --ff-only" (default), "git checkout <Ref>" with -Ref, or nothing with -NoGit
        (you already replaced the files, e.g. from a release zip).
     5. Installs the locked dependencies (uv when available - Goose ships it - else pip) and the package itself.
+    5b. Installs the Prompt Guard 2 22M model if it is missing ("goose-web guard install-model --if-missing": the
+       pinned package, SHA-256 checked; a warning, not a failure, when none is published or the download fails).
     6. Runs "goose-web check".
     7. Restarts the task and waits until /healthz answers; prints the old and new version.
   Never changed: the task definition, the firewall rule, config.yaml, the database content (schema migrations run
@@ -205,6 +207,12 @@ try {
         }
     } finally { Pop-Location }
     Say "Dependencies installed ($(if ($uv) { 'uv' } else { 'pip' }))"
+
+    # 5b. prompt guard model (spec 018): installed from the pinned, SHA-256-checked package when one is published.
+    # Not fatal: without the model the guard fails open (rules still apply) and administrators see a banner.
+    $r = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'guard', 'install-model', '--if-missing')
+    $r.out | Where-Object { $_ } | ForEach-Object { Say "guard: $_" }
+    if ($r.code) { Say "WARNING: the Prompt Guard model is not installed; the prompt guard fails open until it is (goose-web guard install-model; docs/ADMINISTRATION.md, Prompt guard)." }
 
     # 6. check (the gateway still runs; "port in use" is expected)
     $r = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'check')

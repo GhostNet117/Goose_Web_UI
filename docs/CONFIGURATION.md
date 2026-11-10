@@ -135,6 +135,24 @@ API tokens (Settings > Account > API tokens) are sent as `Authorization: Bearer 
 the `/ws` handshake of non-browser clients. They are never accepted in a URL. A user's tokens are revoked when the
 password is changed, set or reset, and when the account is disabled. See [API.md](API.md).
 
+
+### `guard` keys (prompt guard, since 1.14.0)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `guard.threshold` | `0.5` | Block when the classifier's malicious probability is at least this. |
+| `guard.min_chars` | `16` | Shorter text is not classified (rules still apply). |
+| `guard.window_tokens` | `128` | Tokens per classifier window (the model reads at most 512; shorter windows are much cheaper on a CPU). |
+| `guard.window_overlap` | `16` | Tokens shared by consecutive windows. |
+| `guard.max_windows` | `8` | Windows per text (the first ones and the last one). |
+| `guard.timeout_ms` | `3000` | Slower = unavailable: allowed (fail open) and audited. |
+| `guard.load_timeout_s` | `60` | Longest wait for the model to load on first use. |
+| `guard.threads` | `4` | ONNX Runtime threads per inference (capped at the CPU count). |
+| `guard.cache_size` | `2048` | Scores remembered by content hash. |
+| `guard.warm_up` | `true` | Load the model at start-up (and after a settings change) when some guard is on. |
+| `guard.model_dir` | `<system_dir>/models/prompt-guard-2-22m` | Where the model package is installed. |
+| `guard.model_url` / `guard.model_sha256` | empty | Source of `goose-web guard install-model` (https) and its SHA-256; override the pinned package. |
+
 ## 3. Command line
 
 `python -m goose_web [--config FILE] <command>` (or the `goose-web` script). With no command it runs `serve`.
@@ -167,6 +185,7 @@ Admins change these in the UI (Admin > Settings / Sign-in). They are stored in t
 | `default_team_id` | the Everyone team | The team a new user joins when none is given: users created in the admin UI or API without `team`, users created with `user add`, and users auto-created by LDAP/OIDC when no group or claim maps to a team. Empty = new users have no team (they can sign in but cannot chat). |
 | `brand` | `{name: "Goose Web", tagline: ...}` | `name`, `tagline`, `machine` (shown in Herd). |
 | `session_hours` | config `auth.session_hours` | 1 to 720. |
+| `guard_admin` | off | The administrators' prompt guard (Admin > Prompt guard): `enabled`, `check_input`, `rulesets`, `on_block`. Prompt-guard rule sets are in the `guard_rulesets` table. |
 | `allow_self_totp` | `true` | When false, non-admins cannot set up or enable TOTP themselves (`403 totp_self_disabled`). Admins can always enrol. |
 | `require_totp_admins` | `false` | Admins cannot turn off their TOTP. It can only be switched on by an admin who already uses TOTP (`409 totp_needed_first`). The login response and `/api/me` report `totpEnrolmentRequired` for an admin without TOTP. Enrolment is not yet forced at sign-in. |
 | `peers` | `[]` | Herd peers: `{name, url, token, verifyTls}` (max 50). The gateway calls `<url>/api/herd` with `Bearer <token>`. Tokens are masked in reads. |
@@ -238,6 +257,8 @@ Upgrading from 1.4 converts the stored policies once (schema version 4, `meta` k
 completed with the 1.4 defaults, empty mode/provider/model lists in teams and user overrides become `["*"]`, and a
 user in several teams keeps the team with the lowest id (audit `team.migrate.membership`). See
 [ADMINISTRATION.md](ADMINISTRATION.md#98-upgrading-from-14-the-policy-migration).
+
+Since 1.14.0 a team policy may carry `guard` (prompt guard): `{enabled, check_input, rulesets: [id], trusted_extensions: [name], on_block: "notify"|"silent", auto_approve}`. Missing = off. While it is on, `allowed_modes` loses `auto` and `smart_approve` (ADMINISTRATION 9.8). Command line: `goose-web guard status | install-model [--file ZIP --sha256 HEX] [--if-missing] [--force] | remove-model`.
 
 ## 6. Profile layout
 

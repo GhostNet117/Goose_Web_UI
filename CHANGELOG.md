@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.14.0 - 2026-11-10
+
+- **Prompt guard (spec 018), off for every team until an administrator turns it on.** Admin > Teams & policy >
+  Experience > *Prompt guard* and the new **Admin > Prompt guard** page:
+  - **Rule sets** stored in the database and edited in the UI (tool glob, arguments, pipeline / regex / words match,
+    applies to tool arguments and/or prompts, message); shipped defaults *Splunk read-only* and *Destructive shell*,
+    resettable; a Test box (dry run).
+  - **Classifier:** Meta's Llama Prompt Guard 2 22M on ONNX Runtime, CPU only, loaded on first use, windows of 128
+    tokens, cached, nothing at run time over the network. Built with Llama.
+  - **Enforcement:** what guarded users type (block, as an error or silently) and the arguments of tool calls Goose
+    asks permission for (the gateway answers *deny once*; tool results are never inspected). Guarded teams use
+    Approve (no Auto / Smart approve, no *always allow*); **guarded auto** lets the gateway approve calls that pass.
+    Administrators: their own guard; Auto bypasses, Approve is guarded, Smart approve is refused while it is on.
+  - **Fail open** with `guard.unavailable` audit and an admin banner; `guard.blocked` audit (and activity.jsonl)
+    without content.
+  - `goose-web guard status | install-model | remove-model`, a `check` line, `install.ps1` / `upgrade.ps1` install the
+    model when a package is pinned (SHA-256 verified). The official weights are gated on Hugging Face, so 1.14.0 pins
+    no package yet: `scripts/export-prompt-guard.py` builds it once from an account that accepted the Llama 4
+    Community License (ADMINISTRATION 9.8).
+- New dependencies (hash-locked): onnxruntime, tokenizers, numpy (< 2.5, for Python 3.11). Database schema 5
+  (`guard_rulesets`). Service worker cache `gw-shell-v19`. THIRD-PARTY-NOTICES.md.
+- Tests: a TestClient test now uses the httpx flavour Starlette picks (httpx2 when installed).
+
 ## 1.13.1 - 2026-11-10
 
 **Security fix - upgrade if you have non-admin users.**

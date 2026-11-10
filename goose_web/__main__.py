@@ -637,6 +637,75 @@ def install_acl_problems(paths: list[str] | None = None) -> list[tuple[str, list
     return out
 
 
+def guard_runtime() -> tuple[bool, str]:
+    """(importable, versions) of the prompt guard's runtime (onnxruntime, tokenizers, numpy)."""
+    import importlib
+    vers, missing_mods = [], []
+    for m in ("onnxruntime", "tokenizers", "numpy"):
+        try:
+            vers.append(f"{m} {importlib.import_module(m).__version__}")
+        except Exception:
+            missing_mods.append(m)
+    if missing_mods:
+        return False, "missing " + ", ".join(missing_mods) + " (reinstall from requirements.lock)"
+    return True, ", ".join(vers)
+
+
+def cmd_guard(args, settings) -> int:
+    """Spec 018: the prompt guard's model - status, install (pinned download or a local package), remove."""
+    import asyncio as _asyncio
+    from . import guardmodel
+    if args.action == "install-model":
+        if args.if_missing and not guardmodel.verify_dir(guardmodel.model_dir(settings)):
+            print(f"The Prompt Guard model is installed ({guardmodel.model_dir(settings)}).")
+            return 0
+        try:
+            guardmodel.install(settings, file=args.file, sha256=args.sha256, force=args.force)
+        except guardmodel.InstallError as e:
+            print(f"Prompt Guard model not installed: {e}", file=sys.stderr)
+            return 3
+        except Exception as e:   # network, disk
+            print(f"Prompt Guard model not installed: {e.__class__.__name__}: {e}", file=sys.stderr)
+            return 4
+        return 0
+    if args.action == "remove-model":
+        print("removed" if guardmodel.remove(settings) else "not installed")
+        return 0
+    # status
+    ok_rt, rt = guard_runtime()
+    info = guardmodel.describe(settings)
+    print(f"[{'OK' if ok_rt else '!!'}] runtime: {rt}")
+    d = guardmodel.model_dir(settings)
+    problem = guardmodel.verify_dir(d, deep=True) if info["installed"] else "not installed"
+    print(f"[{'OK' if not problem else '!!'}] model: {d}: " + (problem or
+          f"{info.get('model')} @ {str(info.get('revision') or '')[:12]} ({info.get('quantization')}, "
+          f"exported {info.get('exported')})" + (" - TEST PROXY, NOT PROMPT GUARD" if info.get("proxy") else "")))
+    pin = info["pin"]
+    print(f"[{'OK' if pin['published'] else '--'}] package source: " +
+          (f"{pin['url']} (sha256 {pin['sha256'][:16]}...)" if pin["published"] else
+           "none pinned yet (the official weights are gated; see docs/ADMINISTRATION.md, Prompt guard)"))
+    healthy = ok_rt and not problem
+    if healthy:
+        from .db import Database
+        from .guard import GuardService
+        db = Database(settings.system_dir / "goose-web.db")
+        try:
+            g = GuardService(settings, db)
+            res = _asyncio.run(g.self_test())
+            g.shutdown()
+        finally:
+            db.close()
+        h = res["health"]
+        healthy = h["state"] == "ok"
+        print(f"[{'OK' if healthy else '!!'}] self-test: " + (
+            f"loaded in {g.classifier.load_seconds:.1f} s; benign {res['benign']['score']} "
+            f"({res['benign']['latencyMs']} ms), injection {res['injection']['score']} "
+            f"({res['injection']['latencyMs']} ms); threshold {h['threshold']}" if healthy else h["reason"]))
+    print("Built with Llama: Prompt Guard 2 is licensed under the Llama 4 Community License (LICENSE and NOTICE in the "
+          "model folder).")
+    return 0 if healthy else 1
+
+
 def cmd_check(args, settings) -> int:
     from . import winsec
     from .workers import desktop_running, goose_version
@@ -703,6 +772,14 @@ def cmd_check(args, settings) -> int:
              not st.get("error") and (st["effective"] != "files" or not cert.get("error")))
     except Exception as e:
         line("https", f"cannot read the TLS settings: {e}", False)
+    from . import guardmodel
+    ok_rt, rt = guard_runtime()
+    gd = guardmodel.model_dir(settings)
+    gproblem = guardmodel.verify_dir(gd)
+    # Information unless the runtime is missing: without the model the guard fails open (spec 018 R7).
+    line("prompt guard runtime", rt, ok_rt)
+    print(f"[{'OK' if not gproblem else '--'}] prompt guard model: " + (f"installed in {gd}" if not gproblem else
+          f"{gproblem}; the guard fails open without it (goose-web guard install-model, goose-web guard status)"))
     u = logjanitor.usage(settings)
     print(f"[OK] logs: {u['bytes'] / 2**20:.1f} MB of {u['budget'] / 2**20:.0f} MB "
           f"({u['percent']}% of the disk) in {u['files']} file(s)")
@@ -776,6 +853,12 @@ def main(argv: list[str] | None = None) -> int:
     tl = sub.add_parser("tls", help="built-in HTTPS certificate: status, renew, export-ca PATH, trust")
     tl.add_argument("action", choices=["status", "renew", "export-ca", "trust"])
     tl.add_argument("path", nargs="?")
+    gd = sub.add_parser("guard", help="prompt guard model: status, install-model, remove-model")
+    gd.add_argument("action", choices=["status", "install-model", "remove-model"])
+    gd.add_argument("--file", help="install-model: a local package zip (from scripts/export-prompt-guard.py)")
+    gd.add_argument("--sha256", help="install-model --file: the package's SHA-256 (required unless it is pinned)")
+    gd.add_argument("--if-missing", action="store_true", help="install-model: do nothing if a valid model is there")
+    gd.add_argument("--force", action="store_true", help="install-model: reinstall even if the same package is there")
     sub.add_parser("check", help="diagnostics")
     sub.add_parser("version")
     args = p.parse_args(argv)
@@ -787,7 +870,8 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "serve" and not hasattr(args, "host"):
         args.host, args.port = None, None
     return {"serve": cmd_serve, "init": cmd_init, "user": cmd_user, "ip": cmd_ip, "check": cmd_check,
-            "native-root": cmd_native_root, "native-hints": cmd_native_hints, "sandbox": cmd_sandbox, "tls": cmd_tls}[cmd](args, settings)
+            "native-root": cmd_native_root, "native-hints": cmd_native_hints, "sandbox": cmd_sandbox, "tls": cmd_tls,
+            "guard": cmd_guard}[cmd](args, settings)
 
 
 if __name__ == "__main__":

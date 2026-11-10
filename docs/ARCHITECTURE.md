@@ -127,6 +127,8 @@ The main ideas:
 | `hub.py` | `Hub`, `Upstream`, `Client`, `SessionState`: relays ACP, rewrites ids, buffers and replays session updates, fans out asks, derives herd status, watches for external changes, audits calls. |
 | `workers.py` | `WorkerManager` and `Worker`: spawns, health-checks, restarts and idles out `goose serve`; scheduler ownership; worker logs; Windows Job Object; Goose Desktop detection. |
 | `policy.py` | Least-privilege default, legacy (1.4) and admin policies, `effective_policy` (one team + overrides), chat gating (`chat_block`, `check_session_choice`), team warnings (`team_warnings`), roots (`user_roots`), path containment (`path_allowed`), and the ACP method firewall (`check`). |
+| `guard.py` | Prompt guard (spec 018): rule sets (validation, SPL-aware pipeline parser, globs, defaults), `GuardContext` per user (team or admin guard), `Classifier` (Prompt Guard 2 22M on ONNX Runtime: windows, cache, lazy load), `GuardService` (contexts cached per user, `check_prompt`, `check_tool`, health, fail open, `guard.unavailable`). |
+| `guardmodel.py` | The model package: folder, pin (`MODEL_PIN`, `guard.model_url/sha256`), SHA-256-verified install from a URL or a local zip (safe extract, integrity check against `export.json`), remove. |
 | `auth.py` | `AuthService`: local passwords, LDAP/Active Directory, OIDC (authorization code with PKCE), TOTP, lockout and rate limits, cookie sessions, API tokens. |
 | `ipblock.py` | `IPBlocker`: counts failed sign-ins per client address (IPv4, or IPv6 /64) in the `ip_blocks` table, blocks after `auth.ip_block_threshold` in a row within the window, expiry, unblock, listing; in-memory cache of blocked keys refreshed every 15 s. |
 | `security.py` | Stdlib-only primitives: scrypt password hashing, strong-password rules, `ip_in`, tokens, constant-time compare, TOTP, `RateLimiter`, `safe_name`. |
@@ -141,7 +143,7 @@ The main ideas:
 |---|---|
 | `index.html` | Shell page: theme stylesheets, `modulepreload` of `js/app.js`, boot spinner. |
 | `manifest.webmanifest` | PWA manifest. |
-| `sw.js` | Service worker (`gw-shell-v18`): offline shell, network-first for app code, cache-first for vendor files. |
+| `sw.js` | Service worker (`gw-shell-v19`): offline shell, network-first for app code, cache-first for vendor files. |
 | `css/app.css` | All styles and themes. |
 | `icons/` | `goose.svg`, `goose-maskable.svg`. |
 | `vendor/` | Vendored libraries (marked, DOMPurify, highlight.js, qrcode-generator) with `README.md` and `SHA256SUMS`. |
@@ -1058,7 +1060,7 @@ data:
 - **Install** pre-caches the shell list on a best-effort basis and calls
   `skipWaiting()`.
 - **Activate** deletes every cache whose name is not the current `VERSION`
-  (`gw-shell-v18`) and claims open clients.
+  (`gw-shell-v19`) and claims open clients.
 - **notificationclick** focuses an open window, or opens one, at
   `/#/chat/<sessionId>` or `/#/herd`.
 
@@ -1115,7 +1117,7 @@ objects.
 
 ### 10.3 Schema version and migrations
 
-`SCHEMA_VERSION = 4` (3: the `ip_blocks` table, 1.3.0; 4: one team per user and
+`SCHEMA_VERSION = 5` (5: the `guard_rulesets` table and its seeded defaults, 1.14.0; 3: the `ip_blocks` table, 1.3.0; 4: one team per user and
 least-privilege policies, 1.5.0). Column migrations are additive and
 idempotent:
 
@@ -1595,6 +1597,31 @@ position, so they are guarded:
 
 ---
 
+### 12.11 Prompt guard (`guard.py`, `guardmodel.py`, spec 018)
+
+- **Where it runs.** `Upstream.from_client` checks a `session/prompt` against the typing user's guard
+  (`Hub.guard_ctx(username)` -> `GuardService.context_for`: the team's `guard` policy or the `guard_admin` setting,
+  cached 10 s and invalidated by every team, user, rule-set or admin-guard write) after the policy firewall and before
+  the prompt is echoed or forwarded. `Upstream._dispatch` hands a `session/request_permission` of a guarded profile
+  (the profile owner's guard) to `_guarded_permission` (a task: the read loop never waits for the classifier); an
+  unguarded profile keeps the old path (`_register_ask`). The tool and extension names come from the `tool_call`
+  notification with the same `toolCallId` (`Upstream.tool_meta`, bounded, filled only while a guard is in use), else
+  from the title.
+- **Decisions.** Rules first (`evaluate_rules` / `evaluate_tool_rules`), then `GuardService.classify` (single worker
+  thread, `wait_for(timeout)`). Block -> prompt: RPC error `-32003` or `{stopReason: "refusal"}`; tool: the gateway
+  answers `reject_once` and sends `_gw/notice`. Pass -> guarded auto: `allow_once`; otherwise the ask is registered with
+  `guarded=True`, its `allow_always` option removed, and `_answer_ask` turns an `allow_always` answer into `allow_once`.
+- **Admins.** An Auto chat (`session_mode(load_result)`) skips the prompt check; a Smart approve chat is refused.
+- **Policy.** `effective_policy` copies `clean_team_guard(team.guard)` into `policy["guard"]` and, when on, filters
+  `allowed_modes` (`guarded_modes`) after user overrides; `check` refuses `tools/permissions/set` with `always_allow`;
+  `Profiles.provision` strips `user.always_allow` from `permission.yaml` (`strip_always_allow`).
+- **Health and audit.** `GuardService.state` (`idle`, `loading`, `ok`, `not_installed`, `error`); transitions call
+  `on_health` (app: `_gw/guard` to admin sockets) and `on_unavailable` (app: `db.audit("guard.unavailable")`).
+  `Hub.audit_guard` writes `guard.blocked` through `on_audit` (no content).
+- **Model.** `<system_dir>/models/prompt-guard-2-22m/`: `model.onnx`, `tokenizer.json`, `config.json`
+  (`malicious_index`), LICENSE, NOTICE, USE_POLICY.md, README.md, `export.json` (per-file SHA-256). `verify_dir`
+  checks sizes at load and hashes at install/status. Built by `scripts/export-prompt-guard.py`.
+
 ## 13. Configuration loading
 
 `docs/CONFIGURATION.md` lists every key. This section covers the mechanism
@@ -1719,6 +1746,8 @@ location) and disables the cache plugin.
 | `tests/test_profiles.py` | Isolated layout and base extensions, team items and secrets, library listing, native scheduler yielding to Goose Desktop. |
 | `tests/test_team_profiles.py` | Spec 009: new teams allow nothing, no team cannot chat, Any and explicit lists, config writes and the locked `CONTEXT_FILE_NAMES`, prompts refused in chats with a disallowed model, team warnings, roots, the 1.4 migration, hints order and dropped personal hints, the hints file and worker environment, team folder and default model, one team per user (moves), effective hints view and upload refusal. |
 | `tests/test_hub.py` | A `FakeAgent` WebSocket server (`initialize`, `session/new`, `session/load`, `session/prompt`). Tests: a run survives a tab disconnect and is replayed, policy denial, the second answer to an ask loses, idle replay only while unchanged elsewhere, the watcher announces external changes, Retry/add/remove of an extension updates the replayed start-up status. `tests/test_edit_and_paths.py`: prompt stamping (`_gw/prompt_created` + echo), truncate guard and buffer invalidation, `native-root`, `GOOSE_PATH_ROOT` auto-detection, no author-specific goose path. |
+| `tests/test_guard.py` | Spec 018: Splunk/shell default rules (pipelines, quotes, subsearches, macros), words/regex/globs, rule validation, team guard policy and mode filtering, `always_allow` refused, provisioning resets mode and `permission.yaml`, rule-set seeding and migration, classifier windows/cache with the tiny test model (`tests/data/guard_tiny`), fail open and health, model install checks (hash, zip slip, 86M, tamper), CLI, admin API. |
+| `tests/test_guard_hub.py` | Spec 018 against a fake agent that asks permission: prompt blocked (error / silent), unguarded member untouched, tool call blocked with notice and audit, card without *Always allow* and the downgrade, guarded auto, admin Auto bypass / Smart approve refused / Approve checked, classifier down = fail open with health for admins. |
 | `tests/test_auth_hardening.py` | TOTP replay and lockout, TOTP settings, OIDC subject binding and takeover protection, LDAP plaintext refusal, token revocation on reset, disable and password change, admin and CLI two-factor reset, column and link-table allow-lists, audit purge, additive migration of a legacy database. |
 | `tests/test_platform_hardening.py` | Generated admin password and one-time printing, `init` password options, path containment including symlink escapes, `address_blocked`, webhook pinning and no redirects, log rotation, vendored file checksums, hashed lock file covering `pyproject.toml`, SHA-pinned actions. |
 | `tests/test_release_fixes.py` | Regression tests for the `NEW-nn` findings: WebSocket token only in the header and never with `Origin`, Host allow-list and `HostGuard` (including WebSockets and forwarded hosts), allowed origins with and without `public_url`, OIDC requires `public_url`, `tools/call` prefix matching, upload name sanitising and exclusive create, download headers, app frame CSP and policy check, webhook validation at save time, `trust_env=False`, CLI reset revokes tokens, vendored files not EOL-converted. |

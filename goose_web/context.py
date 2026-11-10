@@ -51,6 +51,7 @@ class Ctx:
     version: str
     goose_version: str = ""
     started_at: float = field(default_factory=time.time)
+    guard: Any = None                 # guard.GuardService (spec 018)
 
     # ---------------------------------------------------------- cookies / origin
     @property

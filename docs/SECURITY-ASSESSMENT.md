@@ -527,3 +527,25 @@ Still accepted: administrators are trusted; Goose loads plugins for them like Go
 a folder that a member with `allow_shell` can write (a team folder) runs that member's plugins unsandboxed. Members
 with `allow_shell` can create `.agents` folders with their shell (they can run commands anyway). Plugin `skills`
 folders are still read as instructions where the folder already exists.
+
+## 11. Addendum: prompt guard (2026-11-10), 1.14.0
+
+Spec 018 adds an optional, per-team **prompt guard** (ADMINISTRATION 9.8, ARCHITECTURE 12.11) that narrows GW-08
+("untrusted content can steer the model"):
+
+- **Deterministic rules on tool-call arguments** (for example *Splunk read-only*, *Destructive shell*) enforced by the
+  gateway at `session/request_permission`: a matching call is answered `reject_once` by the gateway, whatever the
+  user, the model or injected content asked for. **Classifier** (Llama Prompt Guard 2 22M, local CPU) on what guarded
+  users type and on free-text tool arguments.
+- **Closing the gaps the guard depends on:** for guarded teams Auto and Smart approve are not allowed, stored *always
+  allow* tool permissions are removed and cannot be set again, and *always allow* answers are downgraded - so Goose
+  asks before every tool call (Goose 1.50 and 1.57: `permission_inspector.rs`, Approve asks unless the tool has a user
+  `always_allow`). Guarded auto approves passing calls in the gateway instead.
+- **Fail open by design** for the classifier (rules still apply); `guard.unavailable` is audited and admins see a
+  banner. `guard.blocked` never records content.
+- **Residual risk:** tool results (web pages, search results) are not inspected - an injection can still steer the
+  model, but a guarded tool call must still pass the rules; classifiers can be evaded; scheduled runs, sub-agents and
+  recipe checks started through shell extensions are not guarded; administrators' existing *always allow* tools are
+  not guarded; the 22M model is weak on non-English text. New dependencies (onnxruntime, tokenizers and their
+  dependencies, numpy < 2.5) are hash-locked; the model package is installed only with a verified SHA-256 and its
+  zip is extracted with a fixed file list (no paths).

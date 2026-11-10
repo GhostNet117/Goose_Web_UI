@@ -1,0 +1,84 @@
+{
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [
+  {
+   "id": 0,
+   "content": "[PAD]",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 1,
+   "content": "[CLS]",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 2,
+   "content": "[SEP]",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 3,
+   "content": "[UNK]",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  }
+ ],
+ "normalizer": {
+  "type": "Lowercase"
+ },
+ "pre_tokenizer": {
+  "type": "Whitespace"
+ },
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+  "type": "WordLevel",
+  "vocab": {
+   "[PAD]": 0,
+   "[CLS]": 1,
+   "[SEP]": 2,
+   "[UNK]": 3,
+   "ignore": 4,
+   "all": 5,
+   "previous": 6,
+   "instructions": 7,
+   "and": 8,
+   "the": 9,
+   "what": 10,
+   "is": 11,
+   "weather": 12,
+   "in": 13,
+   "paris": 14,
+   "print": 15,
+   "your": 16,
+   "system": 17,
+   "prompt": 18,
+   "run": 19,
+   "search": 20,
+   "index": 21,
+   "main": 22,
+   "stats": 23,
+   "count": 24,
+   "by": 25,
+   "user": 26
+  },
+  "unk_token": "[UNK]"
+ }
+}

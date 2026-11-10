@@ -899,6 +899,95 @@ For extensions and providers added from a profile library, the secrets named by 
 Items added manually through the API never copy secrets from another profile. Removing an item, or removing a user
 from the team, removes what was provisioned (but never items the user created).
 
+### 9.8 Prompt guard (since 1.14.0)
+
+The prompt guard stops forbidden or injected instructions from reaching the tools of a team. It is **off for every
+team** until you turn it on, and existing teams are not changed by the upgrade. It inspects two things and nothing
+else (it never inspects what a tool returns, for example a web page):
+
+- **what a guarded user types** (`session/prompt`), before Goose sees it;
+- **the arguments of a tool call** Goose asks permission for (`session/request_permission`), before the tool runs.
+
+Two checks run, in this order:
+
+1. **Rule sets** - deterministic rules, edited in **Admin > Prompt guard** (stored in the database). A rule names the
+   tools it applies to (`<extension>__<tool>` glob, case-insensitive, for example `*splunk*` or `*shell*`), the
+   arguments it reads (`*` = every text value, nested ones too), how it matches (**pipeline** = SPL command at the
+   start of a pipeline segment, outside quotes and inside subsearches; **regex**; **words** = whole words or phrases),
+   whether it applies to tool arguments, to what the user types, or both, and the message shown on a block. Every
+   rule blocks. Two sets are shipped as editable defaults: **Splunk read-only** (outputlookup, outputcsv, outputtext,
+   collect, tscollect, mcollect, meventcollect, sendemail, sendalert, delete, script, run, map, savedsearch,
+   dbxoutput, outputtelemetry, and backtick macros) and **Destructive shell** (recursive deletes, format and disk
+   tools, shutdown/restart, registry, boot and shadow-copy deletion, force-push / git clean / hard reset). *Reset to
+   default* restores one; *Restore defaults* re-creates a deleted one. The **Test** box shows what a rule set would
+   do with a tool call or a message (dry run, nothing is audited).
+2. **The classifier** - Meta's **Llama Prompt Guard 2 22M**, run locally on the gateway's CPU with ONNX Runtime (no
+   GPU, no remote service, no network call at run time). It scores the user's text and the free-text arguments of
+   guarded tool calls; at or above `guard.threshold` (0.5) the message or call is blocked. It is loaded on first use
+   (or at start-up when a guard is on), text under `guard.min_chars` is not scored, scores are cached, and long text
+   is read in windows of `guard.window_tokens` (128) tokens, at most `guard.max_windows` (8) of them (the first ones
+   and the last one). The 22M model is mainly accurate for English; the 86M model is never used.
+
+**Per team** (Admin > Teams & policy > *team* > Experience > **Prompt guard**): on/off; *Check what members type*;
+*Guarded auto*; the rule sets; *Trusted extensions* (one name per line: their calls skip the rules and the classifier;
+every other extension is guarded); and what happens on a block: *drop it and tell the user* (the user sees an error
+for a message, or a notice for a tool call) or *drop it silently* (a message ends with no answer). A blocked tool call
+is answered "deny once" by the gateway: Goose tells the model the user declined it.
+
+**Approval modes.** The guard sees a tool call only when Goose asks first. Goose does not ask in Auto, and Smart
+approve skips tools annotated (or judged) read-only, and a tool set to *Always allow* is never asked about again. So
+for a guarded team: Auto and Smart approve are removed from the allowed modes (Any becomes Approve + Chat), members'
+profiles are switched to Approve and their stored *always allow* tool permissions are removed (`permission.yaml`,
+the worker restarts), the permission card has no *Always allow* button, an *always allow* answer is turned into
+*allow once*, and *Set tool permissions* cannot set *always allow*. **Guarded auto** keeps the flow smooth: Goose stays
+in Approve and the gateway itself answers *allow once* for every call that passes the guard, so members see no card.
+Checked on Goose 1.50.0 and 1.57.0 (same permission logic in both).
+
+**Administrators** are not in a team: **Admin > Prompt guard > Administrators** turns a guard on for all of them (rule
+sets, message check, on block). An administrator chat in **Auto bypasses** the guard; in **Approve** it gets the same
+controls as a guarded team; a **Smart approve** chat is refused while the administrators' guard is on ("use Approve or
+Auto"). Tools an administrator set to *always allow* earlier (the native profile's `permission.yaml`, shared with Goose
+Desktop) are not changed by Goose Web, so the guard does not see calls to them.
+
+**Limits.** Scheduled runs have nobody to ask, so their tool calls are not guarded; sub-agents and recipe checks
+started through the shell extensions are not seen either (the team page warns about both). Tool results and internet
+content are not inspected (they are already in the model's context). Classifiers can be bypassed by adaptive attacks;
+the rules are the enforcement for what must never happen.
+
+**Fail open.** If the model is missing, damaged or slower than `guard.timeout_ms`, the message or call is allowed, the
+rules still apply, `guard.unavailable` is audited (on each change, then at most every 10 minutes) and administrators
+see a banner on every page until it is healthy again (*Check now* on Admin > Prompt guard re-tests it).
+
+**Audit.** `guard.blocked` (user, team, profile, chat, point `prompt`/`tool`, extension and tool, rule set and rule or
+classifier score, mode) and `guard.unavailable` go to the audit log and `activity.jsonl` (section 18.1). The text of
+the message or the arguments is never recorded.
+
+**The model.** `goose-web guard status` shows the runtime, the model and a self-test; `goose-web guard install-model`
+installs it into `<system_dir>\models\prompt-guard-2-22m\`; `goose-web check` reports it; `install.ps1`, `upgrade.ps1`
+run `guard install-model --if-missing` (a warning, not a failure). The package is installed only after its SHA-256 is
+verified (the pinned package, `guard.model_url` + `guard.model_sha256` in config.yaml, or `--file X.zip --sha256 HEX`).
+
+Meta publishes the weights on Hugging Face behind a licence click-through (Llama 4 Community License), so they cannot
+be downloaded anonymously, and Goose Web 1.14.0 ships **no pinned package yet**. Until one is pinned the guard runs
+with rules only and fails open for the classifier. To build the package once (any administrator):
+
+1. On huggingface.co, sign in, open `meta-llama/Llama-Prompt-Guard-2-22M`, accept the licence and wait for access;
+   create a *read* access token.
+2. In a throwaway virtual environment (not the gateway's), install torch (CPU), transformers, sentencepiece, protobuf,
+   onnx, onnxscript, onnxruntime and `numpy<2.5`, set `HF_TOKEN` to the token, and run
+   `python scripts\export-prompt-guard.py --out <folder>`. It exports the pinned revision to ONNX, quantises it to
+   int8, checks it against the PyTorch model, and writes a zip with the licence, the Acceptable Use Policy, the
+   NOTICE and a "Built with Llama" README, then prints the zip's SHA-256.
+3. Install it: `goose-web guard install-model --file <zip> --sha256 <hash>`, then `goose-web guard status`.
+4. Optional, for every other installation: publish the zip (for example as a release asset of your fork) and set its
+   URL and SHA-256 in `guard.model_url` / `guard.model_sha256`, or pin them in `goose_web/guardmodel.py`
+   (`MODEL_PIN`). Redistribution must keep LICENSE, USE_POLICY.md and NOTICE in the package and display "Built with
+   Llama" (THIRD-PARTY-NOTICES.md).
+
+Measured on an Intel N100 (4 cores, int8 package, 4 threads, same-size test export): 16 tokens about 15 ms, 64 tokens
+about 32 ms (p95 35 ms), 512 tokens 260 ms, 1024 tokens 410 ms; about 240-280 MB more memory once loaded. A whole
+512-token window costs about 0.8-1 s on this CPU, which is why windows are 128 tokens.
+
 ## 10. Shared goose hints
 
 The **Admin > Hints library** holds shared hints documents. Assign a document to a team (on the team's Experience page,

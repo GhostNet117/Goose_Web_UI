@@ -1170,6 +1170,18 @@ Lists and limits:
 
 Teams that existed before version 1.5.0 kept their earlier settings, so your team may allow more than a new team.
 
+### Prompt guard
+
+If your team uses the prompt guard, Goose Web checks what you type and the tool calls Goose wants to make:
+
+- A message that looks like a prompt-injection attempt is not sent: you see *forbidden: the prompt guard blocked this
+  message*. Rephrase it; if it is legitimate (for example a question *about* prompt injection), ask your administrator.
+- A tool call your team's rules forbid (for example a Splunk search that writes a lookup with `| outputlookup`, or a
+  recursive delete) is refused for you: Goose is told you declined it and you see a notice naming the rule.
+- You work in **Approve** mode (Auto and Smart approve are not available), and permission cards have no *Always
+  allow* button. If your team uses *guarded auto*, calls that pass the guard run without a card.
+- Depending on your team, a block may also be silent (the message simply gets no answer).
+
 ## 16. FAQ
 
 **Does Goose stop when I close the browser?**

@@ -1,0 +1,10 @@
+{
+  "model": "goose-web/tiny-test-model",
+  "revision": "test",
+  "id2label": {
+    "0": "BENIGN",
+    "1": "MALICIOUS"
+  },
+  "malicious_index": 1,
+  "proxy": true
+}

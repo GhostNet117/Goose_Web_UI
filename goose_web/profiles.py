@@ -34,7 +34,7 @@ import yaml
 
 from .config import Settings, default_native_goose_root
 from .db import Database
-from .policy import (ANY, GUARDED_EXTENSIONS, allows, effective_policy, ext_key, extension_needs,
+from .policy import (ANY, GUARDED_EXTENSIONS, allows, effective_policy, ext_key, extension_needs, guard_on,
                      is_command_extension, missing)
 from .security import safe_name
 
@@ -78,6 +78,21 @@ def _atomic_write(p: Path, text: str) -> None:
 
 def _write_yaml(p: Path, data: dict) -> None:
     _atomic_write(p, yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+
+
+def strip_always_allow(path: Path) -> bool:
+    """Spec 018: drop the user 'always allow' tool permissions from a profile's permission.yaml (Goose never asks
+    about those tools, even in Approve mode, so a guarded member's calls to them would bypass the guard). Goose reads
+    the file at worker start; the caller's change list restarts the worker. Returns True if something was removed."""
+    if not path.exists():
+        return False
+    data = _read_yaml(path)
+    user = data.get("user") if isinstance(data.get("user"), dict) else None
+    if not user or not user.get("always_allow"):
+        return False
+    user["always_allow"] = []
+    _write_yaml(path, data)
+    return True
 
 
 def _same_path(a: str | Path, b: str | Path) -> bool:
@@ -560,6 +575,8 @@ class Profiles:
         if modes and not allows(pol, "allowed_modes", cfg.get("GOOSE_MODE")):
             cfg["GOOSE_MODE"] = "approve" if allows(pol, "allowed_modes", "approve") else modes[0]
             changes.append(f"mode {cfg['GOOSE_MODE']}")
+        if guard_on(pol) and strip_always_allow(cfg_dir / "permission.yaml"):
+            changes.append("prompt guard: 'always allow' tool permissions removed")
 
         _write_yaml(cfg_path, cfg)
         if secrets or secrets_path.exists():

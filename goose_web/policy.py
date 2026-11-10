@@ -18,7 +18,13 @@ LIST_KEYS = ["allowed_modes", "allowed_providers", "allowed_models", "allowed_ro
 CHAT_LISTS = ["allowed_modes", "allowed_providers", "allowed_models"]
 ANY = "*"
 # Extra keys a team policy may carry besides BOOL_KEYS / LIST_KEYS / max_concurrent_runs.
-TEAM_EXTRA_KEYS = ["default_provider", "default_model", "share_folder"]
+# guard: the team's prompt guard (spec 018, guard.clean_team_guard); missing = off.
+TEAM_EXTRA_KEYS = ["default_provider", "default_model", "share_folder", "guard"]
+# Approval modes in which Goose does not ask before every tool call: Auto never asks, Smart approve skips tools
+# annotated (or judged) read-only. A guarded team cannot use them (spec 018): the guard sees tool calls only through
+# Goose's permission requests.
+UNGUARDED_MODES = ("auto", "smart_approve")
+GUARDED_MODES = ["approve", "chat"]
 
 # The base every team starts from (spec 009): everything off, nothing allowed.
 DEFAULT_POLICY: dict[str, Any] = {**{k: False for k in BOOL_KEYS}, **{k: [] for k in LIST_KEYS},
@@ -187,11 +193,30 @@ def effective_policy(user: dict, teams: list[dict]) -> dict:
             if tp.get(k):
                 pol[k] = str(tp[k])
         pol["team"] = {"id": team.get("id"), "name": team.get("name")}
+        from .guard import clean_team_guard
+        pol["guard"] = clean_team_guard(tp.get("guard"))
     for k, v in (user.get("policy_overrides") or {}).items():
         if k in DEFAULT_POLICY:
             pol[k] = v
+    if (pol.get("guard") or {}).get("enabled"):
+        pol["allowed_modes"] = guarded_modes(pol.get("allowed_modes") or [])
     pol["chat_blocked"] = chat_block(pol)
     return pol
+
+
+def guarded_modes(modes: list[str]) -> list[str]:
+    """allowed_modes of a guarded team (spec 018): without Auto and Smart approve. "*" becomes Approve + Chat only;
+    a list that only had tool-running modes the guard cannot see gets Approve instead."""
+    if ANY in modes:
+        return list(GUARDED_MODES)
+    out = [m for m in modes if m not in UNGUARDED_MODES]
+    if len(out) < len(modes) and "approve" not in out:
+        out.insert(0, "approve")
+    return out
+
+
+def guard_on(policy: dict) -> bool:
+    return bool((policy.get("guard") or {}).get("enabled"))
 
 
 def check_session_choice(policy: dict, load_result: dict | None) -> None:
@@ -243,6 +268,25 @@ def team_warnings(policy: dict, *, hints: int, members: int) -> list[dict]:
         out.append({"level": "info", "text": "Members may add personal hints (team hints take precedence)."})
     if not members:
         out.append({"level": "info", "text": "No members yet."})
+    from .guard import clean_team_guard
+    g = clean_team_guard(p.get("guard"))
+    if g["enabled"]:
+        modes = p.get("allowed_modes") or []
+        if ANY in modes or any(m in modes for m in UNGUARDED_MODES):
+            out.append({"level": "info", "text": "Prompt guard on: Auto and Smart approve are not available to "
+                                                 "members (the guard sees tool calls only when Goose asks first)"
+                                                 + ("; guarded auto approves calls that pass." if g["auto_approve"]
+                                                    else ".")})
+        if not g["rulesets"] and not g["check_input"]:
+            out.append({"level": "warn", "text": "Prompt guard on, but with no rule sets and no input check it only "
+                                                 "classifies tool-call arguments."})
+        if p.get("allow_shell"):
+            out.append({"level": "warn", "text": "Prompt guard with shell on: sub-agents and recipe checks started "
+                                                 "through the shell extensions run tools the guard does not see."})
+        if p.get("schedules"):
+            out.append({"level": "warn", "text": "Prompt guard: scheduled runs have nobody to ask, so their tool "
+                                                 "calls are not guarded. Turn off schedules for this team if that "
+                                                 "matters."})
     return out
 
 
@@ -710,6 +754,11 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
         raise Denied(f"{params.get('key')} is managed by Goose Web")
     if method == P + "session/import":
         sanitize_session_import(params, policy)   # the hub checks the imported recipe (if any)
+    if method == P + "tools/permissions/set" and guard_on(policy):
+        # spec 018: an "always allow" tool is never asked about again, so the guard would never see its calls
+        for e in params.get("toolPermissions") or []:
+            if isinstance(e, dict) and str(e.get("permission") or "").lower().replace("-", "_") == "always_allow":
+                raise Denied("your team uses the prompt guard, so tools cannot be set to 'always allow'")
     if method in ALWAYS:
         return
     if method in SOURCE_METHODS:

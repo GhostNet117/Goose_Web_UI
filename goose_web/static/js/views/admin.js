@@ -12,6 +12,7 @@ const TABS = [
   { id: 'users', label: 'Users', icon: 'users' },
   { id: 'teams', label: 'Teams & policy', icon: 'shield' },
   { id: 'hints', label: 'Hints library', icon: 'hint' },
+  { id: 'guard', label: 'Prompt guard', icon: 'shield' },
   { id: 'auth', label: 'Auth providers', icon: 'key' },
   { id: 'settings', label: 'Settings', icon: 'sliders' },
   { id: 'system', label: 'System', icon: 'cpu' },
@@ -38,7 +39,7 @@ export function renderAdmin(ctx, tab) {
   const el = h('div', { class: 'view view-page view-settings' },
     pageHeader(h('span', { class: 'row' }, iconBtn('menu', 'Toggle sidebar', () => ctx.toggleSidebar(), { class: 'only-mobile' }), 'Admin'), null, [mob]),
     h('div', { class: 'page-body settings-layout' }, nav, body));
-  const R = { users: usersTab, teams: teamsTab, hints: hintsLibTab, auth: authTab, settings: settingsTab, system: systemTab, ownership: ownershipTab, hosttasks: hostTasksTab, ipblocks: ipBlocksTab, audit: auditTab, logs: logsTab };
+  const R = { users: usersTab, teams: teamsTab, hints: hintsLibTab, guard: guardTab, auth: authTab, settings: settingsTab, system: systemTab, ownership: ownershipTab, hosttasks: hostTasksTab, ipblocks: ipBlocksTab, audit: auditTab, logs: logsTab };
   let inner = null;
   try { inner = R[cur.id](body) || null; } catch (e) { console.error(e); body.replaceChildren(banner('error', errMsg(e))); }
   return { el, destroy() { if (inner && inner.destroy) inner.destroy(); } };
@@ -181,7 +182,29 @@ const EXPERIENCE = [
   { id: 'ext', title: 'Extensions & tools', flags: ['allow_shell', 'extensions_edit', 'tools_permissions', 'apps'], kinds: ['extension'] },
   { id: 'recipes', title: 'Recipes, skills & schedules', flags: ['recipes_edit', 'skills_edit', 'schedules'], kinds: ['recipe', 'skill'] },
   { id: 'other', title: 'Other', flags: ['prompts_edit', 'config_edit', 'notify_webhook'] },
+  { id: 'guard', title: 'Prompt guard', flags: [] },
 ];
+const GUARD_DEFAULT = { enabled: false, check_input: true, rulesets: [], trusted_extensions: [], on_block: 'notify', auto_approve: false };
+const ON_BLOCK = [{ value: 'notify', label: 'Drop it and tell the user' }, { value: 'silent', label: 'Drop it silently' }];
+async function loadGuardSets() { return arr(await GET('/api/admin/guard/rulesets'), 'rulesets'); }
+
+// Spec 018: the team's prompt guard (policy key `guard`). Returns {el, get()}.
+function teamGuardEditor(g0, sets) {
+  const g = { ...GUARD_DEFAULT, ...(g0 || {}) };
+  const row = (label, sub, key) => h('div', { class: 'set-row' }, h('div', { class: 'grow' }, h('div', null, label), h('div', { class: 'muted small' }, sub)), toggle(!!g[key], (v) => { g[key] = v; }));
+  const rs = multiPick(sets.map((s) => ({ value: s.id, label: s.name, sub: s.ruleCount + ' rules' + (s.description ? ' · ' + s.description : '') })), g.rulesets, { empty: 'No rule sets (Admin > Prompt guard)' });
+  const trusted = textarea({ rows: 2, class: 'inp mono', value: (g.trusted_extensions || []).join('\n'), placeholder: 'none - every extension is guarded' });
+  const ob = select(ON_BLOCK, g.on_block, { class: 'inp' });
+  const el = h('div', { class: 'stack-sm' },
+    h('div', { class: 'muted small' }, 'Checks what members type and the arguments of the tool calls Goose asks permission for (never tool results). Rules run first; the local Prompt Guard 2 22M classifier (Built with Llama) checks the free text. Members of a guarded team use Approve: Auto and Smart approve are switched off, and tools cannot be set to "always allow".'),
+    row('Prompt guard on', 'Off by default. Applies to every member of this team.', 'enabled'),
+    row('Check what members type', 'Block a message the classifier flags as prompt injection.', 'check_input'),
+    row('Guarded auto', 'Approve tool calls that pass the guard automatically (members do not see a card for them).', 'auto_approve'),
+    field('Rule sets', rs.el, 'Deterministic rules on tool-call arguments (and prompts, if a rule says so). Edit them in Admin > Prompt guard.'),
+    field('Trusted extensions', trusted, 'One extension name per line. Their tool calls skip the rules and the classifier; every other extension is guarded.'),
+    field('When something is blocked', ob));
+  return { el, get: () => ({ ...g, rulesets: rs.get(), trusted_extensions: trusted.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean), on_block: ob.value }) };
+}
 const MODE_CHOICES = [['auto', 'Auto'], ['approve', 'Approve'], ['smart_approve', 'Smart approve'], ['chat', 'Chat only']];
 const WARN_KIND = { err: 'error', warn: 'warn', info: 'info' };
 
@@ -294,7 +317,7 @@ function providerModelPicker(pol, catalog) {
 }
 
 function teamsTab(body) {
-  let teams = [], users = [], hints = [], selId = null;
+  let teams = [], users = [], hints = [], guardSets = [], selId = null;
   const listEl = h('div', { class: 'split-list' }, skeleton(4));
   const detail = h('div', { class: 'split-detail' });
   body.replaceChildren(h('div', { class: 'row' }, h('p', { class: 'muted grow' }, 'Each user belongs to one team. The team decides their experience: hints, providers and models, approval modes, folders, extensions, recipes and skills. Least privilege: nothing is allowed until you allow it.'), btn('New team', () => newTeam(), { icon: 'plus', variant: 'primary', size: 'sm' })), h('div', { class: 'split' }, listEl, detail));
@@ -321,9 +344,11 @@ function teamsTab(body) {
     const maxRuns = input({ type: 'number', min: '0', value: pol.max_concurrent_runs ?? '', placeholder: '3', class: 'inp inp-sm' });
     const members = multiPick(users.filter((u) => u.role !== 'admin' || (t.members || []).includes(u.id)).map((u) => ({ value: u.id, label: u.displayName || u.username, sub: u.username + (u.team && u.team !== t.id ? ' · now in ' + teamName(u.team) + ' (moves here)' : '') })), t.members || [], { empty: 'No users' });
     const hp = multiPick(hints.map((x) => ({ value: x.id, label: x.name, sub: x.description || '' })), t.hints || [], { empty: 'Hints library is empty' });
+    const ge = teamGuardEditor(pol.guard, guardSets);
     const itemBoxes = {};
     const groupBody = (g) => {
       const parts = g.flags.map(flagRow);
+      if (g.id === 'guard') parts.push(ge.el);
       if (g.id === 'hints') parts.unshift(field('Team hints', hp.el, 'Team hints come last in every member\'s hints and take precedence over personal hints.'));
       if (g.id === 'models') parts.unshift(pm.el);
       if (g.id === 'modes') parts.push(modes.el);
@@ -341,7 +366,7 @@ function teamsTab(body) {
           const p = { ...pol, allowed_providers: sel.providers, allowed_models: sel.models, allowed_modes: modes.get(),
             allowed_roots: roots.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
             default_provider: sel.defaultProvider, default_model: sel.defaultModel, share_folder: share.value.trim(),
-            max_concurrent_runs: maxRuns.value === '' ? null : Number(maxRuns.value) };
+            max_concurrent_runs: maxRuns.value === '' ? null : Number(maxRuns.value), guard: ge.get() };
           const r = await PATCH('/api/admin/teams/' + encodeURIComponent(t.id), { name: name.value.trim(), description: desc.value.trim(), policy: p, members: members.get(), hints: hp.get() });
           if (r && (r.moved || []).length) toast('Moved to ' + t.name + ': ' + r.moved.join(', '), { kind: 'info', timeout: 8000 });
           await load();
@@ -393,7 +418,7 @@ function teamsTab(body) {
   };
   async function load() {
     try {
-      [teams, users, hints] = await Promise.all([loadTeams(), loadUsers().catch(() => []), loadHints().catch(() => []), loadProviderCatalog()]);
+      [teams, users, hints, , guardSets] = await Promise.all([loadTeams(), loadUsers().catch(() => []), loadHints().catch(() => []), loadProviderCatalog(), loadGuardSets().catch(() => [])]);
       if (!selId && teams.length) selId = teams[0].id;
       drawList(); drawDetail();
     } catch (e) { listEl.replaceChildren(banner('error', errMsg(e))); }
@@ -433,6 +458,133 @@ function hintsLibTab(body) {
   };
   async function load() { try { docs = await loadHints(); drawList(); drawDetail(); } catch (e) { listEl.replaceChildren(banner('error', errMsg(e))); } }
   load(); drawDetail();
+}
+
+// ===================================================================== Prompt guard (spec 018)
+const GUARD_STATE = { ok: ['ok', 'Healthy'], idle: ['accent', 'Installed, not loaded yet'], loading: ['accent', 'Loading'], not_installed: ['warn', 'Model not installed'], error: ['err', 'Unavailable'] };
+const RULE_KINDS = [{ value: 'pipeline', label: 'Pipeline commands (SPL: | command)' }, { value: 'regex', label: 'Regular expression' }, { value: 'words', label: 'Words / phrases' }];
+const RULE_APPLIES = [{ value: 'tool', label: 'Tool-call arguments' }, { value: 'prompt', label: 'What the user types' }, { value: 'both', label: 'Both' }];
+
+function guardTab(body) {
+  let data = null, sel = null;
+  const statusEl = h('div', null, skeleton(3));
+  const adminEl = h('div');
+  const listEl = h('div', { class: 'split-list' }, skeleton(3));
+  const detail = h('div', { class: 'split-detail' });
+  const testEl = h('div');
+  body.replaceChildren(
+    h('div', { class: 'row' }, h('p', { class: 'muted grow' }, 'Checks what guarded users type and the arguments of the tool calls Goose asks permission for - never tool results. Deterministic rule sets run first; the local Prompt Guard 2 22M classifier checks the free text. Turn it on per team in Teams & policy > Experience > Prompt guard.')),
+    section('Classifier', null, statusEl),
+    section('Administrators', null, adminEl),
+    h('div', { class: 'row' }, h('h3', { class: 'exp-title grow' }, 'Rule sets'),
+      btn('New rule set', () => { sel = { id: null, name: '', description: '', rules: [] }; drawList(); drawDetail(); }, { icon: 'plus', variant: 'primary', size: 'sm' }),
+      actionBtn('Restore defaults', async () => { const r = await POST('/api/admin/guard/rulesets/restore-defaults', {}); toast(r.restored && r.restored.length ? 'Restored: ' + r.restored.join(', ') : 'The default rule sets are all there', { kind: 'info' }); await load(); }, { size: 'sm' })),
+    h('div', { class: 'split' }, listEl, detail),
+    section('Test the rules', null, testEl));
+
+  const drawStatus = () => {
+    const g = data.health || {}; const m = data.model || {}; const [kind, label] = GUARD_STATE[g.state] || ['info', g.state || '?'];
+    const out = h('div', { class: 'stack-sm' });
+    const res = h('div');
+    out.append(
+      h('div', { class: 'row' }, badge(label, kind), h('span', { class: 'muted small grow' }, g.inUse ? 'In use (a team or the administrators have the guard on).' : 'Not in use: no team has the guard on, nothing is loaded.'),
+        actionBtn('Check now', async () => {
+          const r = await POST('/api/admin/guard/check', {});
+          res.replaceChildren(h('div', { class: 'muted small' }, 'Benign sample: ' + fmtScore(r.benign) + ' · injection sample: ' + fmtScore(r.injection)));
+          data.health = r.health; drawStatus(); store.set('guardHealth', r.health.inUse ? r.health : null);
+        }, { size: 'sm', icon: 'activity' })),
+      g.reason && g.state !== 'ok' ? banner(g.state === 'not_installed' ? 'warn' : 'error', g.reason + (g.inUse ? ' Until it is healthy the guard fails open: prompts and tool calls are allowed (rules still apply) and guard.unavailable is audited.' : '')) : null,
+      m.installed ? h('div', { class: 'muted small mono' }, (m.model || '') + ' @ ' + String(m.revision || '').slice(0, 12) + ' · ' + (m.quantization || '') + (m.proxy ? ' · TEST MODEL, not Prompt Guard' : '') + ' · ' + m.dir)
+        : h('div', { class: 'stack-sm' }, h('div', { class: 'muted small' }, 'Install with: ', h('code', { class: 'mono' }, 'goose-web guard install-model'), m.pin && m.pin.published ? '' : ' - no published package is pinned yet. The official weights (' + data.hfRepo + ') are gated on Hugging Face: an administrator who accepted the Llama 4 Community License builds the package with scripts/export-prompt-guard.py and installs it with --file and --sha256 (docs/ADMINISTRATION.md, Prompt guard).')),
+      h('div', { class: 'muted small' }, 'Threshold ' + data.settings.threshold + ' · windows of ' + (data.settings.window_tokens || 128) + ' tokens, at most ' + data.settings.max_windows + ' · text under ' + data.settings.min_chars + ' characters is not classified · timeout ' + data.settings.timeout_ms + ' ms' + (g.lastLatencyMs != null ? ' · last check ' + g.lastLatencyMs + ' ms' : '') + ' (config.yaml, section guard)'),
+      res,
+      h('div', { class: 'muted small' }, h('strong', null, 'Built with Llama. '), 'Llama Prompt Guard 2 is licensed under the Llama 4 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved. The licence and the Acceptable Use Policy are installed with the model (LICENSE, USE_POLICY.md).'));
+    statusEl.replaceChildren(out);
+  };
+  const fmtScore = (x) => x ? (x.score == null ? x.status : x.score + (x.latencyMs != null ? ' (' + x.latencyMs + ' ms)' : '')) : '-';
+
+  const drawAdmin = () => {
+    const a = { enabled: false, check_input: true, rulesets: [], on_block: 'notify', ...(data.admin || {}) };
+    const row = (label, sub, key) => h('div', { class: 'set-row' }, h('div', { class: 'grow' }, h('div', null, label), h('div', { class: 'muted small' }, sub)), toggle(!!a[key], (v) => { a[key] = v; }));
+    const rs = multiPick(data.rulesets.map((s) => ({ value: s.id, label: s.name, sub: s.ruleCount + ' rules' })), a.rulesets, { empty: 'No rule sets' });
+    const ob = select(ON_BLOCK, a.on_block, { class: 'inp' });
+    adminEl.replaceChildren(h('div', { class: 'stack-sm' },
+      h('div', { class: 'muted small' }, 'Administrators are not in a team. In Auto mode they bypass the guard (Goose does not ask before tool calls); in Approve they get the same controls as a guarded team; a Smart approve chat is refused while this is on. Tools an administrator set to "always allow" earlier are not asked about, so the guard does not see them.'),
+      row('Prompt guard for administrators', 'Off by default.', 'enabled'),
+      row('Check what administrators type', 'Block a message the classifier flags as prompt injection (not in Auto mode).', 'check_input'),
+      field('Rule sets', rs.el), field('When something is blocked', ob),
+      h('div', { class: 'row' }, actionBtn('Save', async () => { const r = await PUT('/api/admin/guard', { admin: { ...a, rulesets: rs.get(), on_block: ob.value } }); data = r; drawAll(); }, { variant: 'primary', size: 'sm', success: 'Saved' }))));
+  };
+
+  const drawList = () => listEl.replaceChildren(...(data.rulesets.length ? data.rulesets.map((s) => h('button', { type: 'button', class: ['litem', sel && sel.id === s.id ? 'active' : ''], onclick: async () => { try { sel = await GET('/api/admin/guard/rulesets/' + encodeURIComponent(s.id)); drawList(); drawDetail(); } catch (e) { toastError(e); } } },
+    icon('shield', 14), h('div', { class: 'litem-main' }, h('div', { class: 'litem-title' }, s.name, s.builtin ? h('span', { class: 'muted small' }, ' · default') : null), h('div', { class: 'litem-sub' }, s.ruleCount + ' rules' + (s.teams.length ? ' · ' + s.teams.join(', ') : '') + (s.admins ? ' · administrators' : ''))))) : [empty('shield', 'No rule sets')]));
+
+  const ruleCard = (r, rules, redraw) => {
+    const id = input({ value: r.id || '', class: 'inp mono' }); const tool = input({ value: r.tool || '*', class: 'inp mono', placeholder: 'splunk*__* , *shell*' });
+    const args = input({ value: (r.args || ['*']).join(', '), class: 'inp mono' });
+    const kind = select(RULE_KINDS, r.kind || 'regex', { class: 'inp' }); const ap = select(RULE_APPLIES, r.applies || 'tool', { class: 'inp' });
+    const pats = textarea({ rows: 4, class: 'inp mono', value: (r.patterns || []).join('\n') }); const msg = input({ value: r.message || '' });
+    r._get = () => ({ id: id.value.trim(), tool: tool.value.trim() || '*', args: args.value.split(',').map((x) => x.trim()).filter(Boolean), kind: kind.value, applies: ap.value, patterns: pats.value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean), message: msg.value.trim() });
+    return h('div', { class: 'card stack-sm guard-rule' },
+      h('div', { class: 'row' }, h('strong', { class: 'grow mono' }, r.id || 'new rule'), iconBtn('trash', 'Remove rule', () => { rules.splice(rules.indexOf(r), 1); redraw(); }, { variant: 'danger-soft' })),
+      h('div', { class: 'grid2' }, field('Rule id', id), field('Tool', tool, '<extension>__<tool> glob, case-insensitive.')),
+      h('div', { class: 'grid2' }, field('Arguments', args, 'Argument names (a.b for nested), or * for every text value.'), field('Applies to', ap)),
+      field('Match', kind), field('Patterns', pats, 'One per line. Pipeline: command names (outputlookup); words: whole words or phrases; regex: case-insensitive.'),
+      field('Message shown on a block', msg));
+  };
+
+  const drawDetail = () => {
+    if (!sel) { detail.replaceChildren(empty('shield', 'Select a rule set')); return; }
+    const d = sel; const rules = (d.rules || []).map((r) => ({ ...r }));
+    const n = input({ value: d.name || '' }); const ds = input({ value: d.description || '' });
+    const box = h('div', { class: 'stack-sm' });
+    const redraw = () => box.replaceChildren(...rules.map((r) => ruleCard(r, rules, redraw)), btn('Add rule', () => { rules.push({ id: 'rule-' + (rules.length + 1), tool: '*', args: ['*'], kind: 'regex', applies: 'tool', patterns: [] }); redraw(); }, { icon: 'plus', size: 'sm' }));
+    redraw();
+    detail.replaceChildren(h('div', { class: 'detail-head' }, h('h2', null, d.id ? d.name : 'New rule set'), h('div', { class: 'row' },
+      actionBtn('Save', async () => {
+        const b = { name: n.value.trim(), description: ds.value.trim(), rules: rules.map((r) => r._get()) };
+        if (!b.name) throw new Error('Name is required');
+        const r = d.id ? await PUT('/api/admin/guard/rulesets/' + encodeURIComponent(d.id), b) : await POST('/api/admin/guard/rulesets', b);
+        sel = r.ruleset || sel; await load();
+      }, { variant: 'primary', size: 'sm', success: 'Saved' }),
+      d.id && d.builtin ? actionBtn('Reset to default', async () => {
+        if (!(await confirmDialog({ title: 'Reset ' + d.name + '?', message: 'Your changes to this rule set are replaced by the shipped default.', confirmText: 'Reset' }))) return;
+        const r = await POST('/api/admin/guard/rulesets/' + encodeURIComponent(d.id) + '/reset', {}); sel = r.ruleset; await load();
+      }, { size: 'sm', success: 'Reset' }) : null,
+      d.id ? iconBtn('trash', 'Delete', async () => {
+        if (!(await confirmDialog({ title: 'Delete ' + d.name + '?', message: 'Teams that use it no longer get these rules. A shipped default can be restored later.', confirmText: 'Delete', danger: true }))) return;
+        try { await DEL('/api/admin/guard/rulesets/' + encodeURIComponent(d.id)); sel = null; load(); } catch (e) { toastError(e); }
+      }, { variant: 'danger-soft' }) : null)),
+    h('div', { class: 'grid2' }, field('Name', n), field('Description', ds)),
+    d.teams && d.teams.length ? h('div', { class: 'muted small' }, 'Used by: ' + d.teams.join(', ') + (d.admins ? ', administrators' : '')) : null,
+    h('h3', { class: 'exp-title' }, 'Rules (each one blocks)'), box);
+  };
+
+  const drawTest = () => {
+    const rs = multiPick(data.rulesets.map((s) => ({ value: s.id, label: s.name })), data.rulesets.map((s) => s.id));
+    const tool = input({ class: 'inp mono', placeholder: 'splunk_mcp__run_query' }); const args = textarea({ rows: 3, class: 'inp mono', placeholder: '{"query": "index=main | outputlookup x.csv"}' });
+    const text = textarea({ rows: 2, class: 'inp', placeholder: 'A message a user might type' });
+    let classify = false;
+    const cls = checkbox(false, 'Also run the classifier on the message', (v) => { classify = v; });
+    const res = h('div', { class: 'stack-sm' });
+    const show = (label, x) => x ? banner(x.blocked ? 'error' : 'success', label + ': ' + (x.blocked ? 'blocked by ' + (x.rule ? x.rule + ' (' + x.ruleset + ')' : 'the classifier') + (x.message ? ' - ' + x.message : '') : 'allowed') + (x.score != null ? ' · score ' + x.score : '') + (x.status && x.status !== 'ok' ? ' · classifier ' + x.status : '')) : null;
+    testEl.replaceChildren(h('div', { class: 'stack-sm' }, h('div', { class: 'muted small' }, 'A dry run: nothing is sent to Goose and nothing is audited.'), field('Rule sets', rs.el),
+      h('div', { class: 'grid2' }, field('Tool', tool), field('Arguments (JSON)', args)), field('Message', text), cls,
+      h('div', { class: 'row' }, actionBtn('Test', async () => {
+        const r = await POST('/api/admin/guard/test', { rulesets: rs.get(), tool: tool.value.trim(), args: args.value.trim() || null, text: text.value, classify });
+        res.replaceChildren(show('Tool call', r.tool), show('Message (rules)', r.prompt), show('Message (classifier)', r.classifier));
+      }, { size: 'sm', icon: 'play' })), res));
+  };
+
+  const drawAll = () => { drawStatus(); drawAdmin(); drawList(); drawDetail(); drawTest(); };
+  async function load() {
+    try {
+      data = await GET('/api/admin/guard');
+      if (sel && sel.id && !data.rulesets.some((s) => s.id === sel.id)) sel = null;
+      drawAll();
+    } catch (e) { statusEl.replaceChildren(banner('error', errMsg(e))); }
+  }
+  load();
 }
 
 // ===================================================================== Auth providers

@@ -107,6 +107,23 @@ DEFAULTS: dict[str, Any] = {
         "read_dirs": [],                  # extra program folders the workers may read and run (Python, node, uv, git)
         "relays": [],                     # local services sandboxed workers may reach, e.g. ["127.0.0.1:8317"] (relay.py)
     },
+    # Prompt guard (guard.py, spec 018): the local Prompt Guard 2 22M classifier. Teams switch the guard on in
+    # Admin > Teams; these are the classifier's knobs. Nothing loads while no team (and not the admins) uses it.
+    "guard": {
+        "threshold": 0.5,                 # block when the malicious probability is at least this
+        "min_chars": 16,                  # shorter text is not classified (rules still apply)
+        "window_tokens": 128,             # tokens per window (the model reads at most 512; shorter is much cheaper)
+        "window_overlap": 16,             # tokens shared by consecutive windows
+        "max_windows": 8,                 # windows per text (the first ones and the last one)
+        "timeout_ms": 3000,               # slower than this = unavailable: allowed (fail open) and audited
+        "load_timeout_s": 60,
+        "threads": 4,                     # ONNX Runtime threads for one inference (capped at the CPU count)
+        "cache_size": 2048,               # scores remembered by content hash
+        "warm_up": True,                  # load the model at start-up when some guard is on
+        "model_dir": "",                  # default: <system_dir>/models/prompt-guard-2-22m
+        "model_url": "",                  # override of the pinned package URL (https)
+        "model_sha256": "",               # its SHA-256 (required with model_url)
+    },
     "auth": {
         "session_hours": 12,
         "remember_days": 30,

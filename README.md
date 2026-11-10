@@ -13,7 +13,7 @@ it, on a desktop or a phone.
   `%APPDATA%\Block\goose`) with all of its chats, recipes and settings. Nothing gets copied around, and Goose
   Desktop keeps working on the same profile.
 
-`goose-web 1.13.1` - Python 3.11+ - Windows 10/11 and Windows Server 2019+ - Apache-2.0
+`goose-web 1.14.0` - Python 3.11+ - Windows 10/11 and Windows Server 2019+ - Apache-2.0
 
 ## Windows only
 
@@ -34,6 +34,9 @@ contain the Linux/macOS installer and the Docker files, but they are unsupported
   all your tabs). Recipe parameters and elicitation forms. Mode, provider, model and thinking-effort switching, also
   on the New chat screen before the first message. File upload into your
   workspace.
+- **Prompt guard** (optional, per team): editable rule sets on tool-call arguments (shipped: *Splunk read-only*,
+  *Destructive shell*) and Meta's Llama Prompt Guard 2 22M classifier on what users type, run locally on the CPU;
+  blocks are audited without content. Built with Llama (see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)).
 - **Live activity** (as in Goose Desktop): the model's thinking, every tool call with its input, live output
   and result, and a live bar with the current step, tool-call count and elapsed time. How much stays open is a
   per-user preference.
@@ -238,3 +241,5 @@ in a public issue.
 ## License
 
 [Apache License 2.0](LICENSE). Copyright 2026 Goose AI Web Interface contributors.
+
+Third-party components and the Llama Prompt Guard 2 model licence: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

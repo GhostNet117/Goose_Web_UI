@@ -538,6 +538,12 @@ def create_app(settings: Settings) -> Starlette:
         hub.on_audit = make_audit_handler(c)
         hub.on_event = make_event_handler(c)
         hub.profile_root_for = lambda username: str(profiles.root_for(db.user_by_name(username) or {"username": username}))
+        # Prompt guard (spec 018): rules + the local classifier; loads nothing until some guard is on.
+        from .guard import GuardService
+        c.guard = hub.guard = GuardService(settings, db)
+        c.guard.on_unavailable = lambda reason, point: db.audit(
+            "guard.unavailable", target=point, detail={"reason": reason[:300], "point": point}, ok=False)
+        c.guard.on_health = lambda h: hub.broadcast_admins({"jsonrpc": "2.0", "method": "_gw/guard", "params": h})
         app.state.ctx = c
         hub.start()
         workers.start_monitor()
@@ -552,11 +558,15 @@ def create_app(settings: Settings) -> Starlette:
         db.audit("system.start", detail={"version": __version__, "goose": c.goose_version,
                                           "https": tls.ACTIVE.get("mode") if tls.is_active() else "off"})
         maintenance = asyncio.create_task(_maintenance_loop(c))
+        warm = asyncio.create_task(c.guard.warm_up()) if settings.get("guard", "warm_up") else None
         log.info("Goose Web %s ready (goose %s)", __version__, c.goose_version or "?")
         try:
             yield
         finally:
             maintenance.cancel()
+            if warm is not None:
+                warm.cancel()
+            c.guard.shutdown()
             await workers.shutdown()
             db.audit("system.stop")
             db.close()

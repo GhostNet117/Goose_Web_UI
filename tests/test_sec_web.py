@@ -414,7 +414,9 @@ def test_admin_must_enrol_before_anything_else(gw):
                          ("POST", f"/api/admin/users/{boss['id']}/reset-totp"), ("PUT", "/api/me/prefs")):
         r = client.request(method, path, headers=h, json={})
         assert (r.status_code, r.json()["error"]) == (403, "totp_enrolment_required"), path
-    r = httpx.Client(transport=client._transport, base_url="http://testserver").get(
+    # the httpx flavour the TestClient itself uses (starlette prefers httpx2 when it is installed)
+    from starlette import testclient as _stc
+    r = _stc.httpx.Client(transport=client._transport, base_url="http://testserver").get(
         "/api/admin/users", headers={"authorization": f"Bearer {old_token}"})
     assert r.status_code == 403
     assert c.must_enrol_or_change(eve)
