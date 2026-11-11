@@ -1089,6 +1089,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .theme-sw { width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--border-2); flex: none; }
 .swatch { width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--bg); box-shadow: 0 0 0 1px var(--border-2); cursor: pointer; padding: 0; background: linear-gradient(135deg, var(--accent), var(--accent-2)); flex: none; }
 .swatch.active { box-shadow: 0 0 0 2px var(--fg); }
+.vis-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px 16px; margin-top: 10px; }
+.vis-list .badge { margin-left: 6px; }
 .prov-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--bg-2); overflow: hidden; }
 .prov { border-bottom: 1px solid var(--border); }
 .prov:last-child { border-bottom: 0; }

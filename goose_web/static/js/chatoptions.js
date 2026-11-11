@@ -5,6 +5,7 @@ import { h, select } from './ui.js';
 import { icon } from './icons.js';
 import { rpc, G } from './rpc.js';
 import { allowedValue } from './store.js';
+import { pickerProviders, visibilityContext, rememberProviderMeta } from './providervis.js';
 
 // Goose's approval modes (goose-provider-types GooseMode), with Goose's own descriptions.
 export const MODES = [
@@ -97,18 +98,24 @@ export async function loadNewChatOptions() {
     cfg('GOOSE_MODE'),
     cfg('GOOSE_THINKING_EFFORT'),
   ]);
-  const providers = (p.entries || [])
+  // Team policy first; then the user's own picker choice (spec 023, providervis.js; the default provider is kept).
+  const allProviders = (p.entries || [])
     .filter((e) => e.configured && allowedValue('allowed_providers', e.providerId))
     .map((e) => ({
       id: e.providerId, name: e.providerName || e.providerId, defaultModel: e.defaultModel || '',
       engine: e.gwEngine || '',   // spec 021: added by the gateway (custom_providers/*.json)
+      variantOf: e.gwVariantOf || '',   // spec 022 hook (not set yet): an effort variant of another provider
       models: (e.models || []).filter((m) => allowedValue('allowed_models', m.id)).map((m) => ({ id: m.id, name: m.name || m.id })),
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
-  rememberEngines(providers);
+  rememberEngines(allProviders);
+  const defaultProvider = (d && d.providerId) || '';
+  rememberProviderMeta({ defaultProvider, entries: p.entries || [] });   // for the chat header (no extra request)
+  const providers = pickerProviders(allProviders, visibilityContext(defaultProvider));
   return {
-    providers,
-    defaultProvider: (d && d.providerId) || '',
+    providers,          // what the provider picker offers
+    allProviders,       // every provider the policy allows, incl. hidden ones (valid targets, e.g. spec 022 variants)
+    defaultProvider,
     defaultModel: (d && d.modelId) || '',
     defaultMode: String(mode || 'auto'),          // Goose's own default mode is auto
     defaultEffort: String(effort || ''),

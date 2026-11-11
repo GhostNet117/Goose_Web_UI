@@ -8,6 +8,7 @@ import { setBaseTitle, chime } from '../herd.js';
 import { router } from '../router.js';
 import { THEMES, ACCENTS, prefs, pref, setPref, patchPref, activityPrefs } from '../prefs.js';
 import { mdElement } from '../markdown.js';
+import { hiddenList, setHiddenProviders, hideAllExcept, rememberProviderMeta } from '../providervis.js';
 import { passwordForm } from './login.js';
 import { sessionsState, sessionTitle } from '../sessions.js';
 import { currentChat } from '../chatsession.js';
@@ -49,6 +50,7 @@ function providersTab(body) {
   const canEdit = policy('providers_edit');
   let entries = []; let defaults = {}; let q = ''; let showAll = false;
   const defBox = h('div', { class: 'card' }, skeleton(2));
+  const visBox = h('div', { class: 'card', 'data-section': 'chat-pickers' }, skeleton(3));
   const list = h('div', { class: 'prov-list' }, skeleton(6));
   const secretsBox = h('div');
   const search = input({ type: 'search', placeholder: 'Search providers…', class: 'inp inp-sm' });
@@ -56,6 +58,7 @@ function providersTab(body) {
   body.replaceChildren(
     ro('providers_edit', 'providers'),
     section('Default model', null, defBox),
+    section('Chat pickers', null, visBox),
     section('Providers', [search, toggle(showAll, (v) => { showAll = v; draw(); }, { text: 'Show unconfigured' }),
       canEdit ? btn('Refresh models', async () => { try { const r = await rpc.call(G('providers/inventory/refresh'), {}); toast('Refreshing ' + (r.started || []).length + ' provider(s)', { kind: 'info' }); setTimeout(load, 2500); } catch (e) { toastError(e); } }, { size: 'sm', icon: 'refresh' }) : null,
       canEdit ? btn('Custom provider', () => customDialog(null), { size: 'sm', icon: 'plus', variant: 'primary' }) : null], list),
@@ -81,6 +84,45 @@ function providersTab(body) {
         actionBtn('Save default', async () => { if (!pSel.value) throw new Error('Choose a provider'); defaults = await rpc.call(G('defaults/save'), { providerId: pSel.value, modelId: mSel.value || null }); drawDefaults(); }, { variant: 'primary', success: 'Default saved' }),
         actionBtn('Clear', async () => { defaults = await rpc.call(G('defaults/clear'), {}); drawDefaults(); }, { success: 'Default cleared' }),
         pSel.value ? actionBtn('Check readiness', async () => { const r = await rpc.call(G('providers/readiness/check'), { providerId: pSel.value }); toast(r.ready ? 'Provider is ready' : 'Not ready: ' + (r.error || 'unknown'), { kind: r.ready ? 'success' : 'error' }); }, { icon: 'activity' }) : null) : null);
+    rememberProviderMeta({ defaultProvider: defaults.providerId || '' });
+    drawVis();
+  };
+  // Spec 023: which configured providers the chat pickers (New chat, chat header) offer. A display preference of this
+  // user (saved with the preferences on the server), so it needs no providers_edit permission and applies after the
+  // policy. The default provider is always shown. Effort variants (spec 022, gwVariantOf) are not listed here.
+  const drawVis = () => {
+    const def = defaults.providerId || '';
+    const rows = entries.filter((e) => e.configured && allowed(e) && !e.gwVariantOf);
+    if (!rows.length) { visBox.replaceChildren(h('div', { class: 'muted' }, 'No configured providers yet.')); return; }
+    const hidden = new Set(hiddenList());
+    const shown = (e) => e.providerId === def || !hidden.has(e.providerId);
+    const save = (ids) => { setHiddenProviders(ids, def); drawVis(); };
+    const keepDefault = (e) => {
+      toast(e.providerName + ' is your default provider for new chats, so it is always shown. Choose another default above first to hide it.', { kind: 'warn', timeout: 8000 });
+      drawVis();
+    };
+    visBox.replaceChildren(
+      h('div', { class: 'row wrap' },
+        h('div', { class: 'muted small grow' }, rows.filter(shown).length + ' of ' + rows.length + ' shown. Unticked providers are left out of the provider pickers on the New chat screen and in the chat header. They stay configured, and a chat that already uses one still shows it. Only you see this choice; it follows you to every browser.'),
+        btn('Show all', () => save([]), { size: 'sm' }),
+        btn('Hide all except default', () => {
+          if (!def) { toast('Set a default provider above first: it is the one that stays.', { kind: 'warn' }); return; }
+          save(hideAllExcept(rows.map((e) => e.providerId), def));
+        }, { size: 'sm' })),
+      h('div', { class: 'vis-list', role: 'group', 'aria-label': 'Show in chat pickers' }, ...rows.map((e) => {
+        const isDef = e.providerId === def;
+        const cb = checkbox(shown(e), h('span', null, e.providerName, ' ', h('span', { class: 'muted small mono' }, e.providerId),
+          isDef ? h('span', { class: 'badge badge-accent', title: 'The default provider is always shown' }, 'default') : null), (v) => {
+          if (!v && isDef) { keepDefault(e); return; }
+          const ids = new Set(hiddenList());
+          if (v) ids.delete(e.providerId); else ids.add(e.providerId);
+          save([...ids]);
+        });
+        cb.dataset.provider = e.providerId;
+        cb.title = isDef ? 'Default provider: always shown in chat pickers' : 'Show in chat pickers';
+        return cb;
+      })),
+      def && hidden.has(def) ? h('div', { class: 'muted small' }, 'Your default provider was hidden earlier; it is shown while it is the default.') : null);
   };
   const draw = () => {
     const items = entries.filter((e) => allowed(e) && (showAll || e.configured || e.providerType === 'Custom') && (!q || (e.providerName + ' ' + e.providerId + ' ' + e.description).toLowerCase().includes(q)));
@@ -199,8 +241,9 @@ function providersTab(body) {
       const [p, d] = await Promise.all([rpc.call(G('providers/list'), {}), rpc.call(G('defaults/read'), {}).catch(() => ({}))]);
       entries = (p.entries || []).filter((e) => !e.deprecated || e.configured).sort((a, b) => (b.configured - a.configured) || a.providerName.localeCompare(b.providerName));
       defaults = d || {};
+      rememberProviderMeta({ defaultProvider: defaults.providerId || '', entries: p.entries || [] });
       drawDefaults(); draw();
-    } catch (e) { list.replaceChildren(banner('error', errMsg(e))); defBox.replaceChildren(); }
+    } catch (e) { list.replaceChildren(banner('error', errMsg(e))); defBox.replaceChildren(); visBox.replaceChildren(); }
   }
   load(); loadSecrets();
 }

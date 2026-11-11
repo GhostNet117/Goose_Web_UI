@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.17.0 - 2026-11-11
+
+**Choose which providers the chat pickers offer.** No database schema change.
+
+- **Settings > Models & Providers > Chat pickers.** One **Show in chat pickers** checkbox per configured provider
+  (name and id), plus **Show all** and **Hide all except default**. Unticked providers, and their models, are left
+  out of the provider picker on the New chat screen and in the chat header. Saved per user on the server (a new
+  `providerVisibility` preference: the hidden ids only, so a provider set up later is shown); it follows the user
+  to every browser. Members get it for their own profile; it needs no `providers_edit` permission.
+- **Never hidden:** the default provider (unticking it is refused with an explanation), and the provider a chat
+  already uses (its header shows it marked "(hidden in settings)").
+- **Policy first:** the team's allowed providers still decide what can be listed at all; hiding is a display
+  preference and blocks nothing. Admin pages (team provider pickers), the default-model picker and the Settings
+  provider list are not filtered.
+- **Chat header:** its provider picker now offers the same providers as New chat. Goose lists every provider it
+  knows there (about 95), including ones that are not set up; those are left out (the chat's own provider always
+  stays). The list is remembered from the last New chat or Settings visit, so opening a picker sends no request.
+- Built so that effort-variant providers (spec 022, not part of this release) can be left out of the pickers while
+  staying valid targets (`variantOf` role, `allProviders` list).
+- Docs: USER-GUIDE (Settings > Models & Providers, New chat, chat header), ARCHITECTURE.
+
 ## 1.16.1 - 2026-11-11
 
 **New chats use the highest thinking effort by default.** No database schema change.

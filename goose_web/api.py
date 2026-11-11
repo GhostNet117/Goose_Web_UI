@@ -348,8 +348,21 @@ async def me_prefs(request: Request):
     stored = u.get("prefs") or {}
     prefs = {k: v for k, v in b.items() if not str(k).startswith("_")}
     prefs.update({k: v for k, v in stored.items() if str(k).startswith("_")})
+    if "providerVisibility" in prefs:
+        prefs["providerVisibility"] = _clean_provider_visibility(prefs["providerVisibility"])
     c.db.update_user(u["id"], prefs=prefs)
     return ok()
+
+
+def _clean_provider_visibility(v) -> dict:
+    """Spec 023: the providers a user left out of the chat pickers (a display preference, not a policy).
+    Only {"hidden": [provider ids]} is kept: unique non-empty strings of at most 200 characters, at most 500."""
+    hidden: list[str] = []
+    raw = v.get("hidden") if isinstance(v, dict) else None
+    for x in raw if isinstance(raw, list) else []:
+        if isinstance(x, str) and x and len(x) <= 200 and x not in hidden:
+            hidden.append(x)
+    return {"hidden": hidden[:500]}
 
 
 def _check_self_totp_allowed(c: Ctx, u: dict) -> None:

@@ -11,6 +11,7 @@ import { store, bus, policy, allowedValue } from '../store.js';
 import { elsewhereFor, sourceLabel } from '../elsewhere.js';
 import { isPinned, togglePin } from '../prefs.js';
 import { pillSelect, rememberEffortOptions, effortNote, optionById } from '../chatoptions.js';
+import { visibilityContext, pickerHidden, HIDDEN_LABEL } from '../providervis.js';
 import { setBaseTitle, agentFor } from '../herd.js';
 import { mdElement } from '../markdown.js';
 
@@ -92,7 +93,11 @@ export function renderChat(ctx, sessionId) {
     for (const o of chat.configOptions) {
       if (o === modeOpt || o.type !== 'select' || !Array.isArray(o.options)) continue;
       const listKey = o.id === 'provider' ? 'allowed_providers' : o.id === 'model' ? 'allowed_models' : null;
-      const opts = o.options.filter((x) => !listKey || allowedValue(listKey, x.value) || x.value === o.currentValue).map((x) => ({ value: x.value, label: x.name || x.value, title: x.description }));
+      // spec 023: after the policy, the providers the user hid in Settings are left out - except the one this chat uses
+      const vis = o.id === 'provider' ? visibilityContext() : null;
+      const opts = o.options.filter((x) => !listKey || allowedValue(listKey, x.value) || x.value === o.currentValue)
+        .filter((x) => !vis || x.value === o.currentValue || !pickerHidden(x.value, vis))
+        .map((x) => ({ value: x.value, label: (x.name || x.value) + (vis && pickerHidden(x.value, vis) === 'user' ? HIDDEN_LABEL : ''), title: x.description }));
       const ic = o.id === 'provider' ? 'cpu' : o.id === 'model' ? 'zap' : o.category === 'thought_level' ? 'brain' : 'sliders';
       // spec 021: say so when Goose sends no effort for this provider+model (the pick would change nothing)
       const note = o.category === 'thought_level' ? effortNote((optionById(chat.configOptions, 'provider') || {}).currentValue, (optionById(chat.configOptions, 'model') || {}).currentValue) : '';

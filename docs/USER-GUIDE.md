@@ -275,7 +275,7 @@ and a row of option pickers for the new chat.
 
    | Picker | What it sets |
    |---|---|
-   | Provider | The model provider. Only providers set up in your profile (and allowed by your policy) are listed. |
+   | Provider | The model provider. Only providers set up in your profile (and allowed by your policy) are listed, minus the ones you hid in **Settings > Models & Providers > Chat pickers** (version 1.17.0 and later; your default provider is always listed). |
    | Model | The model of that provider. Changing the provider resets the model to its default. |
    | Thinking effort | How much the model reasons before answering (Off, Low, Medium, High, Max, or the values the provider offers). The list shows the values Goose offered last time for that model. |
    | Approval mode | When Goose asks before it runs a tool: Auto, Approve, Smart approve or Chat only (see [Mode](#mode)). |
@@ -370,6 +370,9 @@ for models that support it, a thinking level picker.
 
 - Changes apply to this chat only. The default for new chats is set in **Settings > Models & Providers**.
 - Your team decides which providers and models you can use. Only allowed values appear.
+- The provider picker lists the providers set up in your profile, without the ones you hid in **Settings > Models &
+  Providers > Chat pickers** (version 1.17.0 and later). A chat that uses a hidden provider still shows it, marked
+  **(hidden in settings)**; once you switch away it is no longer offered in that chat.
 - If your team stops allowing the provider, model or mode that an older chat uses, Goose Web refuses new messages
   in that chat ("this chat uses the model ..., which your team does not allow"). Pick an allowed one in the chat
   header first, then send again.
@@ -1006,6 +1009,17 @@ policy does not allow shows a "Read-only" note or is hidden.
 
 **Default model**: choose the **Provider** and **Model** used for new chats and click **Save default**.
 **Clear** removes the default. **Check readiness** tests the provider.
+
+**Chat pickers** (version 1.17.0 and later): one **Show in chat pickers** checkbox per provider set up in your
+profile (name and id). Untick the providers you never use: they are left out of the provider picker on the New chat
+screen and in the chat header, and their models with them. Nothing else changes - they stay configured, recipes,
+schedules and administrators' team settings still see them, and a chat that already uses one still shows it.
+**Show all** ticks everything again; **Hide all except default** leaves only your default provider. Your default
+provider is always shown: unticking it is refused with a short explanation (choose another default first). The
+choice is saved on the server with your other preferences, so it applies in every browser you sign in from; a
+provider that is set up later is shown until you untick it. Members can do this for their own profile, without the
+`providers_edit` permission. Your team's allowed providers still come first: a provider your team does not allow is
+never listed, whatever you tick.
 
 **Providers**: a list of providers. Configured ones come first. Turn on **Show unconfigured** to see all.
 

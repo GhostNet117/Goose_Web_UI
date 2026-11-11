@@ -29,6 +29,8 @@ export const DEFAULT_PREFS = {
   activity: { thinking: 'auto', tools: 'auto', statusBar: true },
   // New chat screen choices (spec 008); '' = profile default.
   newChat: { provider: '', model: '', effort: '', mode: '' },
+  // Providers left out of the chat pickers (spec 023, providervis.js); only the hidden ids, so new providers show.
+  providerVisibility: { hidden: [] },
 };
 
 export function prefs() { return { ...DEFAULT_PREFS, ...(store.get('prefs') || {}) }; }
