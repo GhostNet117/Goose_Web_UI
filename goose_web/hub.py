@@ -28,6 +28,7 @@ from typing import Any, Callable
 import websockets
 
 from . import __version__
+from . import effort as effortmod
 from . import guard as guardmod
 from . import policy as pol
 from .workers import Worker, WorkerManager
@@ -98,6 +99,7 @@ def goose_caps(init_result: dict | None) -> dict:
 
 # Everyday chat activity recorded per user (spec 015, Hub.audit_activity).
 STEER = "_goose/unstable/session/steer"
+PROVIDERS_LIST = "_goose/unstable/providers/list"   # spec 021: answered with each provider's engine (gwEngine)
 CHAT_ACTIVITY = {"session/new": "chat.new", "session/load": "chat.open", "session/prompt": "chat.prompt",
                  "session/cancel": "chat.cancel", "session/fork": "chat.fork", "session/set_mode": "chat.mode",
                  STEER: "chat.steer"}
@@ -1241,6 +1243,17 @@ class Upstream:
         s.buffer_bytes, s.truncated = 0, False
         s.loaded, s.load_result, s.fp = False, None, None
 
+    def _with_engines(self, result: Any) -> Any:
+        """spec 021: tell the front end each provider's engine (custom_providers/*.json of this worker's profile), so
+        it can say when Goose sends no thinking effort for a model. Never fails the reply."""
+        from .config import default_native_goose_root
+        try:
+            root = Path(self.worker.path_root or default_native_goose_root())
+            return effortmod.annotate_providers(result, effortmod.provider_engines(root / "config"))
+        except Exception:
+            log.debug("providers/list engine annotation skipped", exc_info=True)
+            return result
+
     def _db_paths(self) -> list[Path]:
         from .config import default_native_goose_root
         try:
@@ -1380,6 +1393,8 @@ class Upstream:
                     out["error"] = msg["error"]
                 else:
                     out["result"] = msg.get("result")
+                    if method == PROVIDERS_LIST:
+                        out["result"] = self._with_engines(out["result"])
                 client.send(out)
             return
         method = msg.get("method")

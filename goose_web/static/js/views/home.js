@@ -8,7 +8,7 @@ import { Composer } from '../composer.js';
 import { pickFolder, fsRoots } from './folderpicker.js';
 import { pref, setPref, addRecentFolder } from '../prefs.js';
 import { allowedValue, chatBlocked } from '../store.js';
-import { MODES, pillSelect, knownEfforts, loadNewChatOptions, applyNewChatOptions } from '../chatoptions.js';
+import { MODES, pillSelect, knownEfforts, effortsKnown, topEffort, effortNote, loadNewChatOptions, applyNewChatOptions } from '../chatoptions.js';
 import { getChat } from '../chatsession.js';
 import { upsertSession, sessionsState, sessionTitle, activityTime } from '../sessions.js';
 import { setBaseTitle, herdList } from '../herd.js';
@@ -93,9 +93,14 @@ export function renderHome(ctx, query = {}) {
         choice.provider, (v) => { choice.provider = v; choice.model = ''; choice.effort = ''; saveChoice(); renderOpts(); }));
       nodes.push(pillSelect('zap', 'Model', [{ value: '', label: 'Default model' + (defModel ? ' (' + defModel + ')' : '') }, ...models.map((m) => ({ value: m.id, label: m.name }))],
         choice.model, (v) => { choice.model = v; choice.effort = ''; saveChoice(); renderOpts(); }));
-      const efforts = knownEfforts(effProvider, choice.model || defModel);
+      const effModel = choice.model || defModel;
+      const efforts = knownEfforts(effProvider, effModel);
       if (choice.effort && !efforts.some((x) => x.value === choice.effort)) choice.effort = '';
-      nodes.push(pillSelect('brain', 'Thinking effort', [{ value: '', label: 'Default effort' + (optData.defaultEffort ? ' (' + optData.defaultEffort + ')' : '') }, ...efforts], choice.effort, (v) => { choice.effort = v; saveChoice(); }));
+      // spec 021: the default is the highest level the model offers (applied after session/new, applyNewChatOptions)
+      const top = effortsKnown(effProvider, effModel) ? topEffort(efforts) : 'highest offered';
+      nodes.push(pillSelect('brain', 'Thinking effort', [{ value: '', label: 'Default effort (' + (top || 'highest offered') + ')' }, ...efforts], choice.effort, (v) => { choice.effort = v; saveChoice(); }));
+      const note = effortNote(effProvider, effModel, pEntry ? pEntry.engine : '');
+      if (note) nodes.push(h('span', { class: 'home-opts-note muted small', role: 'note', title: note }, icon('info', 12), ' Effort set by the provider configuration, not per chat'));
     }
     const modes = MODES.filter((m) => allowedValue('allowed_modes', m.value));
     if (choice.mode && !modes.some((m) => m.value === choice.mode)) choice.mode = '';
@@ -103,9 +108,9 @@ export function renderHome(ctx, query = {}) {
     nodes.push(pillSelect('shield', 'Approval mode', [{ value: '', label: 'Default approval' + (dm ? ' (' + dm.label + ')' : '') }, ...modes], choice.mode, (v) => { choice.mode = v; saveChoice(); }));
     optsRow.replaceChildren(...nodes);
   };
-  // Apply the non-default choices to the new chat before its first prompt; unavailable ones only warn.
+  // Apply the choices to the new chat before its first prompt; unavailable ones only warn. Always runs: without an
+  // effort choice the chat gets the highest effort it offers (spec 021).
   const applyChoice = async (chat) => {
-    if (!choice.provider && !choice.model && !choice.effort && !choice.mode) return;
     const warn = await applyNewChatOptions(chat, { ...choice });
     if (warn.length) toast('Some chat options were not applied:\n' + warn.join('\n'), { kind: 'warn', timeout: 10000 });
   };

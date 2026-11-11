@@ -281,8 +281,17 @@ and a row of option pickers for the new chat.
    | Approval mode | When Goose asks before it runs a tool: Auto, Approve, Smart approve or Chat only (see [Mode](#mode)). |
 
    Each picker starts at **Default (...)**, which keeps the default from **Settings > Models & Providers** and
-   **Settings > Preferences**. Your choices are remembered for the next new chat. They are applied to the chat
-   before your first message is sent. If the new chat does not offer a choice (for example a thinking effort the
+   **Settings > Preferences**. Thinking effort is different (version 1.16.1 and later): **Default effort (max)** means
+   the new chat gets the *highest* effort the chosen model offers - Max, or the top of its list when it has no Max
+   (for example High). Pick a level to use less; that pick is remembered like the others. Until you have used a model
+   once, the label says **Default effort (highest offered)**.
+
+   Some models never receive an effort from Goose: models other than OpenAI's (and xAI Grok) on an OpenAI-compatible
+   provider, for example GLM or DeepSeek behind a company gateway. For those the picker row shows **Effort set by the
+   provider configuration, not per chat** (the chat header's effort picker says the same in its tooltip). The level
+   such a model uses is set once per model by an administrator (see CONFIGURATION, "Thinking effort").
+
+   Your choices are remembered for the next new chat. They are applied to the chat before your first message is sent. If the new chat does not offer a choice (for example a thinking effort the
    model does not support), Goose Web shows a warning and the chat starts with Goose's value instead. The pickers
    in the chat header can still change everything later.
 4. Type what Goose should work on.

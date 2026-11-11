@@ -170,6 +170,61 @@ administrator has Goose Web open.
 | `elsewhere.done_hours` | `24` | Sessions that finished elsewhere while nobody had Goose Web open are looked for this far back (they then join Done). |
 | `elsewhere.max_items` | `40` | Entries (groups) in Working elsewhere, and Done-elsewhere groups kept (the oldest is marked read beyond that). |
 
+### Thinking effort (since 1.16.1)
+
+Goose Web has no key of its own for this; it uses Goose's `GOOSE_THINKING_EFFORT` and Goose's per-model settings.
+
+- **New chats get the highest effort the model offers.** Without a pick on the New chat screen, Goose Web sets the
+  new chat to `max`, or to the top of the list Goose offers for that provider and model when it has no `max`
+  (ranking `off < none < minimal < low < medium < high < xhigh < max`). A level the user picks (New chat screen or the
+  chat header) wins.
+- **Isolated profiles** get `GOOSE_THINKING_EFFORT: max` at provisioning when they have no value. A value the member
+  saved in **Settings > Preferences > Default thinking effort** is kept. This default applies to that profile's
+  schedules and recipes too.
+- **The native profile** (and Goose Desktop / the CLI on that Windows account) uses Goose's own config. Set its
+  default with **Settings > Preferences > Default thinking effort** as an administrator, or with Goose's own tools;
+  never by editing `config.yaml` while Goose runs. `max` is safe for every model: Goose clamps it per model
+  (OpenAI catalog models: `max`, else `xhigh`, else `high`; xAI, Google and Ollama: `high`; Anthropic: adaptive
+  effort `max`, or a 32,000-token thinking budget capped to fit `max_tokens`; GLM-5.3 / Kimi K3 menus: `max`).
+
+**Models that never receive an effort from Goose.** On the OpenAI engine (the built-in `openai` provider and custom
+providers with `"engine": "openai"`), Goose 1.50 to 1.59 send `reasoning_effort` only for OpenAI reasoning models and
+xAI Grok. Any other model behind an OpenAI-compatible endpoint - for example GLM or DeepSeek served by a LiteLLM-based
+gateway - gets no effort field at all, whatever the picker says; the model runs at the gateway's or vendor's default.
+Goose Web marks these models in the New chat picker ("Effort set by the provider configuration, not per chat"; the
+gateway reads each custom provider's `engine` from `custom_providers/*.json` to decide).
+
+To give such a model a fixed effort, add a static `request_params` object to its entry in the custom provider file
+(`<profile>/config/custom_providers/<id>.json`; native: `%APPDATA%\Block\goose\config\custom_providers\`). Goose
+merges it into every request body for that model (Goose 1.50 and later; `messages`, `model`, `stream` and
+`stream_options` cannot be overridden). The picker does not change it. Field names and values are the model
+vendor's, not Goose's:
+
+```json
+{
+  "name": "custom_gateway",
+  "engine": "openai",
+  "base_url": "https://llm-gateway.example.com/v1",
+  "models": [
+    { "name": "deepseek-v4.1-flash", "context_limit": 1000000, "reasoning": true,
+      "request_params": { "thinking": { "type": "enabled" }, "reasoning_effort": "max" } },
+    { "name": "glm-5.3", "context_limit": 320000, "reasoning": true,
+      "request_params": { "reasoning_effort": "max" } }
+  ]
+}
+```
+
+- DeepSeek (OpenAI format): `thinking: {type: enabled|disabled}` and `reasoning_effort: low|high|max`. GLM-5.2 and
+  later: `reasoning_effort` (GLM-5.3: `low|high|max`, default `max`; thinking cannot be switched off). Never add
+  `thinking_effort`: Goose forwards unknown fields literally.
+- A LiteLLM-based gateway rejects or drops optional fields a route does not list in its `supported_openai_params`
+  (see the gateway's model list); send only the fields the route supports, and check one small request (HTTP 200,
+  and `usage.completion_tokens_details.reasoning_tokens` when the gateway reports it).
+- Goose 1.57's custom provider editor (Goose Web Settings > Models & Providers, ACP `providers/custom/update`) keeps an existing `request_params` when it saves the provider but cannot add or change
+  one. Edit the file while Goose is closed (Desktop, CLI and the Goose Web worker of that profile), keep a backup,
+  and restart the worker afterwards (Admin > Workers). For isolated profiles, a team provider (ADMINISTRATION 9) can
+  carry the same JSON.
+
 ## 3. Command line
 
 `python -m goose_web [--config FILE] <command>` (or the `goose-web` script). With no command it runs `serve`.

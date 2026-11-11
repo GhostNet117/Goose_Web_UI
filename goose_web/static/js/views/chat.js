@@ -10,7 +10,7 @@ import { getSession, removeSession, patchSession, sessionTitle, upsertSession, i
 import { store, bus, policy, allowedValue } from '../store.js';
 import { elsewhereFor, sourceLabel } from '../elsewhere.js';
 import { isPinned, togglePin } from '../prefs.js';
-import { pillSelect, rememberEffortOptions } from '../chatoptions.js';
+import { pillSelect, rememberEffortOptions, effortNote, optionById } from '../chatoptions.js';
 import { setBaseTitle, agentFor } from '../herd.js';
 import { mdElement } from '../markdown.js';
 
@@ -94,7 +94,9 @@ export function renderChat(ctx, sessionId) {
       const listKey = o.id === 'provider' ? 'allowed_providers' : o.id === 'model' ? 'allowed_models' : null;
       const opts = o.options.filter((x) => !listKey || allowedValue(listKey, x.value) || x.value === o.currentValue).map((x) => ({ value: x.value, label: x.name || x.value, title: x.description }));
       const ic = o.id === 'provider' ? 'cpu' : o.id === 'model' ? 'zap' : o.category === 'thought_level' ? 'brain' : 'sliders';
-      nodes.push(pillSelect(ic, o.name || o.id, opts, o.currentValue, async (v) => { try { await chat.setConfig(o.id, v); } catch (e) { toastError(e, o.name); renderSelects(); } }));
+      // spec 021: say so when Goose sends no effort for this provider+model (the pick would change nothing)
+      const note = o.category === 'thought_level' ? effortNote((optionById(chat.configOptions, 'provider') || {}).currentValue, (optionById(chat.configOptions, 'model') || {}).currentValue) : '';
+      nodes.push(pillSelect(ic, (o.name || o.id) + (note ? ' - ' + note : ''), opts, o.currentValue, async (v) => { try { await chat.setConfig(o.id, v); } catch (e) { toastError(e, o.name); renderSelects(); } }));
     }
     selects.replaceChildren(...nodes);
     rememberEffortOptions(chat.configOptions);   // the New chat screen offers the effort values seen here

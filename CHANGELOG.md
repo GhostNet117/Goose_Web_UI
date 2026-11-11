@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.16.1 - 2026-11-11
+
+**New chats use the highest thinking effort by default.** No database schema change.
+
+- **Max effort by default.** Without a pick on the New chat screen, a new chat gets the highest effort the chosen
+  provider and model offer: `max`, else the top of Goose's list (for example `high`). The picker says
+  **Default effort (max)** (or the real top level; "highest offered" until the model has been used once). A level the
+  user picks - remembered on the New chat screen, or set in the chat header - still wins.
+- **Isolated profiles** are provisioned with `GOOSE_THINKING_EFFORT: max` when they have no value; a member's saved
+  preference is kept.
+- **Honest picker for models Goose sends no effort to.** On the OpenAI engine Goose sends `reasoning_effort` only for
+  OpenAI reasoning models and xAI Grok, so GLM, DeepSeek and similar models behind an OpenAI-compatible gateway never
+  received the picker's value. The New chat picker now shows "Effort set by the provider configuration, not per chat"
+  for them (the chat header's effort picker says it in its tooltip). The gateway adds each custom provider's engine
+  (`gwEngine`) to `providers/list` replies for this. CONFIGURATION ("Thinking effort") shows how to give such a model
+  a fixed effort with per-model `request_params` in the custom provider file.
+- Docs: USER-GUIDE (New chat options), CONFIGURATION (Thinking effort), ADMINISTRATION 11.8.
+
 ## 1.16.0 - 2026-11-11
 
 **An upgrade no longer interrupts running chats, and administrators see what Goose Desktop, the CLI and scheduled

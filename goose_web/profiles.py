@@ -34,6 +34,7 @@ import yaml
 
 from .config import Settings, default_native_goose_root
 from .db import Database
+from .effort import DEFAULT_EFFORT
 from .policy import (ANY, GUARDED_EXTENSIONS, allows, effective_policy, ext_key, extension_needs, guard_on,
                      is_command_extension, missing)
 from .security import safe_name
@@ -575,6 +576,11 @@ class Profiles:
         if modes and not allows(pol, "allowed_modes", cfg.get("GOOSE_MODE")):
             cfg["GOOSE_MODE"] = "approve" if allows(pol, "allowed_modes", "approve") else modes[0]
             changes.append(f"mode {cfg['GOOSE_MODE']}")
+        # spec 021: the highest thinking effort by default (Goose clamps it per model: models without `max` get their
+        # top level). A value the member saved (Settings > Preferences) is kept. No team policy restricts effort.
+        if not str(cfg.get("GOOSE_THINKING_EFFORT") or "").strip():
+            cfg["GOOSE_THINKING_EFFORT"] = DEFAULT_EFFORT
+            changes.append(f"thinking effort {DEFAULT_EFFORT} (default)")
         if guard_on(pol) and strip_always_allow(cfg_dir / "permission.yaml"):
             changes.append("prompt guard: 'always allow' tool permissions removed")
 

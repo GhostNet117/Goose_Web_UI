@@ -903,6 +903,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .home-composer { display: flex; flex-direction: column; gap: 10px; }
 .home-chips { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .home-opts { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.home-opts-note { display: inline-flex; align-items: center; gap: 4px; cursor: help; }
 .exp-title { margin: 22px 0 4px; font-size: 15px; }
 .home-status { display: flex; align-items: center; gap: 8px; color: var(--fg-2); font-size: .9em; }
 .home-recent { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 18px; margin-top: 22px; }

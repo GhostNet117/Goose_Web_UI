@@ -1375,6 +1375,17 @@ the same for every version: point `goose.binary` (or `install.ps1 -GooseBinary`)
 After upgrading Goose, run `goose-web check`, open a chat and check that its extensions load. If an upgrade changes
 Goose's compaction or extension start-up behaviour, revisit the settings in 11.5.
 
+### 11.8 Thinking effort (since 1.16.1)
+
+New chats start at the highest thinking effort the chosen model offers (`max`, else the top of its list) unless the
+user picks a level. Isolated profiles are provisioned with `GOOSE_THINKING_EFFORT: max` when they have no value. For
+the native profile (shared with Goose Desktop and the CLI), set **Settings > Preferences > Default thinking effort**
+to `max` as an administrator; Goose clamps it per model, so it is safe for models without `max`.
+
+Goose sends no effort at all for non-OpenAI models on an OpenAI-compatible provider (for example GLM or DeepSeek behind
+a LiteLLM-based gateway); Goose Web says so in the New chat picker. Give those models a fixed effort with a per-model
+`request_params` entry in the custom provider file: [CONFIGURATION.md, "Thinking effort"](CONFIGURATION.md#thinking-effort-since-1161).
+
 ## 12. Workers
 
 Admin > System lists every worker with its state (`stopped`, `starting`, `ready`, `crashed`), PID and port, uptime,
