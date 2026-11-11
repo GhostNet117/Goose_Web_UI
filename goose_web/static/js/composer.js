@@ -81,14 +81,19 @@ export class Composer {
   setProgress(text) { this.progress.hidden = !text; this.progress.replaceChildren(text ? h('span', { class: 'spinner', style: { width: '11px', height: '11px' } }) : '', text ? h('span', null, text) : ''); }
   // queue: [{blocks, held?, steer?, note?}] (spec 019: kept by the gateway). A held item is a steer the agent never
   // read (the run ended first): it is not sent automatically; the user sends it, edits it or removes it.
-  setQueue(queue, { onRemove, onSteer, onSend, onEdit }) {
+  // The gateway sends rows (preview, size, author), not the messages (security review 2026-11-11, SC-2); a row
+  // someone else queued (an administrator in your chat, or yours seen by an administrator) is never sent by itself.
+  setQueue(queue, { onRemove, onSteer, onSend, onEdit, me = '', foreignOnly = false }) {
     this.queueRow.hidden = !queue.length;
     this.queueRow.replaceChildren(...queue.map((q, i) => {
-      const blocks = Array.isArray(q) ? q : (q.blocks || []);
-      const text = blocks.filter((b) => b.type === 'text').map((b) => b.text).join(' ') || '[attachment]';
-      const held = !!q.held;
-      return h('div', { class: ['queued', held ? 'held' : ''], title: held ? (q.note || '') : 'Sent when the current run finishes' },
-        icon(held ? 'alert' : 'queue', 13), held ? h('span', { class: 'queued-tag' }, q.steer ? 'Steer not delivered' : 'Not sent yet') : null,
+      const blocks = Array.isArray(q) ? q : (q.blocks || null);
+      const text = blocks ? (blocks.filter((b) => b.type === 'text').map((b) => b.text).join(' ') || '[attachment]')
+        : ((q.preview || '') + (q.attachments ? ' [+' + q.attachments + ' attachment' + (q.attachments > 1 ? 's' : '') + ']' : '') || '[attachment]');
+      const foreign = !q.local && (foreignOnly || (!!q.by && !!me && q.by.toLowerCase() !== me.toLowerCase()));
+      const held = !!q.held || foreign;
+      const tag = q.held ? (q.steer ? 'Steer not delivered' : 'Not sent yet') : foreign ? 'Queued by ' + (q.by || 'someone else') : null;
+      return h('div', { class: ['queued', held ? 'held' : ''], title: q.held ? (q.note || '') : foreign ? 'Not sent automatically: send it, edit it or remove it' : 'Sent when the current run finishes' },
+        icon(held ? 'alert' : 'queue', 13), tag ? h('span', { class: 'queued-tag' }, tag) : null,
         h('span', { class: 'queued-text' }, text),
         held && onSend ? btn(onSteer ? 'Steer now' : 'Send', () => onSend(i), { size: 'sm', variant: 'ghost', icon: onSteer ? 'steer' : 'send' }) : null,
         !held && onSteer ? btn('Send now', () => onSteer(i), { size: 'sm', variant: 'ghost', icon: 'steer' }) : null,

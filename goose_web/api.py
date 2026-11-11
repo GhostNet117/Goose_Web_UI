@@ -127,6 +127,8 @@ async def logout(request: Request):
         c.check_csrf(request, ident)   # a valid session is only ended by the page that holds it (A-14)
     if token:
         c.auth.logout(token)
+        if c.hub is not None:   # SC-3: sockets signed in with what was just revoked close now
+            c.hub.revalidate_clients()
     if ident:
         c.audit(request, "auth.logout", ident.user)
     resp = ok()
@@ -328,6 +330,8 @@ async def me_password(request: Request):
         raise _weak(problems)
     c.db.update_user(u["id"], password_hash=await asyncio.to_thread(security.hash_password, new), must_change_pw=0)
     c.auth.revoke_user_sessions(u["id"], keep_hash=ident.session["token_hash"] if ident.session else None)
+    if c.hub is not None:   # SC-3: sockets signed in with what was just revoked close now
+        c.hub.revalidate_clients()
     revoked = c.auth.revoke_user_tokens(u["id"])  # a password change also ends API-token access (GW-21)
     c.audit(request, "user.password", u, detail={"tokensRevoked": revoked})
     return ok()
@@ -424,6 +428,8 @@ async def me_token_delete(request: Request):
     c = ctx(request)
     u = c.require(request).user
     c.db.execute("DELETE FROM api_tokens WHERE id=? AND user_id=?", (int(request.path_params["tid"]), u["id"]))
+    if c.hub is not None:   # SC-3: sockets signed in with what was just revoked close now
+        c.hub.revalidate_clients()
     c.audit(request, "user.token.delete", u, target=request.path_params["tid"])
     return ok()
 
@@ -445,6 +451,8 @@ async def me_login_delete(request: Request):
     if not lid.isalnum() or len(lid) != 12:
         raise HTTPError(400, "bad_id")
     c.db.execute("DELETE FROM auth_sessions WHERE user_id=? AND substr(token_hash,1,12)=?", (ident.user["id"], lid))
+    if c.hub is not None:   # SC-3: sockets signed in with what was just revoked close now
+        c.hub.revalidate_clients()
     return ok()
 
 
@@ -588,6 +596,12 @@ async def fs_mkdir(request: Request):
     return ok({"path": str(p)})
 
 
+def _disconnect(c: Ctx, username: str, reason: str = "") -> None:
+    """SC-3: close the open sockets of a user whose sign-ins were just revoked."""
+    if c.hub is not None:
+        c.hub.disconnect_user(username, reason=reason)
+
+
 def _refuse_agents_dir(u: dict, path) -> None:
     """NEW-36: a non-admin may not create or write into a `.agents` folder (any component of the path, also as an
     8.3 short name or an NTFS stream name). Goose starts the MCP servers of every plugin in <cwd>/.agents/plugins
@@ -601,7 +615,8 @@ def _refuse_agents_dir(u: dict, path) -> None:
 def _refuse_hint_name(u: dict, name: str) -> None:
     """Spec 009: a non-admin may not place a Goose context file (AGENTS.md, .goosehints, .goose-web-hints.md) in
     any folder: it would sit beside the team hints that the administrator controls."""
-    if u["role"] != "admin" and str(name or "").strip().rstrip(". ").lower() in HINT_FILE_NAMES:
+    # SD-6: like is_agents_name - an NTFS stream suffix (AGENTS.md::$INDEX_ALLOCATION) names the same file/folder
+    if u["role"] != "admin" and str(name or "").split(":", 1)[0].strip().rstrip(". ").lower() in HINT_FILE_NAMES:
         raise HTTPError(403, "hint_file_refused",
                         f"'{name}' is a Goose hints file name. Your team's hints are managed by your administrator.")
 
@@ -1027,8 +1042,10 @@ async def admin_user(request: Request):
             raise HTTPError(400, "self", "You cannot delete your own account")
         if u["role"] == "admin" and _admin_count(c) <= 1:
             raise HTTPError(400, "last_admin", "Keep at least one administrator")
+        # SC-3: close the user's sockets (and sockets viewing the profile) first, so nothing writes after the delete
+        if c.hub is not None:
+            c.hub.drop_profile(u["username"])
         await c.workers.stop(u["username"].lower(), "(user deleted)")
-        c.hub.upstreams.pop(u["username"].lower(), None)
         c.db.delete_chat_state(u["username"].lower())   # spec 019: the user's queues and herd marks
         await _drop_sandbox(c, u)
         where = await asyncio.to_thread(c.profiles.archive_profile, u, request.query_params.get("purgeProfile") == "1")
@@ -1071,6 +1088,7 @@ async def admin_user(request: Request):
         # disabling or an admin password reset ends every session and API token of the user (GW-21)
         c.auth.revoke_user_sessions(u["id"])
         c.auth.revoke_user_tokens(u["id"])
+        _disconnect(c, u["username"], reason="disabled or password reset")   # SC-3: open sockets too
     u2 = c.db.user_by_id(u["id"])
     changes = await _reprovision(c, [u2]) if {"team", "teams", "hints", "policyOverrides"} & b.keys() else {}
     if "role" in b and c.workers.get(u2["username"].lower()) and not c.profiles.is_native(u2):
@@ -1091,6 +1109,7 @@ async def admin_user_reset(request: Request):
                      auth_source="local", failed_logins=0, locked_until=0)
     c.auth.revoke_user_sessions(u["id"])
     c.auth.revoke_user_tokens(u["id"])  # GW-21: a reset must also cut off API-token access
+    _disconnect(c, u["username"], reason="password reset")   # SC-3
     c.audit(request, "user.reset_password", admin, target=u["username"])
     return ok({"tempPassword": temp})
 
@@ -1143,6 +1162,7 @@ async def admin_user_reset_totp(request: Request):
                      locked_until=0)
     c.auth.revoke_user_sessions(u["id"])
     revoked = c.auth.revoke_user_tokens(u["id"])
+    _disconnect(c, u["username"], reason="two-factor reset")   # SC-3
     c.audit(request, "user.totp.reset", admin, target=u["username"], detail={"tokensRevoked": revoked})
     return ok({"user": _admin_user_view(c, c.db.user_by_id(u["id"])), "sessionsEnded": True,
                "tokensRevoked": revoked})
@@ -1476,6 +1496,8 @@ async def admin_guard_check(request: Request):
 async def admin_guard_test(request: Request):
     c = ctx(request)
     c.require(request, admin=True)
+    if c.guard is None:
+        raise HTTPError(503, "unavailable", "The prompt guard is not available")
     b = await body_json(request, 512 * 1024)
     ids = [int(x) for x in b.get("rulesets") or [] if str(x).lstrip("-").isdigit()]
     args = b.get("args")
@@ -1487,8 +1509,9 @@ async def admin_guard_test(request: Request):
             raise HTTPError(400, "bad_json", "Arguments must be JSON (an object)")
     if args is not None and not isinstance(args, (dict, str)):
         raise HTTPError(400, "bad_json", "Arguments must be a JSON object")
-    out = c.guard.dry_run(ids, text=str(b.get("text") or "")[:100_000], tool=str(b.get("tool") or "")[:200],
-                          ext=str(b.get("extension") or "")[:100], args=args if args not in ("", None) else None)
+    # SA-11: the same child processes and deadline as real checks (a catastrophic regex cannot freeze the gateway)
+    out = await c.guard.dry_run(ids, text=str(b.get("text") or "")[:100_000], tool=str(b.get("tool") or "")[:200],
+                                ext=str(b.get("extension") or "")[:100], args=args if args not in ("", None) else None)
     if b.get("classify") and b.get("text"):
         s, st = await c.guard.classify(str(b["text"])[:100_000], point="test")
         out["classifier"] = {"score": None if s is None else round(s, 4), "status": st,

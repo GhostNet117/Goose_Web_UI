@@ -858,10 +858,14 @@ WebSocket connection of the user.
 - **Goose plugins (since 1.13.1).** Goose loads every folder under `<chat folder>\.agents\plugins` as a plugin when
   a chat starts there and runs the plugin's MCP servers, which are commands; Goose has no setting to turn this off.
   So non-admins cannot create or upload into any folder named `.agents` through the file browser
-  (`403 agents_folder_refused`), and a member without `allow_shell` cannot start a chat in a folder whose
-  `.agents\plugins` holds a plugin folder. Members with `allow_shell` and administrators are not limited: an
-  administrator who starts a chat in a team folder runs, unsandboxed, any plugin a member with `allow_shell` has put
-  there. Check a team folder for `.agents\plugins` before you start a chat in it (SECURITY-ASSESSMENT 10).
+  (`403 agents_folder_refused`), and cannot save project skills or agents (`sources/create`, *project* scope) anywhere
+  but their own workspace (since 1.15.1). A plugin runs as the person who starts the chat, so since 1.15.1 no member
+  can start a chat in the **team folder or the team's extra folders** while their `.agents\plugins` holds a plugin,
+  with or without `allow_shell` ("this shared folder has Goose plugins"); in their own workspace a member needs
+  `allow_shell`. Members with `allow_shell` can still create `.agents` with their shell. An **administrator** who
+  starts a chat in a folder members can write (the profiles root, any team folder or extra folder) that holds plugins
+  sees the list and must confirm it ("Run the Goose plugins in this folder?", audited `chat.plugins_allowed`); a
+  confirmed chat runs them unsandboxed. Remove plugins you did not put there (SECURITY-ASSESSMENT 10 and 12).
 
 ### 9.8 Upgrading from 1.4: the policy migration
 
@@ -921,12 +925,26 @@ Two checks run, in this order:
    tools, shutdown/restart, registry, boot and shadow-copy deletion, force-push / git clean / hard reset). *Reset to
    default* restores one; *Restore defaults* re-creates a deleted one. The **Test** box shows what a rule set would
    do with a tool call or a message (dry run, nothing is audited).
+   The rule sets are **best-effort deny lists**: they stop the common forms and the evasions found in the 2026-11-11
+   review (flag order, quoting, PowerShell parameter prefixes, `rd /s`, .NET deletes, `+branch` / `:branch` pushes,
+   encoded PowerShell, `summaryindex`, `dump`, `dbxquery` writes, `fit ... into`, the Splunk REST API from a shell), not
+   every way a shell can express the same action; for a hard guarantee give the account (for example the Splunk
+   role) only the rights it needs. A rule's tool may list several globs separated by `|`. Since 1.15.1 rules run in
+   two small child processes with a deadline (`guard.rules_timeout_ms`, 1500): a check that takes longer is
+   **blocked** (`guard-timeout`), never allowed, and the gateway stays responsive. A regular expression with nested
+   unbounded repeats such as `(\w+\s?)*` is refused when you save it; use bounded repeats (`{0,300}`). Argument text
+   longer than 200,000 characters for a tool a rule applies to is blocked (`guard-too-long`). Unedited shipped sets
+   are upgraded automatically (audited `guard.ruleset.upgrade`); edited ones are left alone (*Reset to default*).
 2. **The classifier** - Meta's **Llama Prompt Guard 2 22M**, run locally on the gateway's CPU with ONNX Runtime (no
    GPU, no remote service, no network call at run time). It scores the user's text and the free-text arguments of
    guarded tool calls; at or above `guard.threshold` (0.5) the message or call is blocked. It is loaded on first use
    (or at start-up when a guard is on), text under `guard.min_chars` is not scored, scores are cached, and long text
-   is read in windows of `guard.window_tokens` (128) tokens, at most `guard.max_windows` (8) of them (the first ones
-   and the last one). The 22M model is mainly accurate for English; the 86M model is never used.
+   is read in windows of `guard.window_tokens` (128) tokens, **every** window (since 1.15.1; before, only the first
+   ones and the last one, so the middle of a long text was not inspected). Text longer than `guard.max_input_chars`
+   (16,000 characters) or needing more than `guard.max_windows` (48) windows is **not inspected**: a guarded message
+   is refused ("too long for the prompt guard to check", before any work is done), and a tool call is never approved
+   by Guarded auto - the user decides on the card (audited `guard.not_inspected`). `guard.timeout_ms` is 10,000 since
+   1.15.1. The 22M model is mainly accurate for English; the 86M model is never used.
 
 **Per team** (Admin > Teams & policy > *team* > Experience > **Prompt guard**): on/off; *Check what members type*;
 *Guarded auto*; the rule sets; *Trusted extensions* (one name per line: their calls skip the rules and the classifier;
@@ -942,12 +960,25 @@ the worker restarts), the permission card has no *Always allow* button, an *alwa
 *allow once*, and *Set tool permissions* cannot set *always allow*. **Guarded auto** keeps the flow smooth: Goose stays
 in Approve and the gateway itself answers *allow once* for every call that passes the guard, so members see no card.
 Checked on Goose 1.50.0 and 1.57.0 (same permission logic in both).
+Since 1.15.1 (security review 2026-11-11, SA-1) the agent cannot keep a tool out of the guard's sight: every worker
+start provisions the member's profile again (the `always allow` entries, extensions, provider, model and mode of the
+team policy are restored, whatever the agent wrote into its config files), tool arguments that name the profile's
+own config files (`permission.yaml`, `config.yaml`, `secrets.yaml`, the hints file, `custom_providers`) are refused by
+the built-in rule `guard-self-protect`, and a tool call that runs without a permission request (an *always allow*
+entry, a provider that runs tools itself) cancels the run: audited `guard.bypass`, a notice in the chat and to
+administrators, and an isolated member's worker restarts with clean settings. Members see a block's message but not
+the rule id; administrators see both. After 10 blocks within 10 minutes a user's guarded requests are refused for the
+rest of the window (`guard.burst`, administrators are told). A member cannot add an extension named like one of the
+team's *trusted extensions*, and a trusted extension is trusted only while the profile's entry is the one the team
+provides. A guarded user's system prompt, saved prompts, recipes, imported chats and MCP Apps tool calls are checked
+too.
 
 **Administrators** are not in a team: **Admin > Prompt guard > Administrators** turns a guard on for all of them (rule
 sets, message check, on block). An administrator chat in **Auto bypasses** the guard; in **Approve** it gets the same
 controls as a guarded team; a **Smart approve** chat is refused while the administrators' guard is on ("use Approve or
 Auto"). Tools an administrator set to *always allow* earlier (the native profile's `permission.yaml`, shared with Goose
-Desktop) are not changed by Goose Web, so the guard does not see calls to them.
+Desktop) are not changed by Goose Web; since 1.15.1 such a call in an Approve chat cancels the run (`guard.bypass`) -
+remove the *always allow* entry, or use Auto for that chat (unguarded).
 
 **Limits.** Scheduled runs have nobody to ask, so their tool calls are not guarded; sub-agents and recipe checks
 started through the shell extensions are not seen either (the team page warns about both). Tool results and internet
@@ -959,7 +990,8 @@ rules still apply, `guard.unavailable` is audited (on each change, then at most 
 see a banner on every page until it is healthy again (*Check now* on Admin > Prompt guard re-tests it).
 
 **Audit.** `guard.blocked` (user, team, profile, chat, point `prompt`/`tool`, extension and tool, rule set and rule or
-classifier score, mode) and `guard.unavailable` go to the audit log and `activity.jsonl` (section 18.1). The text of
+classifier score, mode; `guardedUser` when an administrator typed into a member's chat), `guard.bypass`,
+`guard.not_inspected`, `guard.burst` and `guard.unavailable` (with the user and chat since 1.15.1) go to the audit log and `activity.jsonl` (section 18.1). The text of
 the message or the arguments is never recorded.
 
 **The model.** `goose-web guard status` shows the runtime, the model, the package source and a self-test;
@@ -984,8 +1016,8 @@ a dedicated GitHub release, separate from the app versions so that its address n
 
 Every source file was checked against the SHA-256 of Meta's release before the conversion
 (`scripts/export-prompt-guard.py`, `OFFICIAL_FILES`). The pin (URL, SHA-256, size, revision) is `MODEL_PIN` in
-`goose_web/guardmodel.py`. The download uses HTTPS only (github.com redirects to its file host
-`release-assets.githubusercontent.com`), honours the standard proxy variables (`HTTPS_PROXY`, `NO_PROXY`), gives up on a
+`goose_web/guardmodel.py`. The download uses HTTPS only, on every redirect (at most 5; for the pinned package only
+`github.com`, `objects.githubusercontent.com` and `release-assets.githubusercontent.com`), honours the standard proxy variables (`HTTPS_PROXY`, `NO_PROXY`), gives up on a
 connection that sends no data for 60 seconds, tries three times (waiting 5 and 15 seconds) on network errors and
 server errors, prints its progress, and stops if the file is larger than the pinned size.
 
@@ -1622,7 +1654,10 @@ JSON, and the gateway log is one line per event plus traceback continuation line
 | Archived profiles | `<profiles_root>/_deleted/` | profiles of deleted users |
 | Native profile | `%APPDATA%\Block\goose` when bound to the existing profile (outside the profiles root); `<profiles_root>/appdata` on fresh installs | the admin's Goose profile |
 
-The database and the profiles contain credentials. Encrypt and restrict backups like the originals.
+The database and the profiles contain credentials. Encrypt and restrict backups like the originals. Since 1.15 the
+database also holds messages users queued for a running chat (`chat_state`, plaintext, deleted when sent, removed
+or older than 7 days; `secure_delete` is on since 1.15.1), so a database backup can contain prompt text: keep the
+same retention for it.
 
 ### 19.2 Online backup of the database
 

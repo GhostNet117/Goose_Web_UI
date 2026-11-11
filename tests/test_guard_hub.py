@@ -166,7 +166,8 @@ async def test_rule_blocks_tool_call_and_notifies(genv):
     await s.wait_for(lambda m: m.get("id") == 2)
     assert agent.answers == ["reject_once"]                        # the gateway answered for the user
     note = await s.wait_for(lambda m: m.get("method") == "_gw/notice")
-    assert "spl-write-send-delete" in note["params"]["message"]
+    # SA-9: a member sees the rule's message, not its id (the audit keeps it)
+    assert "spl-write-send-delete" not in note["params"]["message"] and "read-only" in note["params"]["message"]
     assert not any(m.get("method") == "session/request_permission" for m in s.msgs)   # no card shown
     ev = [a for a in audits if a[1] == "guard.blocked"][0]
     assert ev[0] == "alice" and ev[2]["tool"] == "splunk_mcp__run_query" and ev[2]["rule"] == "spl-write-send-delete"

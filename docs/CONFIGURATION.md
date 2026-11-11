@@ -144,8 +144,10 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 | `guard.min_chars` | `16` | Shorter text is not classified (rules still apply). |
 | `guard.window_tokens` | `128` | Tokens per classifier window (the model reads at most 512; shorter windows are much cheaper on a CPU). |
 | `guard.window_overlap` | `16` | Tokens shared by consecutive windows. |
-| `guard.max_windows` | `8` | Windows per text (the first ones and the last one). |
-| `guard.timeout_ms` | `3000` | Slower = unavailable: allowed (fail open) and audited. |
+| `guard.max_windows` | `48` | Windows scored per text (every window since 1.15.1); a text needing more is not inspected (guarded messages refused, tool calls asked). |
+| `guard.max_input_chars` | `16000` | Longer text is not classified: a guarded message is refused before any work, a tool call is never auto-approved (1.15.1). |
+| `guard.timeout_ms` | `10000` | Slower = unavailable: allowed (fail open) and audited (was 3000 before 1.15.1). |
+| `guard.rules_timeout_ms` | `1500` | Deadline for the rule sets (run in child processes since 1.15.1); slower = blocked (fail closed). |
 | `guard.load_timeout_s` | `60` | Longest wait for the model to load on first use. |
 | `guard.threads` | `4` | ONNX Runtime threads per inference (capped at the CPU count). |
 | `guard.cache_size` | `2048` | Scores remembered by content hash. |

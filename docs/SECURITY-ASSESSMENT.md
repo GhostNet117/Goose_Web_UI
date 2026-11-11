@@ -521,12 +521,14 @@ read-only extensions (`analyze`, `summarize`, `chatrecall`) can read what the wo
 
 | ID | Finding | Severity | Status | Where | Notes |
 |---|---|---|---|---|---|
-| NEW-36 | Goose auto-loads plugins from `<cwd>/.agents/plugins`: a member without `allow_shell` ran commands | High | **Fixed in 1.13.1** | `policy.py: check`, `project_plugins`, `has_agents_component`; `api.py: _refuse_agents_dir` (`fs_mkdir`, `fs_upload`) | Goose 1.50-1.57 treats every folder under `<cwd>/.agents/plugins` of a new chat as an enabled plugin (`plugins/discovery.rs`; unknown plugins are added to config as enabled) and starts its MCP servers (`.mcp.json` or the plugin manifest: any command line) during `session/new` (`acp/server.rs: initial_session_extensions`). No Goose setting or environment variable turns discovery off. A member with every permission off created `.agents/plugins/x/.mcp.json` with the file browser in their workspace or the team folder, started a chat there, and the command ran in their sandbox (measured on Goose 1.50.0 and 1.57.0, sandbox on). In the team folder it would run in every member's worker that opens a chat there, and unsandboxed in an administrator's native worker. Now: non-admins cannot create or upload into any `.agents` folder (any case, trailing dots/spaces, NTFS stream names, 8.3 short names via the resolved path; `403 agents_folder_refused`), and a member without `allow_shell` cannot start a chat in a folder whose `.agents/plugins` has a plugin folder (an unreadable one counts). Goose rediscovers plugins only on `session/new`; `session/load`, `fork`, `resume` and working-folder changes do not, and recipe chats skip plugins. Plugin hooks and scheduled jobs use the worker's own folder (the profile root), which members cannot reach through the file API. Tests: `tests/test_agents_plugins.py`. **Upgrade if you have non-admin users.** |
+| NEW-36 | Goose auto-loads plugins from `<cwd>/.agents/plugins`: a member without `allow_shell` ran commands | High | **Fixed in 1.13.1** | `policy.py: check`, `project_plugins`, `has_agents_component`; `api.py: _refuse_agents_dir` (`fs_mkdir`, `fs_upload`) | Goose 1.50-1.57 treats every folder under `<cwd>/.agents/plugins` of a new chat as an enabled plugin (`plugins/discovery.rs`; unknown plugins are added to config as enabled) and starts its MCP servers (`.mcp.json` or the plugin manifest: any command line) during `session/new` (`acp/server.rs: initial_session_extensions`). No Goose setting or environment variable turns discovery off. A member with every permission off created `.agents/plugins/x/.mcp.json` with the file browser in their workspace or the team folder, started a chat there, and the command ran in their sandbox (measured on Goose 1.50.0 and 1.57.0, sandbox on). In the team folder it would run in every member's worker that opens a chat there, and unsandboxed in an administrator's native worker. Now: non-admins cannot create or upload into any `.agents` folder through the file browser (any case, trailing dots/spaces, NTFS stream names, 8.3 short names via the resolved path; `403 agents_folder_refused`), and a member without `allow_shell` cannot start a chat in a folder whose `.agents/plugins` has a plugin folder (an unreadable one counts). Correction (security review 2026-11-11, section 12): until 1.15.1 Goose's own `sources/create` (skills_edit) could still write `.agents/skills` and `.agents/agents` into the team folder (SD-3), and a plugin in a team folder ran in the chats of members WITH `allow_shell` and of administrators (SD-2); both are closed in 1.15.1. Goose rediscovers plugins only on `session/new`; `session/load`, `fork`, `resume` and working-folder changes do not, and recipe chats skip plugins. Plugin hooks and scheduled jobs use the worker's own folder (the profile root), which members cannot reach through the file API. Tests: `tests/test_agents_plugins.py`. **Upgrade if you have non-admin users.** |
 
-Still accepted: administrators are trusted; Goose loads plugins for them like Goose Desktop does, so an admin chat in
-a folder that a member with `allow_shell` can write (a team folder) runs that member's plugins unsandboxed. Members
-with `allow_shell` can create `.agents` folders with their shell (they can run commands anyway). Plugin `skills`
-folders are still read as instructions where the folder already exists.
+Still accepted: members with `allow_shell` can create `.agents` folders with their shell (they can run commands
+anyway). Plugin `skills` folders are still read as instructions where the folder already exists. Since 1.15.1 (SD-2)
+a member cannot start a chat in a shared folder (team folder, team extra folders) that holds plugins, whatever
+their permissions - plugins run only in the member's own workspace and only with `allow_shell` - and an
+administrator starting a chat in a member-writable folder with plugins must confirm the exact plugin list first
+(audited `chat.plugins_allowed`); a confirmed admin chat runs them unsandboxed, as Goose Desktop would.
 
 ## 11. Addendum: prompt guard (2026-11-10), 1.14.0
 
@@ -538,8 +540,11 @@ Spec 018 adds an optional, per-team **prompt guard** (ADMINISTRATION 9.8, ARCHIT
   user, the model or injected content asked for. **Classifier** (Llama Prompt Guard 2 22M, local CPU) on what guarded
   users type and on free-text tool arguments.
 - **Closing the gaps the guard depends on:** for guarded teams Auto and Smart approve are not allowed, stored *always
-  allow* tool permissions are removed and cannot be set again, and *always allow* answers are downgraded - so Goose
-  asks before every tool call (Goose 1.50 and 1.57: `permission_inspector.rs`, Approve asks unless the tool has a user
+  allow* tool permissions are removed and cannot be set again through Goose Web, and *always allow* answers are
+  downgraded - so Goose asks before every tool call. Correction (section 12, SA-1): before 1.15.1 the removal ran only
+  at re-provisioning and the agent could write the entry into its own `permission.yaml`; since 1.15.1 every worker
+  start re-provisions the profile, tool arguments naming the profile's config files are refused, and a tool call
+  that runs without a permission request cancels the run (`guard.bypass`) (Goose 1.50 and 1.57: `permission_inspector.rs`, Approve asks unless the tool has a user
   `always_allow`). Guarded auto approves passing calls in the gateway instead.
 - **Fail open by design** for the classifier (rules still apply); `guard.unavailable` is audited and admins see a
   banner. `guard.blocked` never records content.
@@ -550,4 +555,45 @@ Spec 018 adds an optional, per-team **prompt guard** (ADMINISTRATION 9.8, ARCHIT
   dependencies, numpy < 2.5) are hash-locked; the model package is installed only with a verified SHA-256 and its
   zip is extracted with a fixed file list (no paths). Since 1.14.2 the package is downloaded from this project's
   GitHub release `prompt-guard-2-22m-onnx-1` (https only, size-capped, SHA-256 pinned in the code): a changed or
-  replaced asset is refused, so trust rests on the pinned hash, not on the release page.
+  replaced asset is refused, so trust rests on the pinned hash, not on the release page. Correction (section 12,
+  SB-3): before 1.15.1 only the final address had to be https; since 1.15.1 every redirect is checked (https, at
+  most 5, GitHub download hosts only for the pinned source).
+- **Not covered in 1.14.0 (section 12):** rule matching ran on the gateway's event loop without a time limit, and the
+  shipped patterns backtracked quadratically, so one long tool argument or prompt (from a member or from injected
+  content) could stall every user (SA-2); admin regexes were only compiled. The shipped rule sets are best-effort
+  deny lists: they stop common forms, not every way a shell can say the same thing (SA-5).
+
+## 12. Addendum: security review of 1.12.0 - 1.15.0 (2026-11-11), fixed in 1.15.1
+
+Four adversarial reviews (prompt guard; supply chain and model install; live state and queue; files, plugins and
+admin) of every change since section 9, each finding proven with a PoC on a throwaway gateway. 33 findings after
+de-duplication. Every fix was re-attacked on a throwaway gateway with Goose 1.57.0 and the real Prompt Guard 2 22M.
+
+| ID | Finding | Severity | Status |
+|---|---|---|---|
+| SA-1 | The agent writes `always_allow` into its own `permission.yaml` (or rewrites `config.yaml`); after the next worker start Goose stops asking, so the guard never sees the tool | High | **Fixed**: every worker start re-provisions an isolated profile (policy, extensions, mode, `always_allow`); built-in rule `guard-self-protect` refuses tool arguments naming the profile's config files; a guarded tool call that runs without a permission request cancels the run, is audited `guard.bypass`, and restarts an isolated worker. Re-test: write refused; tampered file reset at restart; live bypass on Goose 1.57 cancelled. |
+| SA-2, SD-1, SA-11 | Rule-engine ReDoS on the event loop (one 60 KB argument froze the gateway 6.3 s; 200 KB: 43-307 s per shipped regex); admin regexes unchecked; Test box on the loop | High | **Fixed**: rules run in child processes (`rulematch.py`) with a deadline (`guard.rules_timeout_ms`, 1500); timeout = blocked; shipped gaps bounded (whole default set < 1.1 s on 200 KB adversarial text); nested quantifiers refused at save; Test box uses the same path, 503 without a guard. Re-test: /healthz max 0.06 s (was 6.3 s). |
+| SA-3 | A guarded 16 MB prompt was tokenised whole (gateway frozen 18 s) and never classified | Medium | **Fixed**: refused before any tokenising above `guard.max_input_chars` (16,000); `guard.unavailable` names user and chat. Re-test: refused in 0.4 s, /healthz 0.008 s. |
+| SA-4 | The classifier skipped the middle of long texts | Medium | **Fixed**: every window scored (`max_windows` 48); longer = not inspected: prompts refused, tool calls never auto-allowed (`guard.not_inspected`). Re-test: mid-text injection blocked (was 0.0014). |
+| SA-5 | 17 evasions of the shipped rules | Medium | **Fixed for the listed evasions** (flag order, quoting, PowerShell prefixes, `rd/del /s`, .NET deletes, `+ref`/`:ref` pushes, `-enc`, `summaryindex`, `dump`, `dbxquery` writes, `fit into`, Splunk REST from a shell, more tool-name globs); unmodified built-ins upgrade automatically. Rules remain best-effort deny lists. |
+| SA-6 | System prompt, saved prompts, recipes, imported chats not checked | Low | **Fixed** for guarded users (checked like a prompt); attachments other than text are not classified. |
+| SA-7 | MCP Apps `tools/call` not guarded by the gateway | Low | **Fixed** (tool check of caller and owner). |
+| SA-8 | Trusted extension by name only; guard context failed open on errors | Low | **Fixed** (config-entry fingerprint, colliding names refused, last good context or fail closed). |
+| SA-9, SA-10 | Rule ids shown to members; audit gaps | Info | **Fixed** (members see the rule's message only; 10 blocks in 10 min = refused for the window, `guard.burst`; `chat.prompt` after the guard). |
+| SB-1 | Model folder installed with an owner-only DACL (Python >= 3.12.4): a `-RunAs` service account cannot read it | Medium | **Fixed** (permissions reset to inherit; `--if-missing` repairs; `check`/`guard status` report it). |
+| SB-2, SB-3, SB-4, SB-5, SB-9 | `model_dir` unchecked; redirect hops; size-only integrity; ONNX telemetry; no rollback | Low/Info | **Fixed**. |
+| SB-6, SB-7 | Export toolchain unpinned; very fresh / unused transitive dependencies | Info | **Accepted / documented**: the published package is SHA-pinned; next lock refresh with a 7-day `--exclude-newer` cool-down. |
+| SB-8 (C-4) | Install and repo folders Modify for Authenticated Users on the maintainer's host | High | **Accepted by the operator** (operational, not code); `goose-web check` reports it. |
+| SC-1, SC-6, SC-8 | An administrator viewing a member's chat auto-sent the member's queued text as the administrator (member's guard bypassed) | Medium | **Fixed**: only the owner's tab sends its own items automatically (server-enforced); text into a profile always passes the owner's guard; non-owner take/remove audited; rows show who queued them. Re-test: automatic take refused; manual send blocked by the member's guard. |
+| SC-2, SC-4, SC-9 | Queue DoS (whole queue re-serialised and written on the loop per change, 36 GB per profile, full queues in every hello) | Medium | **Fixed**: 32 MB per profile, 20 chats, 10 pending steers; writes in a background thread; tabs get rows, not content. Re-test: other member's round trip 0.35 s (was 8.85 s), hello 4 KB. |
+| SC-3 | An open socket survived user deletion and re-created the user's state for a new same-name account | Medium | **Fixed**: delete/disable/reset/token revoke close the user's sockets at once, others re-validate every 30 s; a deleted user's state never writes again; a new account starts clean. |
+| SC-5, SC-7 | Drafts keyed by chat id only; queued text kept in plaintext and forever | Low | **Fixed** (drafts per user and profile, 7 days, cleared on expiry; `secure_delete`, 7-day queue expiry, rows of chats deleted elsewhere pruned). DB backups made by deploy scripts contain queued messages: keep them as private as the database. |
+| SD-2 | A plugin in a team folder ran in another member's chat (allow_shell) and unsandboxed for admins | Medium | **Fixed** (see section 10). Re-test: member refused (also with trailing spaces / `\.`); admin needs the confirmed list. |
+| SD-3, SD-5, SD-6 | `sources/create` into the team folder; raw cwd; hint name with `:stream` | Low/Info | **Fixed**. |
+| SD-4 | Inaccurate statements in sections 10 and 11 | Info | **Fixed** (corrections above). |
+
+Residual risks: rules and classifier remain best effort (a shell can express a command in ways no deny list
+covers); the bypass detector notices a tool that ran without asking after it started; the native administrator
+profile is never rewritten (its chats are cancelled instead while the admin guard is on); a guarded member who
+keeps both rule matchers busy can make other guarded users' checks time out (blocked, never allowed) until the
+burst limit stops them; queued messages are still plaintext in the database.

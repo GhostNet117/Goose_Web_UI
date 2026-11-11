@@ -191,6 +191,8 @@ class Database:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA busy_timeout=5000")
+            # SC-7: deleted rows (queued prompts, sessions, audit) are overwritten, not left in free pages
+            self._conn.execute("PRAGMA secure_delete=ON")
             self._conn.executescript(SCHEMA)
             self._conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
             self._migrate()
@@ -276,10 +278,26 @@ class Database:
 
     def _seed_guard(self) -> None:
         """Spec 018: insert the shipped prompt-guard rule sets once (an admin may delete or edit them later; Admin >
-        Prompt guard can restore them). Teams are not touched: their guard stays off until an admin turns it on."""
+        Prompt guard can restore them). Teams are not touched: their guard stays off until an admin turns it on.
+        Security review 2026-11-11 (SA-5): a built-in set whose rules are still exactly an earlier shipped version
+        (never edited) is upgraded to the current one on every start."""
+        from .guard import DEFAULT_RULESETS, PREVIOUS_DEFAULT_RULES, rules_hash
+        for rid, key, raw in self._conn.execute("SELECT id, builtin, rules FROM guard_rulesets WHERE builtin<>''"
+                                                ).fetchall():
+            rs = DEFAULT_RULESETS.get(key)
+            try:
+                h = rules_hash(json.loads(raw or "[]"))
+            except ValueError:
+                continue
+            if rs and h in PREVIOUS_DEFAULT_RULES.get(key, set()) and h != rules_hash(rs["rules"]):
+                self._conn.execute("UPDATE guard_rulesets SET description=?, rules=?, updated_at=? WHERE id=?",
+                                   (rs["description"], json.dumps(rs["rules"]), time.time(), rid))
+                self._conn.execute(
+                    "INSERT INTO audit(ts, user_id, username, ip, action, target, detail, ok) VALUES(?,?,?,?,?,?,?,1)",
+                    (time.time(), None, "", "", "guard.ruleset.upgrade", key,
+                     json.dumps({"reason": "shipped default updated (security review 2026-11-11)"})))
         if self._conn.execute("SELECT 1 FROM meta WHERE key='guard_seeded'").fetchone():
             return
-        from .guard import DEFAULT_RULESETS
         now = time.time()
         for key, rs in DEFAULT_RULESETS.items():
             self._conn.execute("INSERT OR IGNORE INTO guard_rulesets(name, description, rules, builtin, updated_at) "
@@ -368,6 +386,8 @@ class Database:
         self._check_user_columns(fields)
         cols = ", ".join(fields)
         marks = ", ".join("?" for _ in fields)
+        # SC-3: a new account never inherits live state left under its name (a deleted user with the same name)
+        self.execute("DELETE FROM chat_state WHERE profile=?", (str(fields.get("username") or "").lower(),))
         # Column names are checked against the users table's real columns (_check_user_columns);
         # all values are bound parameters.
         return self.execute(f"INSERT INTO users({cols}) VALUES({marks})", list(fields.values()))  # nosec B608
@@ -439,6 +459,19 @@ class Database:
             self.execute("DELETE FROM chat_state WHERE profile=?", (profile,))
         else:
             self.execute("DELETE FROM chat_state WHERE profile=? AND session_id=?", (profile, session_id))
+
+    def sweep_chat_state(self, *, queue_age: float, mark_age: float, now: float | None = None) -> int:
+        """SC-7: queued messages older than queue_age and herd marks older than mark_age seconds are deleted
+        (maintenance loop; before 1.15.1 rows lived until the profile's next restore)."""
+        now = time.time() if now is None else now
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM chat_state WHERE (kind='queue' AND updated_at<?) OR "
+                                     "(kind='mark' AND updated_at<?)", (now - queue_age, now - mark_age))
+            return cur.rowcount or 0
+
+    def chat_state_sessions(self, profile: str) -> set[str]:
+        return {r["session_id"] for r in self.query("SELECT DISTINCT session_id FROM chat_state WHERE profile=?",
+                                                     (profile,))}
 
     def audit(self, action: str, *, user: dict | None = None, ip: str = "", target: str = "",
               detail: dict | None = None, ok: bool = True) -> None:

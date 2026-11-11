@@ -143,7 +143,7 @@ The main ideas:
 |---|---|
 | `index.html` | Shell page: theme stylesheets, `modulepreload` of `js/app.js`, boot spinner. |
 | `manifest.webmanifest` | PWA manifest. |
-| `sw.js` | Service worker (`gw-shell-v21`): offline shell, network-first for app code, cache-first for vendor files. |
+| `sw.js` | Service worker (`gw-shell-v22`): offline shell, network-first for app code, cache-first for vendor files. |
 | `css/app.css` | All styles and themes. |
 | `icons/` | `goose.svg`, `goose-maskable.svg`. |
 | `vendor/` | Vendored libraries (marked, DOMPurify, highlight.js, qrcode-generator) with `README.md` and `SHA256SUMS`. |
@@ -1090,7 +1090,7 @@ data:
 - **Install** pre-caches the shell list on a best-effort basis and calls
   `skipWaiting()`.
 - **Activate** deletes every cache whose name is not the current `VERSION`
-  (`gw-shell-v21`) and claims open clients.
+  (`gw-shell-v22`) and claims open clients.
 - **notificationclick** focuses an open window, or opens one, at
   `/#/chat/<sessionId>` or `/#/herd`.
 

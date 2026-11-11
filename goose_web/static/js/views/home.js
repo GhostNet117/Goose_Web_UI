@@ -1,5 +1,5 @@
 // New chat / home view: hero composer with folder chip + optional recipe; creates session/new then sends.
-import { h, btn, iconBtn, toast, toastError, shortPath, baseName, menu, relTime, spinner, banner } from '../ui.js';
+import { h, btn, iconBtn, toast, toastError, shortPath, baseName, menu, relTime, spinner, banner, confirmDialog } from '../ui.js';
 import { icon, logo } from '../icons.js';
 import { rpc, G } from '../rpc.js';
 import { router } from '../router.js';
@@ -19,7 +19,24 @@ export async function createSession({ cwd, recipeId = null, recipeDeeplink = nul
   if (recipeDeeplink) _meta.recipeDeeplink = recipeDeeplink;
   let res;
   try {
-    res = await rpc.call('session/new', { cwd, mcpServers: [], _meta });
+    try {
+      res = await rpc.call('session/new', { cwd, mcpServers: [], _meta });
+    } catch (e) {
+      // SD-2 (security review 2026-11-11): an administrator starting a chat in a folder members can write is shown the
+      // Goose plugins there (they would run as the administrator, unsandboxed) and must accept exactly that list.
+      const d = e && e.data;
+      if (!(d && d.confirm && Array.isArray(d.plugins))) throw e;
+      const list = h('ul', null, ...d.plugins.map((n) => h('li', { class: 'mono' }, String(n))));
+      const ok = await confirmDialog({
+        title: 'Run the Goose plugins in this folder?', danger: true, confirmText: 'Run them and start the chat',
+        message: h('div', null,
+          h('p', null, 'Members can write to this folder, and it holds Goose plugins (.agents/plugins). Goose starts their programs on this computer as you, without a sandbox, when the chat starts:'),
+          list,
+          h('p', { class: 'muted small' }, 'Only continue if you know who put them there and what they run.')),
+      });
+      if (!ok) { const err = new Error('Chat not started: the plugins in this folder were not accepted.'); err.code = 'cancelled'; throw err; }
+      res = await rpc.call('session/new', { cwd, mcpServers: [], _meta: { ..._meta, [d.confirm]: d.plugins } });
+    }
   } catch (e) {
     // Fresh profiles have no provider yet: point the user at the place to fix it.
     if (/GOOSE_PROVIDER/.test(String((e && (e.data || e.message)) || ''))) {

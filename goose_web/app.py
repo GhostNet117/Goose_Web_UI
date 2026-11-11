@@ -10,6 +10,7 @@ import re
 import socket
 import time
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
@@ -24,7 +25,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import __version__, activity, api, logjanitor, tls
+from . import __version__, activity, api, logjanitor, security, tls
 from .auth import AuthService
 from .config import Settings
 from .context import DEFAULT_BODY_LIMIT, BodyTooLarge, Ctx, HTTPError, _ip_in
@@ -304,6 +305,12 @@ async def _maintenance_loop(c: Ctx) -> None:
             pruned = await asyncio.to_thread(logjanitor.prune_audit, c.settings, c.db)
             if pruned:
                 log.info("audit: pruned %d old row(s)", pruned)
+            # SC-7: queued messages and herd marks do not live forever (a restart no longer is the only cleanup)
+            from .hub import MARK_MAX_AGE, QUEUE_MAX_AGE
+            swept = await asyncio.to_thread(c.db.sweep_chat_state, queue_age=QUEUE_MAX_AGE, mark_age=MARK_MAX_AGE)
+            if swept:
+                log.info("chat state: removed %d expired queue/mark row(s)", swept)
+            c.hub.expire_queues(QUEUE_MAX_AGE)
             if tls.is_active() and tls.ACTIVE.get("mode") == "self-signed":
                 st = await asyncio.to_thread(tls.ensure, c.settings)
                 if st.get("renewed"):
@@ -326,6 +333,13 @@ async def ca_cert(request: Request):
                     headers={"Content-Disposition": 'attachment; filename="goose-web-ca.crt"', "Cache-Control": "no-cache"})
 
 
+async def _close_ws(websocket: WebSocket) -> None:
+    try:
+        await websocket.close(code=4401)
+    except Exception:
+        pass
+
+
 async def ws_endpoint(websocket: WebSocket):
     c: Ctx = websocket.app.state.ctx
     origin = websocket.headers.get("origin")
@@ -334,9 +348,11 @@ async def ws_endpoint(websocket: WebSocket):
     # access and proxy logs would record them). Browsers cannot set that header, and a token socket must not
     # carry an Origin; browser sockets authenticate with the session cookie from an allowed Origin.
     authz = websocket.headers.get("authorization") or ""
+    token_hash = ""
     if authz:
         if not origin and authz[:7].lower() == "bearer ":
             ident = c.auth.resolve_token(authz[7:].strip())
+            token_hash = security.token_hash(authz[7:].strip())
     elif origin and origin in c.allowed_origins(websocket):
         ident = c.identity(websocket)
     if ident is None or c.must_enrol_or_change(ident.user):   # password change / two-factor enrolment first (A-8)
@@ -363,6 +379,25 @@ async def ws_endpoint(websocket: WebSocket):
     roots = c.roots_for(target, policy)
     up = c.upstream_for(target)
     client = Client(websocket.send_text, user, policy, roots, ip)
+    # SC-3: the hub can end this socket (user deleted / disabled / signed out) and re-checks its sign-in
+    session_hash = (ident.session or {}).get("token_hash") if ident.session else None
+
+    def kick() -> None:
+        asyncio.get_running_loop().create_task(_close_ws(websocket))
+
+    def still_valid() -> bool:
+        now = time.time()
+        if session_hash:
+            row = c.db.one("SELECT expires_at FROM auth_sessions WHERE token_hash=?", (session_hash,))
+        elif token_hash:
+            row = c.db.one("SELECT expires_at FROM api_tokens WHERE token_hash=?", (token_hash,))
+            if row is not None and not row["expires_at"]:
+                row = {"expires_at": now + 1}
+        else:
+            return True
+        u = c.db.user_by_id(user["id"])
+        return bool(row and row["expires_at"] > now and u and not u["disabled"])
+    client.kick, client.still_valid = kick, still_valid
     client.start()
     c.hub.attach(up, client)
     opened = time.time()
@@ -514,6 +549,104 @@ def make_event_handler(c: Ctx):
     return handler
 
 
+def _ext_fingerprint(e: Any) -> tuple:
+    e = e if isinstance(e, dict) else {}
+    return tuple(str(e.get(k) or "") for k in ("type", "cmd", "uri", "url", "name")) + \
+        (json.dumps(e.get("args") or [], sort_keys=True),)
+
+
+def wire_security_hooks(c: Ctx) -> None:
+    """Security review 2026-11-11 hooks between the hub, the workers, the guard and the profiles."""
+    from . import guard as guardmod
+    from . import policy as pol
+    from .profiles import _read_yaml, strip_always_allow
+
+    def pre_start(w) -> None:
+        """SA-1: before EVERY worker start an isolated profile is provisioned again, so whatever the agent wrote
+        into its own config files (permission.yaml 'always allow', config.yaml extensions / mode / provider) is
+        reset to the team policy before Goose reads them. The native profile is never rewritten (shared with
+        Goose Desktop); the bypass detector covers it."""
+        u = c.db.user_by_name(w.username)
+        if not u or c.profiles.is_native(u):
+            return
+        changes = c.profiles.provision(u)
+        if u.get("role") == "admin" and c.guard is not None and c.guard.admin_config()["enabled"]:
+            if strip_always_allow(c.profiles.config_dir(u) / "permission.yaml"):
+                changes.append("prompt guard: 'always allow' tool permissions removed")
+        if changes:
+            log.info("worker %s: provisioned before start (%s)", w.key, "; ".join(changes)[:500])
+    c.workers.pre_start = pre_start
+
+    def profile_paths(username: str) -> list[str]:
+        u = c.db.user_by_name(username)
+        return [str(c.profiles.config_dir(u))] if u else []
+    c.guard.profile_paths = profile_paths
+
+    def ext_identity(username: str, ext: str) -> bool:
+        """SA-8: a trusted extension is the team's only while the profile's config entry for it is the entry the
+        team provides (or a bundled platform/builtin one) - not a member's own extension with that name."""
+        u = c.db.user_by_name(username)
+        if not u:
+            return False
+        want = guardmod.ext_key(ext)
+        team = {}
+        for it in c.profiles.team_items(u):
+            if it["kind"] == "extension":
+                p = it.get("payload") or {}
+                for n in (p.get("key"), it["name"], pol._ext_name(p.get("entry"))):
+                    if n and guardmod.ext_key(n) == want and isinstance(p.get("entry"), dict):
+                        team = p["entry"]
+        exts = (_read_yaml(c.profiles.config_dir(u) / "config.yaml").get("extensions") or {})
+        mine = [e for k, e in exts.items() if isinstance(e, dict) and want in (guardmod.ext_key(k),
+                                                                              guardmod.ext_key(e.get("name")))]
+        if not mine:
+            return False
+        if team:
+            return all(_ext_fingerprint(e) == _ext_fingerprint(team) for e in mine)
+        return all(str(e.get("type") or "").lower() in ("platform", "builtin") and e.get("bundled") is not False
+                   for e in mine)
+    c.guard.ext_identity = ext_identity
+
+    def on_burst(username: str) -> None:
+        c.db.audit("guard.burst", user=c.db.user_by_name(username), target=username,
+                   detail={"limit": guardmod.BURST_LIMIT, "windowSeconds": guardmod.BURST_WINDOW}, ok=False)
+        c.hub.broadcast_admins({"jsonrpc": "2.0", "method": "_gw/notice", "params": {
+            "level": "warning", "kind": "guard",
+            "message": f"The prompt guard blocked {guardmod.BURST_LIMIT} requests of {username} within "
+                       f"{int(guardmod.BURST_WINDOW // 60)} minutes; their guarded requests are refused for now."}})
+    c.guard.on_burst = on_burst
+
+    def on_bypass(key: str, username: str) -> None:
+        """SA-1: re-provision the isolated profile (strips 'always allow') and restart its worker, so the next run
+        asks again. The native profile is left alone (its chats are cancelled each time instead)."""
+        u = c.db.user_by_name(username)
+        if not u or c.profiles.is_native(u):
+            return
+
+        async def run():
+            try:
+                await c.workers.restart(key)   # pre_start provisions before Goose starts again
+            except Exception:
+                log.exception("restarting %s after a guard bypass", key)
+        asyncio.get_running_loop().create_task(run())
+    c.hub.on_guard_bypass = on_bypass
+
+    def member_writable(path: str) -> bool:
+        """SD-2: folders members can write: the profiles root (their profiles, the default team folders) and
+        every team's share folder and extra folders."""
+        roots = [str(c.settings.profiles_root)]
+        for t in c.db.query("SELECT * FROM teams"):
+            roots.append(str(c.profiles.team_folder(t)))
+            roots += [r for r in ((t.get("policy") or {}).get("allowed_roots") or []) if r and r != pol.ANY]
+        try:
+            return any(pol._within(pol._norm(path), pol._norm(r)) or
+                       ((pol._real(path) or "") and pol._real(r) and pol._within(pol._real(path), pol._real(r)))
+                       for r in roots)
+        except (OSError, ValueError):
+            return True
+    c.hub.member_writable = member_writable
+
+
 def make_audit_handler(c: Ctx):
     def handler(client: Client, action: str, target: str, detail: dict, ok: bool):
         try:
@@ -542,9 +675,13 @@ def create_app(settings: Settings) -> Starlette:
         # Prompt guard (spec 018): rules + the local classifier; loads nothing until some guard is on.
         from .guard import GuardService
         c.guard = hub.guard = GuardService(settings, db)
-        c.guard.on_unavailable = lambda reason, point: db.audit(
-            "guard.unavailable", target=point, detail={"reason": reason[:300], "point": point}, ok=False)
+        # SA-10: who and which chat made the classifier unavailable (the user's own row in the audit)
+        c.guard.on_unavailable = lambda reason, point, who: db.audit(
+            "guard.unavailable", user=db.user_by_name(who.get("username") or "") if who.get("username") else None,
+            target=point, detail={"reason": reason[:300], "point": point, **{k: v for k, v in who.items() if v}},
+            ok=False)
         c.guard.on_health = lambda h: hub.broadcast_admins({"jsonrpc": "2.0", "method": "_gw/guard", "params": h})
+        wire_security_hooks(c)
         app.state.ctx = c
         hub.start()
         workers.start_monitor()
@@ -568,6 +705,12 @@ def create_app(settings: Settings) -> Starlette:
             if warm is not None:
                 warm.cancel()
             c.guard.shutdown()
+            from . import rulematch
+            rulematch.shutdown()
+            try:
+                hub.flush_state_now()   # queued messages changed in the last half second
+            except Exception:
+                log.exception("saving chat state at shutdown")
             await workers.shutdown()
             db.audit("system.stop")
             db.close()

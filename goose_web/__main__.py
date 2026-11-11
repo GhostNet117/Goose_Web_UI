@@ -651,13 +651,59 @@ def guard_runtime() -> tuple[bool, str]:
     return True, ", ".join(vers)
 
 
+def _gateway_principals() -> list[str]:
+    """Windows: the accounts the scheduled tasks of this install's gateway run as (lower case, without domain)."""
+    if os.name != "nt":
+        return []
+    import subprocess
+    venv = os.path.normcase(os.path.dirname(sys.executable))
+    ps = ("Get-ScheduledTask | Where-Object { $_.Actions | Where-Object { $_.Arguments -match 'goose_web' -and "
+          "$_.Arguments -match 'serve' } } | ForEach-Object { $_.Principal.UserId + '|' + "
+          "(($_.Actions | ForEach-Object { $_.Execute }) -join ';') }")
+    exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0",
+                       "powershell.exe")
+    try:  # fixed command, no user input
+        out = subprocess.run([exe, "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=60,  # nosec B603
+                             stdin=subprocess.DEVNULL).stdout
+    except Exception:
+        return []
+    rows = []
+    for ln in out.splitlines():
+        parts = ln.strip().split("|")
+        if len(parts) == 2 and parts[0] and os.path.normcase(os.path.dirname(parts[1].strip('"'))) == venv:
+            rows.append(parts[0].split("\\")[-1].lower())
+    return rows
+
+
+def model_acl_problem(d) -> tuple[bool, str] | None:
+    """SB-1: (is it an error, text) when the model folder does not inherit its parent's permissions - an error when a
+    gateway task of this install runs as another account (it could not read model.onnx); None when fine."""
+    from . import guardmodel
+    if not guardmodel.acl_protected(d):
+        return None
+    from . import winsec
+    me = winsec.current_user().split("\\")[-1].lower()
+    others = [p for p in _gateway_principals() if p and p != me]
+    fix = f'goose-web guard install-model --if-missing (or icacls "{d}" /reset /T)'
+    if others:
+        return True, (f"{d} has its own owner-only permissions, so the gateway account ({', '.join(others)}) cannot "
+                      f"read the model and the classifier fails open. Fix: {fix}")
+    return False, f"{d} does not inherit its parent's permissions (only this account can read it). Fix: {fix}"
+
+
 def cmd_guard(args, settings) -> int:
     """Spec 018: the prompt guard's model - status, install (pinned download or a local package), remove."""
     import asyncio as _asyncio
     from . import guardmodel
     if args.action == "install-model":
-        if args.if_missing and not guardmodel.verify_dir(guardmodel.model_dir(settings)):
-            print(f"The Prompt Guard model is installed ({guardmodel.model_dir(settings)}); nothing to do.")
+        d0 = guardmodel.model_dir(settings)
+        # SB-4: --if-missing hashes the files (a same-size replacement is reinstalled); SB-1: repairs the folder's
+        # permissions if an older version installed it with a protected, owner-only DACL
+        if args.if_missing and not guardmodel.verify_dir(d0, deep=True):
+            if guardmodel.acl_protected(d0) and guardmodel.reset_acl(d0):
+                print(f"Reset the permissions of {d0} to inherit from its parent (a gateway running as another "
+                      "account can read the model again).")
+            print(f"The Prompt Guard model is installed ({d0}); nothing to do.")
             return 0
         try:
             guardmodel.install(settings, file=args.file, sha256=args.sha256, force=args.force,
@@ -670,7 +716,11 @@ def cmd_guard(args, settings) -> int:
             return 4
         return 0
     if args.action == "remove-model":
-        print("removed" if guardmodel.remove(settings) else "not installed")
+        try:
+            print("removed" if guardmodel.remove(settings) else "not installed")
+        except guardmodel.InstallError as e:
+            print(f"Prompt Guard model not removed: {e}", file=sys.stderr)
+            return 3
         return 0
     # status
     ok_rt, rt = guard_runtime()
@@ -691,7 +741,10 @@ def cmd_guard(args, settings) -> int:
             and info["package_sha256"] != pin["sha256"]:
         print("[--] the installed package is not the one pinned above (goose-web guard install-model --force "
               "replaces it)")
-    healthy = ok_rt and not problem
+    acl_bad = model_acl_problem(d)
+    if acl_bad:
+        print(f"[{'!!' if acl_bad[0] else '--'}] model folder permissions: {acl_bad[1]}")
+    healthy = ok_rt and not problem and not (acl_bad and acl_bad[0])
     if healthy:
         from .db import Database
         from .guard import GuardService
@@ -787,6 +840,12 @@ def cmd_check(args, settings) -> int:
     line("prompt guard runtime", rt, ok_rt)
     print(f"[{'OK' if not gproblem else '--'}] prompt guard model: " + (f"installed in {gd}" if not gproblem else
           f"{gproblem}; the guard fails open without it (goose-web guard install-model, goose-web guard status)"))
+    if not gproblem:
+        acl_bad = model_acl_problem(gd)
+        if acl_bad and acl_bad[0]:
+            line("prompt guard model permissions", acl_bad[1], False)
+        elif acl_bad:
+            print(f"[--] prompt guard model permissions: {acl_bad[1]}")
     gpin = guardmodel.pin(settings)
     print(f"[{'OK' if gpin['url'] and gpin['sha256'] else '--'}] prompt guard package source ({gpin['source']}): "
           + (f"{gpin['url']} sha256 {gpin['sha256'][:16]}..." if gpin["url"] and gpin["sha256"] else

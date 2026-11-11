@@ -163,18 +163,40 @@ def _mb(n: int) -> str:
     return f"{n / 1e6:.1f} MB"
 
 
-def _download_once(url: str, dest: Path, *, expected_size: int, timeout: float, log) -> None:
+MAX_REDIRECTS = 5
+# SB-3: the hosts the pinned GitHub release asset may redirect through (github.com -> its download CDN)
+PINNED_HOSTS = {"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+
+
+def _check_hop(url, pinned: bool) -> None:
+    """Every address of the download, the first and each redirect (security review 2026-11-11, SB-3)."""
+    if url.scheme != "https":
+        raise InstallError(f"the download was redirected to a non-https address ({url.scheme}://{url.host}); refused")
+    if pinned and str(url.host or "").lower() not in PINNED_HOSTS:
+        raise InstallError(f"the download was redirected to {url.host}, which is not a GitHub download host; refused")
+
+
+def _download_once(url: str, dest: Path, *, expected_size: int, timeout: float, log, pinned: bool = False) -> None:
     import httpx
     from . import __version__
     cap = expected_size or MAX_ZIP_BYTES
     n = 0
+
+    def on_response(resp):
+        _check_hop(resp.request.url, pinned)
+        if resp.is_redirect and resp.next_request is not None:
+            _check_hop(resp.next_request.url, pinned)
     # trust_env (the default) = HTTPS_PROXY / ALL_PROXY / NO_PROXY and the system CA settings apply.
-    with httpx.Client(transport=_TRANSPORT, follow_redirects=True, trust_env=True,
-                      timeout=httpx.Timeout(timeout, connect=30.0),
+    with httpx.Client(transport=_TRANSPORT, follow_redirects=True, max_redirects=MAX_REDIRECTS, trust_env=True,
+                      timeout=httpx.Timeout(timeout, connect=30.0), event_hooks={"response": [on_response]},
                       headers={"User-Agent": f"goose-web/{__version__} (prompt guard model install)"}) as client:
-        with client.stream("GET", url) as r:          # GitHub release assets redirect to a CDN
-            if r.url.scheme != "https":
-                raise InstallError("the download was redirected to a non-https address; refused")
+        try:
+            stream = client.stream("GET", url)          # GitHub release assets redirect to a CDN
+            r = stream.__enter__()
+        except httpx.TooManyRedirects:
+            raise InstallError(f"the download was redirected more than {MAX_REDIRECTS} times; refused")
+        try:
+            _check_hop(r.url, pinned)
             if r.status_code == 429 or r.status_code >= 500:
                 raise _Retry(f"HTTP {r.status_code}")
             if r.status_code != 200:
@@ -198,21 +220,24 @@ def _download_once(url: str, dest: Path, *, expected_size: int, timeout: float, 
                     if n >= next_report:
                         log(f"  {_mb(n)}" + (f" of {_mb(total)} ({100 * n // total}%)" if total else ""))
                         next_report += step
+        finally:
+            stream.__exit__(None, None, None)
     if expected_size and n != expected_size:
         raise _Retry(f"the transfer stopped after {n:,} of {expected_size:,} bytes")
 
 
 def download(url: str, dest: Path, *, expected_size: int = 0, timeout: float = 60, log=print,
-             attempts: int = DOWNLOAD_ATTEMPTS) -> None:
+             attempts: int = DOWNLOAD_ATTEMPTS, pinned: bool = False) -> None:
     """HTTPS download with a size cap, retries and progress (installers / CLI only; never at gateway run time).
-    `timeout` applies to each read (no data for that long = a failed attempt), not to the whole transfer."""
+    `timeout` applies to each read (no data for that long = a failed attempt), not to the whole transfer. Every
+    redirect must be https (at most MAX_REDIRECTS); pinned = only GitHub's download hosts (SB-3)."""
     import httpx
     if not url.lower().startswith("https://"):
         raise InstallError("the model URL must be https://")
     last = ""
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            _download_once(url, dest, expected_size=expected_size, timeout=timeout, log=log)
+            _download_once(url, dest, expected_size=expected_size, timeout=timeout, log=log, pinned=pinned)
             return
         except _Retry as e:
             last = str(e)
@@ -246,6 +271,9 @@ def install(settings, *, file: str | None = None, sha256: str | None = None, for
     """Install the model package (download from the pin, or a local zip) after verifying its SHA-256.
     Returns describe(). Raises InstallError with a message for the administrator."""
     d = model_dir(settings)
+    problem = target_problem(settings, d)
+    if problem:
+        raise InstallError(problem)
     p = pin(settings)
     if file:
         expected = _hex(sha256) if sha256 else p["sha256"]
@@ -259,11 +287,13 @@ def install(settings, *, file: str | None = None, sha256: str | None = None, for
                 "(or remove both to use the published package), or install a local zip with --file. See "
                 "docs/ADMINISTRATION.md, Prompt guard.")
         expected = _hex(p["sha256"])
-    if not force and not verify_dir(d):
+    if not force and not verify_dir(d, deep=True):
         try:
             meta = json.loads((d / "export.json").read_text(encoding="utf-8"))
             if meta.get("package_sha256") == expected:
                 log(f"The Prompt Guard model is already installed in {d}.")
+                if acl_protected(d):
+                    reset_acl(d, log=log)
                 return describe(settings)
         except (OSError, ValueError):
             pass
@@ -281,7 +311,7 @@ def install(settings, *, file: str | None = None, sha256: str | None = None, for
         else:
             log("Downloading the Prompt Guard model package" + (f" ({_mb(p['size'])})" if p["size"] else "") +
                 f" from {p['url']}")
-            download(p["url"], zpath, expected_size=p["size"], log=log)
+            download(p["url"], zpath, expected_size=p["size"], log=log, pinned=p["source"] == "pinned")
             log("Downloaded; checking its SHA-256.")
         got = sha256_file(zpath)
         if got != expected:
@@ -299,19 +329,109 @@ def install(settings, *, file: str | None = None, sha256: str | None = None, for
         meta_p.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
         old = d.with_name(d.name + ".old")
         _rmtree(old)
-        if d.exists():
+        had_old = d.exists()
+        if had_old:
             os.replace(d, old)
-        os.replace(new, d)
+        try:
+            os.replace(new, d)
+        except OSError:
+            if had_old:   # SB-9: put the previous model back before reporting the failure
+                try:
+                    os.replace(old, d)
+                except OSError:
+                    log(f"The previous model is in {old}; rename it back to {d.name} by hand.")
+            raise
         _rmtree(old)
+        reset_acl(d, log=log)   # SB-1
         log(f"Installed the Prompt Guard model in {d} (package SHA-256 {expected}).")
         return describe(settings)
     finally:
         _rmtree(stage)
 
 
+def _same_or_parent(a: Path, b: Path) -> bool:
+    """a is b or a folder above b (compared case-insensitively after resolving)."""
+    try:
+        ra, rb = os.path.normcase(os.path.realpath(a)), os.path.normcase(os.path.realpath(b))
+    except (OSError, ValueError):
+        return True
+    return ra == rb or rb.startswith(ra.rstrip("\\/") + os.sep)
+
+
+def target_problem(settings, d: Path) -> str:
+    """'' or why `d` must not be replaced or deleted as the model folder (security review 2026-11-11, SB-2): the
+    system folder, the profiles root, a folder above them or a drive root, or an existing folder that is neither
+    empty nor a model package."""
+    d = Path(d)
+    if not d.is_absolute() or d.parent == d or len(d.parts) < 3:
+        return f"{d} is not a model folder (a drive root or a relative path)"
+    for name, p in (("system folder", Path(settings.system_dir)), ("profiles root", Path(settings.profiles_root))):
+        if _same_or_parent(d, p):
+            return f"{d} is the {name} or above it; set guard.model_dir to a folder of its own"
+    if d.is_file() or d.is_symlink():
+        return f"{d} is not a folder"
+    if d.is_dir():
+        try:
+            names = {e.name for e in os.scandir(d)}
+        except OSError as e:
+            return f"{d} cannot be read: {e}"
+        if names and "model.onnx" not in names and "export.json" not in names:
+            return f"{d} is not empty and holds no model package; nothing was changed"
+        stray = [n for n in names if n not in ALLOWED_MEMBERS]
+        if stray:
+            return f"{d} holds files that are not part of the model package ({', '.join(sorted(stray)[:5])})"
+    return ""
+
+
+def reset_acl(d: Path, log=print) -> bool:
+    """SB-1: give the installed folder its parent's inheritable permissions back. Python >= 3.12.4 creates the
+    staging folder (tempfile.mkdtemp) with a protected, owner-only DACL, which a gateway running as another account
+    (install.ps1 -RunAs) could not read. Windows only; True when icacls succeeded."""
+    if os.name != "nt" or not Path(d).is_dir():
+        return False
+    import subprocess  # nosec B404 - fixed system tool, the path is the model folder
+    exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
+    try:
+        r = subprocess.run([exe, str(d), "/reset", "/T", "/Q"], capture_output=True, text=True, timeout=120,  # nosec B603
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"Could not reset the permissions of {d} ({e}); run: icacls \"{d}\" /reset /T")
+        return False
+    if r.returncode != 0:
+        log(f"Could not reset the permissions of {d} (icacls exit {r.returncode}); run: icacls \"{d}\" /reset /T")
+        return False
+    return True
+
+
+def acl_protected(d: Path) -> bool | None:
+    """True when the folder's DACL does not inherit from its parent (SB-1), None if unknown / not Windows."""
+    if os.name != "nt" or not Path(d).is_dir():
+        return None
+    try:
+        from .__main__ import _path_sddl
+        return "D:P" in _path_sddl(str(d))
+    except Exception:
+        return None
+
+
 def remove(settings) -> bool:
+    """Delete the installed model: only the package's own files, then the folder if it is empty (SB-2)."""
     d = model_dir(settings)
     if not d.exists():
         return False
-    _rmtree(d)
+    problem = target_problem(settings, d)
+    if problem:
+        raise InstallError(problem)
+    for name in ALLOWED_MEMBERS:
+        p = d / name
+        if p.is_file():
+            try:
+                os.chmod(p, stat.S_IWRITE)
+            except OSError:
+                pass
+            p.unlink()
+    try:
+        d.rmdir()
+    except OSError:
+        pass
     return True

@@ -9,7 +9,7 @@ import { loadPrefs, applyTheme, setPref, prefs, resolvedTheme } from './prefs.js
 import { addAsk, resetAsks, resolvedElsewhere, ASK_METHODS, gotoAsk, noteToolCallSource } from './asks.js';
 import { setHerd, upsertAgent, setMyProfile, refreshBadges, browserNotify, chime, setBaseTitle } from './herd.js';
 import { loadSessions, sessionsState, sessionTitle, activityTime, isArchived, refreshSessionsSoon } from './sessions.js';
-import { routeNotification, allChats, currentChat, sessionChangedElsewhere, promptCreated, applyHelloState, queueUpdated, steerUpdated, hasLocalQueue } from './chatsession.js';
+import { routeNotification, allChats, currentChat, sessionChangedElsewhere, promptCreated, applyHelloState, queueUpdated, steerUpdated, hasLocalQueue, clearDrafts } from './chatsession.js';
 import { renderLogin, renderChangePassword } from './views/login.js';
 import { renderSidebar, NAV } from './views/sidebar.js';
 import { renderHome } from './views/home.js';
@@ -48,7 +48,7 @@ async function boot() {
   } catch (e) {
     if (e.status === 403 && e.code === 'password_change_required') { showChangePassword(null); return; }
     if (e.status === 403 && e.code === 'totp_enrolment_required') { showTotpEnrol(null); return; }
-    if (e.status === 401 || e.status === 403) { showLogin(); return; }
+    if (e.status === 401 || e.status === 403) { clearDrafts(true); showLogin(); return; }   // SC-5: no drafts left
     root.replaceChildren(h('div', { class: 'auth-screen' }, h('div', { class: 'auth-card' }, logo(40), h('h1', null, 'Gateway unreachable'), h('p', { class: 'muted' }, errMsg(e)), btn('Retry', () => boot(), { variant: 'primary', icon: 'refresh' }))));
   }
 }
@@ -362,6 +362,7 @@ bus.on('unauthorized', () => {
   if (authLost || !started) return;
   authLost = true;
   toast('Your sign-in expired. Please sign in again.', { kind: 'warn' });
+  clearDrafts(true);   // SC-5: the next person on this browser must not find them
   teardown(); showLogin();
   setTimeout(() => { authLost = false; }, 1500);
 });

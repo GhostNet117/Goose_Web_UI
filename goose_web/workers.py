@@ -283,6 +283,9 @@ class WorkerManager:
         self._desktop_checked = float("-inf")   # monotonic time of the last check
         self.on_restart = None       # async callback(worker) set by the hub
         self.activity = None         # callable(key) -> (clients, active_runs) set by the hub
+        # callable(worker) set by the app: runs before EVERY start of a worker (security review 2026-11-11, SA-1:
+        # re-provisions an isolated profile so nothing the agent wrote into its own config survives a restart)
+        self.pre_start = None
         self._monitor_task: asyncio.Task | None = None
 
     # ---------------------------------------------------------- scheduler ownership
@@ -394,6 +397,14 @@ class WorkerManager:
         async with w._lock:
             if w.state == "ready" and w.proc and w.proc.poll() is None:
                 return w
+            if self.pre_start is not None:
+                try:
+                    await asyncio.to_thread(self.pre_start, w)
+                except Exception as e:
+                    # never start a worker whose configuration could not be reset (fail closed)
+                    w.state, w.last_error = "crashed", f"preparing the profile failed: {e.__class__.__name__}: {e}"
+                    log.exception("worker %s: pre-start provisioning failed", w.key)
+                    raise RuntimeError(w.last_error) from e
             await self._start(w)
         return w
 

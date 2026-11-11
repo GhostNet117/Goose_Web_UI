@@ -16,17 +16,48 @@ const serverQueues = new Map();   // sessionId -> [{id, blocks, held?, steer?, n
 const serverSteers = new Map();   // sessionId -> Map(messageId -> {messageId, blocks, state, at})
 let localSeq = 0;
 
-// Drafts stay on this device (localStorage, cleared at sign-out): typing is never sent to the gateway.
-const DRAFT_KEY = 'gw.draft.';
+// Drafts stay on this device (localStorage, cleared at sign-out and when the sign-in expires): typing is never sent
+// to the gateway. Security review 2026-11-11 (SC-5): keyed by the signed-in user AND the profile shown (Goose session
+// ids are per-profile counters, so an administrator's draft must never appear in a member's chat with the same id),
+// and dropped after a week.
+const DRAFT_PREFIX = 'gw.draft|';
+const DRAFT_MAX_AGE = 7 * 86400 * 1000;
 const draftTimers = new Map();
-function loadDraft(id) { try { return localStorage.getItem(DRAFT_KEY + id) || ''; } catch { return ''; } }
+export function myName() { const me = store.get('me'); return (me && me.user && me.user.username) || ''; }
+function draftKey(id) { return DRAFT_PREFIX + myName().toLowerCase() + '|' + String(rpc.profileParam || myName()).toLowerCase() + '|' + id; }
+function loadDraft(id) {
+  try {
+    const raw = localStorage.getItem(draftKey(id));
+    if (!raw) return '';
+    const d = JSON.parse(raw);
+    if (!d || typeof d.v !== 'string' || !(Date.now() - (d.t || 0) < DRAFT_MAX_AGE)) { localStorage.removeItem(draftKey(id)); return ''; }
+    return d.v;
+  } catch { return ''; }
+}
 export function saveDraft(id, text) {
   clearTimeout(draftTimers.get(id));
+  const key = draftKey(id);
   draftTimers.set(id, setTimeout(() => {
     draftTimers.delete(id);
-    try { if (text) localStorage.setItem(DRAFT_KEY + id, String(text).slice(0, 100000)); else localStorage.removeItem(DRAFT_KEY + id); } catch { /* storage full or disabled */ }
+    try { if (text) localStorage.setItem(key, JSON.stringify({ t: Date.now(), v: String(text).slice(0, 100000) })); else localStorage.removeItem(key); } catch { /* storage full or disabled */ }
   }, 400));
 }
+// Old (1.15.0, keyed by session id only) and expired drafts go; every draft goes when the sign-in expires (app.js).
+export function clearDrafts(all = false) {
+  try {
+    const drop = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith('gw.draft')) continue;
+      if (all || !k.startsWith(DRAFT_PREFIX)) { drop.push(k); continue; }
+      try { const d = JSON.parse(localStorage.getItem(k) || 'null'); if (!d || !(Date.now() - (d.t || 0) < DRAFT_MAX_AGE)) drop.push(k); } catch { drop.push(k); }
+    }
+    for (const k of drop) localStorage.removeItem(k);
+  } catch { /* storage disabled */ }
+}
+clearDrafts();
+// SC-1/SC-6: a tab sends a queued message by itself only if it is this user's own profile and this user queued it.
+function mine(q) { return !!q && (q.local || (!!q.by && q.by.toLowerCase() === myName().toLowerCase())); }
 
 export function applyHelloState(hello) {
   serverQueues.clear();
@@ -63,7 +94,7 @@ export function hasLocalQueue() { return [...chats.values()].some((c) => c.queue
 function drainIdleQueues() {
   if (rpc.profileParam) return;   // an administrator viewing someone else's profile never sends their messages
   for (const [sid, items] of serverQueues) {
-    if (!items.some((q) => !q.held)) continue;
+    if (!items.some((q) => !q.held && mine(q))) continue;
     const a = agentFor(sid);
     if (a && (a.status === 'working' || a.status === 'needs_you')) continue;
     const c = chats.get(sid);
@@ -420,10 +451,11 @@ export class ChatSession extends Emitter {
     return this.id;
   }
 
-  // The run ended: send the first queued message that is not held (returned steers wait for the user).
+  // The run ended: send the first queued message that is not held (returned steers wait for the user). Never in an
+  // administrator's view of another profile, and never someone else's message (SC-1/SC-6: those need a click).
   async drainQueue() {
-    if (this.running || this.promptPending || this.draining) return;
-    const next = this.queue.find((q) => !q.held);
+    if (rpc.profileParam || this.running || this.promptPending || this.draining) return;
+    const next = this.queue.find((q) => !q.held && mine(q));
     if (!next) return;
     this.draining = true;
     try {
@@ -494,6 +526,9 @@ export class ChatSession extends Emitter {
       const msg = 'Steer not delivered. ' + (p.note || '') + ' It is back in the queue below: send it, edit it, or remove it.';
       t.sys(msg, 'warn');
       if (currentId === this.id) toast(msg, { kind: 'warn', timeout: 12000 });
+    } else if (p.state === 'dropped') {   // the queue was full (SC-4): the steer could not come back
+      if (item) t.setSteerState(item, 'returned');
+      t.sys('Steer not delivered, and the chat\'s queue is full, so it was dropped. ' + (p.note || ''), 'warn');
     }
   }
 

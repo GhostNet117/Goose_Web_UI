@@ -1,6 +1,6 @@
 [project]
 name = "goose-web"
-version = "1.15.0"
+version = "1.15.1"
 description = "Goose AI Web Interface - a secure, multi-user web front end for the Goose AI agent (goose serve / ACP)"
 readme = "README.md"
 license = { text = "Apache-2.0" }

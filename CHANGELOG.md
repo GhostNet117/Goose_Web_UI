@@ -1,5 +1,54 @@
 # Changelog
 
+## 1.15.1 - 2026-11-11
+
+**Security release.** A review of everything changed since the 2026-11-09 assessment (1.12.0 - 1.15.0) found 33
+issues; all code findings are fixed (SECURITY-ASSESSMENT 12). Upgrade if you use the prompt guard, have members, or
+let administrators view members' chats. No database schema change.
+
+- **Prompt guard could be switched off by the agent (SA-1, High).** The agent runs as its profile and could write an
+  *always allow* entry into its own `permission.yaml`; after the next worker start Goose stopped asking and the guard
+  never saw that tool. Now every worker start provisions an isolated profile again (team policy, extensions, mode,
+  provider, *always allow*), a built-in rule refuses tool arguments that name the profile's config files, and a tool
+  call that runs without a permission request in a guarded profile cancels the run (`guard.bypass`; the member's
+  worker restarts with clean settings).
+- **One tool call or prompt could freeze the whole gateway (SA-2, High).** Rule matching ran on the event loop and the
+  shipped *Destructive shell* patterns backtracked quadratically (60 KB froze every user for 6 s; 200 KB for minutes).
+  Rules now run in two child processes with a deadline (`guard.rules_timeout_ms`, slower = blocked), the shipped
+  patterns are bounded, admin regexes with nested repeats are refused, and the Test box uses the same path.
+- **Classifier gaps (SA-3, SA-4).** A guarded prompt longer than `guard.max_input_chars` (16,000) is refused before any
+  work (a 16 MB prompt used to stall the gateway 18 s and was never classified); every window of a text is scored
+  (the middle used to be skipped); text too long to score is never auto-approved.
+- **Rule sets hardened (SA-5)** against 17 evasions (flag order, quotes, PowerShell prefixes, `rd /s`, .NET deletes,
+  `+branch`/`:branch` pushes, encoded PowerShell, `summaryindex`, `dump`, `dbxquery` writes, `fit into`, Splunk REST from
+  a shell, more tool names); unedited shipped sets are upgraded automatically. They remain best-effort deny lists.
+- **Guard odds and ends (SA-6..SA-10):** system prompts, saved prompts, recipes, imported chats and MCP Apps tool calls
+  of guarded users are checked; trusted extensions are trusted by their configuration, not their name; the guard fails
+  closed when its settings cannot be read; members no longer see rule ids; 10 blocks in 10 minutes pause a user's
+  guarded requests (`guard.burst`); `guard.unavailable` names the user and chat.
+- **An administrator viewing a member's chat sent the member's queued messages as the administrator (SC-1, SC-6).**
+  Only the owner's tab sends its own queued messages automatically (enforced by the gateway); any text typed into a
+  member's chat also passes the member's prompt guard; takes and removals by others are audited; queue rows show who
+  queued them.
+- **Queue limits (SC-2, SC-4, SC-9).** One member could stall every user for ~9 s per queue change and store 36 GB.
+  Now 32 MB of queued messages per profile, 20 chats with a queue, 10 pending steers; queue state is written in the
+  background; tabs and reconnects get queue rows, not message content.
+- **Deleted, disabled or signed-out users (SC-3).** Their open sockets are closed at once (others re-checked every 30 s),
+  a deleted user's state never writes again, and a new account with the same name starts clean.
+- **Plugins in shared folders (SD-2, SD-3, SD-5, SD-6).** No member can start a chat in the team folder (or the team's
+  extra folders) while it holds Goose plugins, with or without `allow_shell`; administrators must confirm the plugin
+  list; project skills/agents only in the member's own workspace; chat folders are canonicalised; `AGENTS.md::$...`
+  names are refused.
+- **Model install (SB-1..SB-5, SB-9).** The model folder inherits its parent's permissions again (a `-RunAs` service
+  account could not read it on Python 3.12.4+; `--if-missing` repairs it, `check` reports it); a wrong `guard.model_dir`
+  can no longer replace or delete other folders; every redirect must be https on GitHub's download hosts; files are
+  hashed at load and by `--if-missing`; ONNX Runtime telemetry is off; a failed swap restores the old model.
+- **Drafts and residue (SC-5, SC-7).** Drafts are kept per user and profile, for 7 days, and cleared when the sign-in
+  expires; SQLite `secure_delete` is on; queued messages expire after 7 days; state of chats deleted elsewhere is
+  pruned.
+- Config: `guard.max_windows` 8 -> 48, `guard.timeout_ms` 3000 -> 10000, new `guard.max_input_chars` (16000) and
+  `guard.rules_timeout_ms` (1500). Service worker cache `gw-shell-v22`. Tests: `tests/test_security_review.py`.
+
 ## 1.15.0 - 2026-11-10
 
 A steer is never lost silently (bug steer-lost-on-slow-turn), and your live state survives a refresh, another

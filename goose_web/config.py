@@ -114,8 +114,10 @@ DEFAULTS: dict[str, Any] = {
         "min_chars": 16,                  # shorter text is not classified (rules still apply)
         "window_tokens": 128,             # tokens per window (the model reads at most 512; shorter is much cheaper)
         "window_overlap": 16,             # tokens shared by consecutive windows
-        "max_windows": 8,                 # windows per text (the first ones and the last one)
-        "timeout_ms": 3000,               # slower than this = unavailable: allowed (fail open) and audited
+        "max_windows": 48,                # windows scored per text (all of them); more = not inspected
+        "max_input_chars": 16000,         # longer text is not classified: guarded prompts refused, tool calls asked
+        "timeout_ms": 10000,              # slower than this = unavailable: allowed (fail open) and audited
+        "rules_timeout_ms": 1500,         # rule matching deadline (child process); slower = blocked (fail closed)
         "load_timeout_s": 60,
         "threads": 4,                     # ONNX Runtime threads for one inference (capped at the CPU count)
         "cache_size": 2048,               # scores remembered by content hash

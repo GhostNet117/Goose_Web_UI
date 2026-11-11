@@ -340,21 +340,52 @@ def project_plugins(cwd: Any) -> list[str]:
     Goose ignores files there). A plugins folder that exists but cannot be listed counts as one (fail closed)."""
     if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
         return []
-    d = os.path.join(os.path.expanduser(cwd), AGENTS_DIR, "plugins")
-    out = []
-    try:
-        with os.scandir(d) as it:
-            for e in it:
-                try:
-                    if e.is_dir():
-                        out.append(e.name)
-                except OSError:
-                    out.append(e.name)
-    except (FileNotFoundError, NotADirectoryError):
-        return []
-    except (OSError, ValueError):
+    base = os.path.expanduser(cwd)
+    cands = [base]
+    try:   # SD-5: as written, as Win32 normalises it, and with links resolved - whichever Goose ends up opening
+        cands += [os.path.abspath(base), os.path.realpath(base)]
+    except (OSError, ValueError, RuntimeError):
         return ["(unreadable)"]
+    out: set[str] = set()
+    for c in dict.fromkeys(cands):
+        d = os.path.join(c, AGENTS_DIR, "plugins")
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_dir():
+                            out.add(e.name)
+                    except OSError:
+                        out.add(e.name)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except (OSError, ValueError):
+            out.add("(unreadable)")
     return sorted(out)
+
+
+def canonical_dir(p: Any) -> Any:
+    """SD-5: an existing folder in the form Win32 opens it (GetFullPathName: `..`, `.`, separators, and the trailing
+    dots/spaces Windows drops), so the gateway's checks and Goose see the same string. Links are NOT resolved here
+    (a team folder may sit behind a junction); project_plugins also looks at the resolved path. Anything that is
+    not an existing absolute folder is left unchanged (the path checks refuse what they must)."""
+    if not isinstance(p, str) or not p or "\x00" in p:
+        return p
+    try:
+        q = os.path.expanduser(p)
+        if os.path.isabs(q) and os.path.isdir(q):
+            return os.path.abspath(q)
+    except (OSError, ValueError, RuntimeError):
+        pass
+    return p
+
+
+def canonical_dirs(params: dict) -> None:
+    """Rewrite cwd and additionalDirectories of a session call to canonical folders in place."""
+    if "cwd" in params:
+        params["cwd"] = canonical_dir(params.get("cwd"))
+    if isinstance(params.get("additionalDirectories"), list):
+        params["additionalDirectories"] = [canonical_dir(d) for d in params["additionalDirectories"]]
 
 
 def path_allowed(path: str, roots: list[str]) -> bool:
@@ -720,6 +751,8 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
             params["_meta"] = {k: v for k, v in meta.items() if k == "conversationBefore"}
     if method == TOOLS_CALL:
         check_tool_call_target(params)  # every user, admins included (NEW-01)
+    if method in ("session/new", "session/load", "session/fork", "session/resume"):
+        canonical_dirs(params)   # SD-5: every check below and Goose itself see the same, canonical folder
     if is_admin:
         return
     if method in ("session/new", "session/fork", "session/prompt"):
@@ -733,13 +766,22 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
         for d in params.get("additionalDirectories") or []:
             if not path_allowed(str(d), roots):
                 raise Denied(f"folder not allowed: {d}")
-    if method == "session/new" and not policy.get("allow_shell"):
+    if method == "session/new":
         # NEW-36: Goose would start the MCP servers (commands) of every plugin in <cwd>/.agents/plugins.
+        # SD-2 (security review 2026-11-11): in a folder other members can write (the team folder, the team's extra
+        # folders) a plugin may be someone else's program, which would run as THIS member - refused whatever the
+        # member's permissions. Only the member's own workspace allows plugins, and only with allow_shell.
         found = project_plugins(params.get("cwd"))
         if found:
             names = ", ".join(n[:40] for n in found[:3]) + (", ..." if len(found) > 3 else "")
-            raise Denied(f"this folder has Goose plugins in .agents/plugins ({names}); plugins run programs, so "
-                         "chats in this folder need the allow_shell permission")
+            own = bool(roots) and path_allowed(str(params.get("cwd") or ""), roots[:1])
+            if not own:
+                raise Denied(f"this shared folder has Goose plugins in .agents/plugins ({names}); plugins run "
+                             "programs as the person who starts the chat, so chats cannot start here. Ask your "
+                             "administrator to remove them, or start the chat in your own workspace")
+            if not policy.get("allow_shell"):
+                raise Denied(f"this folder has Goose plugins in .agents/plugins ({names}); plugins run programs, so "
+                             "chats in this folder need the allow_shell permission")
     if method == P + "session/working-dir/update" and not path_allowed(str(params.get("workingDir") or ""), roots):
         raise Denied("folder not allowed")
     if method == "session/set_mode" and not allows(policy, "allowed_modes", params.get("modeId")):
@@ -766,9 +808,11 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
         if not policy.get(perm):
             raise Denied(f"needs the {perm} permission")
         target = params.get("target") or {}
+        # SD-3: project skills / agents land in <projectDir>/.agents and are read by everyone who chats there, so a
+        # member may only write them into their own workspace (never the shared team folder)
         if isinstance(target, dict) and target.get("scope") == "projectDir" and \
-                not path_allowed(str(target.get("projectDir") or ""), roots):
-            raise Denied("project folder not allowed")
+                not path_allowed(str(target.get("projectDir") or ""), roots[:1]):
+            raise Denied("project skills and agents can only be saved in your own workspace")
         return
     if method == P + "config/read" and str(params.get("key")) in READABLE_CONFIG_KEYS and not params.get("isSecret"):
         return
