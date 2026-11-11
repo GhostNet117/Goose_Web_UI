@@ -35,7 +35,7 @@ def env(tmp_path, monkeypatch):
 # ------------------------------------------------------------------ ranking (shared with chatoptions.js)
 @pytest.mark.parametrize("values,top", [
     (["off", "low", "medium", "high", "max"], "max"),
-    (["low", "high", "max"], "max"),                       # GLM-5.3 / Kimi K3 menu
+    (["low", "high", "max"], "max"),                       # a low/high/max menu (Goose catalog, e.g. Kimi K3)
     (["off", "low", "medium", "high"], "high"),            # a model without max
     (["none", "minimal", "low", "medium", "high", "xhigh"], "xhigh"),
     (["off"], "off"),                                      # not a reasoning model: nothing to raise
@@ -130,9 +130,9 @@ def test_frontend_rules_in_node():
         "console.log(JSON.stringify(["
         "topEffort([{value:'off'},{value:'low'},{value:'high'},{value:'max'}]), topEffort(['low','medium','high']),"
         "topEffort(['off']), topEffort([]),"
-        "effortSent('openai','api-glm-5.3'), effortSent('openai','api-deepseek-v4.1-flash'),"
+        "effortSent('openai','qwen3-max'), effortSent('openai','deepseek-v4.1-flash'),"
         "effortSent('openai','gpt-5.4'), effortSent('openai','o3-mini'), effortSent('openai','grok-4.3'),"
-        "effortSent('anthropic','claude-opus-5-5'), effortSent('','api-glm-5.3'), effortSent('openai','api-gemma-4-31b')"
+        "effortSent('anthropic','claude-opus-5-5'), effortSent('','qwen3-max'), effortSent('openai','gemma-4-31b')"
         "]));")
     r = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr

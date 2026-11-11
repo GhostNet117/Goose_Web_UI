@@ -185,7 +185,8 @@ Goose Web has no key of its own for this; it uses Goose's `GOOSE_THINKING_EFFORT
   default with **Settings > Preferences > Default thinking effort** as an administrator, or with Goose's own tools;
   never by editing `config.yaml` while Goose runs. `max` is safe for every model: Goose clamps it per model
   (OpenAI catalog models: `max`, else `xhigh`, else `high`; xAI, Google and Ollama: `high`; Anthropic: adaptive
-  effort `max`, or a 32,000-token thinking budget capped to fit `max_tokens`; GLM-5.3 / Kimi K3 menus: `max`).
+  effort `max`, or a 32,000-token thinking budget capped to fit `max_tokens`; models with a `low|high|max` menu,
+  e.g. Kimi K3: `max`).
 
 **Models that never receive an effort from Goose.** On the OpenAI engine (the built-in `openai` provider and custom
 providers with `"engine": "openai"`), Goose 1.50 to 1.59 send `reasoning_effort` only for OpenAI reasoning models and
@@ -207,16 +208,21 @@ vendor's, not Goose's:
   "base_url": "https://llm-gateway.example.com/v1",
   "models": [
     { "name": "deepseek-v4.1-flash", "context_limit": 1000000, "reasoning": true,
-      "request_params": { "thinking": { "type": "enabled" }, "reasoning_effort": "max" } },
-    { "name": "glm-5.3", "context_limit": 320000, "reasoning": true,
-      "request_params": { "reasoning_effort": "max" } }
+      "request_params": { "thinking": { "type": "enabled" }, "reasoning_effort": "max" } }
   ]
 }
 ```
 
-- DeepSeek (OpenAI format): `thinking: {type: enabled|disabled}` and `reasoning_effort: low|high|max`. GLM-5.2 and
-  later: `reasoning_effort` (GLM-5.3: `low|high|max`, default `max`; thinking cannot be switched off). Never add
-  `thinking_effort`: Goose forwards unknown fields literally.
+- DeepSeek (OpenAI format, vendor API): `thinking: {type: enabled|disabled}` and `reasoning_effort: low|high|max`.
+  A self-hosted vLLM route usually takes the same switches inside `chat_template_kwargs` instead (for example
+  `"chat_template_kwargs": {"thinking": true, "reasoning_effort": "max"}`); check the route's documentation. Other
+  vendors use their own field names. Never add `thinking_effort`: Goose forwards unknown fields literally.
+- **Output length.** A custom provider model entry has no max-output field in Goose 1.57. On the OpenAI engine Goose
+  sends `max_tokens` (`max_completion_tokens` for OpenAI reasoning models) only when `GOOSE_MAX_TOKENS` or Goose's
+  model catalog supplies a value, otherwise the server decides; a declared `request_params` value replaces Goose's.
+  On a vLLM-served model whose input and output share one window, `"max_tokens": null` and
+  `"max_completion_tokens": null` remove a `GOOSE_MAX_TOKENS` cap for that model, so a reply may use what the prompt
+  leaves of the window; a fixed value as large as the window would be rejected (prompt plus `max_tokens` must fit).
 - A LiteLLM-based gateway rejects or drops optional fields a route does not list in its `supported_openai_params`
   (see the gateway's model list); send only the fields the route supports, and check one small request (HTTP 200,
   and `usage.completion_tokens_details.reasoning_tokens` when the gateway reports it).
