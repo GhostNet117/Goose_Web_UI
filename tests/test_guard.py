@@ -143,7 +143,7 @@ def test_team_guard_policy_modes_and_firewall():
     assert "only classifies" in texts
     assert G.clean_team_guard({"enabled": 1, "rulesets": ["2", "x", 1], "on_block": "weird"}) == {
         "enabled": True, "check_input": True, "rulesets": [1, 2], "trusted_extensions": [], "on_block": "notify",
-        "auto_approve": False}
+        "auto_approve": False, "threshold": None}   # threshold: 1.18.1 per-team classifier threshold (None = global)
 
 
 def test_strip_always_allow(tmp_path):

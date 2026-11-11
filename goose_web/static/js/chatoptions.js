@@ -18,12 +18,26 @@ export const MODES = [
 // Goose's generic thinking-effort values; the real list depends on the provider and model.
 export const EFFORTS = ['off', 'low', 'medium', 'high', 'max'].map((v) => ({ value: v, label: v[0].toUpperCase() + v.slice(1) }));
 
-export function pillSelect(ic, label, options, value, onChange) {
+export function pillSelect(ic, label, options, value, onChange, { disabled = false } = {}) {
   const s = select(options, value ?? '', { class: 'pill-select', 'aria-label': label, title: label });
   if (value && !options.some((o) => o.value === value)) s.prepend(h('option', { value }, value));
   s.value = value ?? '';
+  if (disabled) s.disabled = true;
   s.addEventListener('change', () => onChange(s.value));
-  return h('label', { class: 'pill', title: label }, icon(ic, 13), s);
+  return h('label', { class: 'pill' + (disabled ? ' pill-disabled' : ''), title: label }, icon(ic, 13), s);
+}
+// closeout 2026-11-11 D2: the chat header's effort picker for a model Goose sends no effort for - one disabled entry,
+// whatever values Goose lists for it (they would change nothing).
+export const PROVIDER_EFFORT = { value: 'provider-config', label: 'Set by provider' };
+export function effortPickerState(note, options, value) {
+  return note ? { options: [PROVIDER_EFFORT], value: PROVIDER_EFFORT.value, disabled: true } : { options, value, disabled: false };
+}
+// closeout 2026-11-11 D3: the chat header's provider list in New chat's order (by name), without entries Goose's
+// provider list does not know (Goose's own "Goose (Default)" entry) - unless the chat uses it. known = Set of
+// provider ids from providers/list (null = not loaded yet: nothing is dropped).
+export function headerProviderOptions(options, current, known) {
+  const kept = (options || []).filter((o) => o.value === current || !known || known.has(o.value) || String(o.value).startsWith('group:'));
+  return kept.slice().sort((a, b) => String(a.label).localeCompare(String(b.label), undefined, { sensitivity: 'base', numeric: true }));
 }
 
 export const optionById = (opts, id) => (opts || []).find((o) => o.id === id);

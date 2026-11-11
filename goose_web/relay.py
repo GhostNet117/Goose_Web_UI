@@ -1,7 +1,7 @@
 """Brokered access from sandboxed workers to allow-listed local services (spec 014, Windows).
 
 A sandboxed worker (sandbox.py) cannot reach 127.0.0.1 of the machine, so a model proxy or another local service
-that listens on loopback is out of reach. `sandbox.relays` lists the targets ("127.0.0.1:8317") sandboxed workers
+that listens on loopback is out of reach. `sandbox.relays` lists the targets ("127.0.0.1:4000") sandboxed workers
 may use. For each sandboxed user and target:
 
   goose (container) --TCP--> forwarder (same container, 127.64.x.y:<port>) --named pipe--> gateway --TCP--> target
@@ -81,6 +81,33 @@ def _url_variants(hostport: str) -> list[str]:
     return [f"{h}:{port}" for h in sorted(names)]
 
 
+def rewrite_text(text: str, mapping: dict[str, str]) -> str:
+    """'//<target host>:<port>' -> '//<forward ip>:<port>' in one text (mapping target -> listen)."""
+    for target, listen in (mapping or {}).items():
+        for v in _url_variants(target):
+            text = text.replace(f"//{v}", f"//{listen}")
+    return text
+
+
+def state_mapping(state_dir: str | Path, name: str) -> dict[str, str]:
+    """The relays the worker of container `name` runs now (<state_dir>/<name>.relays.json, written by
+    workers._start_relays): target -> listen. {} when the user has none (not sandboxed, or no relays)."""
+    try:
+        m = json.loads((Path(state_dir) / f"{name}.relays.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(m, dict):
+        return {}
+    out = {}
+    for t, lst in m.items():
+        try:
+            parse_target(t), parse_target(lst)
+        except ValueError:
+            continue
+        out[str(t)] = str(lst)
+    return out
+
+
 def rewrite_profile_urls(profile_root: str, mapping: dict[str, str]) -> list[str]:
     """Replace '<target host>:<port>' by '<forward ip>:<port>' in the profile's config.yaml and custom provider
     JSON files (mapping target -> listen). Returns the changed files. Idempotent."""
@@ -92,10 +119,7 @@ def rewrite_profile_urls(profile_root: str, mapping: dict[str, str]) -> list[str
             text = f.read_text(encoding="utf-8")
         except OSError:
             continue
-        new = text
-        for target, listen in mapping.items():
-            for v in _url_variants(target):
-                new = new.replace(f"//{v}", f"//{listen}")
+        new = rewrite_text(text, mapping)
         if new != text:
             f.write_text(new, encoding="utf-8")
             changed.append(str(f))

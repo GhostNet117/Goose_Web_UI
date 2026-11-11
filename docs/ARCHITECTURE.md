@@ -122,7 +122,7 @@ The main ideas:
 | `tls.py` | Spec 015: built-in HTTPS - mode resolution (`auto`/`self-signed`/`files`/`off`, Admin UI override), local CA and server certificate (`cryptography`, EC P-256) with every local name/address, renewal (expiry, new names) and hot reload into the live `SSLContext`. |
 | `activity.py` | Spec 015: user activity log, JSON lines in `<system_dir>/logs/activity.jsonl` (every audit event + connections). |
 | `logjanitor.py` | Spec 015: keeps all logs under `logs.max_disk_percent` of the volume (oldest unused files first, copytruncate for a live worker log), prunes the audit table. |
-| `relay.py` | Spec 014: relays from sandboxed workers to allow-listed local services: per-user loopback address, the forwarder that runs inside the container (TCP to named pipe), `PipeRelayServer` (named pipe with a container-only DACL to TCP), and the provider URL rewrite/restore. |
+| `relay.py` | Spec 014: relays from sandboxed workers to allow-listed local services: per-user loopback address, the forwarder that runs inside the container (TCP to named pipe), `PipeRelayServer` (named pipe with a container-only DACL to TCP), and the provider URL rewrite/restore. 1.18.1: `state_mapping` reads the worker's relay record (`<system_dir>/sandbox/<container>.relays.json`) and `Profiles.provision` writes team provider and extension URLs with it applied (`rewrite_text`), so re-provisioning a sandboxed member is a no-op instead of putting the real loopback URL back (the member's chats timed out until the worker restarted). |
 | `sandbox.py` | Spec 012: per-user AppContainer (create/derive, folder grants with icacls, `CreateProcess` with `SECURITY_CAPABILITIES` and an inherited-handle allow-list, suspended start + job object) and `StdioChannel`, the newline-delimited JSON-RPC transport the hub uses instead of a WebSocket for sandboxed (`goose acp`) workers. |
 | `hub.py` | `Hub`, `Upstream`, `Client`, `SessionState`: relays ACP, rewrites ids, buffers and replays session updates, fans out asks, derives herd status, watches for external changes, audits calls. |
 | `control.py` | 1.16.0: the local control channel in `<system_dir>/run/` (`gateway.json`, `req-*.json` / `resp-*.json`): the gateway answers "what is running" (`Hub.busy_report`) and drains before a restart; the client side of `goose-web gateway status|drain|undrain`, with the fallback for gateways older than 1.16 (herd marks in the database). Section [7.8](#78-deploy-busy-check-and-drain-controlpy). |
@@ -164,7 +164,7 @@ The main ideas:
 | `js/composer.js` | Message input: slash commands, @mentions, attachments, send/stop/steer/queue. |
 | `js/asks.js` | Permission, elicitation and recipe-parameter cards and their answers. |
 | `js/herd.js` | Herd store, status transitions, browser notifications, title and favicon badges. |
-| `js/elsewhere.js` | Spec 020: the "Working elsewhere" list (administrators): `setElsewhere`, `elsewhereFor(sessionId)`, `runningElsewhere`, source labels; the sidebar group, the herd section and the chat's read-only banner read it. |
+| `js/elsewhere.js` | Spec 020: the "Working elsewhere" list (administrators): `setElsewhere`, `elsewhereFor(sessionId)`, `runningElsewhere`, source labels; the sidebar group, the herd section and the chat's read-only banner read it. 1.18.1: `namePrefix` (the port of `elsewhere.name_prefix`), `jobPrefixes`, `groupJobRows` - the sidebar's folder list shows the sessions of one elsewhere job as one row. |
 | `js/sessions.js` | Session list loading, paging, refresh, grouping by folder. |
 | `js/markdown.js` | Markdown rendering (marked, then DOMPurify), code highlighting and copy buttons. |
 | `js/cron.js` | Cron presets, validation, description, editor widget. |
@@ -840,7 +840,7 @@ FIX deploy-interrupts-running-turns (1.16.0). Goose cancels a run when its
 worker stops, so a restart of the gateway ends every running turn. Before 1.16
 the deploy scripts judged "idle" by sampling the workers' CPU for 5 s; a turn
 that waits for a long tool call or a sub-agent uses no CPU and was restarted
-away (incident 2026-11-11). Only the gateway knows what runs:
+away (a long tool call was restarted mid-run). Only the gateway knows what runs:
 
 - `Upstream.busy()` lists, per profile: sessions whose turn has not finished
   (`SessionState.running()`: a `session/prompt` in flight, an active run id, or
@@ -860,7 +860,9 @@ away (incident 2026-11-11). Only the gateway knows what runs:
   lists `req-*.json`, answers each with `resp-<id>.json` (atomic replace) and
   cleans unread answers after 10 minutes. No listener, no credential: whoever
   can write the system folder can ask.
-- The client (`goose-web gateway status|drain|undrain`, exit 0 idle / 3 busy):
+- The client (`goose-web gateway status|drain|undrain`; `status` exits 0 idle /
+  3 busy or unknown, `drain`/`undrain` 0 done / 5 not done since 1.18.1,
+  `control.exit_code`):
   a live `gateway.json` pid -> request and wait (default 20 s; no answer =
   unknown = busy). No `gateway.json` (a gateway older than 1.16) -> if
   something listens on the configured port, the herd marks in the database

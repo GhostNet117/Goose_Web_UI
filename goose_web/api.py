@@ -1577,6 +1577,13 @@ async def admin_guard_test(request: Request):
         s, st = await c.guard.classify(str(b["text"])[:100_000], point="test")
         out["classifier"] = {"score": None if s is None else round(s, 4), "status": st,
                              "blocked": s is not None and s >= c.guard.threshold, "threshold": c.guard.threshold}
+        own = []   # closeout F3: guarded teams with their own threshold, and what the score means for them
+        for t in c.db.query("SELECT name, policy FROM teams ORDER BY name"):
+            tg = guardmod.clean_team_guard((t.get("policy") or {}).get("guard"))
+            if tg["enabled"] and tg["threshold"] is not None:
+                own.append({"team": t["name"], "threshold": tg["threshold"],
+                            "blocked": s is not None and s >= tg["threshold"]})
+        out["classifier"]["teams"] = own
     return ok(out)
 
 

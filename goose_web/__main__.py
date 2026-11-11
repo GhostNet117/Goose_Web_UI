@@ -872,7 +872,7 @@ def cmd_gateway(args, settings) -> int:
     else:
         for line in control.describe(r):
             print(line)
-    return control.EXIT_BUSY if control.is_busy(r) else control.EXIT_IDLE
+    return control.exit_code(args.action, r)
 
 
 class _NullIO:
@@ -944,7 +944,8 @@ def main(argv: list[str] | None = None) -> int:
     gd.add_argument("--if-missing", action="store_true", help="install-model: do nothing if a valid model is there")
     gd.add_argument("--force", action="store_true", help="install-model: reinstall even if the same package is there")
     gw = sub.add_parser("gateway", help="ask the running gateway: status (is a chat running?), drain, undrain "
-                                        "(exit 0 = idle, 3 = busy or unknown)")
+                                        "(status: exit 0 = idle, 3 = busy or unknown; drain/undrain: exit 0 = "
+                                        "done, 5 = not done - run status for what is running)")
     gw.add_argument("action", choices=["status", "drain", "undrain"])
     gw.add_argument("--seconds", type=float, default=120,
                     help="drain: refuse new prompts this long (max 900); ends earlier with undrain or the restart")

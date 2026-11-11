@@ -396,11 +396,27 @@ class Profiles:
             "SELECT i.* FROM team_items i JOIN team_members m ON m.team_id=i.team_id WHERE m.user_id=? "
             "ORDER BY i.team_id, i.kind, i.name", (user["id"],))
 
+    def relay_mapping(self, user: dict) -> dict[str, str]:
+        """Spec 014 relays the user's sandboxed worker runs now (target -> forwarder address), from the record
+        workers._start_relays keeps; {} for a user without relays."""
+        from . import relay as rl
+        from . import sandbox as sb
+        return rl.state_mapping(self.s.system_dir / "sandbox", sb.container_name(str(self.root), user["username"]))
+
     def provision(self, user: dict) -> list[str]:
-        """Apply teams, hints and policy to an isolated profile. Idempotent. Returns a change list."""
+        """Apply teams, hints and policy to an isolated profile. Idempotent. Returns a change list.
+        A sandboxed user's provider and extension URLs are written with the worker's relay mapping applied (FIX
+        closeout-2026-11-11 F1): the team item has the real URL (127.0.0.1:<port>), the profile the forwarder's
+        (127.64.x.y:<port>). Writing the real one would cut the member off until the worker restarts, and every
+        save would report the provider as changed."""
         if self.is_native(user):
             return []
         self.ensure_layout(user)
+        from . import relay as rl
+        relays = self.relay_mapping(user)
+
+        def relayed(obj: Any) -> Any:
+            return json.loads(rl.rewrite_text(json.dumps(obj), relays)) if relays else obj
         changes: list[str] = []
         root = self.root_for(user)
         cfg_dir = self.config_dir(user)
@@ -463,7 +479,7 @@ class Profiles:
                 key = payload.get("key") or name
                 if ext_key(key) in _GUARDED:
                     continue   # shell-capable / extension-starting: follows the member's permissions (below)
-                e = copy.deepcopy(entry)
+                e = relayed(copy.deepcopy(entry))
                 if is_command_extension(e) and not pol.get("allow_shell"):
                     # not even dormant: a disabled entry can be switched on (B-2). Removed below if it was there.
                     continue
@@ -479,7 +495,7 @@ class Profiles:
                     target = cfg_dir / "custom_providers" / f"{safe_name(pid, 128)}.json"
                     if not _inside_profile(target, root) or _is_reparse(target):
                         continue   # a junction / link planted in the profile: never write through it (C-3)
-                    text = json.dumps(pj, indent=2)
+                    text = rl.rewrite_text(json.dumps(pj, indent=2), relays)
                     if not target.exists() or target.read_text(encoding="utf-8") != text:
                         _atomic_write(target, text)
                         changes.append(f"provider {pid}")

@@ -140,31 +140,31 @@ def test_forward_ips_are_unique_loopback_addresses():
 
 
 def test_relay_specs_and_pipe_names():
-    specs = rl.relay_specs("GooseWeb.ab12cd34.bob", 7, ["127.0.0.1:8317", "localhost:9000"])
-    assert specs[0]["listen"] == rl.forward_ip(7) + ":8317" and specs[0]["target"] == "127.0.0.1:8317"
-    assert specs == rl.relay_specs("GooseWeb.ab12cd34.bob", 7, ["127.0.0.1:8317", "localhost:9000"])  # stable spec
+    specs = rl.relay_specs("GooseWeb.ab12cd34.bob", 7, ["127.0.0.1:4000", "localhost:9000"])
+    assert specs[0]["listen"] == rl.forward_ip(7) + ":4000" and specs[0]["target"] == "127.0.0.1:4000"
+    assert specs == rl.relay_specs("GooseWeb.ab12cd34.bob", 7, ["127.0.0.1:4000", "localhost:9000"])  # stable spec
     # C-1: the pipe name is chosen per worker start, random and unguessable (not derived from user or target)
     names = {rl.new_pipe_name() for _ in range(50)}
     assert len(names) == 50 and all(n.startswith("\\\\.\\pipe\\goose-web-relay.") for n in names)
     assert all(len(n.rsplit(".", 1)[1]) == 32 for n in names)
     with pytest.raises(ValueError):
-        rl.parse_target("8317")
+        rl.parse_target("4000")
 
 
 def test_profile_urls_are_rewritten_and_restored(tmp_path):
     cfg = tmp_path / "config"
     (cfg / "custom_providers").mkdir(parents=True)
-    (cfg / "config.yaml").write_text("OPENAI_HOST: http://127.0.0.1:8317\nOTHER: http://127.0.0.1:9999\n", encoding="utf-8")
-    (cfg / "custom_providers" / "p.json").write_text('{"api_url": "http://localhost:8317/v1"}', encoding="utf-8")
-    m = {"127.0.0.1:8317": "127.64.0.8:8317"}
+    (cfg / "config.yaml").write_text("OPENAI_HOST: http://127.0.0.1:4000\nOTHER: http://127.0.0.1:9999\n", encoding="utf-8")
+    (cfg / "custom_providers" / "p.json").write_text('{"api_url": "http://localhost:4000/v1"}', encoding="utf-8")
+    m = {"127.0.0.1:4000": "127.64.0.8:4000"}
     assert len(rl.rewrite_profile_urls(str(tmp_path), m)) == 2
-    assert "//127.64.0.8:8317" in (cfg / "config.yaml").read_text(encoding="utf-8")
+    assert "//127.64.0.8:4000" in (cfg / "config.yaml").read_text(encoding="utf-8")
     assert "//127.0.0.1:9999" in (cfg / "config.yaml").read_text(encoding="utf-8")      # not listed: untouched
-    assert "//127.64.0.8:8317/v1" in (cfg / "custom_providers" / "p.json").read_text(encoding="utf-8")
+    assert "//127.64.0.8:4000/v1" in (cfg / "custom_providers" / "p.json").read_text(encoding="utf-8")
     assert rl.rewrite_profile_urls(str(tmp_path), m) == []                               # idempotent
     rl.restore_profile_urls(str(tmp_path), m)
-    assert (cfg / "config.yaml").read_text(encoding="utf-8").startswith("OPENAI_HOST: http://127.0.0.1:8317")
-    assert "//127.0.0.1:8317/v1" in (cfg / "custom_providers" / "p.json").read_text(encoding="utf-8")
+    assert (cfg / "config.yaml").read_text(encoding="utf-8").startswith("OPENAI_HOST: http://127.0.0.1:4000")
+    assert "//127.0.0.1:4000/v1" in (cfg / "custom_providers" / "p.json").read_text(encoding="utf-8")
     # undo_relays: restores from the record the worker wrote and forgets it
     rl.rewrite_profile_urls(str(tmp_path), m)
     state = tmp_path / "state"
@@ -172,7 +172,7 @@ def test_profile_urls_are_rewritten_and_restored(tmp_path):
     (state / "GooseWeb.x.bob.relays.json").write_text(json.dumps(m), encoding="utf-8")
     assert len(rl.undo_relays(str(state), "GooseWeb.x.bob", str(tmp_path))) == 2
     assert not (state / "GooseWeb.x.bob.relays.json").exists()
-    assert "//127.0.0.1:8317" in (cfg / "config.yaml").read_text(encoding="utf-8")
+    assert "//127.0.0.1:4000" in (cfg / "config.yaml").read_text(encoding="utf-8")
     assert rl.undo_relays(str(state), "GooseWeb.x.bob", str(tmp_path)) == []          # nothing recorded: no-op
 
 

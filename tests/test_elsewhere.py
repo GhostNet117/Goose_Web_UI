@@ -46,7 +46,7 @@ class GooseDB:
         self.con.executescript(SCHEMA)
         self.n = 0
 
-    def session(self, sid, name, *, ago, cwd=r"C:\jobs\tqqq", schedule="", parent="", stype="user", msgs=("user", "assistant"),
+    def session(self, sid, name, *, ago, cwd=r"C:\jobs\report", schedule="", parent="", stype="user", msgs=("user", "assistant"),
                 last_tool=False):
         t = time.time() - ago
         self.con.execute("INSERT INTO sessions(id, name, session_type, working_dir, created_at, updated_at, schedule_id, "
@@ -93,8 +93,8 @@ async def _subscribe(hub, up, role="admin", user="alice"):
 
 
 def test_name_prefix():
-    assert ew.name_prefix("TQQQ-Macro 2026-11-11 04:00") == "TQQQ-Macro"
-    assert ew.name_prefix("TQQQ-Macro 2026-11-11T04:00:12Z") == "TQQQ-Macro"
+    assert ew.name_prefix("Hourly-Report 2026-11-11 04:00") == "Hourly-Report"
+    assert ew.name_prefix("Hourly-Report 2026-11-11T04:00:12Z") == "Hourly-Report"
     assert ew.name_prefix("Report (3)") == "Report"
     assert ew.name_prefix("Run #12") == "Run"
     assert ew.name_prefix("Weekly review") == "Weekly review"
@@ -105,8 +105,8 @@ def test_name_prefix():
 async def test_cli_job_desktop_and_schedule_are_listed_grouped_and_private(nenv):
     agent, hub, db = nenv
     for i in range(5):   # a Windows task running `goose run` every few minutes: short finished sessions
-        db.session(f"2026111_{i}", f"TQQQ-Macro 2026-11-11 04:{i:02d}", ago=60 * (i + 1))
-    db.session("2026111_9", "TQQQ-Macro 2026-11-11 04:59", ago=5, msgs=("user",))           # the current run
+        db.session(f"2026111_{i}", f"Hourly-Report 2026-11-11 04:{i:02d}", ago=60 * (i + 1))
+    db.session("2026111_9", "Hourly-Report 2026-11-11 04:59", ago=5, msgs=("user",))           # the current run
     db.session("d1", "Desktop chat", ago=400, cwd=r"C:\work", msgs=("user", "assistant"), last_tool=True)   # long tool
     db.session("old", "Old CLI run", ago=60 * 25, cwd=r"C:\other")                          # finished 25 min ago
     db.session("sch1", "Nightly", ago=30, cwd=r"C:\x", schedule="nightly-report", msgs=("user",))
@@ -118,9 +118,9 @@ async def test_cli_job_desktop_and_schedule_are_listed_grouped_and_private(nenv)
     c, s, res = await _subscribe(hub, up)
     assert res["enabled"] is True
     items = {i["title"]: i for i in res["items"]}   # Working elsewhere = what runs now (finished ones go to Done)
-    assert set(items) == {"TQQQ-Macro 2026-11-11 04:59", "Desktop chat", "Scheduled job nightly-report",
+    assert set(items) == {"Hourly-Report 2026-11-11 04:59", "Desktop chat", "Scheduled job nightly-report",
                           "Desktop parent"}
-    g = items["TQQQ-Macro 2026-11-11 04:59"]
+    g = items["Hourly-Report 2026-11-11 04:59"]
     assert (g["count"], g["running"], g["status"], g["sessionId"]) == (1, 1, "running", "2026111_9")
     assert res["done"] == []   # first start: what finished before is history, not "done" (no backfill)
     assert items["Desktop chat"]["status"] == "running"          # assistant tool request last: a tool is running
@@ -128,7 +128,7 @@ async def test_cli_job_desktop_and_schedule_are_listed_grouped_and_private(nenv)
     sch = items["Scheduled job nightly-report"]
     assert sch["source"] == "schedule" and sch["scheduleId"] == "nightly-report" and sch["scheduler"] == "Goose Desktop"
     raw = json.dumps(res)
-    for secret in ("secret message content", "jobs", "tqqq\\", "C:\\\\work", "cwd"):   # no folders, no content
+    for secret in ("secret message content", "jobs", "\\\\report", "C:\\\\work", "cwd"):   # no folders, no content
         assert secret not in raw
     # the gateway's own chat is never "elsewhere"; once it ran in Goose Web two minutes before the write it is not either
     assert "gw1" not in raw
@@ -261,7 +261,7 @@ def test_status_rules_and_restart_forgets_own_chats():
     assert st(age=60, role="assistant", sub=True) == "running"        # its sub-agent writes
 
 
-def _finish(db, sid, name, cwd=r"C:\jobs\tqqq", **kw):
+def _finish(db, sid, name, cwd=r"C:\jobs\report", **kw):
     db.session(sid, name, ago=1, cwd=cwd, **kw)   # created and finished between two polls
 
 
@@ -269,7 +269,7 @@ async def test_done_elsewhere_grouped_persisted_until_opened(nenv, tmp_path):
     """Every chat that finished elsewhere stays in Done until the administrator interacts with it in Goose Web;
     a job's many short sessions are ONE entry; the markers survive a refresh, other devices and a restart."""
     agent, hub, db = nenv
-    db.session("r1", "TQQQ-Macro 2026-11-11 05:00", ago=5, msgs=("user",))          # working elsewhere now
+    db.session("r1", "Hourly-Report 2026-11-11 05:00", ago=5, msgs=("user",))          # working elsewhere now
     db.session("hist", "Old run", ago=600, cwd=r"C:\h")                              # finished before: history
     up = hub.upstream("alice", "alice")
     c, s, res = await _subscribe(hub, up)
@@ -277,19 +277,19 @@ async def test_done_elsewhere_grouped_persisted_until_opened(nenv, tmp_path):
     wt = hub.elsewhere["alice"]
     db.add("r1", "assistant", TEXT, time.time())                                        # r1 ends
     for k in range(60):                                                                 # a flood of short CLI runs
-        _finish(db, f"q{k}", f"TQQQ-Macro 2026-11-11 05:{k:02d}")
+        _finish(db, f"q{k}", f"Hourly-Report 2026-11-11 05:{k:02d}")
     _finish(db, "dsk", "Desktop chat", cwd=r"C:\work")
     _finish(db, "nr", "Nightly", cwd=r"C:\x", schedule="nightly-report")
     await hub.elsewhere_tick(up)
     done = {d["title"]: d for d in wt.done()}
-    assert set(done) == {"TQQQ-Macro", "Desktop chat", "Scheduled job nightly-report"}
-    assert done["TQQQ-Macro"]["count"] == 61 and len(done["TQQQ-Macro"]["sessions"]) == ew.DONE_SEND
+    assert set(done) == {"Hourly-Report", "Desktop chat", "Scheduled job nightly-report"}
+    assert done["Hourly-Report"]["count"] == 61 and len(done["Hourly-Report"]["sessions"]) == ew.DONE_SEND
     assert wt.items == [] and "hist" not in json.dumps(wt.done())
     push = await s.wait_for(lambda m: m.get("method") == "_gw/elsewhere" and len(m["params"]["done"]) == 3)
     assert "C:\\\\jobs" not in json.dumps(push) and "secret" not in json.dumps(push)
     # unchanged database: nothing is added twice
     await hub.elsewhere_tick(up)
-    assert done["TQQQ-Macro"]["count"] == {d["title"]: d for d in wt.done()}["TQQQ-Macro"]["count"]
+    assert done["Hourly-Report"]["count"] == {d["title"]: d for d in wt.done()}["Hourly-Report"]["count"]
     # persisted (survives a gateway restart / another device): a new hub on the same database has it
     hub.flush_state_now()
     hub2 = Hub(hub.workers)
@@ -307,10 +307,10 @@ async def test_done_elsewhere_grouped_persisted_until_opened(nenv, tmp_path):
     w2 = hub2.elsewhere["alice"]
     assert {d["title"] for d in w2.done()} == {"Scheduled job nightly-report"}   # working again: not done
     assert [i["sessionId"] for i in w2.items] == ["dsk"]
-    _finish(db, "q99", "TQQQ-Macro 2026-11-11 06:00")
+    _finish(db, "q99", "Hourly-Report 2026-11-11 06:00")
     await hub2.elsewhere_tick(up2)
     d = {x["title"]: x for x in w2.done()}
-    assert d["TQQQ-Macro 2026-11-11 06:00"]["count"] == 1
+    assert d["Hourly-Report 2026-11-11 06:00"]["count"] == 1
     # members cannot clear; an administrator clears one group, then "mark all read"
     cm, sm = mk_client(user="bob", role="user")
     hub2.attach(up2, cm)
@@ -318,7 +318,7 @@ async def test_done_elsewhere_grouped_persisted_until_opened(nenv, tmp_path):
     assert (await sm.wait_for(lambda m: m.get("id") == 9))["result"] == {"ok": False}
     key = d["Scheduled job nightly-report"]["key"]
     await hub2.gw_method(up2, c2, {"jsonrpc": "2.0", "id": 10, "method": "_gw/elsewhere_clear", "params": {"key": key}})
-    assert {x["title"] for x in w2.done()} == {"TQQQ-Macro 2026-11-11 06:00"}
+    assert {x["title"] for x in w2.done()} == {"Hourly-Report 2026-11-11 06:00"}
     await hub2.gw_method(up2, c2, {"jsonrpc": "2.0", "id": 11, "method": "_gw/elsewhere_clear", "params": {}})
     assert w2.done() == []
     hub2.flush_state_now()

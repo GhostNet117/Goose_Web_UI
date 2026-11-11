@@ -47,8 +47,11 @@ RESPONSE_MAX_AGE = 600          # unread answers older than this are removed
 DRAIN_DEFAULT = 120
 DRAIN_MAX = 900
 SCHEDULE_TIMEOUT = 8.0          # asking a worker's scheduler which jobs run
-# Exit codes of `goose-web gateway ...`
-EXIT_IDLE, EXIT_BUSY, EXIT_USAGE = 0, 3, 2
+# Exit codes of `goose-web gateway ...` (closeout 2026-11-11 D4): `status` 0 idle / 3 busy or unknown; `drain` and
+# `undrain` 0 = done (whatever runs: ask `status` for that) / 5 = not done (no answer, or a gateway older than 1.16
+# that cannot drain). 2 = usage error (argparse).
+EXIT_IDLE, EXIT_BUSY, EXIT_USAGE, EXIT_NOT_DONE = 0, 3, 2, 5
+EXIT_DONE = EXIT_IDLE
 
 
 def run_dir(settings) -> Path:
@@ -312,6 +315,19 @@ def request(settings, action: str = "status", seconds: float = DRAIN_DEFAULT, re
 
 def is_busy(r: dict) -> bool:
     return bool(r.get("busy")) or bool(r.get("unknown"))
+
+
+def action_done(r: dict) -> bool:
+    """drain / undrain: the gateway answered and applied it, or no gateway runs (nothing to drain)."""
+    if r.get("running") is False:
+        return True
+    return r.get("source") == "gateway" and not r.get("error")
+
+
+def exit_code(action: str, r: dict) -> int:
+    if action == "status":
+        return EXIT_BUSY if is_busy(r) else EXIT_IDLE
+    return EXIT_DONE if action_done(r) else EXIT_NOT_DONE
 
 
 def describe(r: dict) -> list[str]:

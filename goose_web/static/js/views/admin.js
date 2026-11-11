@@ -184,7 +184,7 @@ const EXPERIENCE = [
   { id: 'other', title: 'Other', flags: ['prompts_edit', 'config_edit', 'notify_webhook'] },
   { id: 'guard', title: 'Prompt guard', flags: [] },
 ];
-const GUARD_DEFAULT = { enabled: false, check_input: true, rulesets: [], trusted_extensions: [], on_block: 'notify', auto_approve: false };
+const GUARD_DEFAULT = { enabled: false, check_input: true, rulesets: [], trusted_extensions: [], on_block: 'notify', auto_approve: false, threshold: null };
 const ON_BLOCK = [{ value: 'notify', label: 'Drop it and tell the user' }, { value: 'silent', label: 'Drop it silently' }];
 async function loadGuardSets() { return arr(await GET('/api/admin/guard/rulesets'), 'rulesets'); }
 
@@ -195,15 +195,19 @@ function teamGuardEditor(g0, sets) {
   const rs = multiPick(sets.map((s) => ({ value: s.id, label: s.name, sub: s.ruleCount + ' rules' + (s.description ? ' · ' + s.description : '') })), g.rulesets, { empty: 'No rule sets (Admin > Prompt guard)' });
   const trusted = textarea({ rows: 2, class: 'inp mono', value: (g.trusted_extensions || []).join('\n'), placeholder: 'none - every extension is guarded' });
   const ob = select(ON_BLOCK, g.on_block, { class: 'inp' });
+  // closeout 2026-11-11 F3: the team's own classifier threshold (empty = the global guard.threshold)
+  const thr = input({ type: 'number', min: '0.5', max: '0.99', step: '0.01', class: 'inp inp-sm', value: g.threshold != null ? String(g.threshold) : '', placeholder: 'global', 'aria-label': 'Classifier threshold', 'data-guard-threshold': '1' });
   const el = h('div', { class: 'stack-sm' },
     h('div', { class: 'muted small' }, 'Checks what members type and the arguments of the tool calls Goose asks permission for (never tool results). Rules run first; the local Prompt Guard 2 22M classifier (Built with Llama) checks the free text. Members of a guarded team use Approve: Auto and Smart approve are switched off, and tools cannot be set to "always allow".'),
     row('Prompt guard on', 'Off by default. Applies to every member of this team.', 'enabled'),
     row('Check what members type', 'Block a message the classifier flags as prompt injection.', 'check_input'),
+    field('Classifier threshold', thr, 'Block when the classifier scores at least this, 0.5 to 0.99 (prompts and tool-call arguments of this team). Empty = the global threshold (config.yaml guard.threshold, 0.5 by default). Raise it only for a team whose normal wording scores high (security-operations prompts can): try real prompts in Admin > Prompt guard > Test first.'),
     row('Guarded auto', 'Approve tool calls that pass the guard automatically (members do not see a card for them).', 'auto_approve'),
     field('Rule sets', rs.el, 'Deterministic rules on tool-call arguments (and prompts, if a rule says so). Edit them in Admin > Prompt guard.'),
     field('Trusted extensions', trusted, 'One extension name per line. Their tool calls skip the rules and the classifier; every other extension is guarded.'),
     field('When something is blocked', ob));
-  return { el, get: () => ({ ...g, rulesets: rs.get(), trusted_extensions: trusted.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean), on_block: ob.value }) };
+  return { el, get: () => ({ ...g, rulesets: rs.get(), trusted_extensions: trusted.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean), on_block: ob.value,
+    threshold: thr.value.trim() === '' || Number.isNaN(Number(thr.value)) ? null : Math.min(0.99, Math.max(0.5, Number(thr.value))) }) };
 }
 const MODE_CHOICES = [['auto', 'Auto'], ['approve', 'Approve'], ['smart_approve', 'Smart approve'], ['chat', 'Chat only']];
 const WARN_KIND = { err: 'error', warn: 'warn', info: 'info' };
@@ -573,7 +577,9 @@ function guardTab(body) {
       h('div', { class: 'grid2' }, field('Tool', tool), field('Arguments (JSON)', args)), field('Message', text), cls,
       h('div', { class: 'row' }, actionBtn('Test', async () => {
         const r = await POST('/api/admin/guard/test', { rulesets: rs.get(), tool: tool.value.trim(), args: args.value.trim() || null, text: text.value, classify });
-        res.replaceChildren(show('Tool call', r.tool), show('Message (rules)', r.prompt), show('Message (classifier)', r.classifier));
+        const own = (r.classifier && r.classifier.teams) || [];
+        res.replaceChildren(show('Tool call', r.tool), show('Message (rules)', r.prompt), show('Message (classifier)', r.classifier),
+          own.length ? h('div', { class: 'muted small', 'data-guard-teams': '1' }, 'Teams with their own threshold: ' + own.map((t) => t.team + ' (' + t.threshold + '): ' + (t.blocked ? 'blocked' : 'allowed')).join('; ')) : null);
       }, { size: 'sm', icon: 'play' })), res));
   };
 

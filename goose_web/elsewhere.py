@@ -58,7 +58,7 @@ _TRAIL = re.compile(r"(?:[\s\-_:#.,/]*(?:\d[\d\-_:./]*(?:[Tt ]\d[\d:.]*)?[Zz]?|\
 
 
 def name_prefix(name: str) -> str:
-    """'TQQQ-Macro 2026-11-11 04:00' -> 'TQQQ-Macro'; 'Report (3)' -> 'Report'; 'Weekly' -> 'Weekly'."""
+    """'Hourly-Report 2026-11-11 04:00' -> 'Hourly-Report'; 'Report (3)' -> 'Report'; 'Weekly' -> 'Weekly'."""
     n = (name or "").strip()
     return _TRAIL.sub("", n).strip(" -_:#.,/") or n
 

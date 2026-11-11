@@ -274,25 +274,25 @@ async def test_retry_updates_replayed_extension_status(env):
     hub.attach(up, c1)
     agent.counts["e1"] = 3
     agent.ext_results = [{"name": "developer", "success": True},
-                         {"name": "graphify", "success": False, "error": "process quit before initialization"}]
+                         {"name": "example_ext", "success": False, "error": "process quit before initialization"}]
     r = await _load(up, c1, s1, "e1", 1)
     assert r["result"]["_meta"]["extensionResults"][1]["success"] is False
     await _fp_settled(up, "e1")
     # Retry in the extension panel: remove the dead entry, then add it again (MCP: name in server.name)
     await up.from_client(c1, {"jsonrpc": "2.0", "id": 2, "method": "_goose/unstable/session/extensions/remove",
-                              "params": {"sessionId": "e1", "extensionKey": "graphify"}})
+                              "params": {"sessionId": "e1", "extensionKey": "example_ext"}})
     await s1.wait_for(lambda m: m.get("id") == 2)
     await up.from_client(c1, {"jsonrpc": "2.0", "id": 3, "method": "_goose/unstable/session/extensions/add",
-                              "params": {"sessionId": "e1", "extension": {"type": "mcp", "server": {"name": "graphify"}}}})
+                              "params": {"sessionId": "e1", "extension": {"type": "mcp", "server": {"name": "example_ext"}}}})
     await s1.wait_for(lambda m: m.get("id") == 3)
     await _fp_settled(up, "e1")
-    # a second tab (reload) is served from the cache: graphify must now be loaded
+    # a second tab (reload) is served from the cache: example_ext must now be loaded
     c2, s2 = mk_client(role="admin")
     hub.attach(up, c2)
     r = await _load(up, c2, s2, "e1", 4)
     assert agent.loads == 1 and r["result"]["_meta"]["gw"]["replayed"] is True
     assert r["result"]["_meta"]["extensionResults"] == [{"name": "developer", "success": True},
-                                                        {"name": "graphify", "success": True}]
+                                                        {"name": "example_ext", "success": True}]
     # a failed add records Goose's error; a remove drops the entry
     agent.fail_add = "spawn failed"
     await up.from_client(c2, {"jsonrpc": "2.0", "id": 5, "method": "_goose/unstable/session/extensions/add",
@@ -303,7 +303,7 @@ async def test_retry_updates_replayed_extension_status(env):
     await up.from_client(c2, {"jsonrpc": "2.0", "id": 6, "method": "_goose/unstable/session/extensions/remove",
                               "params": {"sessionId": "e1", "extensionKey": "developer"}})
     await s2.wait_for(lambda m: m.get("id") == 6)
-    assert up.sessions["e1"].load_result["_meta"]["extensionResults"] == [{"name": "graphify", "success": True}]
+    assert up.sessions["e1"].load_result["_meta"]["extensionResults"] == [{"name": "example_ext", "success": True}]
 
 
 def test_apply_extension_change_edge_cases():

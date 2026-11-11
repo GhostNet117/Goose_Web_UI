@@ -150,7 +150,7 @@ class BodyLimit:
 
 
 # ---------------------------------------------------------------------- Host allow-list (NEW-04)
-_WILDCARD_BINDS = {"", "0.0.0.0", "::", "*"}
+_WILDCARD_BINDS = {"", "0.0.0.0", "::", "*"}  # nosec B104 - used to detect a wildcard bind, never to bind
 
 
 def host_only(value: str | None) -> str:
@@ -602,6 +602,10 @@ def wire_security_hooks(c: Ctx) -> None:
         if not mine:
             return False
         if team:
+            relays = c.profiles.relay_mapping(u) if hasattr(c.profiles, "relay_mapping") else {}
+            if relays:   # a sandboxed member's entry carries the relay forwarder's URL (spec 014, closeout F1)
+                from . import relay as rl
+                team = json.loads(rl.rewrite_text(json.dumps(team), relays))
             return all(_ext_fingerprint(e) == _ext_fingerprint(team) for e in mine)
         return all(str(e.get("type") or "").lower() in ("platform", "builtin") and e.get("bundled") is not False
                    for e in mine)

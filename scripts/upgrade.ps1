@@ -168,7 +168,15 @@ try {
         return $false
     }
     function GatewayBusy([string]$Action) {   # 'status' or 'drain': $true busy, $false idle, $null = no such command (< 1.16)
-        $r = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'gateway', $Action, '--seconds', '180', '--reason', 'upgrade')
+        if ($Action -eq 'drain') {
+            # 1.18.1+: drain exits 0 = done, 5 = not done (a gateway older than 1.16 cannot drain); what runs is
+            # asked with status next (the drain stays in force, so no turn can start in between)
+            $d = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'gateway', 'drain', '--seconds', '180', '--reason', 'upgrade')
+            $d.out | Where-Object { $_ } | ForEach-Object { Say "gateway: $_" }
+            if ($d.code -eq 2) { return $null }
+            if ($d.code -ne 0) { Say "gateway: drain not confirmed (exit $($d.code)); checking what runs" }
+        }
+        $r = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'gateway', 'status')
         $r.out | Where-Object { $_ } | ForEach-Object { Say "gateway: $_" }
         if ($r.code -eq 0) { return $false }
         if ($r.code -eq 3) { return $true }

@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.18.1 - 2026-11-11
+
+**Close-out fixes.** No database schema change.
+
+- **Fix: a team or user save no longer cuts a sandboxed member off their provider.** With `sandbox.relays`, the
+  worker points the member's provider URL at its relay forwarder. Re-provisioning (any team or user save) wrote the
+  real loopback URL back, so the member's next chats timed out until the worker restarted, and every save reported
+  the provider as changed. Provider and extension URLs are now written with the worker's relay mapping applied: a
+  save that changes nothing changes nothing.
+- **Prompt guard: per-team classifier threshold.** Admin > Teams > Prompt guard > **Classifier threshold** (0.5 to
+  0.99; empty = the global `guard.threshold`). Admin > Prompt guard > Test shows what a score means for each team
+  with its own threshold. ADMINISTRATION 9.8 explains that ordinary security-operations wording can score high and
+  how to test real prompts before switching on the input check.
+- **Prompt guard: `guard remove-model` on a running gateway** takes effect at the next check (the model is unloaded
+  and the guard fails open with the admin banner) instead of after a restart.
+- **`goose-web gateway drain|undrain` exit codes:** 0 = done (also while a turn runs), 5 = not done. Only `status`
+  exits 3 for busy. `upgrade.ps1` drains, then asks `status`.
+- **Sidebar:** the sessions of one job that runs elsewhere (Goose Desktop, the goose CLI, a scheduled task) are one row
+  per folder, like the Herd; its count lists the sessions.
+- **Chat header:** the effort picker of a model that gets no effort from Goose is one greyed-out "Set by provider"
+  entry for every such model; the provider list has New chat's order and leaves out Goose's own "Goose (Default)"
+  entry unless the chat uses it.
+- Neutral example names and ports in the docs and tests.
+
 ## 1.18.0 - 2026-11-11
 
 **Provider groups and model labels.** No database schema change.
@@ -328,7 +352,7 @@ shell extension back on through `extensionmanager` (B-2).
 - **Longer visible history:** a chat now shows the last 300 messages and tool steps (was 80; Settings > Preferences >
   Chat > Messages shown in a chat: 100, 300, 1000 or All) and loads earlier ones automatically when you scroll to the
   top. The old limit looked like early compaction in tool-heavy chats.
-- **Relays for sandboxed users:** `sandbox.relays: ["127.0.0.1:8317"]` lets sandboxed agents use a local service such
+- **Relays for sandboxed users:** `sandbox.relays: ["127.0.0.1:4000"]` lets sandboxed agents use a local service such
   as a model proxy, through a forwarder in the user's own container and a named pipe only that container can open;
   the user's provider URLs are pointed at the forwarder and restored when no longer needed. The rest of loopback stays
   closed (ADMINISTRATION 11.6, SECURITY-ASSESSMENT 8.3).

@@ -230,12 +230,12 @@ def test_legacy_container_is_removed_before_the_new_one_is_used(tmp_path, monkey
     old = sb.legacy_container_name(root, "jo.ann")
     new = sb.container_name(root, "jo.ann")
     (state / f"{old}.json").write_text(json.dumps({"name": old, "sid": "S-1-15-2-1", "grants": {str(folder): "modify"}}))
-    (state / f"{old}.relays.json").write_text(json.dumps({"127.0.0.1:8317": "127.64.0.9:8317"}))
+    (state / f"{old}.relays.json").write_text(json.dumps({"127.0.0.1:4000": "127.64.0.9:4000"}))
     st = sb.migrate_legacy(str(state), root, "jo.ann")
     assert st["name"] == old
     assert ("revoke", str(folder), "S-1-15-2-1") in calls and ("delete", old) in calls
     assert not (state / f"{old}.json").exists()
-    assert json.loads((state / f"{new}.relays.json").read_text()) == {"127.0.0.1:8317": "127.64.0.9:8317"}
+    assert json.loads((state / f"{new}.relays.json").read_text()) == {"127.0.0.1:4000": "127.64.0.9:4000"}
     calls.clear()
     assert sb.migrate_legacy(str(state), root, "jo.ann") == {} and calls == []         # nothing left to do
     assert sb.all_states(str(state)) == []                                           # relay records are not states

@@ -288,7 +288,8 @@ and a row of option pickers for the new chat.
 
    Some models never receive an effort from Goose: models other than OpenAI's (and xAI Grok) on an OpenAI-compatible
    provider, for example GLM or DeepSeek behind a company gateway. For those the picker row shows **Effort set by the
-   provider configuration, not per chat** (the chat header's effort picker says the same in its tooltip). The level
+   provider configuration, not per chat**; in the chat header the effort picker of such a model shows one greyed-out
+   **Set by provider** entry (version 1.18.1 and later; its tooltip says the same). The level
    such a model uses is set once per model by an administrator (see CONFIGURATION, "Thinking effort").
 
    Your choices are remembered for the next new chat. They are applied to the chat before your first message is sent. If the new chat does not offer a choice (for example a thinking effort the
@@ -777,9 +778,10 @@ the top of the chat list, in the Herd page and as "*n* elsewhere" in the sidebar
   the "done" counter) and stays there until you open it here, click **Clear**, or **Mark all read**. Opening it in
   Goose Desktop or the CLI does not clear it (Goose Web cannot see that). Done entries are kept across refreshes,
   devices and Goose Web restarts; runs that finished while Goose Web was closed show up when you come back.
-- A job that makes many short sessions (for example `TQQQ-Macro 2026-11-11 04:00`, `... 04:05`) is one entry with the
+- A job that makes many short sessions (for example `Hourly-Report 2026-11-11 04:00`, `... 04:05`) is one entry with the
   number of sessions and the newest one - also in Done (one card for all the runs that finished since you last
-  opened one; opening any of them clears the card).
+  opened one; opening any of them clears the card). In the chat list the job's sessions are one row as well (version
+  1.18.1 and later): the row opens the newest session, and its **×*n*** count lists the others.
 - **View (read-only)** opens the chat. While the other program runs it, Goose Web only shows it: the message box is
   replaced by a *Working elsewhere - read-only* banner, and there is no Stop or steering - Goose Web cannot reach that
   program. The transcript updates as the program writes. When it has finished, the message box comes back and you
@@ -1022,6 +1024,8 @@ policy does not allow shows a "Read-only" note or is hidden.
 profile (name and id). Untick the providers you never use: they are left out of the provider picker on the New chat
 screen and in the chat header, and their models with them. Nothing else changes - they stay configured, recipes,
 schedules and administrators' team settings still see them, and a chat that already uses one still shows it.
+The chat header lists the same providers as New chat, in the same order (by name; version 1.18.1 and later), and
+without Goose's own "Goose (Default)" entry unless the chat uses it.
 **Show all** ticks everything again; **Hide all except default** leaves only your default provider. Your default
 provider is always shown: unticking it is refused with a short explanation (choose another default first). The
 choice is saved on the server with your other preferences, so it applies in every browser you sign in from; a

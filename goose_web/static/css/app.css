@@ -687,6 +687,13 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .chat-elsewhere { max-width: 860px; margin: 0 auto 4px; }
 .sgroup-elsewhere .sgroup-label { color: var(--info); }
 .srow-elsewhere .sgroup-count { margin-left: auto; }
+/* closeout 2026-11-11 D5: one row per elsewhere job in a folder; the count toggles the job's sessions */
+.srow-job .srow-jobcount { margin-left: auto; border: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; padding: 0 4px; border-radius: 4px; }
+.srow-job .srow-jobcount:hover, .srow-job .srow-jobcount[aria-expanded="true"] { background: var(--bg-hover, rgba(127, 127, 127, .15)); }
+.srow.srow-sub { padding-left: 28px; }
+/* closeout 2026-11-11 D2: the effort picker of a model Goose sends no effort for */
+.pill.pill-disabled { opacity: .65; }
+.pill.pill-disabled .pill-select { cursor: not-allowed; }
 
 /* ---------- Transcript ---------- */
 .transcript { display: flex; flex-direction: column; }

@@ -277,6 +277,9 @@ def team_warnings(policy: dict, *, hints: int, members: int) -> list[dict]:
                                                  "members (the guard sees tool calls only when Goose asks first)"
                                                  + ("; guarded auto approves calls that pass." if g["auto_approve"]
                                                     else ".")})
+        if g["threshold"] is not None:
+            out.append({"level": "info", "text": f"Prompt guard: this team's classifier threshold is {g['threshold']} "
+                                                 "(instead of the global guard.threshold)."})
         if not g["rulesets"] and not g["check_input"]:
             out.append({"level": "warn", "text": "Prompt guard on, but with no rule sets and no input check it only "
                                                  "classifies tool-call arguments."})

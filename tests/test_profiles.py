@@ -82,6 +82,51 @@ def test_team_items_and_secrets(tmp_path, monkeypatch):
     assert yaml.safe_load((native / "config" / "secrets.yaml").read_text())["OTHER"] == "no"
 
 
+def test_reprovision_keeps_relayed_urls_of_a_sandboxed_member(tmp_path, monkeypatch):
+    """FIX closeout-2026-11-11 F1: the worker of a sandboxed member rewrote its provider URL to the relay forwarder
+    (spec 014). A later team or user save re-provisioned the real URL over it (the member's chats timed out until
+    the worker restarted) and reported the provider as changed on every save. Re-provisioning must be a no-op."""
+    from goose_web import relay as rl
+    from goose_web import sandbox as sb
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    (native / "config" / "custom_providers" / "p1.json").write_text(json.dumps(
+        {"name": "p1", "engine": "openai", "api_key_env": "P1_KEY", "base_url": "http://127.0.0.1:8801/v1"}),
+        encoding="utf-8")
+    tid = db.execute("INSERT INTO teams(name, policy, created_at) VALUES('t', ?, 0)",
+                     (json.dumps({"default_provider": "p1", "default_model": "m1", "allowed_providers": ["*"],
+                                 "allowed_models": ["*"], "allowed_modes": ["*"]}),))
+    db.execute("INSERT INTO team_members(team_id, user_id) VALUES(?,?)", (tid, alice["id"]))
+    name, payload = pr.export_item(admin, "provider", "p1")
+    db.execute("INSERT INTO team_items(team_id, kind, name, payload, created_at) VALUES(?,?,?,?,0)",
+               (tid, "provider", name, json.dumps(payload)))
+    pr.provision(alice)
+    root = tmp_path / "profiles" / "alice"
+    pfile = root / "config" / "custom_providers" / "p1.json"
+    assert "//127.0.0.1:8801/v1" in pfile.read_text(encoding="utf-8")
+    # the worker starts in the sandbox: relays on, URLs rewritten, the record kept (workers._start_relays)
+    mapping = {"127.0.0.1:8801": rl.forward_ip(alice["id"]) + ":8801"}
+    rl.rewrite_profile_urls(str(root), mapping)
+    state = s.system_dir / "sandbox"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / f"{sb.container_name(str(s.profiles_root), 'alice')}.relays.json").write_text(json.dumps(mapping))
+    relayed = pfile.read_text(encoding="utf-8")
+    assert "//127.64." in relayed and "//127.0.0.1:8801" not in relayed
+    assert pr.relay_mapping(alice) == mapping
+    # a team / user save: nothing changes, the forwarder URL stays
+    assert [c for c in pr.provision(db.user_by_id(alice["id"])) if c.startswith("provider")] == []
+    assert pfile.read_text(encoding="utf-8") == relayed
+    # a real change of the team item is still written - relayed
+    payload["json"]["base_url"] = "http://127.0.0.1:8801/v2"
+    db.execute("UPDATE team_items SET payload=? WHERE team_id=?", (json.dumps(payload), tid))
+    assert "provider p1" in pr.provision(db.user_by_id(alice["id"]))
+    assert f"//{mapping['127.0.0.1:8801']}/v2" in pfile.read_text(encoding="utf-8")
+    # no relay record (not sandboxed): the real URL as before
+    (state / f"{sb.container_name(str(s.profiles_root), 'alice')}.relays.json").unlink()
+    assert pr.relay_mapping(alice) == {}
+    pr.provision(db.user_by_id(alice["id"]))
+    assert "//127.0.0.1:8801/v2" in pfile.read_text(encoding="utf-8")
+
+
 def test_library_listing(tmp_path, monkeypatch):
     s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
     assert [i["ref"] for i in pr.library(admin, "provider")] == ["p1"]

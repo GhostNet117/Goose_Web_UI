@@ -105,7 +105,7 @@ DEFAULTS: dict[str, Any] = {
         "enabled": "auto",                # auto = on for Windows, off elsewhere; true | false
         "network": "internet",            # none | internet | internet+lan (loopback is never reachable)
         "read_dirs": [],                  # extra program folders the workers may read and run (Python, node, uv, git)
-        "relays": [],                     # local services sandboxed workers may reach, e.g. ["127.0.0.1:8317"] (relay.py)
+        "relays": [],                     # local services sandboxed workers may reach, e.g. ["127.0.0.1:4000"] (relay.py)
     },
     # Prompt guard (guard.py, spec 018): the local Prompt Guard 2 22M classifier. Teams switch the guard on in
     # Admin > Teams; these are the classifier's knobs. Nothing loads while no team (and not the admins) uses it.

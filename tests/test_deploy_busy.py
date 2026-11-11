@@ -33,7 +33,7 @@ class JobAgent(SteerAgent):
     def __init__(self, jobs=None, error=None):
         super().__init__()
         self.jobs = jobs if jobs is not None else [
-            {"id": "tqqq-macro", "cron": "0 * * * *", "currentlyRunning": True, "currentSessionId": "20261111_7",
+            {"id": "hourly-report", "cron": "0 * * * *", "currentlyRunning": True, "currentSessionId": "20261111_7",
              "jobStartTime": "2026-11-11T09:00:00Z"},
             {"id": "idle-job", "cron": "0 0 * * *", "currentlyRunning": False}]
         self.error = error
@@ -138,7 +138,7 @@ async def test_scheduler_jobs_in_a_gateway_worker_are_busy():
         hub.upstream("alice", "alice")
         busy = await hub.busy_report()
         assert [(b["kind"], b["sessionId"], b["title"]) for b in busy] == [
-            ("schedule", "20261111_7", "scheduled job tqqq-macro")]
+            ("schedule", "20261111_7", "scheduled job hourly-report")]
         assert busy[0]["since"] == pytest.approx(1794387600.0)
         agent.jobs = [{"id": "idle-job", "currentlyRunning": False}]
         assert await hub.busy_report() == []

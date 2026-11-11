@@ -988,6 +988,9 @@ the rules are the enforcement for what must never happen.
 **Fail open.** If the model is missing, damaged or slower than `guard.timeout_ms`, the message or call is allowed, the
 rules still apply, `guard.unavailable` is audited (on each change, then at most every 10 minutes) and administrators
 see a banner on every page until it is healthy again (*Check now* on Admin > Prompt guard re-tests it).
+`goose-web guard remove-model` on a running gateway takes effect at the next check (since 1.18.1): the gateway
+notices that the model files are gone, unloads the model and fails open with the banner - no restart needed (before
+1.18.1 the loaded model kept scoring until the next restart).
 
 **Audit.** `guard.blocked` (user, team, profile, chat, point `prompt`/`tool`, extension and tool, rule set and rule or
 classifier score, mode; `guardedUser` when an administrator typed into a member's chat), `guard.bypass`,
@@ -1073,6 +1076,17 @@ writing "ignore the typos in my last message" are blocked too (about 1 in 4 anal
 ordinary questions, SPL searches, log lines and code passed). The score is almost always below 0.01 or above 0.99,
 so raising the threshold removes few false positives. Keep the deterministic rules on: they catch what the
 classifier never will (the write/delete/send command in the tool call itself).
+
+**Security-operations wording (SOC, security analysts) and the team threshold (since 1.18.1).** Ordinary
+security-operations prompts can score in between, with no injection wording at all: "Please summarise yesterday's
+firewall alerts by host" scored 0.70 on the real model and was blocked at the default 0.5. Before you switch on
+**Check what members type** for such a team, paste a handful of its real prompts into **Admin > Prompt guard > Test**
+(tick *Also run the classifier on the message*) and look at the scores. If normal prompts score high, either leave the
+input check off for that team (the rules and the tool-call check still apply) or give the team its own **Classifier
+threshold** (Admin > Teams > the team > Prompt guard: 0.5 to 0.99; empty = the global `guard.threshold`). The Test
+result then also lists every guarded team with its own threshold and whether the score would be blocked there. A
+higher threshold also lets more real injections through: raise it only as far as the team's real prompts need. It
+applies to the team's prompts and tool-call arguments; the administrators' guard always uses `guard.threshold`.
 
 ## 10. Shared goose hints
 
@@ -1286,7 +1300,7 @@ sandbox:
   enabled: auto              # default: on; true | false
   network: internet          # none | internet | internet+lan
   read_dirs: []              # extra program folders agents may run, e.g. C:\Program Files\nodejs, a Python install
-  relays: []                 # local services sandboxed agents may use, e.g. ["127.0.0.1:8317"] (a local model proxy)
+  relays: []                 # local services sandboxed agents may use, e.g. ["127.0.0.1:4000"] (a local model proxy)
 ```
 
 What it does, for every **isolated, non-admin** user (administrators and the native profile are never sandboxed):
@@ -1336,7 +1350,7 @@ agents. List the ones they may use:
 
 ```yaml
 sandbox:
-  relays: ["127.0.0.1:8317"]
+  relays: ["127.0.0.1:4000"]
 ```
 
 For each sandboxed user and listed service, the gateway starts a small forwarder **inside the user's own
@@ -1346,8 +1360,8 @@ ACL admits only that user's container, so another user's agent cannot use it. On
 reachable; the rest of 127.0.0.1 stays closed (no loopback exemption).
 
 The user's Goose configuration (`config/config.yaml` and `config/custom_providers/*.json` in their profile) is
-rewritten so URLs to the service (`//127.0.0.1:8317`, `//localhost:8317`) point at the forwarder
-(`//127.64.x.y:8317`). The rewrite is undone when the service is removed from `sandbox.relays`, when the user stops
+rewritten so URLs to the service (`//127.0.0.1:4000`, `//localhost:4000`) point at the forwarder
+(`//127.64.x.y:4000`). The rewrite is undone when the service is removed from `sandbox.relays`, when the user stops
 being sandboxed (administrator, sandbox off) and by `goose-web sandbox remove`. The forwarder runs on the gateway's
 own Python (its base installation is granted Read & execute). Relays take effect at the worker's next start.
 `goose-web sandbox status` lists them.
@@ -1485,7 +1499,8 @@ running after a tab is closed.
 The native profile is shared with Goose Desktop, the goose CLI and Goose's scheduler on the same Windows account (and
 with Windows scheduled tasks that run `goose run`). Administrators whose own profile is the native one see what those
 programs are running, read-only: a **Working elsewhere** group in the sidebar, a section in the Herd and a counter
-("*n* elsewhere"). Members never see it (the gateway sends it only to administrator tabs of a native profile).
+("*n* elsewhere"). In the sidebar's folder list, the sessions of one job (the grouping rule below) are one row too
+(since 1.18.1): the job's name, the newest session, and a count that lists the others. Members never see it (the gateway sends it only to administrator tabs of a native profile).
 
 - **Source.** The profile's `data\sessions\sessions.db`, read with a read-only connection (`mode=ro`, `query_only`,
   0.5 s busy timeout, closed at once - never a write, never a long lock; Desktop and the CLI keep writing it). The
@@ -1503,7 +1518,7 @@ programs are running, read-only: a **Working elsewhere** group in the sidebar, a
   there until an administrator interacts with it **in Goose Web**: opens it (opening any session of a grouped entry
   clears the whole entry), clicks **Clear** on its card, or **Mark all read** (Done column header; also clears Goose
   Web's own done chats). Opening it in Goose Desktop or the CLI cannot be seen by the gateway and does not clear it.
-  A job's sessions are ONE Done entry with a count (the 54 "TQQQ-Macro" runs of two hours are one card, the newest ten
+  A job's sessions are ONE Done entry with a count (a job's many runs are one card, the newest ten
   listed); at most `max_items` (40) entries, the oldest is dropped (marked read) beyond that. The markers are stored
   in the gateway database (`chat_state`, session `~elsewhere`, kind `done`: groups, a watermark and the ids already
   read), so they survive a refresh, other devices and a gateway restart. Sessions that finished while nobody had Goose
@@ -1511,7 +1526,7 @@ programs are running, read-only: a **Working elsewhere** group in the sidebar, a
   very first start nothing older is imported (no backfill of history). A session that starts working elsewhere again
   leaves Done and comes back when it finishes.
 - **Grouping.** Sessions with the same schedule id, or the same name without its trailing date/number in the same
-  working folder, are one entry with a count and the newest session (a job that ran `goose run` 54 times in two hours
+  working folder, are one entry with a count and the newest session (a job that ran `goose run` many times
   is one line).
 - **Privacy.** The tab gets names, session ids, counts and times - no folders, no message content. Opening an entry is
   the normal chat view of the native profile.
@@ -1785,8 +1800,8 @@ sub-agent (no CPU at all). Now they ask the gateway:
 
 ```powershell
 .venv\Scripts\python.exe -m goose_web --config <config.yaml> gateway status          # exit 0 idle, 3 busy
-.venv\Scripts\python.exe -m goose_web --config <config.yaml> gateway drain --seconds 180   # refuse new prompts, then report
-.venv\Scripts\python.exe -m goose_web --config <config.yaml> gateway undrain
+.venv\Scripts\python.exe -m goose_web --config <config.yaml> gateway drain --seconds 180   # refuse new prompts: exit 0 done, 5 not done
+.venv\Scripts\python.exe -m goose_web --config <config.yaml> gateway undrain        # exit 0 done, 5 not done
 ```
 
 `status` lists every running turn in every worker (prompts in flight - also long tool calls and sub-agents - pending
@@ -1795,7 +1810,10 @@ a gateway worker), with user, chat id, title and since when. `drain` makes the g
 time and tells every open tab ("Goose Web restarts for an update in a moment"); the upgrade drains right before its
 last check and the restart, so no turn can start in between. The answer comes through files in `<system_dir>\run\`
 (no network port, no credential). A gateway older than 1.16 does not answer; then the herd marks in its database say
-which chats run, and it cannot drain. Chats that were running anyway (`-Force`) show *Interrupted: Goose Web restarted
+which chats run, and it cannot drain. Exit codes (since 1.18.1): only `status` reports busy (3); `drain` and
+`undrain` exit 0 when the gateway applied them - also while a turn runs, which `status` then shows - and 5 when they
+were not applied (no answer, or a gateway older than 1.16). Before 1.18.1 `drain`/`undrain` exited 3 whenever
+something ran, although the action had worked. Scripts drain, then ask `status`. Chats that were running anyway (`-Force`) show *Interrupted: Goose Web restarted
 while this chat was running* after the restart.
 
 After the upgrade, ask users to reload the page (a hard refresh if the old UI still shows, see

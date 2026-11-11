@@ -97,7 +97,7 @@ def local_names(settings) -> tuple[list[str], list[str]]:
 
     def add(v: Any) -> None:
         v = str(v or "").strip().strip("[]").rstrip(".").lower()
-        if not v or v in ("0.0.0.0", "::", "*"):
+        if not v or v in ("0.0.0.0", "::", "*"):  # nosec B104 - detects a wildcard bind, never binds
             return
         if _is_ip(v):
             ip = ipaddress.ip_address(v)

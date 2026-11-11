@@ -105,7 +105,7 @@ host_tasks:
 | `logs.audit_days`, `logs.audit_max_rows` | `365`, `500000` | Audit table retention in the database. |
 | `sandbox.enabled` | `auto` | `auto` = on; `true` / `false`. Runs every isolated non-admin user's worker in its own AppContainer, connected over stdio; file access only to the user's profile, the team folder and the team's extra folders (ADMINISTRATION 11.6). |
 | `sandbox.network` | `internet` | Network capabilities of sandboxed workers: `none`, `internet` (outbound internet) or `internet+lan` (also the local network). Loopback is never reachable. |
-| `sandbox.relays` | `[]` | Local services (`host:port` on this machine, for example a model proxy on `127.0.0.1:8317`) that sandboxed workers may reach through a per-user forwarder and a named pipe; their provider URLs are rewritten to the forwarder (ADMINISTRATION 11.6). Everything else on loopback stays closed. |
+| `sandbox.relays` | `[]` | Local services (`host:port` on this machine, for example a model proxy on `127.0.0.1:4000`) that sandboxed workers may reach through a per-user forwarder and a named pipe; their provider URLs are rewritten to the forwarder (ADMINISTRATION 11.6). Everything else on loopback stays closed. |
 | `sandbox.read_dirs` | `[]` | Extra folders sandboxed workers may read and run (Python, node, uv, git installs outside `C:\Program Files`). The goose CLI folder is always included. |
 | `goose.binary` | `""` | Path to `goose`. When empty: `goose` on `PATH`, then `%LOCALAPPDATA%\Programs\Goose\resources\bin\goose.exe`, `%ProgramFiles%\Goose\resources\bin\goose.exe`, `%USERPROFILE%\.local\bin\goose.exe`. Set it for any other location (for example `C:\AI\Goose\resources\bin\goose.exe`); `install.ps1 -GooseBinary` writes it. |
 | `goose.idle_minutes` | `30` | A worker is stopped after this long with no browser clients, no active runs and no scheduler duty. |
@@ -140,7 +140,7 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 
 | Key | Default | Meaning |
 |---|---|---|
-| `guard.threshold` | `0.5` | Block when the classifier's malicious probability is at least this. |
+| `guard.threshold` | `0.5` | Block when the classifier's malicious probability is at least this. A team can have its own (team policy `guard.threshold`, 0.5-0.99, since 1.18.1); the administrators' guard always uses this one. |
 | `guard.min_chars` | `16` | Shorter text is not classified (rules still apply). |
 | `guard.window_tokens` | `128` | Tokens per classifier window (the model reads at most 512; shorter windows are much cheaper on a CPU). |
 | `guard.window_overlap` | `16` | Tokens shared by consecutive windows. |
@@ -337,7 +337,7 @@ completed with the 1.4 defaults, empty mode/provider/model lists in teams and us
 user in several teams keeps the team with the lowest id (audit `team.migrate.membership`). See
 [ADMINISTRATION.md](ADMINISTRATION.md#98-upgrading-from-14-the-policy-migration).
 
-Since 1.14.0 a team policy may carry `guard` (prompt guard): `{enabled, check_input, rulesets: [id], trusted_extensions: [name], on_block: "notify"|"silent", auto_approve}`. Missing = off. While it is on, `allowed_modes` loses `auto` and `smart_approve` (ADMINISTRATION 9.8). Command line: `goose-web guard status | install-model [--file ZIP [--sha256 HEX]] [--if-missing] [--force] | remove-model` (without `--file` it downloads the pinned package; `HTTPS_PROXY` / `NO_PROXY` apply).
+Since 1.14.0 a team policy may carry `guard` (prompt guard): `{enabled, check_input, rulesets: [id], trusted_extensions: [name], on_block: "notify"|"silent", auto_approve, threshold}` (`threshold` since 1.18.1: the team's classifier threshold, 0.5-0.99, `null` = `guard.threshold`). Missing = off. While it is on, `allowed_modes` loses `auto` and `smart_approve` (ADMINISTRATION 9.8). Command line: `goose-web guard status | install-model [--file ZIP [--sha256 HEX]] [--if-missing] [--force] | remove-model` (without `--file` it downloads the pinned package; `HTTPS_PROXY` / `NO_PROXY` apply; since 1.18.1 a running gateway notices a removed model at its next check and fails open, no restart needed).
 
 ## 6. Profile layout
 

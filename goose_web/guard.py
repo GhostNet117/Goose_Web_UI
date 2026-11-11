@@ -315,6 +315,24 @@ def clean_ruleset(body: dict, *, partial_of: dict | None = None) -> dict:
     return {"name": name, "description": desc, "rules": clean}
 
 
+TEAM_THRESHOLD_MIN, TEAM_THRESHOLD_MAX = 0.5, 0.99
+
+
+def clean_threshold(v: Any) -> float | None:
+    """A team's own classifier threshold (closeout 2026-11-11 F3): None = the global guard.threshold; otherwise
+    bounded to 0.5-0.99: a team can ask for a higher score before a block (fewer false positives on its own
+    wording), never for a score below 0.5."""
+    if v is None or v == "" or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f:   # NaN
+        return None
+    return round(min(TEAM_THRESHOLD_MAX, max(TEAM_THRESHOLD_MIN, f)), 2)
+
+
 def clean_team_guard(g: Any) -> dict:
     """The normalised team guard policy (spec 018 R3). Missing or malformed = off."""
     g = g if isinstance(g, dict) else {}
@@ -328,7 +346,8 @@ def clean_team_guard(g: Any) -> dict:
     ob = str(g.get("on_block") or "notify").lower()
     return {"enabled": bool(g.get("enabled")), "check_input": bool(g.get("check_input", True)),
             "rulesets": sorted(set(rs))[:50], "trusted_extensions": trusted,
-            "on_block": ob if ob in ON_BLOCK else "notify", "auto_approve": bool(g.get("auto_approve"))}
+            "on_block": ob if ob in ON_BLOCK else "notify", "auto_approve": bool(g.get("auto_approve")),
+            "threshold": clean_threshold(g.get("threshold"))}
 
 
 def clean_admin_guard(g: Any) -> dict:
@@ -493,6 +512,7 @@ class GuardContext:
     rules: list = field(default_factory=list)       # [CompiledRule]
     protect: CompiledRule | None = None             # built-in SA-1 rule (guarded profiles); None in tests/dry runs
     broken: str = ""                                # the guard settings could not be read: block (fail closed, SA-8)
+    threshold: float | None = None                  # the team's own classifier threshold (None = guard.threshold)
 
     def trusted_ext(self, ext: str) -> bool:
         return bool(ext) and ext_key(ext) in self.trusted
@@ -863,7 +883,13 @@ class GuardService:
         return GuardContext(kind=kind, username=username, team=team, check_input=bool(cfg.get("check_input", True)),
                             on_block=cfg.get("on_block") or "notify", auto_approve=bool(cfg.get("auto_approve")),
                             trusted={ext_key(x) for x in cfg.get("trusted_extensions") or []}, rules=rules,
-                            protect=self_protect_rule(paths) if protect else None)
+                            protect=self_protect_rule(paths) if protect else None,
+                            threshold=clean_threshold(cfg.get("threshold")) if kind == "team" else None)
+
+    def threshold_for(self, ctx: GuardContext | None) -> float:
+        """The classifier threshold that applies: the team's own (F3), else guard.threshold."""
+        t = ctx.threshold if ctx is not None else None
+        return self.threshold if t is None else t
 
     def context_for(self, username: str) -> GuardContext | None:
         """The guard that applies to `username` (None = unguarded: nothing else runs). Cached briefly.
@@ -983,6 +1009,15 @@ class GuardService:
             except Exception:
                 log.exception("guard unavailable callback")
 
+    def _drop_if_removed(self) -> None:
+        """`goose-web guard remove-model` while the gateway runs (closeout 2026-11-11 D1): the next check (or
+        Admin > Prompt guard > Check now) unloads the model, so the guard fails open with guard.unavailable and the
+        admin banner at once instead of scoring with the removed model until a restart. Three file stats."""
+        c = self.classifier
+        if c.loaded and not c.installed():
+            log.warning("prompt guard: the model files are gone (%s); unloading the classifier", c.model_dir)
+            c.unload()
+
     async def ensure_loaded(self) -> None:
         if self.classifier.loaded:
             return
@@ -1016,6 +1051,7 @@ class GuardService:
         if len(text) > self.max_input_chars:   # checked before any tokenising (SA-3)
             return None, "not_inspected"
         try:
+            self._drop_if_removed()
             await self.ensure_loaded()
             loop = asyncio.get_running_loop()
             t0 = time.perf_counter()
@@ -1096,7 +1132,7 @@ class GuardService:
             return Decision(True, "prompt", TOO_LONG_ID, "prompt guard", None,
                             "This message is too long for the prompt guard to check. Send it in shorter parts.",
                             classifier=st)
-        if s is not None and s >= self.threshold:
+        if s is not None and s >= self.threshold_for(ctx):
             return Decision(True, "prompt", score=s, classifier=st,
                             message="This message looks like a prompt-injection attempt.")
         return Decision(False, "prompt", score=s, classifier=st)
@@ -1140,7 +1176,7 @@ class GuardService:
         if not texts:
             return Decision(False, "tool", classifier="not_needed")
         s, st = await self.classify("\n".join(texts), point="tool", who={"username": ctx.username, "sessionId": sid})
-        if s is not None and s >= self.threshold:
+        if s is not None and s >= self.threshold_for(ctx):
             return Decision(True, "tool", score=s, classifier=st,
                             message="The arguments of this tool call look like a prompt-injection attempt.")
         return Decision(False, "tool", score=s, classifier=st)

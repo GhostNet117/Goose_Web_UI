@@ -8,7 +8,7 @@ import { sessionsState, loadSessions, loadMore, setQuery, groupSessions, isArchi
 import { counts, statusFor, agentFor } from '../herd.js';
 import { prefs, patchPref, isPinned, togglePin, setPref, THEMES, resolvedTheme } from '../prefs.js';
 import { dropChat, peekChat } from '../chatsession.js';
-import { elsewhereEnabled, elsewhereList, elsewhereRunningCount, runningElsewhere, elsewhereDoneFor, sourceLabel } from '../elsewhere.js';
+import { elsewhereEnabled, elsewhereList, elsewhereRunningCount, runningElsewhere, elsewhereDoneFor, sourceLabel, elsewhereJobs, groupJobRows } from '../elsewhere.js';
 
 export const NAV = [
   { id: 'new', label: 'New chat', icon: 'chat', path: '/new', key: 'c' },
@@ -92,6 +92,32 @@ export function renderSidebar(ctx) {
       h('span', { class: 'srow-time' }, relTime((s._meta && s._meta.lastMessageAt) || s.updatedAt).replace(' ago', '')), more);
   };
 
+  // closeout 2026-11-11 D5: the sessions of one job that runs elsewhere (Goose Desktop, the CLI, a scheduled task) are
+  // ONE row per folder, like the Herd: the newest session, a count, and a toggle that lists the others.
+  const openJobs = new Set();
+  const jobRow = (g, folder) => {
+    const key = folder + '\u0000' + g.job;
+    const open = openJobs.has(key);
+    const r = router.current();
+    const ids = g.sessions.map((s) => s.sessionId);
+    const newest = g.sessions[0];
+    const active = r.view === 'chat' && ids.includes(r.args[0]);
+    const st = ids.some((id) => runningElsewhere(id)) ? 'elsewhere' : ids.some((id) => statusFor(id) === 'needs_you') ? 'needs_you'
+      : ids.some((id) => elsewhereDoneFor(id)) ? 'done' : statusFor(newest.sessionId) || null;
+    const toggle = h('button', { type: 'button', class: 'sgroup-count srow-jobcount', 'aria-expanded': open ? 'true' : 'false', title: (open ? 'Hide' : 'Show') + ' the ' + g.sessions.length + ' sessions of this job', onclick: (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (openJobs.has(key)) openJobs.delete(key); else openJobs.add(key);
+      renderList();
+    } }, '\u00d7' + g.sessions.length);
+    const row = h('a', { class: ['srow', 'srow-job', active ? 'active' : ''], href: '#/chat/' + encodeURIComponent(newest.sessionId), role: 'treeitem', 'data-job': g.job,
+      title: g.job + ' - ' + g.sessions.length + ' sessions, newest: ' + sessionTitle(newest) + '\nOpens the newest session; the count lists the others.' },
+    h('span', { class: 'sdot s-' + (st || 'none') + (st === 'needs_you' || st === 'elsewhere' ? ' pulse' : '') }), h('span', { class: 'srow-title' }, g.job), toggle,
+    h('span', { class: 'srow-time' }, relTime((newest._meta && newest._meta.lastMessageAt) || newest.updatedAt).replace(' ago', '')));
+    return open ? [row, ...g.sessions.map((s) => { const x = sessionRow(s); x.classList.add('srow-sub'); return x; })] : [row];
+  };
+  const folderRows = (sessions, folder) => groupJobRows(sessions, sessionTitle, elsewhereEnabled() && !sessionsState.query ? elsewhereJobs() : null)
+    .flatMap((x) => (x.job ? jobRow(x, folder) : [sessionRow(x.session)]));
+
   const rowMenu = (anchor, s) => {
     const archived = isArchived(s);
     menu(anchor, [
@@ -144,7 +170,7 @@ export function renderSidebar(ctx) {
         patchPref('sidebar', { collapsed: c }); renderList();
       } }, icon(isCol ? 'chevronRight' : 'chevronDown', 12), icon('folder', 13), h('span', { class: 'sgroup-label' }, g.label), h('span', { class: 'sgroup-count' }, String(g.sessions.length)),
       iconBtn('plus', 'New chat in ' + g.label, (e) => { e.preventDefault(); e.stopPropagation(); router.go('/new?cwd=' + encodeURIComponent(g.path)); }, { size: 'sm', class: 'sgroup-new' }));
-      nodes.push(h('div', { class: 'sgroup' }, head, isCol ? null : g.sessions.map(sessionRow)));
+      nodes.push(h('div', { class: 'sgroup' }, head, isCol ? null : folderRows(g.sessions, g.path)));
     }
     if (!nodes.length) {
       if (sessionsState.loading) nodes.push(h('div', { class: 'skel-wrap' }, ...Array.from({ length: 6 }, (_, i) => h('div', { class: 'skel', style: { width: (55 + ((i * 29) % 40)) + '%' } }))));

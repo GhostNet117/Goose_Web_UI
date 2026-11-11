@@ -10,7 +10,7 @@ import { getSession, removeSession, patchSession, sessionTitle, upsertSession, i
 import { store, bus, policy, allowedValue } from '../store.js';
 import { elsewhereFor, sourceLabel } from '../elsewhere.js';
 import { isPinned, togglePin } from '../prefs.js';
-import { pillSelect, rememberEffortOptions, effortNote, optionById } from '../chatoptions.js';
+import { pillSelect, rememberEffortOptions, effortNote, optionById, effortPickerState, headerProviderOptions } from '../chatoptions.js';
 import { visibilityContext, pickerHidden, HIDDEN_LABEL, knownDefaultProvider } from '../providervis.js';
 import { groupsConfig, groupPicker, groupOfProvider, headerPickers, groupDefault, isGroupValue, splitValue, inventory, loadInventoryOnce, GROUP_PREFIX } from '../providergroups.js';
 import { setBaseTitle, agentFor } from '../herd.js';
@@ -145,10 +145,18 @@ export function renderChat(ctx, sessionId) {
         value = gp.model.value;
         if (groupOfProvider(curP, gcfg)) onPick = async (v) => { const s = splitValue(v); await switchTo(s.provider, s.model); };
       }
+      if (o.id === 'provider') {
+        // D3: New chat's order and set: by name, without Goose's own default entry (kept while the chat uses it)
+        const inv = inventory();
+        const known = inv ? new Set([...inv.map((p) => p.id), ...((vis && vis.unconfigured) || [])]) : null;
+        opts = headerProviderOptions(opts, value, known);
+      }
       const ic = o.id === 'provider' ? 'cpu' : o.id === 'model' ? 'zap' : o.category === 'thought_level' ? 'brain' : 'sliders';
-      // spec 021: say so when Goose sends no effort for this provider+model (the pick would change nothing)
+      // spec 021: say so when Goose sends no effort for this provider+model (the pick would change nothing); D2: then
+      // the picker is one disabled "Set by provider" entry for every such model
       const note = o.category === 'thought_level' ? effortNote(curP, curM) : '';
-      nodes.push(pillSelect(ic, (o.name || o.id) + (note ? ' - ' + note : ''), opts, value, async (v) => { try { await onPick(v); } catch (e) { toastError(e, o.name); } renderSelects(); }));
+      const ep = o.category === 'thought_level' ? effortPickerState(note, opts, value) : { options: opts, value, disabled: false };
+      nodes.push(pillSelect(ic, (o.name || o.id) + (note ? ' - ' + note : ''), ep.options, ep.value, async (v) => { try { await onPick(v); } catch (e) { toastError(e, o.name); } renderSelects(); }, { disabled: ep.disabled }));
     }
     selects.replaceChildren(...nodes);
     rememberEffortOptions(chat.configOptions);   // the New chat screen offers the effort values seen here

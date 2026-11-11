@@ -10,6 +10,46 @@ let done = [];
 let enabled = false;
 const bySession = new Map();   // sessionId -> { item, session } (working)
 const doneBySession = new Map();   // sessionId -> done group
+const jobs = new Set();   // name prefixes of jobs that run elsewhere in several sessions (sidebar grouping, D5)
+
+// The gateway's grouping rule (elsewhere.py name_prefix): the name without its trailing date/number.
+// 'Hourly-Report 2026-11-11 04:00' -> 'Hourly-Report'; 'Report (3)' -> 'Report'; 'Weekly' -> 'Weekly'.
+const TRAIL = /(?:[\s\-_:#.,/]*(?:\d[\d\-_:./]*(?:[Tt ]\d[\d:.]*)?[Zz]?|\(\d+\)|#\d+))+$/;
+export function namePrefix(name) {
+  const n = String(name || '').trim();
+  return n.replace(TRAIL, '').replace(/^[ \-_:#.,/]+|[ \-_:#.,/]+$/g, '') || n;
+}
+// A job: a group with several sessions, or a session name with a trailing date/number (one run of a job).
+export function jobPrefixes(list, doneList) {
+  const out = new Set();
+  const add = (title, count) => {
+    const t = String(title || '').trim();
+    const p = namePrefix(t);
+    if (p && (count > 1 || p !== t)) out.add(p);
+  };
+  for (const it of list || []) {
+    add(it.title, it.count || 1);
+    for (const s of it.sessions || []) add(s.title, it.count || 1);
+  }
+  for (const g of doneList || []) {
+    add(g.title, g.count || 1);
+    for (const s of g.sessions || []) add(s.title, g.count || 1);
+  }
+  return out;
+}
+// Sidebar folder rows: sessions of one elsewhere job (same name prefix, same folder) become one group, in list order
+// (the group sits where its newest session was). Returns [{session} | {job, sessions}]. Pure (tests run it in node).
+export function groupJobRows(sessions, titleOf, jobSet) {
+  const out = []; const at = new Map();
+  for (const s of sessions || []) {
+    const p = jobSet && jobSet.size ? namePrefix(titleOf(s)) : '';
+    if (!p || !jobSet.has(p)) { out.push({ session: s }); continue; }
+    let g = at.get(p);
+    if (!g) { g = { job: p, sessions: [] }; at.set(p, g); out.push(g); }
+    g.sessions.push(s);
+  }
+  return out.map((x) => (x.job && x.sessions.length === 1 ? { session: x.sessions[0] } : x));
+}
 
 export function setElsewhere(list, on = true, doneList = null) {
   enabled = !!on;
@@ -23,8 +63,11 @@ export function setElsewhere(list, on = true, doneList = null) {
     if (!bySession.has(it.sessionId)) bySession.set(it.sessionId, { item: it, session: { sessionId: it.sessionId, status: it.status, last: it.last, title: it.latestTitle } });
   }
   for (const g of done) for (const s of g.sessions || []) doneBySession.set(s.sessionId, g);
+  jobs.clear();
+  if (enabled) for (const p of jobPrefixes(items, done)) jobs.add(p);
   bus.emit('elsewhere');
 }
+export function elsewhereJobs() { return jobs; }
 export function elsewhereEnabled() { return enabled; }
 export function elsewhereList() { return items; }
 export function elsewhereDone() { return done; }
