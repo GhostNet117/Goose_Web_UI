@@ -155,6 +155,21 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 | `guard.model_dir` | `<system_dir>/models/prompt-guard-2-22m` | Where the model package is installed. |
 | `guard.model_url` / `guard.model_sha256` | empty | Override of the pinned package (the GitHub release asset `prompt-guard-2-22m-onnx-1`, see ADMINISTRATION 9.8), for example an internal https mirror; set both. |
 
+### `elsewhere` keys (Working elsewhere, since 1.16.0)
+
+Administrators of the native profile see, read-only, the sessions Goose Desktop, the goose CLI or a scheduled job is
+running in it (ADMINISTRATION 15.1). The native `sessions.db` is only read, only when it changed, and only while an
+administrator has Goose Web open.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `elsewhere.enabled` | `true` | Show the list (false = never read the native sessions database for it). |
+| `elsewhere.poll_seconds` | `20` | How often the database's size and time are checked (minimum 5); it is queried only when they changed. |
+| `elsewhere.active_minutes` | `5` | A prompt or tool result the model has not answered for this long no longer counts as running. |
+| `elsewhere.stale_minutes` | `30` | A tool call without any write for this long no longer counts as running. |
+| `elsewhere.done_hours` | `24` | Sessions that finished elsewhere while nobody had Goose Web open are looked for this far back (they then join Done). |
+| `elsewhere.max_items` | `40` | Entries (groups) in Working elsewhere, and Done-elsewhere groups kept (the oldest is marked read beyond that). |
+
 ## 3. Command line
 
 `python -m goose_web [--config FILE] <command>` (or the `goose-web` script). With no command it runs `serve`.
@@ -174,6 +189,7 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 | `sandbox` | `status \| remove USER \| remove --all` | Sandbox (ADMINISTRATION 11.6): list every user's AppContainer, SID and folder grants; or revoke one user's grants and delete the container. |
 | `native-hints` | `status \| enable USER [--team NAME] [--adopt] [--doc-name NAME] \| disable` | Managed native hints (ADMINISTRATION 10.1): Goose Web writes the native admin's composed hints (personal, assigned, team documents) into the native profile's `config/.goosehints`, which Goose Desktop, the CLI and schedules on that account load too. `--team` puts the user in that team (created if missing); `--adopt` keeps the current file as a library document. Audit `hints.native.managed` / `hints.native.unmanaged`. |
 | `native-root` | `[PATH]` | Without PATH: show the native Goose profile (Goose appdata folder). With PATH: move the native profile to that folder (must contain `config\`), update every native user that used the old one, audit `system.native_root`. Files are not copied. Restart the gateway afterwards. |
+| `gateway` | `status \| drain \| undrain`, `--seconds N` (drain, default 120, max 900), `--reason TEXT`, `--timeout S` (default 20), `--json` | 1.16.0: asks the running gateway what is running (every turn in every worker, pending permission requests, direct tool calls, scheduler jobs inside a gateway worker), through files in `<system_dir>/run/`. `drain` also refuses new prompts for N seconds and tells every tab (before a restart); `undrain` ends it. Exit 0 = idle (or not running), 3 = busy or unknown (no answer). A gateway older than 1.16 is judged by its herd marks in the database. Used by `scripts\upgrade.ps1` (ADMINISTRATION 20.1). |
 | `version` | | Prints the version. |
 
 ## 4. Settings stored in the database

@@ -10,7 +10,10 @@
 
   What it does, in this order (it stops at the first failure, before the gateway is touched):
     1. Finds the gateway's scheduled task (any task folder) and its config.yaml from the task's arguments.
-    2. Refuses while a worker is busy (an agent is running), unless -Force.
+    2. Refuses while anything runs in Goose Web, unless -Force: it asks the gateway (`goose-web gateway status`,
+       1.16+: every running turn in every worker - also one waiting for a long tool call or a sub-agent, which uses
+       no CPU - pending permission requests and scheduler jobs) and samples the workers' CPU. With -WaitHours it
+       waits (checks every 60 s) instead of refusing. A gateway older than 1.16 is judged by its herd marks.
     3. Backs up the database (SQLite online backup) and config.yaml to <profiles_root>\backups\upgrade-<time>\.
     3b. Restricts the install folder (code, .venv, .git) to you, SYSTEM and Administrators, read & execute for the
        task's account if it is another one (as install.ps1 does); "goose-web check" fails while other local users
@@ -22,7 +25,9 @@
        pinned package from the project's GitHub release, SHA-256 checked; a warning, not a failure, when the
        download fails - then install it later, or offline with --file <zip>).
     6. Runs "goose-web check".
-    7. Restarts the task and waits until /healthz answers; prints the old and new version.
+    7. Drains the gateway (new prompts refused for a moment, users told), checks once more that nothing runs, restarts
+       the task and waits until /healthz answers; prints the old and new version. If a chat started meanwhile it
+       does not restart (or waits, with -WaitHours); the new version is installed and starts at the next restart.
   Never changed: the task definition, the firewall rule, config.yaml, the database content (schema migrations run
   automatically when the new version opens it - after the backup), user profiles, Goose's own folders.
 
@@ -39,7 +44,8 @@
 param(
     [string]$Ref = '',                # tag/commit/branch to check out; '' = git pull --ff-only on the current branch
     [switch]$NoGit,                   # files were already replaced; only reinstall + restart
-    [switch]$Force,                   # restart even if a worker looks busy
+    [switch]$Force,                   # restart even if something is running (it is interrupted)
+    [double]$WaitHours = 0,           # wait up to this long for nothing to run (checks every 60 s) instead of refusing
     [switch]$Detached,
     [int]$DelaySeconds = 60,          # with -Detached: wait this long first (lets the calling chat's turn finish)
     [string]$TaskName = '',           # full task path\name if auto-detection finds none or several
@@ -63,6 +69,7 @@ if ($Detached) {
     if ($Ref) { $argsList += @('-Ref', "`"$Ref`"") }
     if ($NoGit) { $argsList += '-NoGit' }
     if ($Force) { $argsList += '-Force' }
+    if ($WaitHours -gt 0) { $argsList += @('-WaitHours', $WaitHours.ToString([Globalization.CultureInfo]::InvariantCulture)) }
     if ($TaskName) { $argsList += @('-TaskName', "`"$TaskName`"") }
     $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
         CommandLine = 'powershell.exe ' + ($argsList -join ' '); CurrentDirectory = $InstallDir }
@@ -143,22 +150,45 @@ try {
     $oldVer = RunningVersion
     if (-not $oldVer) { $oldVer = '(not running)' }
 
-    # 2. busy check: a goose serve worker of this gateway using CPU means an agent is working
-    if ($task.State -eq 'Running' -and -not $Force) {
+    # 2. busy check. The gateway knows every running turn (goose-web gateway status, 1.16+); a turn waiting for a long
+    # tool call or a sub-agent uses no CPU, so the CPU sample of the workers is only an extra signal.
+    function CpuBusy() {
         # The gateway = processes running "goose_web ... serve" with this config (a uv venv's pythonw.exe is a launcher
         # whose child runs the same command line); its workers are the goose.exe "serve" children.
         $all = @(Get-CimInstance Win32_Process)
         $gwIds = @($all | Where-Object { $_.CommandLine -and $_.CommandLine -match 'goose_web' -and $_.CommandLine -match '\bserve\b' -and
             $_.CommandLine.IndexOf($cfg, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | ForEach-Object { $_.ProcessId })
         $workers = @($all | Where-Object { $_.Name -ieq 'goose.exe' -and $_.CommandLine -match '\bserve\b' -and $gwIds -contains $_.ParentProcessId })
-        Say "gateway processes: $($gwIds.Count); workers: $($workers.Count)"
         foreach ($w in $workers) {
             $a = (Get-Process -Id $w.ProcessId -ErrorAction SilentlyContinue).TotalProcessorTime.TotalMilliseconds; Start-Sleep 5
             $b = (Get-Process -Id $w.ProcessId -ErrorAction SilentlyContinue).TotalProcessorTime.TotalMilliseconds
             $cpu = [int]($b - $a); Say "worker $($w.ProcessId): cpu $cpu ms in 5 s"
-            if ($cpu -gt 1500) { throw "A worker looks busy (an agent is running). Try again later, or pass -Force." }
+            if ($cpu -gt 1500) { return $true }
+        }
+        return $false
+    }
+    function GatewayBusy([string]$Action) {   # 'status' or 'drain': $true busy, $false idle, $null = no such command (< 1.16)
+        $r = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'gateway', $Action, '--seconds', '180', '--reason', 'upgrade')
+        $r.out | Where-Object { $_ } | ForEach-Object { Say "gateway: $_" }
+        if ($r.code -eq 0) { return $false }
+        if ($r.code -eq 3) { return $true }
+        return $null
+    }
+    function WaitUntilIdle([string]$Action, [string]$When) {
+        $until = (Get-Date).AddHours($WaitHours)
+        while ($true) {
+            $g = GatewayBusy $Action
+            $busy = ($g -eq $true) -or (CpuBusy)
+            if (-not $busy) { return }
+            if ($Action -eq 'drain' -and $null -ne $g) { Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'gateway', 'undrain') | Out-Null }
+            if ((Get-Date) -ge $until) {
+                throw "Something is running in Goose Web (see above)$When. Try again later, pass -WaitHours 12 to wait, or -Force to interrupt it."
+            }
+            Say "Busy: checking again in 60 s (waiting until $($until.ToString('HH:mm')))"
+            Start-Sleep 60
         }
     }
+    if ($task.State -eq 'Running' -and -not $Force) { WaitUntilIdle 'status' '; nothing was changed' }
 
     # 3. backup BEFORE anything changes
     $bdir = Join-Path $root ('backups\upgrade-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -221,7 +251,11 @@ try {
     $r.out | Where-Object { $_ -match '^\[' } | ForEach-Object { Say "check $_" }
     if ($r.code) { throw "goose-web check failed; the gateway was NOT restarted and still runs the old version. Fix the [!!] items and run upgrade.ps1 -NoGit." }
 
-    # 7. restart + health
+    # 7. drain + last check (the new code is installed: its CLI drains a 1.16+ gateway, so no turn can start between
+    # this check and the restart), then restart + health
+    if ($task.State -eq 'Running' -and -not $Force) {
+        WaitUntilIdle 'drain' '; the new version is installed but the gateway was NOT restarted (run upgrade.ps1 -NoGit later)'
+    }
     try {
         Stop-ScheduledTask -TaskPath $task.TaskPath -TaskName $task.TaskName
         Start-Sleep 3

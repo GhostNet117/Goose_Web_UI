@@ -1469,6 +1469,50 @@ running after a tab is closed.
   (`/?profile=<username>`). Only admins can do this. It is recorded as `ws.impersonate`, and calls made on another
   user's profile are recorded as `acp.*` entries in the audit log.
 
+### 15.1 Working elsewhere (since 1.16.0)
+
+The native profile is shared with Goose Desktop, the goose CLI and Goose's scheduler on the same Windows account (and
+with Windows scheduled tasks that run `goose run`). Administrators whose own profile is the native one see what those
+programs are running, read-only: a **Working elsewhere** group in the sidebar, a section in the Herd and a counter
+("*n* elsewhere"). Members never see it (the gateway sends it only to administrator tabs of a native profile).
+
+- **Source.** The profile's `data\sessions\sessions.db`, read with a read-only connection (`mode=ro`, `query_only`,
+  0.5 s busy timeout, closed at once - never a write, never a long lock; Desktop and the CLI keep writing it). The
+  gateway only `stat()`s the file every `elsewhere.poll_seconds` (20 s) and queries it when it changed, and only while
+  an administrator has Goose Web open. A few indexed queries per change; nothing when nobody watches.
+- **Running / finished.** Running = the last message is an assistant tool request (a tool runs; long tool calls write
+  nothing - up to `stale_minutes`, 30), or a prompt / tool result the model has not answered yet (up to
+  `active_minutes`, 5; a cancelled run ends like that too). Otherwise finished: it leaves Working elsewhere and goes
+  to Done (below). Activity is the time of the newest message. Chats Goose Web itself is running or wrote
+  (prompt, end of a turn, edit) at most two minutes before their last message are not "elsewhere"; viewing a chat does
+  not change that. Sub-agent sessions count for their parent; chats without messages are not listed.
+- **Done (since 1.16.0).** Every session that *finished* elsewhere - a run that was working
+  elsewhere and went idle, and one created and finished between two polls (a short `goose run`) - joins the Herd's
+  **Done** column (and the sidebar's "done" counter and the tab badge), next to Goose Web's own finished chats. It stays
+  there until an administrator interacts with it **in Goose Web**: opens it (opening any session of a grouped entry
+  clears the whole entry), clicks **Clear** on its card, or **Mark all read** (Done column header; also clears Goose
+  Web's own done chats). Opening it in Goose Desktop or the CLI cannot be seen by the gateway and does not clear it.
+  A job's sessions are ONE Done entry with a count (the 54 "TQQQ-Macro" runs of two hours are one card, the newest ten
+  listed); at most `max_items` (40) entries, the oldest is dropped (marked read) beyond that. The markers are stored
+  in the gateway database (`chat_state`, session `~elsewhere`, kind `done`: groups, a watermark and the ids already
+  read), so they survive a refresh, other devices and a gateway restart. Sessions that finished while nobody had Goose
+  Web open are found at the next sign-in (the read starts at the watermark, at most `done_hours`, 24, back). At the
+  very first start nothing older is imported (no backfill of history). A session that starts working elsewhere again
+  leaves Done and comes back when it finishes.
+- **Grouping.** Sessions with the same schedule id, or the same name without its trailing date/number in the same
+  working folder, are one entry with a count and the newest session (a job that ran `goose run` 54 times in two hours
+  is one line).
+- **Privacy.** The tab gets names, session ids, counts and times - no folders, no message content. Opening an entry is
+  the normal chat view of the native profile.
+- **Read-only.** While another program runs a chat, the message box is replaced by a banner, and the gateway refuses
+  prompts and edits into it (`-32011`): two programs writing one session would corrupt it. Goose Web cannot stop or
+  steer another program's run; stop it there (Goose Desktop, the console of the CLI, or the scheduled task).
+- **Limits.** The gateway cannot see which program wrote a session, only that it was not Goose Web. A program killed
+  in the middle of a tool call looks running until `stale_minutes` pass. After two gateway restarts within
+  `stale_minutes`, a Goose Web chat that was interrupted in a tool call can appear as running elsewhere until then.
+  A quiet session last written before the gateway started is not listed until it writes again.
+- **Turn it off:** `elsewhere.enabled: false` (CONFIGURATION.md).
+
 ## 16. Audit log
 
 **Admin > Audit log** shows the newest entries first, with filters for the user (prefix) and the action (substring),
@@ -1702,7 +1746,8 @@ powershell -ExecutionPolicy Bypass -File scripts\upgrade.ps1            # newest
 powershell -ExecutionPolicy Bypass -File scripts\upgrade.ps1 -Ref v1.6.0   # a specific tag or commit
 ```
 
-It finds the gateway task and its `config.yaml`, refuses while an agent is running (`-Force` overrides), backs up the
+It finds the gateway task and its `config.yaml`, refuses while an agent is running (`-Force` overrides; `-WaitHours 12`
+waits instead, checking every minute; see "Is anything running?" below), backs up the
 database (online SQLite backup) and `config.yaml` to `<profiles_root>\backups\upgrade-<time>\` **before** anything
 changes, updates the code (`git pull --ff-only`, or `git checkout <Ref>`), installs the locked dependencies (with
 `uv` when available - Goose ships it in `%LOCALAPPDATA%\Goose\bin` - otherwise pip), runs `goose-web check`, and only
@@ -1718,9 +1763,29 @@ choose).
 - 1.6.0 no longer looks for goose in `C:\Goose\dist-windows\resources\bin`. If `check` reports
   `[!!] goose binary: goose (not runnable)`, run `scripts\install.ps1 -GooseBinary <path to goose.exe>` (keeps
   everything else, does not register a second task) and then `upgrade.ps1 -NoGit`.
-- Upgrading from a chat that runs through this goose-web (an agent doing it for you): add `-Detached`. The script
-  starts itself outside the chat's process tree after `-DelaySeconds` (60) and returns; otherwise the restart would
-  end the chat's shell before the gateway is started again. Read the log afterwards.
+- Upgrading from a chat that runs through this goose-web (an agent doing it for you): add `-Detached -WaitHours 12`.
+  The script starts itself outside the chat's process tree after `-DelaySeconds` (60) and returns; otherwise the
+  restart would end the chat's shell before the gateway is started again. The calling chat's own turn counts as
+  running, so the upgrade waits until it has ended. Read the log afterwards.
+
+**Is anything running? (since 1.16.0).** A restart ends every running turn (Goose cancels a run when its worker
+stops). Before 1.16 the scripts sampled the workers' CPU, which misses a turn that waits for a long tool call or a
+sub-agent (no CPU at all). Now they ask the gateway:
+
+```powershell
+.venv\Scripts\python.exe -m goose_web --config <config.yaml> gateway status          # exit 0 idle, 3 busy
+.venv\Scripts\python.exe -m goose_web --config <config.yaml> gateway drain --seconds 180   # refuse new prompts, then report
+.venv\Scripts\python.exe -m goose_web --config <config.yaml> gateway undrain
+```
+
+`status` lists every running turn in every worker (prompts in flight - also long tool calls and sub-agents - pending
+permission requests and questions, direct tool calls, prompts being checked, jobs of Goose's scheduler running inside
+a gateway worker), with user, chat id, title and since when. `drain` makes the gateway refuse new prompts for the given
+time and tells every open tab ("Goose Web restarts for an update in a moment"); the upgrade drains right before its
+last check and the restart, so no turn can start in between. The answer comes through files in `<system_dir>\run\`
+(no network port, no credential). A gateway older than 1.16 does not answer; then the herd marks in its database say
+which chats run, and it cannot drain. Chats that were running anyway (`-Force`) show *Interrupted: Goose Web restarted
+while this chat was running* after the restart.
 
 After the upgrade, ask users to reload the page (a hard refresh if the old UI still shows, see
 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)).

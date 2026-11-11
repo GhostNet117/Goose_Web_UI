@@ -162,11 +162,11 @@ a drawer: open it with the menu button at the top left, close it with the X or b
 | Logo and site name | Click to start a new chat. |
 | **New chat** | Opens the new-chat screen (`Alt+N`). |
 | Command button | Opens the command palette (`Ctrl+K`). |
-| Status counters | "N need you", "N working" and, when there are any, "N done". Click to open the Herd. |
+| Status counters | "N need you", "N working" and, when there are any, "N done" and (administrators, since 1.16) "N elsewhere" - sessions Goose Desktop, the goose CLI or a scheduled job is running (section 8). Click to open the Herd. |
 | Navigation | Herd, Recipes, Skills, Schedules, Apps, Extensions, Settings, and Admin for administrators. |
 | **Search chats** | Searches your chats (`/` focuses it, `Esc` clears it). |
 | List options button | Filters and folder controls (see below). |
-| Chat list | Your chats, grouped by working folder. |
+| Chat list | Your chats, grouped by working folder. Administrators with the native profile also see a **Working elsewhere** group on top (section 8). |
 | Your name | Opens the user menu. |
 | Connection indicator | Shows the connection state. Click it to reconnect now. |
 
@@ -719,7 +719,7 @@ working when you close the tab.
 |---|---|
 | Needs you | Waiting for a permission answer or for input. |
 | Working | Running a turn now. |
-| Error | The last run failed, or the agent stopped unexpectedly (also: "Interrupted" when Goose Web restarted during the run). |
+| Error | The last run failed, or the agent stopped unexpectedly. The card says why, for example *Interrupted: Goose Web restarted while this chat was running*; opening the chat repeats it in the transcript (since 1.16). Send a message to continue. |
 | Done | Finished since you last looked. It becomes Idle when you open the chat. Kept across refreshes, devices and Goose Web restarts (1.15). |
 | Idle | Nothing running. |
 | Offline | Not reachable at the moment. |
@@ -745,6 +745,34 @@ agents, with an online or unreachable badge. **Open on ...** opens the chat on t
 Administrators see an **All users** switch that shows every user's agents. Opening another user's chat opens a
 new tab in an admin view of that profile, with a banner that says actions are audited. See
 [ADMINISTRATION.md](ADMINISTRATION.md).
+
+### Working elsewhere (administrators with the native profile, since 1.16)
+
+Your native Goose profile is shared with Goose Desktop, the goose CLI and scheduled jobs (Goose's own scheduler, or
+a Windows scheduled task that runs `goose run`). What they are running appears in a **Working elsewhere** group at
+the top of the chat list, in the Herd page and as "*n* elsewhere" in the sidebar summary (a hollow blue ring):
+
+- **Working elsewhere** - the program is working on it (a tool call can run for a long time without new messages).
+- **Done** - when it has finished it moves to the Herd's **Done** column (with Goose Web's own finished chats, and in
+  the "done" counter) and stays there until you open it here, click **Clear**, or **Mark all read**. Opening it in
+  Goose Desktop or the CLI does not clear it (Goose Web cannot see that). Done entries are kept across refreshes,
+  devices and Goose Web restarts; runs that finished while Goose Web was closed show up when you come back.
+- A job that makes many short sessions (for example `TQQQ-Macro 2026-11-11 04:00`, `... 04:05`) is one entry with the
+  number of sessions and the newest one - also in Done (one card for all the runs that finished since you last
+  opened one; opening any of them clears the card).
+- **View (read-only)** opens the chat. While the other program runs it, Goose Web only shows it: the message box is
+  replaced by a *Working elsewhere - read-only* banner, and there is no Stop or steering - Goose Web cannot reach that
+  program. The transcript updates as the program writes. When it has finished, the message box comes back and you
+  can continue the chat here.
+- Only names, ids and times are listed. Members never see the native profile.
+
+### When Goose Web restarts for an update
+
+An update waits until no agent is running. Right before the restart, a notice says *Goose Web restarts for an update
+in a moment*; for about a minute a new message is not sent - it stays in the message box with *Goose Web is
+restarting for an update: send this again in a minute*. If an agent was running anyway (an administrator forced the
+restart), its chat shows **Error - Interrupted: Goose Web restarted while this chat was running**; send a message to
+continue.
 
 ## 9. Recipes
 

@@ -862,6 +862,19 @@ def cmd_check(args, settings) -> int:
     return 0 if ok else 1
 
 
+def cmd_gateway(args, settings) -> int:
+    """FIX deploy-interrupts-running-turns: the deploy scripts' idle check (control.py)."""
+    import json
+    from . import control
+    r = control.request(settings, args.action, seconds=args.seconds, reason=args.reason, timeout=args.timeout)
+    if args.json:
+        print(json.dumps(r, indent=1, default=str))
+    else:
+        for line in control.describe(r):
+            print(line)
+    return control.EXIT_BUSY if control.is_busy(r) else control.EXIT_IDLE
+
+
 class _NullIO:
     """Stand-in for stdout/stderr under pythonw.exe (no console), where they are None."""
     _gw_null = True
@@ -930,6 +943,14 @@ def main(argv: list[str] | None = None) -> int:
     gd.add_argument("--sha256", help="install-model --file: the package's SHA-256 (default: the pinned one)")
     gd.add_argument("--if-missing", action="store_true", help="install-model: do nothing if a valid model is there")
     gd.add_argument("--force", action="store_true", help="install-model: reinstall even if the same package is there")
+    gw = sub.add_parser("gateway", help="ask the running gateway: status (is a chat running?), drain, undrain "
+                                        "(exit 0 = idle, 3 = busy or unknown)")
+    gw.add_argument("action", choices=["status", "drain", "undrain"])
+    gw.add_argument("--seconds", type=float, default=120,
+                    help="drain: refuse new prompts this long (max 900); ends earlier with undrain or the restart")
+    gw.add_argument("--reason", default="", help="drain: shown in the gateway log")
+    gw.add_argument("--timeout", type=float, default=20, help="seconds to wait for the gateway's answer")
+    gw.add_argument("--json", action="store_true", help="print the full answer as JSON")
     sub.add_parser("check", help="diagnostics")
     sub.add_parser("version")
     args = p.parse_args(argv)
@@ -942,7 +963,7 @@ def main(argv: list[str] | None = None) -> int:
         args.host, args.port = None, None
     return {"serve": cmd_serve, "init": cmd_init, "user": cmd_user, "ip": cmd_ip, "check": cmd_check,
             "native-root": cmd_native_root, "native-hints": cmd_native_hints, "sandbox": cmd_sandbox, "tls": cmd_tls,
-            "guard": cmd_guard}[cmd](args, settings)
+            "guard": cmd_guard, "gateway": cmd_gateway}[cmd](args, settings)
 
 
 if __name__ == "__main__":

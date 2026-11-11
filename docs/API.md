@@ -188,6 +188,12 @@ Frames are JSON-RPC 2.0 text frames.
   watched sessions. Herd summaries always flow.
 * **`_gw/herd`** `{all?:bool}` → `{agents:[Agent]}`
 * **`_gw/seen`** `{sessionId}`: changes `done` to `idle` for that session.
+* **`_gw/elsewhere`** `{}` (1.16.0, administrators of the native profile) → `{enabled, items, done, at, pollSeconds}`:
+  sessions Goose Desktop, the goose CLI or a scheduled job is running in the native profile (spec 020), and
+  subscribes the socket to `_gw/elsewhere` pushes. Others get `{enabled:false, items:[]}`.
+* **Gateway refusals** (1.16.0): `-32010` - the gateway drains before a restart (new `session/prompt`,
+  `tools/call` or `schedules/run-now` refused for a moment; send again after the restart); `-32011` - a
+  `session/prompt` or `conversation/truncate` into a chat another program is running.
 * **Responses to agent requests:** `{jsonrpc:"2.0", id:<id of the forwarded request>, result:{...}}`. The
   first answer wins. Later answers get the notification `_gw/ask_resolved` instead.
 
@@ -201,7 +207,9 @@ Frames are JSON-RPC 2.0 text frames.
 * **`_gw/ask_resolved`** `{id, sessionId, by}`
 * **`_gw/herd_update`** `{agent:Agent}`
 * **`_gw/upstream`** `{state:"starting"|"ready"|"down", error?}`
-* **`_gw/notice`** `{level, message}`
+* **`_gw/notice`** `{level, message, kind?}` (`kind:"restart"` when the gateway drains before a restart, 1.16.0)
+* **`_gw/elsewhere`** `{items, done, at}` (1.16.0): the "Working elsewhere" list or the Done-elsewhere groups changed
+  (subscribed administrator sockets). `_gw/elsewhere_clear {key?}` (tab -> gateway) clears one Done group or all.
 
 ### Herd state machine (per session)
 

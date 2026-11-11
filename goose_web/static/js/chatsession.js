@@ -408,6 +408,12 @@ export class ChatSession extends Emitter {
     } catch (e) {
       if (e && (e.disconnected || e.code === 'disconnected')) {
         this.transcript.sys('Connection lost. The agent keeps working on the server; the transcript will resync when reconnected.', 'warn');
+      } else if (e && (e.code === -32010 || e.code === -32011)) {
+        // -32010: the gateway drains before a restart for an update; -32011: another program (Goose Desktop, the
+        // CLI, a scheduled job) is running this chat (spec 020). Nothing was sent: the text goes back into the box.
+        if (item && item.el) item.el.remove();
+        this.transcript.sys(errMsg(e) + ' Your message was not sent; it is back in the box.', 'warn');
+        this.emit('edit', blocks);
       } else {
         this.transcript.sys('Error: ' + errMsg(e), 'error');
       }

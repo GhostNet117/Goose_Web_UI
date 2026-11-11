@@ -685,6 +685,10 @@ def create_app(settings: Settings) -> Starlette:
         app.state.ctx = c
         hub.start()
         workers.start_monitor()
+        # FIX deploy-interrupts-running-turns: local scripts ask "is anything running?" and drain before a restart
+        from .control import ControlChannel
+        control = ControlChannel(hub, settings, __version__)
+        control.start()
         # profiles with schedules must run even when nobody is connected
         for u in db.users():
             if u["disabled"]:
@@ -701,6 +705,7 @@ def create_app(settings: Settings) -> Starlette:
         try:
             yield
         finally:
+            control.stop()
             maintenance.cancel()
             if warm is not None:
                 warm.cancel()

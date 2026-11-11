@@ -328,6 +328,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .sdot.pulse { animation: pulse 1.6s var(--ease) infinite; }
 .s-needs_you.pulse { box-shadow: 0 0 0 0 color-mix(in srgb, var(--warn) 60%, transparent); }
 .s-working.pulse { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent-2) 60%, transparent); }
+/* Running elsewhere (spec 020): another program runs it; hollow ring = read-only here */
+.s-elsewhere { background: transparent; border: 2px solid var(--info); opacity: 1; width: 9px; height: 9px; }
+.s-elsewhere.done { border-style: dotted; opacity: .6; }
 @keyframes pulse {
   0% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 0%, transparent); transform: scale(1); }
   50% { transform: scale(1.15); }
@@ -573,7 +576,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .side-search-row { display: flex; gap: 4px; padding: 4px 12px 8px; }
 .side-search { height: 30px; background: var(--bg); font-size: .9em; }
 .side-herd {
-  display: flex; align-items: center; gap: 12px; margin: 0 12px 8px; padding: 8px 10px; border-radius: var(--r);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; margin: 0 12px 8px; padding: 8px 10px; border-radius: var(--r);
   border: 1px solid var(--border); background: var(--bg); color: var(--fg-2); font-size: .84em; text-decoration: none !important;
   transition: border-color var(--t), background var(--t);
 }
@@ -681,6 +684,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .jump-btn { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); border-radius: 50% !important; width: 34px !important; height: 34px; box-shadow: var(--shadow-sm); z-index: 5; animation: pop-in 140ms var(--ease); }
 .chat-composer-wrap { flex: none; padding: 0 24px 16px; }
 .chat-composer-wrap > .composer { max-width: 860px; margin: 0 auto; }
+.chat-elsewhere { max-width: 860px; margin: 0 auto 4px; }
+.sgroup-elsewhere .sgroup-label { color: var(--info); }
+.srow-elsewhere .sgroup-count { margin-left: auto; }
 
 /* ---------- Transcript ---------- */
 .transcript { display: flex; flex-direction: column; }
@@ -991,6 +997,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .hcard-time { font-size: .78em; color: var(--fg-3); flex: none; font-variant-numeric: tabular-nums; }
 .hcard-meta { display: flex; flex-wrap: wrap; gap: 4px; }
 .hcard-meta .chip { cursor: default; font-family: var(--font); }
+.hs-elsewhere { border-left: 2px dashed var(--info); }
+.hcard-ask.hcard-err { color: var(--err); }
+.herd-sect-head .herd-markall { margin-left: auto; }
+.hcard-list { margin: 0; padding-left: 18px; font-size: .84em; display: grid; gap: 2px; }
+.hcard-list li { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hcard-text { font-size: .86em; color: var(--fg-2); display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
 .hcard-ask { display: flex; align-items: center; gap: 6px; font-size: .86em; color: var(--warn); }
 .hcard-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }

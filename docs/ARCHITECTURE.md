@@ -114,7 +114,7 @@ The main ideas:
 | File | Responsibility |
 |---|---|
 | `__init__.py` | Package version. |
-| `__main__.py` | CLI: `python -m goose_web [--config FILE] serve|init|user|check|version`. Logging setup, first-run initialisation (database, native root, first admin, `Everyone` team), user management, environment checks, `uvicorn.run`. |
+| `__main__.py` | CLI: `python -m goose_web [--config FILE] serve|init|user|check|gateway|version`. Logging setup, first-run initialisation (database, native root, first admin, `Everyone` team), user management, environment checks, `uvicorn.run`. |
 | `config.py` | `Settings`: built-in defaults, then `config.yaml`, then `GOOSE_WEB__SECTION__KEY` environment variables. Goose binary auto-detection, default native Goose root. |
 | `app.py` | ASGI app factory `create_app`: middleware (`SecurityHeaders`, `GZipMiddleware`, `HostGuard`, `IPBlockGuard`), static and SPA routes, `/ws` endpoint, lifespan, webhook SSRF guard and sender, event/audit handlers wired into the hub. |
 | `context.py` | `Ctx` (shared services), `HTTPError`, request helpers: identity resolution, `require()` (auth, CSRF, origin, role), allowed origins, client IP, policy and roots for a user, `upstream_for(user)`, `body_json`. |
@@ -125,6 +125,8 @@ The main ideas:
 | `relay.py` | Spec 014: relays from sandboxed workers to allow-listed local services: per-user loopback address, the forwarder that runs inside the container (TCP to named pipe), `PipeRelayServer` (named pipe with a container-only DACL to TCP), and the provider URL rewrite/restore. |
 | `sandbox.py` | Spec 012: per-user AppContainer (create/derive, folder grants with icacls, `CreateProcess` with `SECURITY_CAPABILITIES` and an inherited-handle allow-list, suspended start + job object) and `StdioChannel`, the newline-delimited JSON-RPC transport the hub uses instead of a WebSocket for sandboxed (`goose acp`) workers. |
 | `hub.py` | `Hub`, `Upstream`, `Client`, `SessionState`: relays ACP, rewrites ids, buffers and replays session updates, fans out asks, derives herd status, watches for external changes, audits calls. |
+| `control.py` | 1.16.0: the local control channel in `<system_dir>/run/` (`gateway.json`, `req-*.json` / `resp-*.json`): the gateway answers "what is running" (`Hub.busy_report`) and drains before a restart; the client side of `goose-web gateway status|drain|undrain`, with the fallback for gateways older than 1.16 (herd marks in the database). Section [7.8](#78-deploy-busy-check-and-drain-controlpy). |
+| `elsewhere.py` | Spec 020: "Working elsewhere" - reads the native profile's `sessions.db` read-only (only when it changed, only while an administrator watches), derives running / finished, groups sessions of one job, `ElsewhereWatcher` per native profile. Section [7.9](#79-running-elsewhere-elsewherepy-spec-020). |
 | `workers.py` | `WorkerManager` and `Worker`: spawns, health-checks, restarts and idles out `goose serve`; scheduler ownership; worker logs; Windows Job Object; Goose Desktop detection. |
 | `policy.py` | Least-privilege default, legacy (1.4) and admin policies, `effective_policy` (one team + overrides), chat gating (`chat_block`, `check_session_choice`), team warnings (`team_warnings`), roots (`user_roots`), path containment (`path_allowed`), and the ACP method firewall (`check`). |
 | `guard.py` | Prompt guard (spec 018): rule sets (validation, SPL-aware pipeline parser, globs, defaults), `GuardContext` per user (team or admin guard), `Classifier` (Prompt Guard 2 22M on ONNX Runtime: windows, cache, lazy load), `GuardService` (contexts cached per user, `check_prompt`, `check_tool`, health, fail open, `guard.unavailable`). |
@@ -143,7 +145,7 @@ The main ideas:
 |---|---|
 | `index.html` | Shell page: theme stylesheets, `modulepreload` of `js/app.js`, boot spinner. |
 | `manifest.webmanifest` | PWA manifest. |
-| `sw.js` | Service worker (`gw-shell-v22`): offline shell, network-first for app code, cache-first for vendor files. |
+| `sw.js` | Service worker (`gw-shell-v23`): offline shell, network-first for app code, cache-first for vendor files. |
 | `css/app.css` | All styles and themes. |
 | `icons/` | `goose.svg`, `goose-maskable.svg`. |
 | `vendor/` | Vendored libraries (marked, DOMPurify, highlight.js, qrcode-generator) with `README.md` and `SHA256SUMS`. |
@@ -159,6 +161,7 @@ The main ideas:
 | `js/composer.js` | Message input: slash commands, @mentions, attachments, send/stop/steer/queue. |
 | `js/asks.js` | Permission, elicitation and recipe-parameter cards and their answers. |
 | `js/herd.js` | Herd store, status transitions, browser notifications, title and favicon badges. |
+| `js/elsewhere.js` | Spec 020: the "Working elsewhere" list (administrators): `setElsewhere`, `elsewhereFor(sessionId)`, `runningElsewhere`, source labels; the sidebar group, the herd section and the chat's read-only banner read it. |
 | `js/sessions.js` | Session list loading, paging, refresh, grouping by folder. |
 | `js/markdown.js` | Markdown rendering (marked, then DOMPurify), code highlighting and copy buttons. |
 | `js/cron.js` | Cron presets, validation, description, editor widget. |
@@ -593,6 +596,9 @@ delete.
 | `_gw/watch {sessionIds}` | tab -> gateway | Replaces the set of sessions this tab receives updates for (max 200). |
 | `_gw/herd {all}` | tab -> gateway | Returns the herd. `all: true` (admin only) returns every profile's agents and subscribes the tab to all herd updates. |
 | `_gw/seen {sessionId}` | tab -> gateway | Acknowledges a `done` or `error` session, which goes back to `idle`. |
+| `_gw/elsewhere` | tab -> gateway | Spec 020, administrators of the native profile only (anyone else gets `{enabled: false, items: []}`): returns `{enabled, items, at, pollSeconds}` and subscribes the tab to `_gw/elsewhere` pushes. |
+| `_gw/elsewhere_clear {key?}` | tab -> gateway | Spec 020, administrators: clear one Done-elsewhere group, or all ("mark all read"). |
+| `_gw/elsewhere {items, done, at}` | gateway -> tab | The "Working elsewhere" list or the Done-elsewhere groups (`{key, title, sessionId, latestTitle, count, last, first, source, scheduleId, sessions}`) changed. Items: `{key, title, sessionId (newest), latestTitle, count, running, status, last, first, source, scheduleId, scheduler, sessions [{sessionId, title, last, status}]}` - names, ids and times only. |
 | `_gw/queue {sessionId, op, blocks?, id?, manual?}` | tab -> gateway | The chat's composer queue (1.15): `add`, `remove`, `take` (claim before sending; held items only with `manual`), `list`. |
 | `_gw/queue_update {sessionId, items}` | gateway -> tab | The queue changed (any tab, a returned steer, a deleted chat). |
 | `_gw/steer_update {sessionId, messageId, state, ...}` | gateway -> tab | A steer is `pending` (with its blocks), `delivered`, or `returned` (with `reason` and `note`). |
@@ -603,9 +609,16 @@ delete.
 | `_gw/prompt_created {sessionId, created}` | gateway -> tab | Sent only to the tab that sent a `session/prompt`: the server time (unix seconds) the gateway stamped on that prompt. The same value is in the prompt's echo (`_meta.goose.created`) for other tabs and replays. Needed to edit the prompt later (1.6.0). |
 | `_gw/session_changed {sessionId, messageCount, updatedAt, title}` | gateway -> tab | A buffered session was changed by another client (for example Goose Desktop). |
 
-Unknown `_gw/*` methods return `-32601 unknown gateway method`. The SPA also
-handles a `_gw/notice` toast message, but the server code does not currently
-send it.
+Unknown `_gw/*` methods return `-32601 unknown gateway method`. `_gw/notice
+{level, kind, message}` is a toast (prompt guard, queue limits, and since 1.16.0
+`kind: "restart"` when the gateway drains before a restart). `_gw/hello` also
+carries `draining` (1.16.0).
+
+Error codes the gateway itself returns to a tab besides the policy's `-32003`:
+`-32010` (1.16.0) - a new prompt, direct tool call or "run now" while the
+gateway drains before a restart; `-32011` (spec 020) - a prompt or an edit
+(`conversation/truncate`) into a chat another program is running. The tab puts
+the text back into the message box for both.
 
 ### 6.5 What the policy firewall checks
 
@@ -817,6 +830,91 @@ Schedules are Goose's own feature, stored in the profile's
 
 Scheduled runs show up in the herd through `session_info_update`/`activeRunId`.
 The session list includes them when `sidebar.includeScheduled` is on.
+
+### 7.8 Deploy busy check and drain (`control.py`)
+
+FIX deploy-interrupts-running-turns (1.16.0). Goose cancels a run when its
+worker stops, so a restart of the gateway ends every running turn. Before 1.16
+the deploy scripts judged "idle" by sampling the workers' CPU for 5 s; a turn
+that waits for a long tool call or a sub-agent uses no CPU and was restarted
+away (incident 2026-11-11). Only the gateway knows what runs:
+
+- `Upstream.busy()` lists, per profile: sessions whose turn has not finished
+  (`SessionState.running()`: a `session/prompt` in flight, an active run id, or
+  status working / needs you - long tool calls and sub-agents run inside the
+  turn), pending asks (permission, question, recipe parameters), direct
+  `tools/call` requests in flight, and prompts between the drain check and
+  Goose (`Upstream.starting`: prompt guard, worker start). `Upstream.
+  running_jobs()` asks a worker that runs Goose's scheduler which jobs run
+  (`schedules/list`, `currentlyRunning`; an error other than "method not
+  found" counts as busy). `Hub.busy_report()` joins them for every worker.
+- `Hub.set_draining(seconds, reason)` refuses `session/prompt`, `tools/call`
+  and `schedules/run-now` with `-32010` (checked first in `Upstream.
+  from_client`, before any await), tells every tab (`_gw/notice` kind
+  `restart`) and ends by itself (`expire_drain`) or with `end_draining`.
+- The channel: `ControlChannel` writes `<system_dir>/run/gateway.json` (pid,
+  version, protocol) at start and removes it at a clean stop; once a second it
+  lists `req-*.json`, answers each with `resp-<id>.json` (atomic replace) and
+  cleans unread answers after 10 minutes. No listener, no credential: whoever
+  can write the system folder can ask.
+- The client (`goose-web gateway status|drain|undrain`, exit 0 idle / 3 busy):
+  a live `gateway.json` pid -> request and wait (default 20 s; no answer =
+  unknown = busy). No `gateway.json` (a gateway older than 1.16) -> if
+  something listens on the configured port, the herd marks in the database
+  (`chat_state` kind `mark`, status working / needs_you) are the list; nothing
+  listening = not running = idle.
+
+### 7.9 Working elsewhere (`elsewhere.py`, spec 020)
+
+The native profile is shared with Goose Desktop, the goose CLI and Goose's
+scheduler; they write the same `sessions.db`. For administrators, the gateway
+lists what they are running:
+
+- **When it reads.** `Hub._elsewhere_loop` every `elsewhere.poll_seconds`
+  (20), only for native profiles with a subscribed administrator tab. Each
+  tick `stat()`s `sessions.db` and `-wal`; only a changed signature triggers
+  `read_activity` in a thread: `mode=ro` URI, `PRAGMA query_only`, 0.5 s busy
+  timeout, closed at once. A locked or unreadable database keeps the previous
+  list.
+- **What it reads.** `messages.timestamp >= horizon` grouped by session
+  (index `idx_messages_timestamp`), sessions with `updated_at`/`created_at` in
+  the horizon or with such messages (index `idx_sessions_updated`, max 300),
+  their parents, and for each top-level candidate the role of its last message
+  and whether an assistant message holds a `toolRequest` (index
+  `idx_messages_session_created`, one row each).
+- **Status** (`session_status`): assistant tool request -> running for up to
+  `stale_minutes` without writes; a user message / tool result -> running for
+  `active_minutes` (a cancelled run ends with a tool result); a sub-agent's
+  recent write -> running; else finished (-> Done, below).
+  Activity is the newest message's time (`updated_at` is bumped by merely
+  opening a chat, so it only selects candidates). Excluded: chats Goose Web
+  runs, or wrote at most 2 minutes before their last message
+  (`SessionState.wrote_at`: prompt sent, turn ended, edit, restored herd mark;
+  never a `session/load`, so viewing a chat read-only does not make it Goose
+  Web's), sub-agent sessions (folded into the parent), hidden sessions,
+  sessions without messages, quiet ones last written before the gateway
+  started.
+- **Grouping**: same `schedule_id`, else same name without its trailing date /
+  number in the same working folder; up to 5 sessions per entry. The folder is
+  used for grouping only and never sent.
+- **Done markers** (`ElsewhereWatcher._update_done`): a finished session
+  whose last message is newer than the stored watermark (minus 5 s) and than
+  its acknowledged time joins its group's Done entry (same grouping; count of
+  distinct ids, newest 20 kept, 10 sent; at most `max_items` groups). A session
+  working again leaves Done. After every fresh read the watermark moves to
+  now - 5 s; reads start at `min(window, watermark - 60 s)`, at most
+  `done_hours` back, so what finished while nobody watched is caught up. One
+  `chat_state` row per native profile (`~elsewhere` / `done`: watermark,
+  groups, acked ids; written by the background flusher; `prune_chat_state`
+  skips `~` rows). `_gw/seen {sessionId}` (a tab opened the chat) acks the
+  whole group containing it; `_gw/elsewhere_clear {key?}` acks one group or
+  all. Acked ids are remembered (max 5000, dropped after `done_hours` + 2 h).
+  The front end adds these groups to the Herd's Done column and the done
+  counter / badge (`herd.js counts()`).
+- **Read-only**: `session/prompt` and `conversation/truncate` into a running
+  one are refused with `-32011` (only while the list is fresh); the tab hides
+  its message box and shows a banner; opening it is a normal `session/load`,
+  and the session watcher reloads it as it changes.
 
 ---
 

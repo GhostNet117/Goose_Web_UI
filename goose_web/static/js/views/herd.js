@@ -8,6 +8,7 @@ import { router } from '../router.js';
 import { STATUS_ORDER, STATUS_LABEL, setHerd, setBaseTitle } from '../herd.js';
 import { askCard } from '../asks.js';
 import { prefs, patchPref } from '../prefs.js';
+import { elsewhereEnabled, elsewhereList, elsewhereDone, clearElsewhereDone, sourceLabel } from '../elsewhere.js';
 
 export function renderHerd(ctx) {
   setBaseTitle('Herd · Goose');
@@ -43,6 +44,7 @@ export function renderHerd(ctx) {
         a.profile && (all || peer) ? h('span', { class: 'chip chip-sm' }, icon('user', 11), a.username || a.profile) : null,
         u.cost ? h('span', { class: 'chip chip-sm' }, fmtCost(u.cost)) : null,
         u.contextLimit ? h('span', { class: 'chip chip-sm', title: fmtNum(u.used) + ' / ' + fmtNum(u.contextLimit) + ' tokens' }, h('span', { class: 'mini-bar' }, h('span', { style: { width: pct + '%' } })), Math.round(pct) + '%') : null),
+      a.status === 'error' && a.error ? h('div', { class: 'hcard-ask hcard-err' }, icon('alert', 13), h('span', null, a.error.slice(0, 280))) : null,
       a.lastText ? h('div', { class: 'hcard-text' }, a.lastText.slice(0, 280)) : null,
       a.ask && !asks.length ? h('div', { class: 'hcard-ask' }, icon('shield', 13), h('span', null, a.ask.title || a.ask.kind || 'Waiting for input')) : null,
       ...asks.map((x) => askCard(x, { compact: true })),
@@ -51,16 +53,57 @@ export function renderHerd(ctx) {
         !peer && (a.status === 'working' || a.status === 'needs_you') ? btn('Stop', () => { rpc.notify('session/cancel', { sessionId: a.sessionId }); }, { size: 'sm', variant: 'danger-soft', icon: 'stop' }) : null));
   };
 
+  // Spec 020: sessions another program runs in the native profile (Working elsewhere: read-only, no Stop, no steering),
+  // and the ones that finished there (Done until opened here or cleared). One card per job, however many sessions.
+  const elseCard = (it, { finished = false } = {}) => {
+    const open = (sid) => router.go('/chat/' + encodeURIComponent(sid));
+    return h('article', { class: ['hcard', finished ? 'hs-done' : 'hs-elsewhere'], tabindex: 0, onkeydown: (e) => { if (e.key === 'Enter' && e.target === e.currentTarget) open(it.sessionId); } },
+      h('div', { class: 'hcard-top' },
+        h('span', { class: finished ? 'sdot s-done' : 'sdot s-elsewhere pulse' }),
+        h('button', { type: 'button', class: 'hcard-title', onclick: () => open(it.sessionId), title: finished ? 'Open (clears it from Done)' : 'View read-only' }, it.title || 'Untitled session'),
+        h('span', { class: 'hcard-time', title: new Date(it.last * 1000).toLocaleString() }, relTime(it.last * 1000))),
+      h('div', { class: 'hcard-meta' },
+        h('span', { class: 'badge ' + (finished ? '' : 'badge-ok') }, finished ? 'finished elsewhere' : 'working elsewhere'),
+        h('span', { class: 'chip chip-sm' }, icon('monitor', 11), sourceLabel(it)),
+        it.count > 1 ? h('span', { class: 'chip chip-sm', title: finished ? 'Sessions of this job that finished since you last opened one' : 'Sessions of this job running now' }, it.count + ' sessions' + (finished ? ' finished' : ' running')) : null),
+      it.count > 1 ? h('ul', { class: 'hcard-list' }, (it.sessions || []).map((s) => h('li', null,
+        h('a', { href: '#/chat/' + encodeURIComponent(s.sessionId) }, s.title || s.sessionId), ' ',
+        h('span', { class: 'muted small' }, relTime(s.last * 1000))))) : null,
+      h('div', { class: 'hcard-text muted small' }, finished ? 'Stays here until you open it in Goose Web or clear it.' : 'Read-only here: Goose Web cannot stop, steer or message it.'),
+      h('div', { class: 'hcard-actions' },
+        btn(finished ? (it.count > 1 ? 'Open newest' : 'Open') : (it.count > 1 ? 'View newest (read-only)' : 'View (read-only)'), () => open(it.sessionId), { size: 'sm', icon: finished ? 'chat' : 'eye' }),
+        finished ? btn('Clear', () => clearElsewhereDone(it.key).catch((e) => toastError(e, 'Clear')), { size: 'sm', variant: 'ghost', icon: 'check' }) : null));
+  };
+  const markAllRead = async (doneAgents) => {
+    for (const a of doneAgents) rpc.call('_gw/seen', { sessionId: a.sessionId }).catch(() => {});
+    if (elsewhereDone().length) { try { await clearElsewhereDone(); } catch (e) { toastError(e, 'Mark all read'); } }
+  };
+
   const renderGroups = () => {
     let list = [...store.get('herd').values()];
     if (!all && me && me.user) list = list.filter((a) => !a.profile || a.profile === me.user.username || a.username === me.user.username);
     const by = {};
     for (const a of list) (by[a.status] = by[a.status] || []).push(a);
-    const sections = STATUS_ORDER.filter((s) => by[s] && by[s].length).map((s) => {
-      const items = by[s].sort((x, y) => String(y.since || '').localeCompare(String(x.since || '')));
-      return h('section', { class: 'herd-sect' }, h('div', { class: 'herd-sect-head' }, h('span', { class: 'sdot s-' + s }), h('h3', null, STATUS_LABEL[s] || s), h('span', { class: 'count' }, String(items.length))),
-        h('div', { class: 'hgrid' }, items.map((a) => card(a))));
-    });
+    const working = isAdmin && elsewhereEnabled() ? elsewhereList() : [];
+    const doneElse = isAdmin && elsewhereEnabled() ? elsewhereDone() : [];
+    const head = (dot, label, n, ...extra) => h('div', { class: 'herd-sect-head' }, h('span', { class: 'sdot ' + dot }), h('h3', null, label), h('span', { class: 'count' }, String(n)), ...extra);
+    const sections = [];
+    for (const s of STATUS_ORDER) {
+      const items = (by[s] || []).sort((x, y) => String(y.since || '').localeCompare(String(x.since || '')));
+      const extra = s === 'done' ? doneElse : [];
+      if (items.length || extra.length) {
+        const mine = items.filter((a) => !a.profile || !me || !me.user || a.profile === me.user.username);
+        sections.push(h('section', { class: 'herd-sect' + (s === 'done' ? ' herd-done' : '') },
+          head('s-' + s, STATUS_LABEL[s] || s, items.length + extra.length,
+            s === 'done' ? btn('Mark all read', () => markAllRead(mine), { size: 'sm', variant: 'ghost', icon: 'check', class: 'herd-markall' }) : null),
+          h('div', { class: 'hgrid' }, items.map((a) => card(a)), extra.map((g) => elseCard(g, { finished: true })))));
+      }
+      if (s === 'working' && working.length) {   // Working elsewhere, right after Working
+        sections.push(h('section', { class: 'herd-sect herd-elsewhere' },
+          head('s-elsewhere', 'Working elsewhere', working.length, h('span', { class: 'muted small' }, 'Goose Desktop, the goose CLI and scheduled jobs in your native profile')),
+          h('div', { class: 'hgrid' }, working.map((g) => elseCard(g)))));
+      }
+    }
     groupsEl.replaceChildren(...(sections.length ? sections : [empty('herd', 'No live agents', 'Agents appear here while they run. They keep working when you close the tab.', btn('Start a chat', () => router.go('/new'), { icon: 'plus', variant: 'primary' }))]));
   };
 
@@ -103,6 +146,6 @@ export function renderHerd(ctx) {
   const peerTimer = setInterval(async () => {
     try { const r = await GET('/api/herd' + (all ? '?all=1' : ''), { quiet: true }); peers = r.peers || []; peerErr = null; renderPeers(); } catch { /* */ }
   }, 30000);
-  const offs = [bus.on('herd', renderGroups), store.on('change:asks', renderGroups)];
+  const offs = [bus.on('herd', renderGroups), bus.on('elsewhere', renderGroups), store.on('change:asks', renderGroups)];
   return { el, destroy() { clearInterval(timer); clearInterval(peerTimer); offs.forEach((f) => f()); } };
 }

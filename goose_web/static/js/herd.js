@@ -3,6 +3,7 @@ import { store, bus } from './store.js';
 import { prefs } from './prefs.js';
 import { router } from './router.js';
 import { toast } from './ui.js';
+import { elsewhereDoneCount, elsewhereRunningCount } from './elsewhere.js';
 
 export const STATUS_ORDER = ['needs_you', 'working', 'error', 'done', 'idle', 'offline'];
 export const STATUS_LABEL = { needs_you: 'Needs you', working: 'Working', done: 'Done', idle: 'Idle', error: 'Error', offline: 'Offline' };
@@ -41,6 +42,10 @@ export function upsertAgent(agent) {
 export function counts() {
   const c = { needs_you: 0, working: 0, done: 0, idle: 0, error: 0, offline: 0 };
   for (const a of store.get('herd').values()) if (!myProfile || !a.profile || a.profile === myProfile) c[a.status] = (c[a.status] || 0) + 1;
+  // spec 020: chats that finished elsewhere (Desktop, CLI, scheduled jobs) are Done too, until opened here
+  c.doneElsewhere = elsewhereDoneCount();
+  c.done += c.doneElsewhere;
+  c.elsewhere = elsewhereRunningCount();
   return c;
 }
 
@@ -125,3 +130,4 @@ function setFavicon(state) {
 }
 
 store.on('change:asks', () => refreshBadges());
+bus.on('elsewhere', () => { lastBadge = -1; refreshBadges(); });

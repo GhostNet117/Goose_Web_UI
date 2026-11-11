@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.16.0 - 2026-11-11
+
+**An upgrade no longer interrupts running chats, and administrators see what Goose Desktop, the CLI and scheduled
+jobs are running.** No database schema change.
+
+- **Upgrades and deploys wait until nothing runs (fix).** The busy check of `scripts\upgrade.ps1` sampled the workers'
+  CPU for 5 s; a turn waiting for a long tool call or a sub-agent uses no CPU, so it counted as idle and the restart
+  ended it (seen on 2026-11-11: two chats killed, one inside a 30-minute tool call). The gateway now answers the
+  question itself: `goose-web gateway status` lists every running turn in every worker (prompts in flight, long tool
+  calls and sub-agents included, pending permission requests and questions, direct tool calls, prompts being checked,
+  jobs of Goose's scheduler running inside a gateway worker); exit 3 = busy. `goose-web gateway drain` makes the
+  gateway refuse new prompts for a moment (`-32010`; the text goes back into the message box) and tells every tab
+  *Goose Web restarts for an update in a moment*, so no turn starts between the last check and the restart.
+  `upgrade.ps1` checks before it changes anything, drains and checks again right before the restart, and waits instead
+  of refusing with `-WaitHours`. Local control channel in `<system_dir>\run\`, no port, no credential; a gateway older
+  than 1.16 is judged by its herd marks.
+- **"Interrupted" is visible.** A chat a restart ended was marked *error* since 1.15, but the reason was not shown;
+  the Herd card, the sidebar tooltip and the transcript now say *Interrupted: Goose Web restarted while this chat was
+  running*.
+- **Working elsewhere (spec 020, administrators).** Sessions of the native profile that Goose Desktop, the goose CLI or
+  a scheduled job (Goose's scheduler, or a Windows task running `goose run`) is running appear in a *Working
+  elsewhere* group in the sidebar and the Herd, with a counter. Many short sessions of one job are one entry (count +
+  newest). Opening one is read-only: no message box, no Stop or steering; prompts and edits into it are refused
+  (`-32011`) until it has finished. The native `sessions.db` is read with a read-only connection, only when it
+  changed, only while an administrator has Goose Web open; tabs get names, ids and times only. Members never see it.
+  New `elsewhere.*` settings (CONFIGURATION).
+- **Done includes chats that finished elsewhere.** A session that finished in Goose Desktop, the goose CLI or a
+  scheduled job joins the Herd's Done column and the done counter (one entry per job, with a count) and stays there
+  until it is opened in Goose Web, cleared, or *Mark all read* is used; kept in the database across refreshes,
+  devices and restarts; runs that finished while Goose Web was closed are caught up at the next visit.
+
 ## 1.15.1 - 2026-11-11
 
 **Security release.** A review of everything changed since the 2026-11-09 assessment (1.12.0 - 1.15.0) found 33

@@ -8,6 +8,7 @@ import { router } from './router.js';
 import { loadPrefs, applyTheme, setPref, prefs, resolvedTheme } from './prefs.js';
 import { addAsk, resetAsks, resolvedElsewhere, ASK_METHODS, gotoAsk, noteToolCallSource } from './asks.js';
 import { setHerd, upsertAgent, setMyProfile, refreshBadges, browserNotify, chime, setBaseTitle } from './herd.js';
+import { setElsewhere, elsewhereDoneFor } from './elsewhere.js';
 import { loadSessions, sessionsState, sessionTitle, activityTime, isArchived, refreshSessionsSoon } from './sessions.js';
 import { routeNotification, allChats, currentChat, sessionChangedElsewhere, promptCreated, applyHelloState, queueUpdated, steerUpdated, hasLocalQueue, clearDrafts } from './chatsession.js';
 import { renderLogin, renderChangePassword } from './views/login.js';
@@ -281,6 +282,12 @@ rpc.on('hello', (hello) => {
   applyHelloState(hello);
   setHerd(hello.herd || []);
   loadSessions({ reset: true });
+  // spec 020: administrators of the native profile see what Goose Desktop / the CLI / scheduled jobs are running
+  const meNow = store.get('me');
+  if (meNow && meNow.isAdmin && !rpc.profileParam) {
+    rpc.call('_gw/elsewhere', {}).then((r) => setElsewhere((r && r.items) || [], r && r.enabled, (r && r.done) || [])).catch(() => setElsewhere([], false));
+  } else setElsewhere([], false);
+  if (hello.draining) toast('Goose Web restarts for an update in a moment. New messages wait until it is back.', { kind: 'warn', timeout: 8000 });
   if (!firstHello) {
     const cur = currentChat();
     for (const c of allChats()) {
@@ -318,6 +325,12 @@ rpc.on('_gw/upstream', (p) => {
   if (p && p.state === 'ready' && prev === 'down') toast('Goose agent is back', { kind: 'success' });
 });
 rpc.on('_gw/guard', (p) => store.set('guardHealth', p || null));
+rpc.on('_gw/elsewhere', (p) => {
+  setElsewhere((p && p.items) || [], true, (p && p.done) || []);
+  // a chat that finished elsewhere while it is open and visible here was seen: it does not wait in Done
+  const cur = currentChat();
+  if (cur && elsewhereDoneFor(cur.id) && document.visibilityState === 'visible') rpc.call('_gw/seen', { sessionId: cur.id }).catch(() => {});
+});
 rpc.on('_gw/notice', (p) => {
   const lvl = (p && p.level) || 'info';
   toast((p && p.message) || '', { kind: lvl === 'warning' ? 'warn' : lvl === 'error' ? 'error' : lvl === 'success' ? 'success' : 'info', timeout: lvl === 'error' ? 10000 : 6000 });

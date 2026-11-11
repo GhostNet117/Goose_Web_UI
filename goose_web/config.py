@@ -126,6 +126,17 @@ DEFAULTS: dict[str, Any] = {
         "model_url": "",                  # override of the pinned package URL (https)
         "model_sha256": "",               # its SHA-256 (required with model_url)
     },
+    # Running elsewhere (spec 020, elsewhere.py): administrators see, read-only, the native profile's sessions that
+    # Goose Desktop, the goose CLI or a scheduled job are writing. The native sessions.db is only read (read-only
+    # connection), only when it changed, and only while an administrator has Goose Web open.
+    "elsewhere": {
+        "enabled": True,
+        "poll_seconds": 20,               # how often the database's size/time is checked (min 5)
+        "active_minutes": 5,              # a prompt / tool result without the model's answer this long = not running
+        "stale_minutes": 30,              # a tool call without any write for this long = not running any more
+        "done_hours": 24,                 # Done: sessions finished elsewhere while nobody watched, looked back this far
+        "max_items": 40,                  # entries (groups) in the list
+    },
     "auth": {
         "session_hours": 12,
         "remember_days": 30,

@@ -5,9 +5,10 @@ import { store, bus, policy } from '../store.js';
 import { router } from '../router.js';
 import { rpc, G } from '../rpc.js';
 import { sessionsState, loadSessions, loadMore, setQuery, groupSessions, isArchived, sessionTitle, removeSession, patchSession } from '../sessions.js';
-import { counts, statusFor } from '../herd.js';
+import { counts, statusFor, agentFor } from '../herd.js';
 import { prefs, patchPref, isPinned, togglePin, setPref, THEMES, resolvedTheme } from '../prefs.js';
 import { dropChat, peekChat } from '../chatsession.js';
+import { elsewhereEnabled, elsewhereList, elsewhereRunningCount, runningElsewhere, elsewhereDoneFor, sourceLabel } from '../elsewhere.js';
 
 export const NAV = [
   { id: 'new', label: 'New chat', icon: 'chat', path: '/new', key: 'c' },
@@ -48,7 +49,22 @@ export function renderSidebar(ctx) {
     herdBox.replaceChildren(
       h('span', { class: 'sh-item' + (n ? ' hot' : '') }, h('span', { class: 'sdot s-needs_you' + (n ? ' pulse' : '') }), h('b', null, String(n)), h('span', null, 'need you')),
       h('span', { class: 'sh-item' }, h('span', { class: 'sdot s-working' + (c.working ? ' pulse' : '') }), h('b', null, String(c.working)), h('span', null, 'working')),
-      c.done ? h('span', { class: 'sh-item' }, h('span', { class: 'sdot s-done' }), h('b', null, String(c.done)), h('span', null, 'done')) : null);
+      c.done ? h('span', { class: 'sh-item' }, h('span', { class: 'sdot s-done' }), h('b', null, String(c.done)), h('span', null, 'done')) : null,
+      elsewhereEnabled() && elsewhereRunningCount() ? h('span', { class: 'sh-item', title: 'Working elsewhere: Goose Desktop, the goose CLI or scheduled jobs (read-only here)' },
+        h('span', { class: 'sdot s-elsewhere pulse' }), h('b', null, String(elsewhereRunningCount())), h('span', null, 'elsewhere')) : null);
+  };
+  // Spec 020: what other programs are running in the native profile, newest first; read-only here.
+  const elsewhereRow = (it) => {
+    const r = router.current();
+    const active = r.view === 'chat' && r.args[0] === it.sessionId;
+    const many = it.count > 1;
+    const tip = (many ? it.title + ' - ' + it.count + ' sessions, newest: ' + (it.latestTitle || it.sessionId) : it.title)
+      + '\nWorking elsewhere: ' + sourceLabel(it) + '\nRead-only in Goose Web: it cannot be stopped or steered from here.';
+    return h('a', { class: ['srow', 'srow-elsewhere', active ? 'active' : ''], href: '#/chat/' + encodeURIComponent(it.sessionId), role: 'treeitem', title: tip },
+      h('span', { class: 'sdot s-elsewhere' + (it.status === 'running' ? ' pulse' : ' done') }), h('span', { class: 'srow-title' }, it.title),
+      many ? h('span', { class: 'sgroup-count', title: it.count + ' sessions' }, '\u00d7' + it.count) : null,
+      icon('eye', 11, 'srow-pin'),
+      h('span', { class: 'srow-time' }, relTime(it.last * 1000).replace(' ago', '')));
   };
 
   const navEl = h('nav', { class: 'side-nav', 'aria-label': 'Main' });
@@ -67,11 +83,11 @@ export function renderSidebar(ctx) {
     const r = router.current();
     const active = r.view === 'chat' && r.args[0] === s.sessionId;
     const chat = peekChat(s.sessionId);
-    const st = statusFor(s.sessionId) || (chat && chat.running ? 'working' : null);
+    const st = runningElsewhere(s.sessionId) ? 'elsewhere' : statusFor(s.sessionId) || (chat && chat.running ? 'working' : null) || (elsewhereDoneFor(s.sessionId) ? 'done' : null);
     const more = iconBtn('more', 'Chat actions', (e) => { e.preventDefault(); e.stopPropagation(); rowMenu(more, s); }, { size: 'sm', class: 'row-more' });
     return h('a', {
       class: ['srow', active ? 'active' : '', isArchived(s) ? 'archived' : ''], href: '#/chat/' + encodeURIComponent(s.sessionId), role: 'treeitem', title: sessionTitle(s) + '\n' + (s.cwd || ''),
-    }, h('span', { class: 'sdot s-' + (st || 'none') + (st === 'working' || st === 'needs_you' ? ' pulse' : '') }), h('span', { class: 'srow-title' }, sessionTitle(s)),
+    }, h('span', { class: 'sdot s-' + (st || 'none') + (st === 'working' || st === 'needs_you' || st === 'elsewhere' ? ' pulse' : ''), title: st === 'elsewhere' ? 'Working elsewhere (read-only here)' : st === 'error' ? ((agentFor(s.sessionId) || {}).error || 'Error') : null }), h('span', { class: 'srow-title' }, sessionTitle(s)),
       isPinned(s.sessionId) ? icon('pin', 11, 'srow-pin') : null,
       h('span', { class: 'srow-time' }, relTime((s._meta && s._meta.lastMessageAt) || s.updatedAt).replace(' ago', '')), more);
   };
@@ -108,6 +124,17 @@ export function renderSidebar(ctx) {
     const nodes = [];
     if (pinned.length) {
       nodes.push(h('div', { class: 'sgroup' }, h('div', { class: 'sgroup-head static' }, icon('pin', 12), h('span', { class: 'sgroup-label' }, 'Pinned'), h('span', { class: 'sgroup-count' }, String(pinned.length))), ...pinned.map(sessionRow)));
+    }
+    const elsewhere = elsewhereEnabled() && !sessionsState.query ? elsewhereList() : [];
+    if (elsewhere.length) {
+      const EK = '\u0000elsewhere';
+      const isCol = !!collapsed[EK];
+      const head = h('button', { type: 'button', class: 'sgroup-head sgroup-elsewhere', 'aria-expanded': isCol ? 'false' : 'true', title: 'Sessions Goose Desktop, the goose CLI or scheduled jobs are working on in your native profile (read-only here)', onclick: () => {
+        const c = { ...((prefs().sidebar || {}).collapsed || {}) };
+        if (c[EK]) delete c[EK]; else c[EK] = true;
+        patchPref('sidebar', { collapsed: c }); renderList();
+      } }, icon(isCol ? 'chevronRight' : 'chevronDown', 12), icon('monitor', 13), h('span', { class: 'sgroup-label' }, 'Working elsewhere'), h('span', { class: 'sgroup-count' }, String(elsewhere.length)));
+      nodes.push(h('div', { class: 'sgroup' }, head, isCol ? null : elsewhere.map(elsewhereRow)));
     }
     for (const g of groupSessions(rest)) {
       const isCol = !!collapsed[g.path] && !sessionsState.query;
@@ -184,6 +211,7 @@ export function renderSidebar(ctx) {
   const offs = [
     bus.on('sessions', rerenderList),
     bus.on('herd', () => { renderHerd(); rerenderList(); }),
+    bus.on('elsewhere', () => { renderHerd(); rerenderList(); }),
     store.on('change:asks', renderHerd),
     store.on('change:conn', renderConn),
     store.on('change:upstream', renderConn),

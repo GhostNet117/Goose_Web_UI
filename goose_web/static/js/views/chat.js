@@ -7,14 +7,16 @@ import { getChat, setCurrentChat, dropChat, saveDraft, myName } from '../chatses
 import { Composer } from '../composer.js';
 import { pickFolder } from './folderpicker.js';
 import { getSession, removeSession, patchSession, sessionTitle, upsertSession, isArchived } from '../sessions.js';
-import { store, policy, allowedValue } from '../store.js';
+import { store, bus, policy, allowedValue } from '../store.js';
+import { elsewhereFor, sourceLabel } from '../elsewhere.js';
 import { isPinned, togglePin } from '../prefs.js';
 import { pillSelect, rememberEffortOptions } from '../chatoptions.js';
-import { setBaseTitle } from '../herd.js';
+import { setBaseTitle, agentFor } from '../herd.js';
 import { mdElement } from '../markdown.js';
 
 export function renderChat(ctx, sessionId) {
   const chat = getChat(sessionId);
+  const failed = agentFor(sessionId);   // read before setCurrentChat marks the chat seen (error -> idle)
   setCurrentChat(sessionId);
   const offs = [];
 
@@ -180,9 +182,37 @@ export function renderChat(ctx, sessionId) {
     chat._extNoticeAt = Date.now();
   }));
 
-  const el = h('div', { class: 'view view-chat' }, header, h('div', { class: 'chat-body' }, scroller, jumpBtn), h('div', { class: 'chat-composer-wrap' }, composer.el));
+  // Spec 020: another program (Goose Desktop, the goose CLI, a scheduled job) is running this chat: read-only here.
+  const elseBanner = h('div', { class: 'chat-elsewhere', hidden: true, role: 'status' });
+  const renderElsewhere = () => {
+    const e = elsewhereFor(chat.id);
+    const ro = !!(e && e.session.status === 'running');
+    elseBanner.hidden = !ro;
+    composer.el.hidden = ro;
+    if (ro) {
+      elseBanner.replaceChildren(banner('info', h('span', null, h('b', null, 'Working elsewhere - read-only. '),
+        sourceLabel(e.item) + ' is running this chat. Goose Web shows it as it changes but cannot stop, steer or message it; the message box comes back when it has finished.')));
+    }
+  };
+  offs.push(bus.on('elsewhere', renderElsewhere));
+
+  const el = h('div', { class: 'view view-chat' }, header, h('div', { class: 'chat-body' }, scroller, jumpBtn), h('div', { class: 'chat-composer-wrap' }, elseBanner, composer.el));
 
   renderState();
+  renderElsewhere();
+  // Why the last run ended with an error (e.g. "Interrupted: Goose Web restarted while this chat was running", spec
+  // 019): said once in the transcript, since opening the chat clears the herd's error state.
+  if (failed && failed.status === 'error' && failed.error && chat._errNoted !== failed.since) {
+    chat._errNoted = failed.since;
+    let noted = false;
+    const note = () => {
+      if (noted) return;
+      noted = true;
+      chat.transcript.sys(failed.error + (failed.error.startsWith('Interrupted') ? '. Send a message to continue where it stopped.' : ''), 'warn');
+      scrollSoon();
+    };
+    if (chat.loaded) note(); else offs.push(chat.on('loaded', note));
+  }
   // Once per chat and page: offer to refresh extensions whose stored definition is older than the config.
   const offerRefresh = async () => {
     if (checkedExt.has(chat.id) || !policy('extensions_edit')) return;

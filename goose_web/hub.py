@@ -39,6 +39,19 @@ TOTAL_BUFFER_BYTES = 256 * 1024 * 1024
 AGENT_REQUESTS = {"session/request_permission", "elicitation/create", "_goose/unstable/session/recipe/request-params"}
 SESSION_NOTIFICATIONS = {"session/update", "_goose/unstable/session/update"}
 RPC_FORBIDDEN = -32003
+# FIX deploy-interrupts-running-turns (1.16.0): right before a restart the deploy asks the gateway to drain - new turns
+# are refused for a short while (the tab puts the text back in the box), so none can start between the last
+# "is anything running?" check and the restart.
+RPC_DRAINING = -32010
+DRAIN_REFUSED = {"session/prompt", "_goose/unstable/tools/call", "_goose/unstable/schedules/run-now"}
+DRAIN_NOTICE = ("Goose Web restarts for an update in a moment (about a minute). New messages wait until it is back; "
+                "running chats are not affected.")
+DRAIN_REFUSAL = "Goose Web is restarting for an update: send this again in a minute."
+P_SCHEDULES_LIST = "_goose/unstable/schedules/list"
+# Spec 020: a chat another program (Goose Desktop, the CLI, a scheduled job) is running is read-only in Goose Web
+RPC_ELSEWHERE = -32011
+ELSEWHERE_REFUSAL = ("This chat is running elsewhere (Goose Desktop, the goose CLI or a scheduled job). Goose Web shows "
+                     "it read-only and cannot stop, steer or message it; wait until it has finished.")
 SESSION_INFO = "_goose/unstable/session/info"
 WATCH_INTERVAL = 2.0          # seconds between stat() calls on the profile's sessions.db (+ -wal)
 WATCH_FALLBACK_INTERVAL = 15.0  # no sessions.db found: fingerprint-check watched sessions this often
@@ -289,6 +302,7 @@ class SessionState:
     loading_client: Any = None
     prompts: int = 0
     last_touch: float = field(default_factory=time.time)
+    wrote_at: float = 0.0   # spec 020: when Goose Web last changed this session (prompt, turn end, edit) - not a load
     error: str = ""
     # (messageCount, updatedAt) from Goose when the buffer was known to match the session store. Another
     # process (Goose Desktop, the CLI, a schedule) writing the same session changes it -> the buffer is stale.
@@ -357,6 +371,7 @@ class Client:
         self.is_admin = user.get("role") == "admin"
         self.watch: set[str] = set()
         self.herd_all = False
+        self.elsewhere = False   # spec 020: an administrator's tab that asked for the "running elsewhere" list
         self.closed = False
         self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=20000)
         self.task: asyncio.Task | None = None
@@ -430,6 +445,7 @@ class Upstream:
         self.asked: OrderedDict[str, None] = OrderedDict()
         self.bypassed: OrderedDict[str, None] = OrderedDict()
         self.closed = False   # SC-3: the user was deleted; this object must not write state any more
+        self.starting = 0     # prompts / tool calls between "not draining" and Goose (guard checks, worker start-up)
 
     # ------------------------------------------------------------ connection
     @property
@@ -562,7 +578,77 @@ class Upstream:
         return s
 
     async def from_client(self, client: Client, msg: dict) -> None:
-        """A frame from a browser socket."""
+        """A frame from a browser socket. While the gateway drains before a restart, new turns are refused; a turn
+        that passed this point is counted (`starting`) until Goose has it, so the deploy's last check sees it."""
+        if msg.get("method") not in DRAIN_REFUSED:
+            return await self._from_client(client, msg)
+        if self.hub.draining is not None and not client.closed and not self.closed:
+            if msg.get("id") is not None:
+                client.send({"jsonrpc": "2.0", "id": msg["id"],
+                             "error": {"code": RPC_DRAINING, "message": DRAIN_REFUSAL}})
+            return
+        self.starting += 1
+        try:
+            await self._from_client(client, msg)
+        finally:
+            self.starting -= 1
+
+    def busy(self) -> list[dict]:
+        """What runs in this profile's worker right now, as the gateway knows it (the deploy's idle check)."""
+        out: list[dict] = []
+        base = {"profile": self.key, "username": self.username}
+        listed: set[str] = set()
+        asked = {a["sessionId"] for a in self.asks.values()}
+        for s in self.sessions.values():
+            if s.running():
+                listed.add(s.sid)
+                out.append({**base, "sessionId": s.sid, "title": s.title, "status": s.status, "since": s.since,
+                            "kind": "permission" if s.sid in asked or s.status == "needs_you" else "turn",
+                            "detail": f"{s.prompts} prompt(s) waiting for Goose" if s.prompts else ""})
+        for a in self.asks.values():
+            if a["sessionId"] not in listed:
+                listed.add(a["sessionId"])
+                out.append({**base, "sessionId": a["sessionId"], "title": "", "status": "needs_you", "since": None,
+                            "kind": "permission", "detail": str(a["msg"].get("method") or "")})
+        for entry in list(self.pending.values()):
+            if entry[3] == pol.TOOLS_CALL:
+                p = entry[4] if isinstance(entry[4], dict) else {}
+                out.append({**base, "sessionId": str(p.get("sessionId") or ""), "title": "", "status": "working",
+                            "since": None, "kind": "tool", "detail": f"tool call {str(p.get('name') or '')[:80]}"})
+        if self.starting:
+            out.append({**base, "sessionId": "", "title": "", "status": "working", "since": time.time(),
+                        "kind": "starting", "detail": f"{self.starting} new prompt(s) being checked"})
+        return out
+
+    async def running_jobs(self) -> list[dict]:
+        """Jobs of Goose's scheduler running inside this worker (they never pass through the gateway)."""
+        base = {"profile": self.key, "username": self.username, "kind": "schedule"}
+        try:
+            r = await asyncio.wait_for(self.request(P_SCHEDULES_LIST, {}, timeout=None), 8.0)
+        except RpcError as e:
+            if e.code == -32601:   # this Goose has no schedules API: nothing to ask
+                return []
+            return [{**base, "sessionId": "", "title": "", "status": "unknown", "since": None,
+                     "detail": f"could not list the scheduler's jobs: {e.message}"}]
+        except (asyncio.TimeoutError, OSError) as e:
+            return [{**base, "sessionId": "", "title": "", "status": "unknown", "since": None,
+                     "detail": f"could not list the scheduler's jobs: {e.__class__.__name__}"}]
+        out = []
+        jobs = r.get("jobs") if isinstance(r, dict) else None
+        for j in jobs if isinstance(jobs, list) else []:
+            if isinstance(j, dict) and j.get("currentlyRunning"):
+                since = None
+                try:
+                    from datetime import datetime
+                    since = datetime.fromisoformat(str(j.get("jobStartTime")).replace("Z", "+00:00")).timestamp()
+                except (TypeError, ValueError):
+                    pass
+                out.append({**base, "sessionId": str(j.get("currentSessionId") or ""),
+                            "title": f"scheduled job {str(j.get('id') or '')[:80]}", "status": "working",
+                            "since": since, "detail": ""})
+        return out
+
+    async def _from_client(self, client: Client, msg: dict) -> None:
         if client.closed or self.closed:   # SC-3: a socket of a deleted / disabled / signed-out user
             return
         method = msg.get("method")
@@ -597,6 +683,9 @@ class Upstream:
                 return self._reply(client, mid, self.init_result)
             if method == "_goose/unstable/recipes/delete" and not client.is_admin:
                 await self._guard_recipe_delete(params)
+            if method in ("session/prompt", TRUNCATE) and \
+                    self.hub.elsewhere_running(self.key, str(params.get("sessionId") or "")):
+                raise RpcError(RPC_ELSEWHERE, ELSEWHERE_REFUSAL)   # spec 020: two writers would corrupt the chat
             if method == TRUNCATE:
                 # Goose deletes every message with created >= truncateFrom and does not check for an active run.
                 s0 = self.sessions.get(str(params.get("sessionId") or ""))
@@ -672,6 +761,7 @@ class Upstream:
         if method == "session/prompt":
             s = self.sess(str(params.get("sessionId") or ""))
             s.prompts += 1
+            s.wrote_at = time.time()
             s.cancel_requested = False
             s.loaded = True
             client.watch.add(s.sid)
@@ -1349,6 +1439,10 @@ class Upstream:
         # Our own change to a buffered session (rename, mode, truncate, ...): re-baseline its fingerprint so
         # the watcher does not mistake it for an outside write.
         sid0 = str(params.get("sessionId") or "") if isinstance(params, dict) else ""
+        if sid0 and method in ("session/prompt", STEER, TRUNCATE):
+            sw = self.sessions.get(sid0)
+            if sw is not None:   # spec 020: these messages were Goose Web's, not another program's (only methods
+                sw.wrote_at = time.time()   # that write messages: opening a chat lists extensions etc.)
         if ok and sid0 and method not in _READ_ONLY_SESSION_METHODS and method not in ("session/new",):
             s0 = self.sessions.get(sid0)
             if s0 is not None and s0.loaded and method not in ("session/delete", "session/close"):
@@ -1358,6 +1452,7 @@ class Upstream:
             if sid:
                 s = self.sess(sid)
                 s.loaded, s.load_result, s.cwd = True, result, str(params.get("cwd") or "")
+                s.wrote_at = time.time()
                 s.title = s.title or "New chat"
                 if client is not None:
                     client.watch.add(sid)
@@ -1473,7 +1568,7 @@ class Upstream:
             s = self.sess(str(params.get("sessionId") or ""))
             s.title = str(params.get("title") or s.title)
             self._herd_changed(s)
-        elif method.startswith("_goose/unstable/schedules/") and ok:
+        elif method.startswith("_goose/unstable/schedules/") and ok and method != P_SCHEDULES_LIST:
             self.hub.schedules_changed(self.username)
 
     # ------------------------------------------------------------ herd
@@ -1710,8 +1805,10 @@ class Upstream:
                 s.title, s.cwd = str(data.get("title") or ""), str(data.get("cwd") or "")
                 s.last_text, s.since = str(data.get("lastText") or "")[:300], float(data.get("since") or now)
                 s.status, s.error = data["status"], str(data.get("error") or "")
+                s.wrote_at = s.since   # spec 020: the chat's last writes were Goose Web's own (not "elsewhere")
                 if s.status in ("working", "needs_you"):   # its run ended with the old gateway and its workers
                     s.status, s.since = "error", now
+                    s.wrote_at = now
                     s.error = "Interrupted: Goose Web restarted while this chat was running"
                     self._save(sid, "mark", {
                         "status": s.status, "since": s.since, "title": s.title, "cwd": s.cwd,
@@ -1771,7 +1868,7 @@ class Upstream:
 
     def activity(self) -> tuple[int, int]:
         return (len([c for c in self.clients if not c.closed]),
-                sum(1 for s in self.sessions.values() if s.running()) + len(self.asks))
+                sum(1 for s in self.sessions.values() if s.running()) + len(self.asks) + self.starting)
 
 
 class Hub:
@@ -1790,6 +1887,11 @@ class Hub:
         # wired by the app: is a folder writable by members (SD-2), and what to do after a guard bypass (SA-1)
         self.member_writable: Callable[[str], bool] = lambda path: False
         self.on_guard_bypass: Callable[[str, str], None] | None = None
+        # {since, until, reason} while a deploy drains the gateway before a restart (control.py); None = normal
+        self.draining: dict | None = None
+        self.elsewhere: dict[str, Any] = {}   # spec 020: profile key -> elsewhere.ElsewhereWatcher (native profiles)
+        self.started = time.time()
+        self._elsewhere_task: asyncio.Task | None = None
         self._flusher: asyncio.Task | None = None
         self._state_task: asyncio.Task | None = None
         # SC-2: chat_state writes wait here (latest value per row) and are written by a background task in a thread
@@ -1803,6 +1905,77 @@ class Hub:
         self._flusher = asyncio.create_task(self._flush_loop())
         self._dirty_event = asyncio.Event()
         self._state_task = asyncio.create_task(self._state_loop())
+        self._elsewhere_task = asyncio.create_task(self._elsewhere_loop())
+
+    # ------------------------------------------------------------ running elsewhere (spec 020)
+    def elsewhere_knobs(self) -> dict:
+        from .elsewhere import DEFAULTS
+        s = getattr(self.workers, "s", None)
+        k = dict(DEFAULTS)
+        if s is not None:
+            for name in DEFAULTS:
+                v = s.get("elsewhere", name)
+                if v is not None:
+                    k[name] = v
+        return k
+
+    def is_native(self, up: "Upstream") -> bool:
+        w = getattr(self.workers, "workers", {}).get(up.key)
+        return bool(w is not None and getattr(w, "native", False))
+
+    def _elsewhere_watcher(self, up: "Upstream"):
+        from .elsewhere import DONE_ROW, ElsewhereWatcher
+        wt = self.elsewhere.get(up.key)
+        if wt is None or wt.up is not up:
+            state = None
+            if self.db is not None:   # the Done markers survive a refresh, other devices and a restart
+                try:
+                    state = next((r["data"] for r in self.db.chat_state(up.key)
+                                  if r["session_id"] == DONE_ROW and r["kind"] == "done"), None)
+                except Exception:
+                    log.exception("running elsewhere: reading the Done markers of %s", up.key)
+            wt = self.elsewhere[up.key] = ElsewhereWatcher(
+                up, self.elsewhere_knobs(), state,
+                save=lambda st, key=up.key: self.save_chat_state(key, DONE_ROW, "done", st))
+        return wt
+
+    def elsewhere_push(self, up: "Upstream") -> None:
+        wt = self.elsewhere.get(up.key)
+        if wt is None:
+            return
+        raw = json.dumps({"jsonrpc": "2.0", "method": "_gw/elsewhere",
+                          "params": {"items": wt.items, "done": wt.done(), "at": wt.ticked}}, separators=(",", ":"))
+        for c in self._elsewhere_subs(up):
+            c.send(raw)
+
+    @staticmethod
+    def _elsewhere_subs(up: "Upstream") -> list[Client]:
+        return [c for c in up.clients if c.elsewhere and c.is_admin and not c.closed]
+
+    async def elsewhere_tick(self, up: "Upstream") -> None:
+        wt = self._elsewhere_watcher(up)
+        wt.knobs = self.elsewhere_knobs()
+        if await wt.tick():
+            self.elsewhere_push(up)
+
+    async def _elsewhere_loop(self) -> None:
+        """Only native profiles, only while an administrator's tab asked for the list (no clients = no reads)."""
+        while True:
+            try:
+                await asyncio.sleep(max(5.0, float(self.elsewhere_knobs()["poll_seconds"])))
+                if not self.elsewhere_knobs()["enabled"]:
+                    continue
+                for up in list(self.upstreams.values()):
+                    if not up.closed and self._elsewhere_subs(up) and self.is_native(up):
+                        await self.elsewhere_tick(up)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.exception("running elsewhere")
+
+    def elsewhere_running(self, key: str, sid: str) -> bool:
+        wt = self.elsewhere.get(key)
+        return bool(sid) and wt is not None and sid in wt.running_ids()
 
     async def _flush_loop(self) -> None:
         n = 0
@@ -1879,7 +2052,8 @@ class Hub:
             cutoff = time.time() - 600
             for r in self.db.query("SELECT session_id, MAX(updated_at) AS t FROM chat_state WHERE profile=? "
                                    "GROUP BY session_id", (profile,)):
-                if r["session_id"] not in keep and r["session_id"] not in busy and (r["t"] or 0) < cutoff:
+                if r["session_id"] not in keep and r["session_id"] not in busy and (r["t"] or 0) < cutoff \
+                        and not str(r["session_id"]).startswith("~"):   # "~elsewhere" (spec 020) is no chat
                     self.db.delete_chat_state(profile, r["session_id"])
         try:
             asyncio.get_running_loop().run_in_executor(None, run)
@@ -1932,6 +2106,54 @@ class Hub:
     def _activity(self, key: str) -> tuple[int, int]:
         up = self.upstreams.get(key)
         return up.activity() if up else (0, 0)
+
+    # ------------------------------------------------------------ deploy: busy check and drain (control.py)
+    async def busy_report(self) -> list[dict]:
+        """Every turn running in any worker: prompts in flight (long tool calls and sub-agents included), pending
+        permission requests and questions, direct tool calls, prompts being checked, and scheduler jobs running
+        inside a worker the gateway started."""
+        out = [b for up in list(self.upstreams.values()) for b in up.busy()]
+        sched = []
+        for up in list(self.upstreams.values()):
+            w = self.workers.get(up.key) if hasattr(self.workers, "get") else None
+            if w is not None and getattr(w, "scheduler", False) and getattr(w, "state", "") == "ready" \
+                    and not up.closed:
+                sched.append(up.running_jobs())
+        for jobs in await asyncio.gather(*sched):
+            out += jobs
+        return out
+
+    def broadcast_all(self, obj: dict) -> None:
+        raw = json.dumps(obj, separators=(",", ":"))
+        seen: set[int] = set()
+        for up in list(self.upstreams.values()):
+            for c in list(up.clients):
+                if id(c) not in seen:
+                    seen.add(id(c))
+                    c.send(raw)
+
+    def set_draining(self, seconds: float, reason: str = "") -> None:
+        now = time.time()
+        first = self.draining is None
+        self.draining = {"since": now if first else self.draining["since"], "until": now + seconds,
+                         "reason": reason}
+        if first:
+            log.info("draining for %d s before a restart%s: new prompts are refused", seconds,
+                     f" ({reason})" if reason else "")
+            self.broadcast_all({"jsonrpc": "2.0", "method": "_gw/notice", "params": {
+                "level": "warning", "kind": "restart", "message": DRAIN_NOTICE}})
+
+    def end_draining(self, why: str) -> None:
+        if self.draining is None:
+            return
+        self.draining = None
+        log.info("drain ended (%s): prompts are accepted again", why)
+        self.broadcast_all({"jsonrpc": "2.0", "method": "_gw/notice", "params": {
+            "level": "info", "kind": "restart", "message": "The update was postponed: you can send messages again."}})
+
+    def expire_drain(self) -> None:
+        if self.draining is not None and time.time() >= self.draining["until"]:
+            self.end_draining("expired")
 
     async def _on_restart(self, w: Worker) -> None:
         up = self.upstreams.get(w.key)
@@ -2066,7 +2288,8 @@ class Hub:
             result = {"user": {"username": client.user["username"], "role": client.user.get("role")},
                       "profile": up.key, "agent": up.init_result, "gooseCaps": up.caps(),
                       "asks": [a["msg"] for a in up.asks.values()], "herd": up.herd(),
-                      "upstream": {"state": up.state, "error": err}, **up.snapshot()}
+                      "upstream": {"state": up.state, "error": err}, "draining": self.draining is not None,
+                      **up.snapshot()}
             gh = self.guard_health_for(client)
             if gh is not None:
                 result["guard"] = gh
@@ -2082,10 +2305,35 @@ class Hub:
                 client.herd_all = False
                 self.herd_watchers.discard(client)
                 result = {"agents": up.herd()}
+        elif method == "_gw/elsewhere":
+            # spec 020: administrators of the native profile only; members never see the native profile
+            if not client.is_admin or not self.is_native(up) or not self.elsewhere_knobs()["enabled"]:
+                client.elsewhere = False
+                result = {"enabled": False, "items": [], "done": []}
+            else:
+                client.elsewhere = True
+                wt = self._elsewhere_watcher(up)
+                if time.time() - wt.ticked > 2:
+                    await self.elsewhere_tick(up)
+                result = {"enabled": True, "items": wt.items, "done": wt.done(), "at": wt.ticked,
+                          "pollSeconds": self.elsewhere_knobs()["poll_seconds"]}
+        elif method == "_gw/elsewhere_clear":
+            # spec 020: Done entries of sessions finished elsewhere - one group ({key}) or all ("mark all read")
+            wt = self.elsewhere.get(up.key)
+            if not client.is_admin or not self.is_native(up) or wt is None:
+                result = {"ok": False}
+            else:
+                key = params.get("key")
+                if wt.clear(str(key) if key else None):
+                    self.elsewhere_push(up)
+                result = {"ok": True}
         elif method == "_gw/seen":
             s = up.sessions.get(str(params.get("sessionId") or ""))
             if s and s.status in ("done", "error"):
                 up._set_status(s, "idle")
+            wt = self.elsewhere.get(up.key)   # spec 020: opening a chat in Goose Web clears its "done elsewhere"
+            if wt is not None and client.is_admin and wt.ack(str(params.get("sessionId") or "")):
+                self.elsewhere_push(up)
             result = {"ok": True}
         elif method == "_gw/queue":
             try:
