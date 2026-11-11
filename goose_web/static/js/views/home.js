@@ -10,6 +10,8 @@ import { pref, setPref, addRecentFolder } from '../prefs.js';
 import { allowedValue, chatBlocked } from '../store.js';
 import { MODES, pillSelect, knownEfforts, effortsKnown, topEffort, effortNote, loadNewChatOptions, applyNewChatOptions } from '../chatoptions.js';
 import { getChat } from '../chatsession.js';
+import { visibilityContext } from '../providervis.js';
+import { groupsConfig, groupPicker, entryOfProvider, groupDefault, isGroupValue, joinValue, splitValue, labelIn } from '../providergroups.js';
 import { upsertSession, sessionsState, sessionTitle, activityTime } from '../sessions.js';
 import { setBaseTitle, herdList } from '../herd.js';
 
@@ -81,25 +83,39 @@ export function renderHome(ctx, query = {}) {
   const renderOpts = () => {
     const nodes = [];
     if (optData && optData.providers.length) {
-      const provs = optData.providers;
-      if (choice.provider && !provs.some((x) => x.id === choice.provider)) { choice.provider = ''; choice.model = ''; choice.effort = ''; }
-      const defP = provs.find((x) => x.id === optData.defaultProvider);
+      // Spec 023 visibility + spec 024 groups: a group is one entry; choice.provider/model always hold the REAL ids.
+      const gcfg = groupsConfig();
+      const provs = groupPicker(optData.allProviders, gcfg, visibilityContext(optData.defaultProvider));
+      if (choice.provider && !entryOfProvider(provs, choice.provider)) { choice.provider = ''; choice.model = ''; choice.effort = ''; }
+      const defP = entryOfProvider(provs, optData.defaultProvider);
       const effProvider = choice.provider || optData.defaultProvider;
-      const pEntry = provs.find((x) => x.id === effProvider);
-      const models = pEntry ? pEntry.models : [];
-      if (choice.model && !models.some((m) => m.id === choice.model)) { choice.model = ''; choice.effort = ''; }
-      const defModel = (!choice.provider || choice.provider === optData.defaultProvider) && optData.defaultModel ? optData.defaultModel : (pEntry ? pEntry.defaultModel : '');
+      const pEntry = entryOfProvider(provs, effProvider);   // the entry shown (a group for a member)
+      const real = optData.allProviders.find((x) => x.id === effProvider);
+      if (choice.model && !(real ? real.models : []).some((m) => m.id === choice.model)) { choice.model = ''; choice.effort = ''; }
+      const defModel = (!choice.provider || choice.provider === optData.defaultProvider) && optData.defaultModel ? optData.defaultModel : (real ? real.defaultModel : '');
       nodes.push(pillSelect('cpu', 'Provider', [{ value: '', label: 'Default provider' + (defP ? ' (' + defP.name + ')' : '') }, ...provs.map((x) => ({ value: x.id, label: x.name }))],
-        choice.provider, (v) => { choice.provider = v; choice.model = ''; choice.effort = ''; saveChoice(); renderOpts(); }));
-      nodes.push(pillSelect('zap', 'Model', [{ value: '', label: 'Default model' + (defModel ? ' (' + defModel + ')' : '') }, ...models.map((m) => ({ value: m.id, label: m.name }))],
-        choice.model, (v) => { choice.model = v; choice.effort = ''; saveChoice(); renderOpts(); }));
+        choice.provider && pEntry ? pEntry.id : '', (v) => {
+          // a group: its default member (the default provider when it is one), with that member's default model
+          const g = isGroupValue(v) ? provs.find((x) => x.id === v) : null;
+          choice.provider = g ? groupDefault(g, optData.defaultProvider, '').provider : v;
+          choice.model = ''; choice.effort = ''; saveChoice(); renderOpts();
+        }));
+      const defLabel = defModel ? labelIn(pEntry, effProvider, defModel, gcfg) : '';
+      const modelOpts = pEntry && pEntry.group ? pEntry.models.map((m) => ({ value: m.value, label: m.label }))
+        : (pEntry ? pEntry.models : []).map((m) => ({ value: m.id, label: m.name }));
+      nodes.push(pillSelect('zap', 'Model', [{ value: '', label: 'Default model' + (defLabel ? ' (' + defLabel + ')' : '') }, ...modelOpts],
+        choice.model ? (pEntry && pEntry.group ? joinValue(effProvider, choice.model) : choice.model) : '', (v) => {
+          if (pEntry && pEntry.group && v) { const s = splitValue(v); choice.provider = s.provider; choice.model = s.model; }   // a label = a real provider + model
+          else choice.model = v;
+          choice.effort = ''; saveChoice(); renderOpts();
+        }));
       const effModel = choice.model || defModel;
       const efforts = knownEfforts(effProvider, effModel);
       if (choice.effort && !efforts.some((x) => x.value === choice.effort)) choice.effort = '';
       // spec 021: the default is the highest level the model offers (applied after session/new, applyNewChatOptions)
       const top = effortsKnown(effProvider, effModel) ? topEffort(efforts) : 'highest offered';
       nodes.push(pillSelect('brain', 'Thinking effort', [{ value: '', label: 'Default effort (' + (top || 'highest offered') + ')' }, ...efforts], choice.effort, (v) => { choice.effort = v; saveChoice(); }));
-      const note = effortNote(effProvider, effModel, pEntry ? pEntry.engine : '');
+      const note = effortNote(effProvider, effModel, real ? real.engine : '');
       if (note) nodes.push(h('span', { class: 'home-opts-note muted small', role: 'note', title: note }, icon('info', 12), ' Effort set by the provider configuration, not per chat'));
     }
     const modes = MODES.filter((m) => allowedValue('allowed_modes', m.value));

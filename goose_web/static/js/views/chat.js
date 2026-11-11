@@ -11,7 +11,8 @@ import { store, bus, policy, allowedValue } from '../store.js';
 import { elsewhereFor, sourceLabel } from '../elsewhere.js';
 import { isPinned, togglePin } from '../prefs.js';
 import { pillSelect, rememberEffortOptions, effortNote, optionById } from '../chatoptions.js';
-import { visibilityContext, pickerHidden, HIDDEN_LABEL } from '../providervis.js';
+import { visibilityContext, pickerHidden, HIDDEN_LABEL, knownDefaultProvider } from '../providervis.js';
+import { groupsConfig, groupPicker, groupOfProvider, headerPickers, groupDefault, isGroupValue, splitValue, inventory, loadInventoryOnce, GROUP_PREFIX } from '../providergroups.js';
 import { setBaseTitle, agentFor } from '../herd.js';
 import { mdElement } from '../markdown.js';
 
@@ -90,18 +91,64 @@ export function renderChat(ctx, sessionId) {
       const opts = modes.filter((m) => allowedValue('allowed_modes', m.value) || m.value === curMode);
       nodes.push(pillSelect('shield', 'Mode', opts, curMode, async (v) => { try { await chat.setMode(v); } catch (e) { toastError(e, 'Mode'); renderSelects(); } }));
     }
+    // spec 024: provider groups - members collapse into one provider entry, a grouped chat's model list is the group's
+    // labelled list, and a pick switches the REAL provider, then the model (the chat keeps its history).
+    const gcfg = groupsConfig();
+    const curP = (optionById(chat.configOptions, 'provider') || {}).currentValue || '';
+    const curM = (optionById(chat.configOptions, 'model') || {}).currentValue || '';
+    let gp = null;
+    if (gcfg.groups.length || Object.keys(gcfg.modelNames).length) {
+      const filt = (o) => (o && Array.isArray(o.options) ? o.options : []);
+      const vis0 = visibilityContext();
+      const pOpts = filt(optionById(chat.configOptions, 'provider')).filter((x) => allowedValue('allowed_providers', x.value) || x.value === curP)
+        .filter((x) => x.value === curP || !pickerHidden(x.value, vis0)).map((x) => ({ value: x.value, label: x.name || x.value, title: x.description }));
+      const mOpts = filt(optionById(chat.configOptions, 'model')).filter((x) => allowedValue('allowed_models', x.value) || x.value === curM)
+        .map((x) => ({ value: x.value, label: x.name || x.value, title: x.description }));
+      const inv = inventory();
+      if (!inv && groupOfProvider(curP, gcfg)) loadInventoryOnce().then((l) => { if (l) renderSelects(); });   // once per page
+      const invList = (inv || []).filter((p) => allowedValue('allowed_providers', p.id))
+        .map((p) => ({ ...p, models: (p.models || []).filter((m) => allowedValue('allowed_models', m.id) || (p.id === curP && m.id === curM)) }));
+      const entries = groupPicker(invList, gcfg, { ...vis0, current: curP });
+      gp = headerPickers(pOpts, curP, curM, mOpts, entries, gcfg);
+      gp.entries = entries;
+    }
+    const switchTo = async (p, m) => {
+      if (p && p !== (optionById(chat.configOptions, 'provider') || {}).currentValue) await chat.setConfig('provider', p);
+      if (m && m !== (optionById(chat.configOptions, 'model') || {}).currentValue) await chat.setConfig('model', m);
+    };
     for (const o of chat.configOptions) {
       if (o === modeOpt || o.type !== 'select' || !Array.isArray(o.options)) continue;
       const listKey = o.id === 'provider' ? 'allowed_providers' : o.id === 'model' ? 'allowed_models' : null;
       // spec 023: after the policy, the providers the user hid in Settings are left out - except the one this chat uses
       const vis = o.id === 'provider' ? visibilityContext() : null;
-      const opts = o.options.filter((x) => !listKey || allowedValue(listKey, x.value) || x.value === o.currentValue)
+      let opts = o.options.filter((x) => !listKey || allowedValue(listKey, x.value) || x.value === o.currentValue)
         .filter((x) => !vis || x.value === o.currentValue || !pickerHidden(x.value, vis))
         .map((x) => ({ value: x.value, label: (x.name || x.value) + (vis && pickerHidden(x.value, vis) === 'user' ? HIDDEN_LABEL : ''), title: x.description }));
+      let value = o.currentValue;
+      let onPick = async (v) => { await chat.setConfig(o.id, v); };
+      if (gp && o.id === 'provider') {
+        const hiddenCur = vis && pickerHidden(curP, vis) === 'user';
+        opts = gp.provider.options.map((x) => (x.value === curP && hiddenCur ? { ...x, label: x.label + HIDDEN_LABEL } : x));
+        value = gp.provider.value;
+        onPick = async (v) => {
+          if (!isGroupValue(v)) { await chat.setConfig('provider', v); return; }
+          if (v === value) return;   // already on a member of this group
+          const g = gp.entries.find((x) => x.id === v);
+          // the group's default member; without the model lists yet: its first member this chat's Goose offers
+          const raw = gcfg.groups.find((x) => GROUP_PREFIX + x.id === v);
+          const first = raw && raw.members.find((m) => o.options.some((x) => x.value === m.provider) && !pickerHidden(m.provider, vis));
+          const t = g ? groupDefault(g, knownDefaultProvider(), '') : { provider: first ? first.provider : '', model: '' };
+          if (t.provider) await switchTo(t.provider, '');
+        };
+      } else if (gp && o.id === 'model') {
+        opts = gp.model.options;
+        value = gp.model.value;
+        if (groupOfProvider(curP, gcfg)) onPick = async (v) => { const s = splitValue(v); await switchTo(s.provider, s.model); };
+      }
       const ic = o.id === 'provider' ? 'cpu' : o.id === 'model' ? 'zap' : o.category === 'thought_level' ? 'brain' : 'sliders';
       // spec 021: say so when Goose sends no effort for this provider+model (the pick would change nothing)
-      const note = o.category === 'thought_level' ? effortNote((optionById(chat.configOptions, 'provider') || {}).currentValue, (optionById(chat.configOptions, 'model') || {}).currentValue) : '';
-      nodes.push(pillSelect(ic, (o.name || o.id) + (note ? ' - ' + note : ''), opts, o.currentValue, async (v) => { try { await chat.setConfig(o.id, v); } catch (e) { toastError(e, o.name); renderSelects(); } }));
+      const note = o.category === 'thought_level' ? effortNote(curP, curM) : '';
+      nodes.push(pillSelect(ic, (o.name || o.id) + (note ? ' - ' + note : ''), opts, value, async (v) => { try { await onPick(v); } catch (e) { toastError(e, o.name); } renderSelects(); }));
     }
     selects.replaceChildren(...nodes);
     rememberEffortOptions(chat.configOptions);   // the New chat screen offers the effort values seen here

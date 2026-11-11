@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.18.0 - 2026-11-11
+
+**Provider groups and model labels.** No database schema change.
+
+- **Settings > Models & Providers > Provider groups.** Create, rename and delete groups; tick the providers that
+  belong to a group (a provider is in one group only) and give each an optional prefix. **Model display names**
+  give model ids friendly names. Saved per user on the server (new `providerGroups` preference, cleaned by the
+  server); members get it for their own profile without `providers_edit`.
+- **Pickers.** On the New chat screen and in the chat header a group is ONE provider entry; its model list is the
+  union of its providers' models labelled `<prefix>-<model name>`, sorted by prefix then model. Picking a label
+  sets the real provider and model (in a chat: provider switch, then model; the history is kept). A chat on a
+  member shows the group name and the label. Display names apply to ungrouped providers too.
+- **Rules.** Team policy applies to the real ids first; spec 023's Chat pickers hiding works per member (a group row
+  there hides all its providers; a hidden member leaves the group's list; the default provider and the chat's own
+  provider are always kept, and a group holding the default provider shows it as the default). The thinking-effort
+  picker is unchanged (providers whose effort is fixed by their configuration keep the note).
+- Display only: Goose's configuration, recipes, schedules and Goose Desktop are not affected. The members' model
+  lists come from the provider list New chat and Settings already load (remembered per user), so opening a picker
+  sends no request.
+- Docs: USER-GUIDE (Settings > Models & Providers, New chat, chat header), ARCHITECTURE, API.
+
 ## 1.17.0 - 2026-11-11
 
 **Choose which providers the chat pickers offer.** No database schema change.

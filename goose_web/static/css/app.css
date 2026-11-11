@@ -1091,6 +1091,17 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .swatch.active { box-shadow: 0 0 0 2px var(--fg); }
 .vis-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px 16px; margin-top: 10px; }
 .vis-list .badge { margin-left: 6px; }
+.vis-group { margin-top: 12px; }
+.vis-members { margin-top: 4px; padding-left: 22px; }
+.grp-card { border: 1px solid var(--border); border-radius: var(--r-lg); padding: 10px 12px; margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.grp-members { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 6px 16px; }
+.grp-member { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.grp-member .grp-prefix { width: 130px; flex: none; }
+.grp-preview { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.grp-names { margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.grp-name-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 6px 16px; }
+.grp-name-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; align-items: center; }
+.grp-name-row .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prov-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--bg-2); overflow: hidden; }
 .prov { border-bottom: 1px solid var(--border); }
 .prov:last-child { border-bottom: 0; }

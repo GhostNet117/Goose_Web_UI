@@ -671,7 +671,7 @@ chat link) and `Priority` (`high` for "needs you", otherwise `default`). Other U
 
 ## 14. Old user interface after an upgrade
 
-The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v25`). The
+The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v26`). The
 page, scripts and styles are fetched from the network first, and the cache is used only when the gateway cannot
 be reached; `/api/` and `/ws` are never cached. Third-party libraries and icons are served from the cache first.
 The gateway sends these files with `Cache-Control: no-cache`.

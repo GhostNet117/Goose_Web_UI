@@ -6,6 +6,7 @@ import { icon } from './icons.js';
 import { rpc, G } from './rpc.js';
 import { allowedValue } from './store.js';
 import { pickerProviders, visibilityContext, rememberProviderMeta } from './providervis.js';
+import { rememberInventory } from './providergroups.js';
 
 // Goose's approval modes (goose-provider-types GooseMode), with Goose's own descriptions.
 export const MODES = [
@@ -111,9 +112,10 @@ export async function loadNewChatOptions() {
   rememberEngines(allProviders);
   const defaultProvider = (d && d.providerId) || '';
   rememberProviderMeta({ defaultProvider, entries: p.entries || [] });   // for the chat header (no extra request)
+  rememberInventory(p.entries || []);   // spec 024: the members' model lists for a grouped chat header
   const providers = pickerProviders(allProviders, visibilityContext(defaultProvider));
   return {
-    providers,          // what the provider picker offers
+    providers,          // what the provider picker offers (spec 023; the New chat screen groups allProviders itself)
     allProviders,       // every provider the policy allows, incl. hidden ones (valid targets, e.g. spec 022 variants)
     defaultProvider,
     defaultModel: (d && d.modelId) || '',

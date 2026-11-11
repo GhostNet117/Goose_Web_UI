@@ -9,6 +9,7 @@ import { router } from '../router.js';
 import { THEMES, ACCENTS, prefs, pref, setPref, patchPref, activityPrefs } from '../prefs.js';
 import { mdElement } from '../markdown.js';
 import { hiddenList, setHiddenProviders, hideAllExcept, rememberProviderMeta } from '../providervis.js';
+import { groupsConfig, setGroups, newGroupId, groupOfProvider, groupPicker, rememberInventory } from '../providergroups.js';
 import { passwordForm } from './login.js';
 import { sessionsState, sessionTitle } from '../sessions.js';
 import { currentChat } from '../chatsession.js';
@@ -51,6 +52,7 @@ function providersTab(body) {
   let entries = []; let defaults = {}; let q = ''; let showAll = false;
   const defBox = h('div', { class: 'card' }, skeleton(2));
   const visBox = h('div', { class: 'card', 'data-section': 'chat-pickers' }, skeleton(3));
+  const grpBox = h('div', { class: 'card', 'data-section': 'provider-groups' }, skeleton(3));
   const list = h('div', { class: 'prov-list' }, skeleton(6));
   const secretsBox = h('div');
   const search = input({ type: 'search', placeholder: 'Search providers…', class: 'inp inp-sm' });
@@ -59,6 +61,7 @@ function providersTab(body) {
     ro('providers_edit', 'providers'),
     section('Default model', null, defBox),
     section('Chat pickers', null, visBox),
+    section('Provider groups', btn('New group', () => newGroup(), { size: 'sm', icon: 'plus' }), grpBox),
     section('Providers', [search, toggle(showAll, (v) => { showAll = v; draw(); }, { text: 'Show unconfigured' }),
       canEdit ? btn('Refresh models', async () => { try { const r = await rpc.call(G('providers/inventory/refresh'), {}); toast('Refreshing ' + (r.started || []).length + ' provider(s)', { kind: 'info' }); setTimeout(load, 2500); } catch (e) { toastError(e); } }, { size: 'sm', icon: 'refresh' }) : null,
       canEdit ? btn('Custom provider', () => customDialog(null), { size: 'sm', icon: 'plus', variant: 'primary' }) : null], list),
@@ -101,6 +104,22 @@ function providersTab(body) {
       toast(e.providerName + ' is your default provider for new chats, so it is always shown. Choose another default above first to hide it.', { kind: 'warn', timeout: 8000 });
       drawVis();
     };
+    const rowCb = (e) => {
+      const isDef = e.providerId === def;
+      const cb = checkbox(shown(e), h('span', null, e.providerName, ' ', h('span', { class: 'muted small mono' }, e.providerId),
+        isDef ? h('span', { class: 'badge badge-accent', title: 'The default provider is always shown' }, 'default') : null), (v) => {
+        if (!v && isDef) { keepDefault(e); return; }
+        const ids = new Set(hiddenList());
+        if (v) ids.delete(e.providerId); else ids.add(e.providerId);
+        save([...ids]);
+      });
+      cb.dataset.provider = e.providerId;
+      cb.title = isDef ? 'Default provider: always shown in chat pickers' : 'Show in chat pickers';
+      return cb;
+    };
+    const gcfg = groupsConfig();
+    const grouped = gcfg.groups.map((g) => ({ g, members: g.members.map((m) => rows.find((e) => e.providerId === m.provider)).filter(Boolean) })).filter((x) => x.members.length);
+    const inGroup = new Set(grouped.flatMap((x) => x.members.map((e) => e.providerId)));
     visBox.replaceChildren(
       h('div', { class: 'row wrap' },
         h('div', { class: 'muted small grow' }, rows.filter(shown).length + ' of ' + rows.length + ' shown. Unticked providers are left out of the provider pickers on the New chat screen and in the chat header. They stay configured, and a chat that already uses one still shows it. Only you see this choice; it follows you to every browser.'),
@@ -109,20 +128,94 @@ function providersTab(body) {
           if (!def) { toast('Set a default provider above first: it is the one that stays.', { kind: 'warn' }); return; }
           save(hideAllExcept(rows.map((e) => e.providerId), def));
         }, { size: 'sm' })),
-      h('div', { class: 'vis-list', role: 'group', 'aria-label': 'Show in chat pickers' }, ...rows.map((e) => {
-        const isDef = e.providerId === def;
-        const cb = checkbox(shown(e), h('span', null, e.providerName, ' ', h('span', { class: 'muted small mono' }, e.providerId),
-          isDef ? h('span', { class: 'badge badge-accent', title: 'The default provider is always shown' }, 'default') : null), (v) => {
-          if (!v && isDef) { keepDefault(e); return; }
+      h('div', { class: 'vis-list', role: 'group', 'aria-label': 'Show in chat pickers' }, ...rows.filter((e) => !inGroup.has(e.providerId)).map(rowCb)),
+      // spec 024: a group is one row (hides or shows all its members) with its members under it
+      ...grouped.map(({ g, members }) => {
+        const gcb = checkbox(members.some(shown), h('span', null, h('strong', null, g.name), ' ', h('span', { class: 'muted small' }, 'group of ' + members.length)), (v) => {
           const ids = new Set(hiddenList());
-          if (v) ids.delete(e.providerId); else ids.add(e.providerId);
+          for (const e of members) { if (v) ids.delete(e.providerId); else if (e.providerId !== def) ids.add(e.providerId); }
+          if (!v && members.some((e) => e.providerId === def)) toast('The group holds your default provider, which is always shown.', { kind: 'warn', timeout: 8000 });
           save([...ids]);
         });
-        cb.dataset.provider = e.providerId;
-        cb.title = isDef ? 'Default provider: always shown in chat pickers' : 'Show in chat pickers';
-        return cb;
-      })),
+        gcb.dataset.group = g.id;
+        gcb.title = 'Show this group in chat pickers (all its providers)';
+        return h('div', { class: 'vis-group' }, gcb, h('div', { class: 'vis-list vis-members', role: 'group', 'aria-label': g.name + ' providers' }, ...members.map(rowCb)));
+      }),
       def && hidden.has(def) ? h('div', { class: 'muted small' }, 'Your default provider was hidden earlier; it is shown while it is the default.') : null);
+  };
+  // ----- spec 024: provider groups (a display alias for the chat pickers; per user, saved with the preferences) -----
+  const saveGroups = (cfg) => { setGroups(cfg); drawGroups(); drawVis(); };
+  const newGroup = async () => {
+    const name = await promptDialog({ title: 'New provider group', label: 'Name shown in the chat pickers', placeholder: 'e.g. Team gateway', confirmText: 'Create',
+      validate: (x) => (!x.trim() ? 'Name required' : x.trim().length > 80 ? 'At most 80 characters' : null) });
+    if (!name) return;
+    const cfg = groupsConfig();
+    cfg.groups.push({ id: newGroupId(), name: name.trim(), members: [] });
+    saveGroups(cfg);
+  };
+  let showAllModels = false;
+  const drawGroups = () => {
+    const cfg = groupsConfig();
+    const rows = entries.filter((e) => e.configured && allowed(e) && !e.gwVariantOf);
+    const byId = new Map(entries.map((e) => [e.providerId, e]));
+    const groupCard = (g) => {
+      const nameInp = input({ value: g.name, class: 'inp inp-sm', 'aria-label': 'Group name', maxlength: '80' });
+      nameInp.addEventListener('change', () => { const c = groupsConfig(); const x = c.groups.find((y) => y.id === g.id); if (x && nameInp.value.trim()) { x.name = nameInp.value.trim(); saveGroups(c); } else nameInp.value = g.name; });
+      const memberRow = (e) => {
+        const owner = groupOfProvider(e.providerId, cfg);
+        const mine = owner && owner.id === g.id;
+        const m = mine ? g.members.find((x) => x.provider === e.providerId) : null;
+        const cb = checkbox(!!mine, h('span', null, e.providerName, ' ', h('span', { class: 'muted small mono' }, e.providerId),
+          owner && !mine ? h('span', { class: 'muted small' }, ' (in ' + owner.name + ')') : null), (v) => {
+          const c = groupsConfig(); const x = c.groups.find((y) => y.id === g.id); if (!x) return;
+          if (v) { if (!groupOfProvider(e.providerId, c)) x.members.push({ provider: e.providerId, prefix: '' }); } else x.members = x.members.filter((y) => y.provider !== e.providerId);
+          saveGroups(c);
+        }, { disabled: !!owner && !mine });
+        cb.dataset.provider = e.providerId;
+        const pre = mine ? input({ value: m.prefix, class: 'inp inp-sm mono grp-prefix', placeholder: 'prefix (optional)', 'aria-label': 'Model label prefix for ' + e.providerName, maxlength: '40' }) : null;
+        if (pre) {
+          pre.dataset.provider = e.providerId;
+          pre.addEventListener('change', () => { const c = groupsConfig(); const x = c.groups.find((y) => y.id === g.id); const mm = x && x.members.find((y) => y.provider === e.providerId); if (mm) { mm.prefix = pre.value.trim(); saveGroups(c); } });
+        }
+        return h('div', { class: 'grp-member' }, cb, pre);
+      };
+      // members that are no longer configured (or not allowed): listed so they can be removed
+      const gone = g.members.filter((m) => !rows.some((e) => e.providerId === m.provider));
+      const picker = groupPicker(rows.map((e) => ({ id: e.providerId, name: e.providerName, defaultModel: e.defaultModel || '', models: (e.models || []).map((x) => ({ id: x.id, name: x.name || x.id })) })),
+        { groups: [g], modelNames: cfg.modelNames }, {}).find((x) => x.group);
+      const labels = picker ? picker.models.map((x) => x.label) : [];
+      return h('div', { class: 'grp-card', 'data-group': g.id },
+        h('div', { class: 'row wrap' }, field('Name', nameInp, null, { inline: true }), h('span', { class: 'grow' }),
+          btn('Delete group', async () => {
+            if (!(await confirmDialog({ title: 'Delete the group "' + g.name + '"?', message: 'Its providers show separately again. Nothing else changes.', confirmText: 'Delete', danger: true }))) return;
+            const c = groupsConfig(); c.groups = c.groups.filter((y) => y.id !== g.id); saveGroups(c);
+          }, { size: 'sm', icon: 'trash' })),
+        h('div', { class: 'muted small' }, 'Tick the providers to show as "' + g.name + '". Each model is listed as <prefix>-<model name>; leave the prefix empty to list the plain name.'),
+        h('div', { class: 'grp-members', role: 'group', 'aria-label': g.name + ' members' }, ...rows.map(memberRow),
+          ...gone.map((m) => h('div', { class: 'grp-member' }, checkbox(true, h('span', null, (byId.get(m.provider) || {}).providerName || m.provider, ' ', h('span', { class: 'muted small' }, '(not available)')), () => {
+            const c = groupsConfig(); const x = c.groups.find((y) => y.id === g.id); if (x) { x.members = x.members.filter((y) => y.provider !== m.provider); saveGroups(c); }
+          })))),
+        labels.length ? h('div', { class: 'muted small grp-preview', title: labels.join('\n') }, 'Model list: ' + labels.slice(0, 8).join(', ') + (labels.length > 8 ? ', … (' + labels.length + ' in all)' : '')) : null);
+    };
+    // model display names: the models of grouped providers (and names already set); all models on request
+    const grouped = new Set(cfg.groups.flatMap((g) => g.members.map((m) => m.provider)));
+    const models = new Map();
+    for (const e of rows) for (const m of e.models || []) if ((showAllModels || grouped.has(e.providerId) || cfg.modelNames[m.id]) && !models.has(m.id)) models.set(m.id, m.name || m.id);
+    for (const id of Object.keys(cfg.modelNames)) if (!models.has(id)) models.set(id, id);
+    const nameRow = (id, gooseName) => {
+      const inp = input({ value: cfg.modelNames[id] || '', class: 'inp inp-sm', placeholder: gooseName, 'aria-label': 'Display name for ' + id, maxlength: '120' });
+      inp.dataset.model = id;
+      inp.addEventListener('change', () => { const c = groupsConfig(); const v = inp.value.trim(); if (v) c.modelNames[id] = v; else delete c.modelNames[id]; saveGroups(c); });
+      return h('div', { class: 'grp-name-row' }, h('span', { class: 'mono small' }, id), inp);
+    };
+    grpBox.replaceChildren(
+      h('div', { class: 'muted small' }, 'Show several providers as one entry in the New chat and chat header pickers (for example providers that serve the same models). Picking a model label still uses the real provider and model. Only the display changes; only you see it, and it follows you to every browser.'),
+      cfg.groups.length ? h('div', { class: 'stack' }, ...cfg.groups.map(groupCard)) : h('div', { class: 'muted' }, 'No groups yet. Use "New group".'),
+      h('div', { class: 'grp-names' },
+        h('div', { class: 'row wrap' }, h('strong', null, 'Model display names'), h('span', { class: 'muted small grow' }, 'Optional friendly names, used in the chat pickers for every provider.'),
+          toggle(showAllModels, (v) => { showAllModels = v; drawGroups(); }, { text: 'All models' })),
+        models.size ? h('div', { class: 'grp-name-list' }, ...[...models.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([id, n]) => nameRow(id, n)))
+          : h('div', { class: 'muted small' }, 'Models of grouped providers are listed here. Turn on "All models" for the others.')));
   };
   const draw = () => {
     const items = entries.filter((e) => allowed(e) && (showAll || e.configured || e.providerType === 'Custom') && (!q || (e.providerName + ' ' + e.providerId + ' ' + e.description).toLowerCase().includes(q)));
@@ -242,8 +335,9 @@ function providersTab(body) {
       entries = (p.entries || []).filter((e) => !e.deprecated || e.configured).sort((a, b) => (b.configured - a.configured) || a.providerName.localeCompare(b.providerName));
       defaults = d || {};
       rememberProviderMeta({ defaultProvider: defaults.providerId || '', entries: p.entries || [] });
-      drawDefaults(); draw();
-    } catch (e) { list.replaceChildren(banner('error', errMsg(e))); defBox.replaceChildren(); visBox.replaceChildren(); }
+      rememberInventory(p.entries || []);   // spec 024: model lists for a grouped chat header
+      drawDefaults(); draw(); drawGroups();
+    } catch (e) { list.replaceChildren(banner('error', errMsg(e))); defBox.replaceChildren(); visBox.replaceChildren(); grpBox.replaceChildren(); }
   }
   load(); loadSecrets();
 }

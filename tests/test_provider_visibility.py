@@ -108,7 +108,8 @@ def test_frontend_wiring():
     assert "allProviders," in load and "variantOf: e.gwVariantOf" in load
     assert "rememberProviderMeta({ defaultProvider, entries: p.entries || [] })" in load   # the header needs no request
     home = _js("views/home.js")
-    assert "optData.providers" in home and "allProviders" not in home       # New chat offers the filtered list
+    # New chat offers the filtered list (1.18.0: grouped by spec 024's groupPicker, which applies the same visibility)
+    assert "groupPicker(optData.allProviders, gcfg, visibilityContext(optData.defaultProvider))" in home
     chat = _js("views/chat.js")
     sel = chat.split("const renderSelects = () => {", 1)[1].split("\n  };", 1)[0]
     assert "x.value === o.currentValue || !pickerHidden(x.value, vis)" in sel and "HIDDEN_LABEL" in sel

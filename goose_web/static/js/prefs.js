@@ -31,6 +31,8 @@ export const DEFAULT_PREFS = {
   newChat: { provider: '', model: '', effort: '', mode: '' },
   // Providers left out of the chat pickers (spec 023, providervis.js); only the hidden ids, so new providers show.
   providerVisibility: { hidden: [] },
+  // Provider groups and model display names for the chat pickers (spec 024, providergroups.js); display only.
+  providerGroups: { groups: [], modelNames: {} },
 };
 
 export function prefs() { return { ...DEFAULT_PREFS, ...(store.get('prefs') || {}) }; }

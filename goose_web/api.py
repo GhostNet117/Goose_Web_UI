@@ -7,6 +7,7 @@ import logging
 import math
 import mimetypes
 import os
+import re
 import secrets
 import shutil
 import string
@@ -350,8 +351,55 @@ async def me_prefs(request: Request):
     prefs.update({k: v for k, v in stored.items() if str(k).startswith("_")})
     if "providerVisibility" in prefs:
         prefs["providerVisibility"] = _clean_provider_visibility(prefs["providerVisibility"])
+    if "providerGroups" in prefs:
+        prefs["providerGroups"] = _clean_provider_groups(prefs["providerGroups"])
     c.db.update_user(u["id"], prefs=prefs)
     return ok()
+
+
+_GROUP_ID = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def _clean_provider_groups(v) -> dict:
+    """Spec 024: provider groups and model display names for the chat pickers (a display alias, not a policy).
+    Kept: {"groups": [{"id", "name", "members": [{"provider", "prefix"}]}], "modelNames": {model id: name}}.
+    Groups <= 50 (id [A-Za-z0-9_-]{1,40}, a missing or repeated id gets a new one; name trimmed <= 80, empty ->
+    "Group"); members <= 100 per group (provider <= 200 chars, in the first group that lists it only; prefix trimmed
+    <= 40); modelNames <= 1000 (id <= 200 chars, name trimmed 1..120)."""
+    groups: list[dict] = []
+    ids: set[str] = set()
+    taken: set[str] = set()
+    raw = v.get("groups") if isinstance(v, dict) else None
+    for g in (raw if isinstance(raw, list) else [])[:50]:
+        if not isinstance(g, dict):
+            continue
+        gid = g.get("id") if isinstance(g.get("id"), str) and _GROUP_ID.match(g.get("id")) else ""
+        if not gid or gid in ids:
+            n = len(groups) + 1
+            while f"g{n}" in ids:
+                n += 1
+            gid = f"g{n}"
+        ids.add(gid)
+        name = g.get("name").strip()[:80] if isinstance(g.get("name"), str) else ""
+        members: list[dict] = []
+        for m in g.get("members") if isinstance(g.get("members"), list) else []:
+            if len(members) >= 100:
+                break
+            p = m.get("provider") if isinstance(m, dict) else None
+            if not isinstance(p, str) or not p or len(p) > 200 or p in taken:
+                continue
+            taken.add(p)
+            prefix = m.get("prefix")
+            members.append({"provider": p, "prefix": prefix.strip()[:40] if isinstance(prefix, str) else ""})
+        groups.append({"id": gid, "name": name or "Group", "members": members})
+    names: dict[str, str] = {}
+    rawn = v.get("modelNames") if isinstance(v, dict) else None
+    for k, x in (rawn.items() if isinstance(rawn, dict) else []):
+        if len(names) >= 1000:
+            break
+        if isinstance(k, str) and k and len(k) <= 200 and isinstance(x, str) and x.strip():
+            names[k] = x.strip()[:120]
+    return {"groups": groups, "modelNames": names}
 
 
 def _clean_provider_visibility(v) -> dict:

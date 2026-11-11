@@ -275,8 +275,8 @@ and a row of option pickers for the new chat.
 
    | Picker | What it sets |
    |---|---|
-   | Provider | The model provider. Only providers set up in your profile (and allowed by your policy) are listed, minus the ones you hid in **Settings > Models & Providers > Chat pickers** (version 1.17.0 and later; your default provider is always listed). |
-   | Model | The model of that provider. Changing the provider resets the model to its default. |
+   | Provider | The model provider. Only providers set up in your profile (and allowed by your policy) are listed, minus the ones you hid in **Settings > Models & Providers > Chat pickers** (version 1.17.0 and later; your default provider is always listed). A **provider group** (version 1.18.0 and later) is listed once, under its group name. |
+   | Model | The model of that provider. Changing the provider resets the model to its default. For a provider group, the models of all its providers, labelled `<prefix>-<model name>` (for example `B-High-Model X`); picking a label starts the chat on that label's real provider and model. Model display names you set in Settings are used here for every provider. |
    | Thinking effort | How much the model reasons before answering (Off, Low, Medium, High, Max, or the values the provider offers). The list shows the values Goose offered last time for that model. |
    | Approval mode | When Goose asks before it runs a tool: Auto, Approve, Smart approve or Chat only (see [Mode](#mode)). |
 
@@ -373,6 +373,14 @@ for models that support it, a thinking level picker.
 - The provider picker lists the providers set up in your profile, without the ones you hid in **Settings > Models &
   Providers > Chat pickers** (version 1.17.0 and later). A chat that uses a hidden provider still shows it, marked
   **(hidden in settings)**; once you switch away it is no longer offered in that chat.
+- **Provider groups** (version 1.18.0 and later, set up in **Settings > Models & Providers > Provider groups**): a
+  chat on one of a group's providers shows the group name as its provider, and its model picker lists the labelled
+  models of all the group's providers (`<prefix>-<model name>`). Picking a label switches the chat to that label's
+  real provider, then its model; the conversation so far is kept and the next message goes to the new one. Picking
+  the group in the provider picker (from a provider outside it) switches to the group's first provider, or to your
+  default provider when it is in the group. The thinking-effort picker is unchanged: for providers whose effort is
+  set in their configuration it keeps its note, so with one provider per effort level you choose the level through
+  the label.
 - If your team stops allowing the provider, model or mode that an older chat uses, Goose Web refuses new messages
   in that chat ("this chat uses the model ..., which your team does not allow"). Pick an allowed one in the chat
   header first, then send again.
@@ -1019,7 +1027,23 @@ provider is always shown: unticking it is refused with a short explanation (choo
 choice is saved on the server with your other preferences, so it applies in every browser you sign in from; a
 provider that is set up later is shown until you untick it. Members can do this for their own profile, without the
 `providers_edit` permission. Your team's allowed providers still come first: a provider your team does not allow is
-never listed, whatever you tick.
+never listed, whatever you tick. A provider group (below) is one row here: unticking it hides all its providers;
+its providers are listed under it and can be hidden one by one (a hidden provider is left out of the group's model
+list).
+
+**Provider groups** (version 1.18.0 and later): show several providers as ONE provider in the New chat and chat
+header pickers - for example one provider per person or per effort level that all serve the same models. Click
+**New group** and name it (the name the pickers show). Tick the providers that belong to it (a provider can be in
+one group only; one that is in another group is shown greyed out with that group's name) and give each an optional
+**prefix**. The group's model list is every model of its providers, labelled `<prefix>-<model name>` (no prefix:
+just the model name), sorted by prefix and then model, and previewed under the group. **Model display names**
+gives a model id a friendly name (for example `vendor-model-4.1-flash` -> `Model 4.1 Flash`) wherever the pickers
+list it, for grouped and ungrouped providers alike; the list shows the models of grouped providers (turn on **All
+models** for the rest); clear a name to go back to Goose's. Rename a group in its name field; **Delete group** shows
+its providers separately again. It is display only: picking a label uses the label's real provider and model, your
+team's allowed providers and models still apply to those real ids, nothing in Goose's configuration changes, and
+recipes, schedules and Goose Desktop see the providers as before. Saved on the server with your preferences (every
+browser); members can set it up for their own profile.
 
 **Providers**: a list of providers. Configured ones come first. Turn on **Show unconfigured** to see all.
 
