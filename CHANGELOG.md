@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.15.0 - 2026-11-10
+
+A steer is never lost silently (bug steer-lost-on-slow-turn), and your live state survives a refresh, another
+device and a restart (spec 019).
+
+- **Why steers were lost.** Goose accepts a steer at once but the agent reads it only at its next step (after the
+  model's current reply or tool call). In a long chat the first reply can take minutes; pressing Stop before then made
+  Goose drop the steer without a word, while the page showed it as sent. Reproduced with a provider whose first reply
+  takes 75 s (Goose 1.57.0; the same code in 1.50.0).
+- **Steer tracking in the gateway.** The hub follows each steer until its user message appears in the run
+  (*delivered*); if the run ends first (Stop, error, end, worker restart) the steer goes back to the top of the chat's
+  queue, **held**, with a notice in the transcript and a toast. The steer bubble shows *waiting for the agent's next
+  step*, *delivered* or *not delivered - back in your queue*. Fixed: a delivered steer showed its text twice; a
+  steer's chunk could take over the bubble of the prompt before it.
+- **Steers are audited** as `chat.steer` (length and attachments, never the text) and go through the **prompt guard**
+  like prompts (they were not checked before).
+- **Stop while disconnected** now says it was not sent (it used to do nothing).
+- **The queue lives in the gateway** (`_gw/queue`, `_gw/queue_update`): it survives a refresh, shows on all your
+  devices, is sent once even with several tabs open (a tab claims an item before sending), and is kept across a
+  restart (`chat_state` table, schema version 6). Queued items gain **Edit** (back into the message box). Held items
+  (returned steers, items kept across a restart) are only sent by your click.
+- **Per-user snapshot on connect.** `_gw/hello` also returns the queues and pending steers. The *done* / *error*
+  markers ("done" counter, green dots) are kept in the database until you open the chat, so a Goose Web restart no
+  longer resets them; a chat that was running when Goose Web restarted shows *Error: Interrupted*.
+- **Drafts** (unsent text in a chat's message box) are kept in the browser per chat and cleared at sign-out.
+- Docs: USER-GUIDE (While Goose is running, Herd statuses, FAQ), TROUBLESHOOTING 19, ARCHITECTURE (hub steers and
+  queue, `_gw` methods, `chat_state`), ADMINISTRATION (audit list). Service worker cache `gw-shell-v21`.
+
 ## 1.14.2 - 2026-11-10
 
 The Prompt Guard model is installed automatically (spec 018).

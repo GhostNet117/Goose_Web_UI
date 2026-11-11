@@ -1456,7 +1456,7 @@ Recorded actions:
 | Operations | `worker.restart`, `worker.stop`, `hosttask.<action>`, `fs.upload` |
 | Agent calls | `acp.denied` (policy denials, with the reason), `acp.<method>` for sensitive methods (configuration, providers and secrets, recipes save/delete, schedules create/delete, apps import/delete, sources, tool permissions, direct tool calls, adding session extensions, defaults, session delete) and for every call on another user's profile, `acp.answer` (answers to permission prompts and forms, with the choice) |
 | Admin access | `ws.impersonate` |
-| Everyday use (1.11) | `chat.new` (with the folder), `chat.open`, `chat.prompt` (length and number of attachments - never the text), `chat.cancel`, `chat.fork`, `chat.mode`; `settings.tls`, `tls.renewed` |
+| Everyday use (1.11) | `chat.new` (with the folder), `chat.open`, `chat.prompt` (length and number of attachments - never the text), `chat.steer` (1.15, the same), `chat.cancel`, `chat.fork`, `chat.mode`; `settings.tls`, `tls.renewed` |
 
 Retention: entries older than `logs.audit_days` (365) are deleted, and the table is kept to `logs.audit_max_rows`
 (500,000) newest rows; both are applied at start and every `logs.check_minutes`. There is no export button; for

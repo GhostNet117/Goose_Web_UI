@@ -10,8 +10,9 @@ from typing import Any, Iterable
 
 from .policy import ANY, CHAT_LISTS, LEGACY_DEFAULT_POLICY
 
-SCHEMA_VERSION = 5   # v3 (1.3.0): ip_blocks table; v4 (1.5.0): one team per user, least-privilege policies;
+SCHEMA_VERSION = 6   # v3 (1.3.0): ip_blocks table; v4 (1.5.0): one team per user, least-privilege policies;
 #                      v5 (1.14.0): guard_rulesets table (prompt guard, spec 018)
+#                      v6 (1.15.0): chat_state table (composer queues and herd marks survive a restart, spec 019)
 POLICY_MODEL = 2     # meta 'policy_model': 2 = spec 009 semantics (empty list = nothing, "*" = any)
 
 # Audit rows older than this are deleted when the database is opened (GW-23).
@@ -162,6 +163,16 @@ CREATE TABLE IF NOT EXISTS guard_rulesets (
   rules TEXT NOT NULL DEFAULT '[]',
   builtin TEXT NOT NULL DEFAULT '',
   updated_at REAL NOT NULL
+);
+-- per-chat live state the gateway keeps for each profile (hub.py, spec 019): kind 'queue' = the composer queue
+-- (JSON list of messages waiting for the run to end), kind 'mark' = the herd status not yet seen by the user
+CREATE TABLE IF NOT EXISTS chat_state (
+  profile TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  data TEXT NOT NULL DEFAULT '{}',
+  updated_at REAL NOT NULL,
+  PRIMARY KEY (profile, session_id, kind)
 );
 """
 
@@ -401,6 +412,33 @@ class Database:
         if days is None or days <= 0:
             return 0
         return self.execute_count("DELETE FROM audit WHERE ts < ?", (time.time() - 86400 * float(days),))
+
+    # ---- per-chat live state (spec 019)
+    def chat_state(self, profile: str) -> list[dict]:
+        """Every chat_state row of a profile, `data` decoded (rows that do not decode are skipped)."""
+        out = []
+        for r in self.query("SELECT session_id, kind, data FROM chat_state WHERE profile=?", (profile,)):
+            try:
+                out.append({"session_id": r["session_id"], "kind": r["kind"], "data": json.loads(r["data"])})
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def set_chat_state(self, profile: str, session_id: str, kind: str, data: Any) -> None:
+        """Store one row; data None (or empty) deletes it."""
+        if data is None or data == [] or data == {}:
+            self.execute("DELETE FROM chat_state WHERE profile=? AND session_id=? AND kind=?", (profile, session_id, kind))
+            return
+        self.execute("INSERT INTO chat_state(profile, session_id, kind, data, updated_at) VALUES(?,?,?,?,?) "
+                     "ON CONFLICT(profile, session_id, kind) DO UPDATE SET data=excluded.data, "
+                     "updated_at=excluded.updated_at",
+                     (profile, session_id, kind, json.dumps(data, separators=(",", ":")), time.time()))
+
+    def delete_chat_state(self, profile: str, session_id: str | None = None) -> None:
+        if session_id is None:
+            self.execute("DELETE FROM chat_state WHERE profile=?", (profile,))
+        else:
+            self.execute("DELETE FROM chat_state WHERE profile=? AND session_id=?", (profile, session_id))
 
     def audit(self, action: str, *, user: dict | None = None, ip: str = "", target: str = "",
               detail: dict | None = None, ok: bool = True) -> None:

@@ -1029,6 +1029,7 @@ async def admin_user(request: Request):
             raise HTTPError(400, "last_admin", "Keep at least one administrator")
         await c.workers.stop(u["username"].lower(), "(user deleted)")
         c.hub.upstreams.pop(u["username"].lower(), None)
+        c.db.delete_chat_state(u["username"].lower())   # spec 019: the user's queues and herd marks
         await _drop_sandbox(c, u)
         where = await asyncio.to_thread(c.profiles.archive_profile, u, request.query_params.get("purgeProfile") == "1")
         c.db.execute("DELETE FROM users WHERE id=?", (u["id"],))

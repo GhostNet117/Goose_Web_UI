@@ -3,7 +3,7 @@ import { h, btn, iconBtn, menu, toast, toastError, confirmDialog, promptDialog, 
 import { icon } from '../icons.js';
 import { rpc, G } from '../rpc.js';
 import { router } from '../router.js';
-import { getChat, setCurrentChat, dropChat } from '../chatsession.js';
+import { getChat, setCurrentChat, dropChat, saveDraft } from '../chatsession.js';
 import { Composer } from '../composer.js';
 import { pickFolder } from './folderpicker.js';
 import { getSession, removeSession, patchSession, sessionTitle, upsertSession, isArchived } from '../sessions.js';
@@ -137,12 +137,24 @@ export function renderChat(ctx, sessionId) {
     onSend: (blocks) => { stick = true; chat.send(blocks); scrollSoon(); },
     onSteer: (blocks) => { stick = true; chat.steer(blocks); scrollSoon(); },
     onStop: () => chat.cancel(),
-    onInput: (v) => { chat.draft = v; },
+    onInput: (v) => { chat.draft = v; saveDraft(chat.id, v); },
   });
   composer.value = chat.draft || '';
   if (chat.prefill) { composer.value = chat.prefill; chat.prefill = null; }
 
-  const renderQueue = () => composer.setQueue(chat.queue, { onRemove: (i) => chat.removeQueued(i), onSteer: chat.running ? (i) => chat.steerQueued(i) : null });
+  const renderQueue = () => composer.setQueue(chat.queue, {
+    onRemove: (i) => chat.removeQueued(i), onSteer: chat.running ? (i) => chat.steerQueued(i) : null,
+    onSend: (i) => { stick = true; chat.sendQueued(i); scrollSoon(); }, onEdit: (i) => chat.editQueued(i),
+  });
+  // A queued message moved back into the message box (Edit): its text goes in front of what is typed there.
+  offs.push(chat.on('edit', (blocks) => {
+    const text = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
+    const cur = composer.value || '';
+    composer.value = cur ? text + '\n' + cur : text;
+    chat.draft = composer.value; saveDraft(chat.id, chat.draft);
+    if (blocks.some((b) => b.type !== 'text')) toast('Attachments of the queued message were not moved: attach them again.', { kind: 'warn' });
+    composer.focus();
+  }));
   const renderState = () => {
     loadingEl.hidden = !chat.loading || chat.transcript.length > 0;
     composer.setRunning(chat.running);

@@ -166,7 +166,7 @@ def test_migration_keeps_old_behaviour_and_one_team(tmp_path):
         assert ops["allowed_models"] == ["m1"] and ops["allowed_providers"] == ["*"] and ops["allow_shell"] is True
         assert db.user_by_id(5)["policy_overrides"]["allowed_providers"] == ["*"]
         assert [t["id"] for t in db.user_teams(5)] == [1]
-        assert db.one("SELECT value FROM meta WHERE key='schema_version'")["value"] in (5, "5")
+        assert db.one("SELECT value FROM meta WHERE key='schema_version'")["value"] in (6, "6")
         assert db.one("SELECT COUNT(*) AS n FROM audit WHERE action='team.migrate.membership'")["n"] == 1
         with pytest.raises(sqlite3.IntegrityError):
             db.execute("INSERT INTO team_members VALUES(2, 5)")

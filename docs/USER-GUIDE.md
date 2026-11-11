@@ -460,15 +460,30 @@ the arrow keys and `Enter` or `Tab`.
 While a turn runs, the header shows "Working", and the composer changes:
 
 - **Send queues the message.** The send button changes to a queue icon. Your message appears in a queue above
-  the message box and is sent automatically when the current run finishes. Each queued message has **Send now**
-  and an X to remove it.
-- **Steer** sends your message to the running agent right away, so Goose can take it into account without
-  stopping. Click **Steer** or press `Ctrl+Enter`. A steered message is marked "steer" in the transcript. If
-  steering fails, the message is queued instead.
-- **Stop** ends the run. Click the stop button or press `Ctrl+.`. The transcript shows "Stopped".
+  the message box and is sent automatically when the current run finishes. Each queued message has **Send now**,
+  a pencil (**Edit**: moves the text back into the message box) and an X to remove it. Since 1.15 the gateway
+  keeps the queue: it survives a page refresh, shows on your other devices, and is sent even if you reopen the
+  app only after the run ended.
+- **Steer** gives your message to the running agent without stopping it. Click **Steer** or press `Ctrl+Enter`.
+  The agent reads a steer at its **next step**: after the model's current reply, or after the current tool call.
+  It does not interrupt a reply that is still being generated. The steer bubble shows where it is:
 
-If you try to leave the page while messages are still queued, the browser asks you to confirm, because queued
-messages are kept in the page.
+  | Label | Meaning |
+  |---|---|
+  | waiting for the agent's next step | Goose accepted the steer; the agent has not read it yet. In a long chat the model's first reply can take minutes, so this can last a while. |
+  | delivered | The agent has read it. |
+  | not delivered - back in your queue | The run ended (you pressed Stop, it failed, or it finished) before the agent's next step. Goose drops such steers, so Goose Web puts the message back at the top of the queue, marked **Steer not delivered**, with a notice. It is never sent by itself: click **Send** (or **Steer now** while a run is active), the pencil to edit it, or X. |
+
+  If steering fails (for example the run has just ended), the message is queued instead. A steer goes through the
+  same prompt guard as a normal message.
+- **Stop** ends the run. Click the stop button or press `Ctrl+.`. The transcript shows "Stopped". If the page is
+  not connected at that moment, the transcript says that Stop was not sent; try again when the connection is back.
+
+**Stop and steer at once?** Press Stop, then send the text as a new message - or let the run reach its next step
+first. A steer followed by Stop before the next step is returned to you as described above.
+
+The page warns before you leave it only if a queued message could not be saved by the gateway (shown with a note
+in the transcript).
 
 ### Your goose hints as an administrator with the native profile
 
@@ -704,8 +719,8 @@ working when you close the tab.
 |---|---|
 | Needs you | Waiting for a permission answer or for input. |
 | Working | Running a turn now. |
-| Error | The last run failed, or the agent stopped unexpectedly. |
-| Done | Finished since you last looked. It becomes Idle when you open the chat. |
+| Error | The last run failed, or the agent stopped unexpectedly (also: "Interrupted" when Goose Web restarted during the run). |
+| Done | Finished since you last looked. It becomes Idle when you open the chat. Kept across refreshes, devices and Goose Web restarts (1.15). |
 | Idle | Nothing running. |
 | Offline | Not reachable at the moment. |
 
@@ -1216,7 +1231,19 @@ Goose sends each thinking block in one piece once the model has finished it.
 
 **I sent a message while Goose was running. Where did it go?**
 It is in the queue above the message box and will be sent when the run ends. Click **Send now** to steer
-instead.
+instead. The queue is kept by the gateway, so it is still there after a refresh or on another device.
+
+**I steered, then pressed Stop. Did Goose read my steer?**
+Only if its bubble says "delivered". Otherwise it is back in the queue, marked **Steer not delivered** - send it
+again from there.
+
+**What survives a page refresh or a new device?**
+The sidebar counters (need you, working, done), each chat's status dot, open permission requests and questions,
+the running state and transcript of a running chat, the queue, steers still waiting for the agent, and the "done"
+markers until you open the chat. The queue and the "done"/"error" markers also survive a restart of Goose Web; a chat
+that was running when Goose Web restarted shows **Error: Interrupted**, and its queued messages wait for you to send
+them. Unsent text you typed in the message box is kept on the same device (browser storage) and cleared when you
+sign out; it does not follow you to another device.
 
 **Where do my uploaded files go?**
 Into `.goose-web-uploads` inside the chat's working folder, for example

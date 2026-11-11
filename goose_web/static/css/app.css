@@ -694,6 +694,11 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 }
 .tr-user.is-pending .bubble { opacity: .6; }
 .tr-user.is-steer .bubble { border-color: var(--accent-line); background: var(--accent-soft); }
+.steer-state { font-size: .78em; color: var(--fg-3); }
+.steer-state.steer-pending, .steer-state.steer-sending { font-style: italic; }
+.steer-state.steer-delivered { color: var(--ok); }
+.steer-state.steer-returned { color: var(--warn); font-weight: 600; }
+.tr-user.is-returned .bubble { border-style: dashed; border-color: var(--warn); background: var(--warn-soft); }
 .tr-user-meta { display: flex; gap: 6px; align-items: center; margin-bottom: 3px; min-height: 0; }
 .tr-user-meta:empty { display: none; }
 .u-text { white-space: pre-wrap; }
@@ -843,6 +848,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .queued { display: flex; align-items: center; gap: 8px; padding: 5px 6px 5px 10px; border-radius: var(--r-sm); border: 1px dashed var(--border-2); background: var(--bg-2); font-size: .86em; color: var(--fg-2); }
 .queued-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .queued .btn-icon { width: 22px; height: 22px; }
+.queued.held { border-color: var(--warn); background: var(--warn-soft); }
+.queued-tag { flex: none; font-size: .9em; color: var(--warn); font-weight: 600; }
 .composer-progress { display: flex; align-items: center; gap: 7px; font-size: .8em; color: var(--fg-2); padding: 0 6px; }
 
 /* ---------- Ask cards (permission / elicitation / recipe params) ---------- */

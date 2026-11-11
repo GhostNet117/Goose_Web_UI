@@ -13,6 +13,14 @@ const windowSize = () => { const v = Number(prefs().historyWindow ?? 300); retur
 const pageSize = () => Math.min(200, Math.max(60, Math.floor(windowSize() / 2)));
 const MAX_LIVE = 200000;
 
+// Steer bubble states (bug steer-lost-on-slow-turn): Goose accepts a steer at once, the agent reads it at its next step.
+const STEER_LABEL = { sending: 'sending...', pending: 'waiting for the agent\'s next step', delivered: 'delivered', returned: 'not delivered - back in your queue' };
+const STEER_TITLE = {
+  pending: 'Goose accepted this steer. The agent reads it after the current model reply or tool call. If the run stops first, it comes back to your queue.',
+  delivered: 'The agent has read this steer.',
+  returned: 'The run ended before the agent read this steer. It is back in the queue under the message box.',
+};
+
 const KIND_ICON = { read: 'file', edit: 'edit', delete: 'trash', move: 'file', search: 'search', execute: 'terminal', think: 'brain', fetch: 'globe', switch_mode: 'sliders', other: 'tool' };
 
 function timeOf(meta) {
@@ -217,8 +225,9 @@ export class Transcript {
     item.body = body;
     this.renderUserBlocks(item);
     const t = item.time;
-    const el = h('div', { class: ['tr-item', 'tr-user', item.steer ? 'is-steer' : '', item.pending ? 'is-pending' : ''] },
-      h('div', { class: 'tr-user-meta' }, item.steer ? h('span', { class: 'badge badge-accent' }, 'steer') : null,
+    item.stateEl = item.steer ? h('span', { class: 'steer-state steer-' + (item.steerState || 'none'), title: STEER_TITLE[item.steerState] || '' }, STEER_LABEL[item.steerState] || '') : null;
+    const el = h('div', { class: ['tr-item', 'tr-user', item.steer ? 'is-steer' : '', item.pending ? 'is-pending' : '', item.steerState === 'returned' ? 'is-returned' : ''] },
+      h('div', { class: 'tr-user-meta' }, item.steer ? h('span', { class: 'badge badge-accent' }, 'steer') : null, item.stateEl,
         prefs().showTimestamps && t ? h('span', { class: 'tr-time' }, t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })) : null),
       body,
       item.actions = h('div', { class: 'tr-actions' }, copyBtn(() => item.blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n')),
@@ -451,15 +460,20 @@ export class Transcript {
   }
 
   // ---------- public API used by ChatSession ----------
-  addUser(blocks, { messageId = null, time = null, created = null, steer = false, pending = false } = {}) {
+  addUser(blocks, { messageId = null, time = null, created = null, steer = false, pending = false, delivered = false } = {}) {
     if (messageId && this.users.has(messageId)) {
       const it = this.users.get(messageId);
+      if (it.steer && it.steerState) {
+        // our steer bubble already shows its text: Goose echoing it means the agent has read it
+        if (delivered || steer) this.setSteerState(it, 'delivered');
+        return it;
+      }
       it.blocks.push(...blocks);
       this.renderUserBlocks(it);
       return it;
     }
-    // adopt a local echo
-    if (messageId && !this.bulk) {
+    // adopt a local echo (never for a steer: the newest local bubble is then the prompt's echo, not this message)
+    if (messageId && !this.bulk && !steer) {
       for (let i = this.items.length - 1; i >= Math.max(0, this.items.length - 6); i--) {
         const it = this.items[i];
         if (it.kind === 'user' && it.local && !it.messageId) {
@@ -470,12 +484,27 @@ export class Transcript {
       }
     }
     const item = { kind: 'user', blocks: [...blocks], messageId, time: time || new Date(), created: Number.isInteger(created) ? created : null, steer, local: !messageId, pending };
+    if (steer && delivered) item.steerState = 'delivered';
     if (messageId) this.users.set(messageId, item);
     this.finalizeAll();
     this.lastPlan = null;
     return this.push(item);
   }
   markUserSent(item) { if (item) { item.pending = false; if (item.el) item.el.classList.remove('is-pending'); } }
+  // Steer bubble state (bug steer-lost-on-slow-turn): sending -> pending (Goose accepted it; the agent reads it at its
+  // next step) -> delivered, or returned (the run ended first; the gateway put it back in the queue).
+  setSteerState(item, state) {
+    if (!item) return;
+    if (item.steerState === 'delivered' && state !== 'delivered') return;
+    item.steerState = state;
+    if (state === 'delivered' || state === 'returned') item.local = false;
+    if (item.stateEl) {
+      item.stateEl.textContent = STEER_LABEL[state] || '';
+      item.stateEl.className = 'steer-state steer-' + state;
+      item.stateEl.title = STEER_TITLE[state] || '';
+    }
+    if (item.el) item.el.classList.toggle('is-returned', state === 'returned');
+  }
 
   agentChunk(content, messageId, meta) {
     if (!content) return;

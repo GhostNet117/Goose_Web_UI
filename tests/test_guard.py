@@ -186,7 +186,7 @@ def test_rulesets_seeded_once_and_schema(tmp_path):
     db.close()
     db = Database(tmp_path / "a.db")       # an admin's delete is kept: no reseed
     assert [r["name"] for r in db.query("SELECT name FROM guard_rulesets")] == ["Destructive shell"]
-    assert str(db.one("SELECT value FROM meta WHERE key='schema_version'")["value"]) == str(SCHEMA_VERSION) == "5"
+    assert str(db.one("SELECT value FROM meta WHERE key='schema_version'")["value"]) == str(SCHEMA_VERSION) == "6"
     assert G.seed_defaults(db) == ["Splunk read-only"]
     db.close()
 

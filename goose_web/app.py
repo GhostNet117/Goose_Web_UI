@@ -537,6 +537,7 @@ def create_app(settings: Settings) -> Starlette:
         c.goose_version = await asyncio.to_thread(goose_version, settings.goose_binary)
         hub.on_audit = make_audit_handler(c)
         hub.on_event = make_event_handler(c)
+        hub.db = db   # spec 019: composer queues and herd marks survive a restart
         hub.profile_root_for = lambda username: str(profiles.root_for(db.user_by_name(username) or {"username": username}))
         # Prompt guard (spec 018): rules + the local classifier; loads nothing until some guard is on.
         from .guard import GuardService

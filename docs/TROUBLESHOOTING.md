@@ -40,6 +40,7 @@ Examples in this guide use the address `https://goose.example.org`, the LAN addr
 16. [Other common errors](#16-other-common-errors)
 17. [Reporting security issues](#17-reporting-security-issues)
 18. [Prompt guard](#18-prompt-guard)
+19. [Steer, Stop and state after a refresh](#19-steer-stop-and-state-after-a-refresh)
 
 ---
 
@@ -670,7 +671,7 @@ chat link) and `Priority` (`high` for "needs you", otherwise `default`). Other U
 
 ## 14. Old user interface after an upgrade
 
-The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v20`). The
+The browser app is installed as a Progressive Web App with a service worker (`sw.js`, cache `gw-shell-v21`). The
 page, scripts and styles are fetched from the network first, and the cache is used only when the gateway cannot
 be reached; `/api/` and `/ws` are never cached. Third-party libraries and icons are served from the cache first.
 The gateway sends these files with `Cache-Control: no-cache`.
@@ -778,3 +779,25 @@ user names and host names removed.
 | *this chat uses the approval mode 'auto'* for a guarded member | Guarded teams use Approve. | Pick Approve for the chat; the team can turn on *Guarded auto*. |
 | Admin: *use Approve (guarded) or Auto (not guarded)* | The admins' guard is on and the chat is in Smart approve. | Switch the chat's mode. |
 | `guard.unavailable` lines in activity.jsonl | Classifier down (repeated at most every 10 min). | As above. |
+
+---
+
+## 19. Steer, Stop and state after a refresh
+
+**How steering works.** Goose answers a steer at once (that only means *accepted*). The agent reads it at its next
+step: after the model's current reply or after the current tool call. In a long chat the model's first reply can
+take minutes, so a steer can wait that long. When a run ends, Goose drops the steers the agent has not read yet,
+without telling anyone. Since 1.15 the gateway tracks each steer and gives undelivered ones back (bug
+steer-lost-on-slow-turn, 2026-11-10).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The steer bubble says *waiting for the agent's next step* for minutes | The model is still writing its reply (long chat, slow provider). | Wait. Or press Stop and send the text as a new message. |
+| *Steer not delivered ... It is back in the queue* after Stop | You stopped the run before the agent's next step; Goose discarded the steer. | Click **Send** on the held queue item (or edit / remove it). |
+| A steered message was "lost" in a version before 1.15 | Same cause, but older versions showed it as sent. | Send it again. `chat.steer` lines (1.15+) in activity.jsonl show when a steer was sent (length only). |
+| *Steer refused: forbidden: the prompt guard blocked this message* | Steers go through the same prompt guard as prompts (1.15). | As for prompts (section 18). |
+| *Not connected: Stop was not sent* | The page had lost its connection (often a reverse proxy dropping idle WebSockets, section 6). | Wait for "Connected", press Stop again. |
+| Stop / Steer do nothing and the chat shows idle while the agent clearly works; gateway.log says `session <id> changed outside this worker` | The chat is running in **another Goose app** on the same native profile (Goose Desktop or the CLI share its sessions database). Goose Web only sees, steers and stops runs of its own worker. | Stop or steer it in the app that runs it. Do not type in Goose Web at the same time: that starts a second run of the same chat in another process. |
+| A queued message was not sent after a Goose Web restart; it says *Kept across a Goose Web restart* | The run it waited for was interrupted by the restart (the chat shows *Error: Interrupted*). Restored queue items are never sent automatically. | Click **Send**, edit or remove it. |
+| Counters (need you / working / done) reset | Before 1.15 they lived only in the gateway's memory and were lost when it restarted. Since 1.15 *done* and *error* markers and queues are kept in the `chat_state` table; a refresh never resets them. *Working* after a restart is impossible (the runs end with the gateway); such chats show *Error: Interrupted*. | Upgrade to 1.15. |
+| Unsent text in the message box is missing on another device | Drafts stay in the browser that typed them (localStorage, cleared at sign-out). | By design. |

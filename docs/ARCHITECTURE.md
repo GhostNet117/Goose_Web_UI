@@ -143,7 +143,7 @@ The main ideas:
 |---|---|
 | `index.html` | Shell page: theme stylesheets, `modulepreload` of `js/app.js`, boot spinner. |
 | `manifest.webmanifest` | PWA manifest. |
-| `sw.js` | Service worker (`gw-shell-v20`): offline shell, network-first for app code, cache-first for vendor files. |
+| `sw.js` | Service worker (`gw-shell-v21`): offline shell, network-first for app code, cache-first for vendor files. |
 | `css/app.css` | All styles and themes. |
 | `icons/` | `goose.svg`, `goose-maskable.svg`. |
 | `vendor/` | Vendored libraries (marked, DOMPurify, highlight.js, qrcode-generator) with `README.md` and `SHA256SUMS`. |
@@ -589,10 +589,13 @@ delete.
 
 | Method | Direction | Purpose |
 |---|---|---|
-| `_gw/hello` | tab -> gateway | Returns `{user {username, role}, profile, agent (cached initialize result), asks (raw pending ask messages), herd, upstream {state, error}}`. The SPA calls it on every (re)connect. |
+| `_gw/hello` | tab -> gateway | Returns `{user {username, role}, profile, agent (cached initialize result), asks (raw pending ask messages), herd, upstream {state, error}, queues {sessionId: items}, steers [pending]}`. The SPA calls it on every (re)connect; it is the per-user snapshot that rebuilds counters, status dots, approvals, queues and pending steers after a refresh or on another device (spec 019). |
 | `_gw/watch {sessionIds}` | tab -> gateway | Replaces the set of sessions this tab receives updates for (max 200). |
 | `_gw/herd {all}` | tab -> gateway | Returns the herd. `all: true` (admin only) returns every profile's agents and subscribes the tab to all herd updates. |
 | `_gw/seen {sessionId}` | tab -> gateway | Acknowledges a `done` or `error` session, which goes back to `idle`. |
+| `_gw/queue {sessionId, op, blocks?, id?, manual?}` | tab -> gateway | The chat's composer queue (1.15): `add`, `remove`, `take` (claim before sending; held items only with `manual`), `list`. |
+| `_gw/queue_update {sessionId, items}` | gateway -> tab | The queue changed (any tab, a returned steer, a deleted chat). |
+| `_gw/steer_update {sessionId, messageId, state, ...}` | gateway -> tab | A steer is `pending` (with its blocks), `delivered`, or `returned` (with `reason` and `note`). |
 | `_gw/upstream` | gateway -> tab | Worker connection state. |
 | `_gw/herd_update {agent}` | gateway -> tab | One agent changed (status, text, usage, ask). |
 | `_gw/ask_resolved {id, by}` | gateway -> tab | An ask was answered in another tab, or cancelled by a worker restart. |
@@ -647,7 +650,34 @@ class SessionState:
     prompts       # in-flight session/prompt calls
     fp, fp_pending  # fingerprint (messageCount, updatedAt, title)
     error, last_touch
+    steers        # accepted steers the agent has not read yet (1.15)
+    cancel_requested, steer_seen
+    queue         # the composer queue, persisted in chat_state (1.15)
 ```
+
+**Steers (1.15, bug steer-lost-on-slow-turn).** Goose answers
+`_goose/unstable/session/steer` as soon as it has queued the message
+(`{runId, messageId}`, plus a `session_info_update` with `queuedSteer`). The
+agent reads queued steers only between turns (after the model's reply or a tool
+result, Goose `SteerOperation`), and `discard_pending_steers` drops the rest
+when the run ends. The hub therefore records each steer (`sending`, then
+`pending` with Goose's `messageId`), marks it delivered when a
+`user_message_chunk` with that `messageId` passes, and when the run ends
+(`activeRunId` cleared, the prompt response, or `_fail_all`) moves every
+still-pending steer to the front of the chat's queue as a **held** item with a
+reason. Every change is sent to the profile's tabs as
+`_gw/steer_update {sessionId, messageId, state: pending|delivered|returned}`
+(pending is not echoed to the sending tab). A steer goes through the prompt
+guard like a prompt and is audited as `chat.steer` (length only).
+
+**Queue (1.15, spec 019).** The queue lives in the hub, not in the page.
+`_gw/queue {op: add|remove|take|list}` changes it and every change is
+broadcast as `_gw/queue_update {sessionId, items}`. Tabs still send the
+prompts (policy, guard and audit stay on the normal `session/prompt` path):
+when a run ends, a tab claims the first item that is not held with
+`op: take` (first claim wins, so two tabs never send it twice) and sends it.
+Held items (returned steers, items restored after a gateway restart) are only
+claimed with `manual: true`, i.e. by the user's click.
 
 `running()` is true while `prompts > 0`, a `run_id` is set, or the status is
 `working` or `needs_you`.
@@ -1060,7 +1090,7 @@ data:
 - **Install** pre-caches the shell list on a best-effort basis and calls
   `skipWaiting()`.
 - **Activate** deletes every cache whose name is not the current `VERSION`
-  (`gw-shell-v20`) and claims open clients.
+  (`gw-shell-v21`) and claims open clients.
 - **notificationclick** focuses an open window, or opens one, at
   `/#/chat/<sessionId>` or `/#/herd`.
 
@@ -1101,6 +1131,7 @@ secrets, schedules) stays in each profile and is never copied into it.
 | `settings` | `key`, `value` (JSON): `auth`, `brand`, `default_team_id`, `session_hours`, `allow_self_totp`, `require_totp_admins`, `peers`, `native_root` |
 | `oidc_states` | `state`, `verifier`, `nonce`, `created_at` (10-minute login handshakes) |
 | `ip_blocks` | `ip` (address key: IPv4 or IPv6 /64), `failures` (JSON list of timestamps of the current run), `last_username`, `blocked_at` (0 = not blocked), `blocked_until` (0 = until unblocked), `updated_at` (schema version 3) |
+| `chat_state` | Per-chat live state the hub keeps for each profile (spec 019, schema version 6): `(profile, session_id, kind)` primary key, `data` (JSON), `updated_at`. `kind = 'queue'`: the composer queue; `kind = 'mark'`: the herd status not yet seen (`working`, `needs_you`, `done`, `error` with title, folder, last text). Written on queue changes and status changes only; read when the profile's `Upstream` is created (`Upstream.restore_state`). Rows are deleted when the queue empties, the status becomes idle (`_gw/seen`), the chat is deleted, or the user is deleted; marks older than 30 days are dropped. |
 
 **JSON columns.** `prefs`, `policy_overrides`, `policy`, `payload`, `detail` and
 `value` are decoded automatically in `_row()`, so callers always get Python
@@ -1117,7 +1148,7 @@ objects.
 
 ### 10.3 Schema version and migrations
 
-`SCHEMA_VERSION = 5` (5: the `guard_rulesets` table and its seeded defaults, 1.14.0; 3: the `ip_blocks` table, 1.3.0; 4: one team per user and
+`SCHEMA_VERSION = 6` (6: the `chat_state` table, 1.15.0; 5: the `guard_rulesets` table and its seeded defaults, 1.14.0; 3: the `ip_blocks` table, 1.3.0; 4: one team per user and
 least-privilege policies, 1.5.0). Column migrations are additive and
 idempotent:
 
@@ -1754,6 +1785,7 @@ location) and disables the cache plugin.
 | `tests/test_team_profiles.py` | Spec 009: new teams allow nothing, no team cannot chat, Any and explicit lists, config writes and the locked `CONTEXT_FILE_NAMES`, prompts refused in chats with a disallowed model, team warnings, roots, the 1.4 migration, hints order and dropped personal hints, the hints file and worker environment, team folder and default model, one team per user (moves), effective hints view and upload refusal. |
 | `tests/test_hub.py` | A `FakeAgent` WebSocket server (`initialize`, `session/new`, `session/load`, `session/prompt`). Tests: a run survives a tab disconnect and is replayed, policy denial, the second answer to an ask loses, idle replay only while unchanged elsewhere, the watcher announces external changes, Retry/add/remove of an extension updates the replayed start-up status. `tests/test_edit_and_paths.py`: prompt stamping (`_gw/prompt_created` + echo), truncate guard and buffer invalidation, `native-root`, `GOOSE_PATH_ROOT` auto-detection, no author-specific goose path. |
 | `tests/test_guard.py` | Spec 018: Splunk/shell default rules (pipelines, quotes, subsearches, macros), words/regex/globs, rule validation, team guard policy and mode filtering, `always_allow` refused, provisioning resets mode and `permission.yaml`, rule-set seeding and migration, classifier windows/cache with the tiny test model (`tests/data/guard_tiny`), fail open and health, model install checks (hash, zip slip, 86M, tamper), CLI, admin API. |
+| `tests/test_live_state.py` | 1.15: a `SteerAgent` that queues steers and drops them when the run ends, like Goose. Steer tracked to delivery (pending not echoed to the sender, in the hello snapshot, `chat.steer` audited without text); steer + Stop returned held to the queue, persisted and restored, claimed once and only manually; refused steer not tracked; worker restart returns steers; steers pass the prompt guard (refused openly); queue ops, limits and per-user isolation; herd marks survive a restart (running -> *Interrupted*, queue held), `_gw/seen` clears them. |
 | `tests/test_guard_hub.py` | Spec 018 against a fake agent that asks permission: prompt blocked (error / silent), unguarded member untouched, tool call blocked with notice and audit, card without *Always allow* and the downgrade, guarded auto, admin Auto bypass / Smart approve refused / Approve checked, classifier down = fail open with health for admins. |
 | `tests/test_auth_hardening.py` | TOTP replay and lockout, TOTP settings, OIDC subject binding and takeover protection, LDAP plaintext refusal, token revocation on reset, disable and password change, admin and CLI two-factor reset, column and link-table allow-lists, audit purge, additive migration of a legacy database. |
 | `tests/test_platform_hardening.py` | Generated admin password and one-time printing, `init` password options, path containment including symlink escapes, `address_blocked`, webhook pinning and no redirects, log rotation, vendored file checksums, hashed lock file covering `pyproject.toml`, SHA-pinned actions. |

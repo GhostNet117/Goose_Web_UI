@@ -506,7 +506,7 @@ def test_additive_migration_on_legacy_database(tmp_path):
         db = Database(path)
         u = db.user_by_name("old")
         assert u["totp_last_counter"] is None and u["oidc_issuer"] is None and u["oidc_subject"] is None
-        assert str(db.one("SELECT value FROM meta WHERE key='schema_version'")["value"]) == "5"
+        assert str(db.one("SELECT value FROM meta WHERE key='schema_version'")["value"]) == "6"
         assert db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='ip_blocks'")
         assert db.one("SELECT name FROM sqlite_master WHERE name='ux_users_oidc'")
         db.close()

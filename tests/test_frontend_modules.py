@@ -155,7 +155,7 @@ def test_signout_clears_client_state_and_sw_ignores_query():
     clear = app.split("async function clearClientState()", 1)[1].split("\n}", 1)[0]
     assert "localStorage.removeItem" in clear and "sessionStorage.clear()" in clear and "caches.delete" in clear
     sw = (JS.parent / "sw.js").read_text(encoding="utf-8")
-    assert "const VERSION = 'gw-shell-v20';" in sw
+    assert "const VERSION = 'gw-shell-v21';" in sw
     assert "c.put(key, copy)" in sw and "url.pathname === '/index.html' ? '/' : url.pathname" in sw
 
 
@@ -166,6 +166,37 @@ def test_asks_name_the_requesting_extension():
     card = asks.split("export function askCard", 1)[1].split("\nexport function", 1)[0]
     assert card.count("sourceLine(ask)") >= 2
     assert "sourceLine(ask), elicitationWarning(ask)" in asks.split("export function openElicitationModal", 1)[1]
+
+
+def test_steer_state_and_server_queue_wiring():
+    """Bug steer-lost-on-slow-turn + spec 019: the queue and undelivered steers come from the gateway."""
+    cs = _js("chatsession.js")
+    assert {"applyHelloState", "queueUpdated", "steerUpdated", "saveDraft", "hasLocalQueue"} <= _exports(JS / "chatsession.js")
+    app = _js("app.js")
+    assert "rpc.on('_gw/queue_update'" in app and "rpc.on('_gw/steer_update'" in app
+    hello = app.split("rpc.on('hello'", 1)[1].split("});", 1)[0]
+    # the hello's queues replace the old copy before the herd change drains idle chats (bug found in E2E: a stale
+    # pre-restart copy was sent); applyHelloState itself never drains
+    assert hello.index("applyHelloState(hello)") < hello.index("setHerd(")
+    assert "drainIdleQueues()" not in cs.split("export function applyHelloState", 1)[1].split("\n}", 1)[0]
+    assert "takeQueued(this.queue[i], true)" in cs.split("async sendQueued(i)", 1)[1].split("\n  }", 1)[0]
+    assert "op: 'take', id: item.id, manual" in cs
+    # a queued item is claimed (take) before it is sent; held items (returned steers) are never sent automatically
+    drain = cs.split("async drainQueue()", 1)[1].split("\n  }\n", 1)[0]
+    assert "!q.held" in drain and "takeQueued(next)" in drain
+    assert "op: 'take'" in cs and "op: 'add'" in cs and "op: 'remove'" in cs
+    assert "rpc.profileParam" in cs.split("function drainIdleQueues()", 1)[1].split("\n}", 1)[0]
+    # Stop while disconnected says so instead of doing nothing (rpc.notify returns false)
+    assert "if (!rpc.notify('session/cancel'" in cs
+    # a refused steer (prompt guard) is not queued
+    assert "e.code === -32003" in cs.split("async steer(blocks)", 1)[1].split("\n  }\n", 1)[0]
+    tr = _js("transcript.js")
+    assert "setSteerState(item, state)" in tr and "returned:" in tr and "delivered:" in tr
+    assert "!this.bulk && !steer" in tr          # a steer chunk never adopts the prompt's echo bubble
+    comp = _js("composer.js")
+    assert "Steer not delivered" in comp and "onEdit" in comp
+    chat = _js("views/chat.js")
+    assert "saveDraft(chat.id, v)" in chat and "chat.on('edit'" in chat
 
 
 def test_versions_agree():

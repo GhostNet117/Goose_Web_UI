@@ -84,8 +84,24 @@ def goose_caps(init_result: dict | None) -> dict:
 
 
 # Everyday chat activity recorded per user (spec 015, Hub.audit_activity).
+STEER = "_goose/unstable/session/steer"
 CHAT_ACTIVITY = {"session/new": "chat.new", "session/load": "chat.open", "session/prompt": "chat.prompt",
-                 "session/cancel": "chat.cancel", "session/fork": "chat.fork", "session/set_mode": "chat.mode"}
+                 "session/cancel": "chat.cancel", "session/fork": "chat.fork", "session/set_mode": "chat.mode",
+                 STEER: "chat.steer"}
+# Composer queue kept by the gateway per chat (spec 019): survives a refresh, another device and a restart.
+QUEUE_MAX_ITEMS = 20
+QUEUE_ITEM_BYTES = 9 * 1024 * 1024   # an inline image is at most 8 MB (composer.js)
+QUEUE_MAX_SESSIONS = 200             # chats with a non-empty queue per profile
+MARK_STATUSES = ("working", "needs_you", "done", "error")   # herd states kept in the database (spec 019)
+MARK_MAX_AGE = 30 * 86400
+QUEUE_RESTORED = "Kept across a Goose Web restart. Send it when you are ready."
+# Why a steer Goose accepted was never read by the agent (bug steer-lost-on-slow-turn). Goose injects a steer only
+# at the agent's next step (after the model's reply or a tool call) and drops what is still waiting when the run ends.
+STEER_RETURNED = {
+    "cancelled": "You stopped the run before the agent's next step, so it never read this steer.",
+    "ended": "The run ended before the agent's next step, so it never read this steer.",
+    "error": "The run failed before the agent's next step, so it never read this steer.",
+}
 
 EXT_ADD = "_goose/unstable/session/extensions/add"
 EXT_REMOVE = "_goose/unstable/session/extensions/remove"
@@ -251,6 +267,14 @@ class SessionState:
     fp: tuple | None = None
     fp_pending: bool = False
     sys_prompts: dict = field(default_factory=dict)   # (mode, key) -> override; re-sent after a load on Goose < 1.55
+    # Steers sent to the active run that the agent has not read yet: {id, messageId, runId, blocks, by, at, state}
+    # with state "sending" (no answer from Goose yet) or "pending" (accepted, waiting for the agent's next step).
+    steers: list = field(default_factory=list)
+    cancel_requested: bool = False   # a session/cancel passed since the last prompt (why undelivered steers came back)
+    steer_seen: deque = field(default_factory=lambda: deque(maxlen=50))   # steer message ids already in the stream
+    # The composer queue (spec 019): [{id, blocks, by, at, held?, steer?, note?}]. A tab sends the first item that is
+    # not held when the run ends; returned steers come back held (the user decides). Persisted per profile.
+    queue: list = field(default_factory=list)
 
     def running(self) -> bool:
         return self.prompts > 0 or bool(self.run_id) or self.status in ("working", "needs_you")
@@ -388,6 +412,10 @@ class Upstream:
                             "params": {"id": ask["msg"]["id"], "sessionId": ask["sessionId"], "by": "worker-restart"}})
         self.asks.clear()
         for s in self.sessions.values():
+            if s.steers:
+                # "sending" steers just failed above (the tab queues them itself); accepted ones come back here
+                s.steers = [e for e in s.steers if e["state"] == "pending"]
+                self._return_steers(s, "error")
             if s.running():
                 self._set_status(s, "error", error=reason)
             s.prompts, s.run_id, s.loaded, s.load_result = 0, None, False, None
@@ -496,6 +524,10 @@ class Upstream:
                     pol.check_session_choice(client.policy, s0.load_result if s0 else None)
                 if self.hub.guard is not None and await self._guard_prompt(client, mid, params):
                     return
+            elif method == STEER and self.hub.guard is not None:
+                # a steer becomes a user message of the run: the same prompt guard applies (it was not checked < 1.15)
+                if await self._guard_prompt(client, mid, params, steer=True):
+                    return
             await self.ensure()
             if method == "session/load":
                 sid = str(params.get("sessionId") or "")
@@ -526,9 +558,21 @@ class Upstream:
             if mid is not None:
                 client.send({"jsonrpc": "2.0", "id": mid, "error": e.to_json()})
             return
+        if method == "session/cancel":
+            s0 = self.sessions.get(str(params.get("sessionId") or ""))
+            if s0 is not None:
+                s0.cancel_requested = True
+        elif method == STEER and mid is not None and isinstance(params.get("prompt"), list):
+            # Goose answers at once ("accepted"), but the agent reads a steer only at its next step. Track it until
+            # its user message appears in the stream (delivered) or the run ends (returned to the user's queue).
+            s0 = self.sess(str(params.get("sessionId") or ""))
+            s0.steers.append({"id": "s" + os.urandom(6).hex(), "messageId": None,
+                              "runId": str(params.get("expectedRunId") or ""), "blocks": params["prompt"],
+                              "by": client.user.get("username"), "at": time.time(), "state": "sending"})
         if method == "session/prompt":
             s = self.sess(str(params.get("sessionId") or ""))
             s.prompts += 1
+            s.cancel_requested = False
             s.loaded = True
             client.watch.add(s.sid)
             s.last_text = ""
@@ -560,6 +604,10 @@ class Upstream:
             await self._send({"jsonrpc": "2.0", "id": up_id, "method": method, "params": params})
         except RpcError as e:
             self.pending.pop(up_id, None)
+            if method == STEER:   # never reached Goose: the tab queues it instead
+                s0 = self.sessions.get(str(params.get("sessionId") or ""))
+                if s0 is not None:
+                    s0.steers = [x for x in s0.steers if x["blocks"] is not params.get("prompt")]
             client.send({"jsonrpc": "2.0", "id": mid, "error": e.to_json()})
 
     def _reply(self, client: Client, mid: Any, result: Any) -> None:
@@ -598,7 +646,7 @@ class Upstream:
             raise pol.Denied(f"you already have {running} agents running (limit {limit})")
 
     # ------------------------------------------------------------ prompt guard (spec 018)
-    async def _guard_prompt(self, client: Client, mid: Any, params: dict) -> bool:
+    async def _guard_prompt(self, client: Client, mid: Any, params: dict, steer: bool = False) -> bool:
         """Check a prompt against the typing user's guard. True = refused (the reply is sent here); False = go on.
         Administrators: an Auto chat bypasses; a Smart approve chat is refused while the admin guard is on (its
         read-only skip would hide tool calls from the guard)."""
@@ -618,7 +666,7 @@ class Upstream:
         if not d.blocked:
             return False
         self.hub.audit_guard(self, sid, ctx, d, mode=mode, actor=client)
-        if ctx.on_block == "silent":
+        if ctx.on_block == "silent" and not steer:   # a steer has no stop reason: it is always refused openly
             self._reply(client, mid, {"stopReason": "refusal"})
         elif mid is not None:
             why = f"rule {d.rule} ({d.ruleset})" if d.rule else "prompt-injection classifier"
@@ -1065,6 +1113,10 @@ class Upstream:
             s.prompts = max(0, s.prompts - 1)
             if s.prompts == 0:
                 self._refresh_fp_soon(s)
+                if s.steers:
+                    stop0 = result.get("stopReason") if ok else None
+                    self._return_steers(s, "error" if not ok else "cancelled"
+                                        if stop0 == "cancelled" or s.cancel_requested else "ended")
                 if ok:
                     stop = result.get("stopReason") or "end_turn"
                     s.run_id = None
@@ -1078,6 +1130,22 @@ class Upstream:
                     s.run_id = None
                     self._set_status(s, "error", error=err)
                     self.hub.notify_event(self, s.sid, "error")
+        elif method == STEER:
+            s = self.sessions.get(sid0)
+            e = next((x for x in s.steers if x["blocks"] is params.get("prompt")), None) if s else None
+            if e is not None:
+                if not ok or not result.get("messageId"):
+                    s.steers.remove(e)   # refused (no active run, wrong run id): the tab queues it instead
+                else:
+                    e["messageId"], e["state"] = str(result["messageId"]), "pending"
+                    e["runId"] = str(result.get("runId") or e["runId"])
+                    if e["messageId"] in s.steer_seen:      # the agent already read it
+                        s.steers.remove(e)
+                        self._steer_update(s, e, "delivered")
+                    else:
+                        self._steer_update(s, e, "pending", skip=client)
+                        if not s.run_id and s.prompts == 0:   # the run ended while Goose was answering
+                            self._return_steers(s, "cancelled" if s.cancel_requested else "ended")
         elif method == "session/set_mode" and ok:
             s = self.sessions.get(str(params.get("sessionId") or ""))
             if s and s.load_result and isinstance(s.load_result.get("modes"), dict):
@@ -1113,9 +1181,14 @@ class Upstream:
                 apply_extension_change(s.load_result, method, params, msg)
         elif method in ("session/delete", "session/close") and ok:
             s = self.sessions.pop(str(params.get("sessionId") or ""), None)
+            if method == "session/delete":
+                self.hub.save_chat_state(self.key, sid0, None, None)   # its queue and herd mark go too
             if s:
                 self.hub.total_buffer -= s.buffer_bytes
                 self.broadcast_herd(s, removed=True)
+                if s.queue:
+                    self.broadcast({"jsonrpc": "2.0", "method": "_gw/queue_update",
+                                    "params": {"sessionId": s.sid, "items": []}})
         elif method == "_goose/unstable/session/rename" and ok:
             s = self.sess(str(params.get("sessionId") or ""))
             s.title = str(params.get("title") or s.title)
@@ -1149,6 +1222,16 @@ class Upstream:
                     {**o, "currentValue": u["currentModeId"]} if isinstance(o, dict) and o.get("id") == "mode" else o
                     for o in s.load_result["configOptions"]]
             return
+        if kind == "user_message_chunk" and not replaying:
+            mid = u.get("messageId") or (((u.get("_meta") or {}).get("goose") or {}).get("messageId"))
+            if isinstance(mid, str) and mid.startswith("steer_"):
+                if mid not in s.steer_seen:
+                    s.steer_seen.append(mid)
+                e = next((x for x in s.steers if x["messageId"] == mid), None)
+                if e is not None:   # the agent read the steer: it is in the conversation now
+                    s.steers.remove(e)
+                    self._steer_update(s, e, "delivered")
+            return
         if kind == "session_info_update":
             if u.get("title"):
                 s.title = str(u["title"])
@@ -1161,6 +1244,8 @@ class Upstream:
                         self._set_status(s, "working")
                 else:
                     s.run_id = None
+                    if s.steers:   # Goose dropped the steers the agent had not read (discard_pending_steers)
+                        self._return_steers(s, "cancelled" if s.cancel_requested else "ended")
                     if s.status == "working" and s.prompts == 0:
                         self._set_status(s, "done")
                         self.hub.notify_event(self, s.sid, "done")
@@ -1183,10 +1268,118 @@ class Upstream:
             self._herd_dirty.add(s.sid)
 
     def _set_status(self, s: SessionState, status: str, error: str = "") -> None:
+        changed = s.status != status or s.error != error
         if s.status != status:
             s.status, s.since = status, time.time()
         s.error = error
+        if changed:   # spec 019: keep "working / needs you / done / error" across a gateway restart
+            mark = {"status": status, "since": s.since, "title": s.title, "cwd": s.cwd,
+                    "lastText": s.last_text, "error": error} if status in MARK_STATUSES else None
+            self.hub.save_chat_state(self.key, s.sid, "mark", mark)
         self._herd_changed(s)
+
+    # ------------------------------------------------------------ steers and the queue (bug steer-lost-on-slow-turn, spec 019)
+    @staticmethod
+    def _steer_view(s: SessionState, e: dict) -> dict:
+        return {"sessionId": s.sid, "id": e["id"], "messageId": e["messageId"], "runId": e["runId"],
+                "blocks": e["blocks"], "by": e["by"], "at": e["at"], "state": e["state"]}
+
+    def _steer_update(self, s: SessionState, e: dict, state: str, skip: Client | None = None, **extra: Any) -> None:
+        params = {**self._steer_view(s, e), "state": state, **extra}
+        if state != "pending":
+            params.pop("blocks", None)
+        raw = json.dumps({"jsonrpc": "2.0", "method": "_gw/steer_update", "params": params}, separators=(",", ":"))
+        for c in list(self.clients):
+            if c is not skip:
+                c.send(raw)
+
+    def _return_steers(self, s: SessionState, reason: str) -> None:
+        """The run ended with accepted steers the agent never read (Goose discards them silently): put them back at
+        the front of the chat's queue, held, so the user can send, edit or drop them - and tell every tab."""
+        back = [e for e in s.steers if e["state"] == "pending"]
+        if not back:
+            return
+        s.steers = [e for e in s.steers if e["state"] != "pending"]
+        note = STEER_RETURNED.get(reason, STEER_RETURNED["ended"])
+        items = [{"id": e["id"], "blocks": e["blocks"], "by": e["by"], "at": e["at"], "held": True, "steer": True,
+                  "note": note} for e in back]
+        s.queue[0:0] = items
+        log.info("session %s: %d steer(s) not delivered (%s), returned to the queue", s.sid, len(back), reason)
+        for e in back:
+            self._steer_update(s, e, "returned", reason=reason, note=note)
+        self._queue_changed(s)
+
+    def _queue_changed(self, s: SessionState) -> None:
+        self.hub.save_chat_state(self.key, s.sid, "queue", s.queue or None)
+        self.broadcast({"jsonrpc": "2.0", "method": "_gw/queue_update", "params": {"sessionId": s.sid, "items": s.queue}})
+
+    def queue_op(self, client: Client, params: dict) -> dict:
+        """_gw/queue: add / remove / take (a tab claims the item it is about to send; first claim wins) / list."""
+        sid = str(params.get("sessionId") or "")
+        op = params.get("op")
+        if not sid or len(sid) > 200:
+            raise RpcError(-32602, "sessionId is required")
+        s = self.sessions.get(sid)
+        if op == "list":
+            return {"items": s.queue if s else []}
+        if op == "add":
+            blocks = params.get("blocks")
+            if not isinstance(blocks, list) or not blocks or not all(isinstance(b, dict) for b in blocks):
+                raise RpcError(-32602, "blocks must be a non-empty list of content blocks")
+            if len(json.dumps(blocks)) > QUEUE_ITEM_BYTES:
+                raise RpcError(-32602, "this message is too large to queue")
+            s = self.sess(sid)
+            if len(s.queue) >= QUEUE_MAX_ITEMS:
+                raise RpcError(-32602, f"at most {QUEUE_MAX_ITEMS} messages can wait in a chat's queue")
+            if not s.queue and sum(1 for x in self.sessions.values() if x.queue) >= QUEUE_MAX_SESSIONS:
+                raise RpcError(-32602, "too many chats have queued messages")
+            item = {"id": "q" + os.urandom(6).hex(), "blocks": blocks, "by": client.user.get("username"),
+                    "at": time.time()}
+            s.queue.append(item)
+            self._queue_changed(s)
+            return {"ok": True, "id": item["id"], "items": s.queue}
+        if op in ("remove", "take"):
+            qid = params.get("id")
+            item = next((x for x in s.queue if x.get("id") == qid), None) if s else None
+            if item is None or (op == "take" and item.get("held") and not params.get("manual")):
+                # a held item (returned steer, kept across a restart) is only sent by the user's own click
+                return {"ok": False, "items": s.queue if s else []}
+            s.queue.remove(item)
+            self._queue_changed(s)
+            return {"ok": True, "item": item, "items": s.queue}
+        raise RpcError(-32602, "op must be add, remove, take or list")
+
+    def restore_state(self, rows: list[dict]) -> None:
+        """Spec 019: the herd marks and queues this profile had before the gateway restarted."""
+        now = time.time()
+        for r in rows:
+            sid, kind, data = r.get("session_id"), r.get("kind"), r.get("data")
+            if not sid or not isinstance(data, (dict, list)):
+                continue
+            if kind == "queue" and isinstance(data, list):
+                # the run these messages waited for ended with the old gateway: never send them by surprise
+                self.sess(sid).queue = [x if x.get("held") else {**x, "held": True, "note": QUEUE_RESTORED}
+                                        for x in data if isinstance(x, dict) and x.get("id")][:QUEUE_MAX_ITEMS * 2]
+            elif kind == "mark" and isinstance(data, dict) and data.get("status") in MARK_STATUSES:
+                if now - float(data.get("since") or 0) > MARK_MAX_AGE:
+                    self.hub.save_chat_state(self.key, sid, "mark", None)
+                    continue
+                s = self.sess(sid)
+                s.title, s.cwd = str(data.get("title") or ""), str(data.get("cwd") or "")
+                s.last_text, s.since = str(data.get("lastText") or "")[:300], float(data.get("since") or now)
+                s.status, s.error = data["status"], str(data.get("error") or "")
+                if s.status in ("working", "needs_you"):   # its run ended with the old gateway and its workers
+                    s.status, s.since = "error", now
+                    s.error = "Interrupted: Goose Web restarted while this chat was running"
+                    self.hub.save_chat_state(self.key, sid, "mark", {
+                        "status": s.status, "since": s.since, "title": s.title, "cwd": s.cwd,
+                        "lastText": s.last_text, "error": s.error})
+
+    def snapshot(self) -> dict:
+        """Spec 019: everything a tab needs to rebuild this user's live state (added to _gw/hello)."""
+        return {"queues": {s.sid: s.queue for s in self.sessions.values() if s.queue},
+                "steers": [self._steer_view(s, e) for s in self.sessions.values() for e in s.steers
+                           if e["state"] == "pending"]}
 
     def _herd_changed(self, s: SessionState) -> None:
         self._herd_dirty.discard(s.sid)
@@ -1241,6 +1434,7 @@ class Hub:
         self.on_schedules: Callable[[str], None] | None = None
         self.profile_root_for: Callable[[str], str] = lambda u: ""
         self.guard: Any = None          # guard.GuardService (spec 018), wired by the app; None = no prompt guard
+        self.db: Any = None             # db.Database, wired by the app: chat_state rows (spec 019); None = memory only
         self._flusher: asyncio.Task | None = None
         workers.activity = self._activity
         workers.on_restart = self._on_restart
@@ -1319,7 +1513,24 @@ class Hub:
         up = self.upstreams.get(key)
         if up is None:
             up = self.upstreams[key] = Upstream(self, key, username)
+            if self.db is not None:
+                try:
+                    up.restore_state(self.db.chat_state(key))
+                except Exception:
+                    log.exception("restoring the chat state of %s", key)
         return up
+
+    def save_chat_state(self, profile: str, sid: str, kind: str | None, data: Any) -> None:
+        """Persist (data) or delete (None) one chat_state row; kind None deletes every row of the chat."""
+        if self.db is None or not sid:
+            return
+        try:
+            if kind is None:
+                self.db.delete_chat_state(profile, sid)
+            else:
+                self.db.set_chat_state(profile, sid, kind, data)
+        except Exception:
+            log.exception("saving the chat state of %s/%s", profile, sid)
 
     def attach(self, up: Upstream, client: Client) -> None:
         up.clients.add(client)
@@ -1365,7 +1576,7 @@ class Hub:
             result = {"user": {"username": client.user["username"], "role": client.user.get("role")},
                       "profile": up.key, "agent": up.init_result, "gooseCaps": up.caps(),
                       "asks": [a["msg"] for a in up.asks.values()], "herd": up.herd(),
-                      "upstream": {"state": up.state, "error": err}}
+                      "upstream": {"state": up.state, "error": err}, **up.snapshot()}
             gh = self.guard_health_for(client)
             if gh is not None:
                 result["guard"] = gh
@@ -1386,6 +1597,13 @@ class Hub:
             if s and s.status in ("done", "error"):
                 up._set_status(s, "idle")
             result = {"ok": True}
+        elif method == "_gw/queue":
+            try:
+                result = up.queue_op(client, params)
+            except RpcError as e:
+                if mid is not None:
+                    client.send({"jsonrpc": "2.0", "id": mid, "error": e.to_json()})
+                return
         else:
             if mid is not None:
                 client.send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "unknown gateway method"}})
@@ -1430,7 +1648,7 @@ class Hub:
         if not self.on_audit:
             return
         detail: dict = {"profile": up.key}
-        if method == "session/prompt":
+        if method in ("session/prompt", STEER):
             blocks = [b for b in (params.get("prompt") or []) if isinstance(b, dict)]
             detail["chars"] = sum(len(str(b.get("text") or "")) for b in blocks if b.get("type") in (None, "text"))
             detail["attachments"] = sum(1 for b in blocks if b.get("type") not in (None, "text"))

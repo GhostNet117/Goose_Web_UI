@@ -9,7 +9,7 @@ import { loadPrefs, applyTheme, setPref, prefs, resolvedTheme } from './prefs.js
 import { addAsk, resetAsks, resolvedElsewhere, ASK_METHODS, gotoAsk, noteToolCallSource } from './asks.js';
 import { setHerd, upsertAgent, setMyProfile, refreshBadges, browserNotify, chime, setBaseTitle } from './herd.js';
 import { loadSessions, sessionsState, sessionTitle, activityTime, isArchived, refreshSessionsSoon } from './sessions.js';
-import { routeNotification, allChats, currentChat, sessionChangedElsewhere, promptCreated } from './chatsession.js';
+import { routeNotification, allChats, currentChat, sessionChangedElsewhere, promptCreated, applyHelloState, queueUpdated, steerUpdated, hasLocalQueue } from './chatsession.js';
 import { renderLogin, renderChangePassword } from './views/login.js';
 import { renderSidebar, NAV } from './views/sidebar.js';
 import { renderHome } from './views/home.js';
@@ -266,7 +266,7 @@ router.on('route', async (r) => {
 });
 
 window.addEventListener('beforeunload', (e) => {
-  const busy = allChats().some((c) => c.queue && c.queue.length);
+  const busy = hasLocalQueue();   // spec 019: the gateway keeps queued messages; only ones it never got are lost
   if (busy) { e.preventDefault(); e.returnValue = ''; }
 });
 
@@ -276,6 +276,9 @@ rpc.on('hello', (hello) => {
   if (hello.profile) setMyProfile(hello.profile);
   store.set('guardHealth', hello.guard || null);
   resetAsks(hello.asks || []);
+  // spec 019: queues and undelivered steers kept by the gateway - before the herd, whose change event sends the
+  // queued messages of chats that are idle (never from a queue copy older than this hello)
+  applyHelloState(hello);
   setHerd(hello.herd || []);
   loadSessions({ reset: true });
   if (!firstHello) {
@@ -304,6 +307,8 @@ rpc.on(G('session/update'), (p) => routeNotification(G('session/update'), p));
 rpc.on('_gw/ask_resolved', (p) => resolvedElsewhere(p || {}));
 rpc.on('_gw/session_changed', (p) => sessionChangedElsewhere(p || {}));
 rpc.on('_gw/prompt_created', (p) => promptCreated(p || {}));
+rpc.on('_gw/queue_update', (p) => queueUpdated(p || {}));
+rpc.on('_gw/steer_update', (p) => steerUpdated(p || {}));
 rpc.on('_gw/sessions_changed', () => refreshSessionsSoon());
 rpc.on('_gw/herd_update', (p) => { const a = p && (p.agent || p); if (a && a.sessionId) upsertAgent(a); });
 rpc.on('_gw/upstream', (p) => {

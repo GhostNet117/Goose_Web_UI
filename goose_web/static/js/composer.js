@@ -79,12 +79,20 @@ export class Composer {
     this.sendBtn.replaceChildren(icon(running ? 'queue' : 'send', 15));
   }
   setProgress(text) { this.progress.hidden = !text; this.progress.replaceChildren(text ? h('span', { class: 'spinner', style: { width: '11px', height: '11px' } }) : '', text ? h('span', null, text) : ''); }
-  setQueue(queue, { onRemove, onSteer }) {
+  // queue: [{blocks, held?, steer?, note?}] (spec 019: kept by the gateway). A held item is a steer the agent never
+  // read (the run ended first): it is not sent automatically; the user sends it, edits it or removes it.
+  setQueue(queue, { onRemove, onSteer, onSend, onEdit }) {
     this.queueRow.hidden = !queue.length;
-    this.queueRow.replaceChildren(...queue.map((blocks, i) => {
+    this.queueRow.replaceChildren(...queue.map((q, i) => {
+      const blocks = Array.isArray(q) ? q : (q.blocks || []);
       const text = blocks.filter((b) => b.type === 'text').map((b) => b.text).join(' ') || '[attachment]';
-      return h('div', { class: 'queued' }, icon('queue', 13), h('span', { class: 'queued-text' }, text),
-        onSteer ? btn('Send now', () => onSteer(i), { size: 'sm', variant: 'ghost', icon: 'steer' }) : null,
+      const held = !!q.held;
+      return h('div', { class: ['queued', held ? 'held' : ''], title: held ? (q.note || '') : 'Sent when the current run finishes' },
+        icon(held ? 'alert' : 'queue', 13), held ? h('span', { class: 'queued-tag' }, q.steer ? 'Steer not delivered' : 'Not sent yet') : null,
+        h('span', { class: 'queued-text' }, text),
+        held && onSend ? btn(onSteer ? 'Steer now' : 'Send', () => onSend(i), { size: 'sm', variant: 'ghost', icon: onSteer ? 'steer' : 'send' }) : null,
+        !held && onSteer ? btn('Send now', () => onSteer(i), { size: 'sm', variant: 'ghost', icon: 'steer' }) : null,
+        onEdit ? iconBtn('edit', 'Edit in the message box', () => onEdit(i), { size: 'sm' }) : null,
         iconBtn('x', 'Remove from queue', () => onRemove(i), { size: 'sm' }));
     }));
   }

@@ -5,11 +5,72 @@ import { Transcript } from './transcript.js';
 import { asksForSession } from './asks.js';
 import { getSession, upsertSession, patchSession } from './sessions.js';
 import { agentFor } from './herd.js';
-import { errMsg } from './ui.js';
+import { errMsg, toast } from './ui.js';
 
 const chats = new Map();
 const MAX_CACHED = 10;
 let currentId = null;
+// Spec 019: the gateway keeps each chat's composer queue and the steers the agent has not read yet, so a refresh,
+// another tab or another device shows the same state. Kept here for chats this tab has not opened.
+const serverQueues = new Map();   // sessionId -> [{id, blocks, held?, steer?, note?}]
+const serverSteers = new Map();   // sessionId -> Map(messageId -> {messageId, blocks, state, at})
+let localSeq = 0;
+
+// Drafts stay on this device (localStorage, cleared at sign-out): typing is never sent to the gateway.
+const DRAFT_KEY = 'gw.draft.';
+const draftTimers = new Map();
+function loadDraft(id) { try { return localStorage.getItem(DRAFT_KEY + id) || ''; } catch { return ''; } }
+export function saveDraft(id, text) {
+  clearTimeout(draftTimers.get(id));
+  draftTimers.set(id, setTimeout(() => {
+    draftTimers.delete(id);
+    try { if (text) localStorage.setItem(DRAFT_KEY + id, String(text).slice(0, 100000)); else localStorage.removeItem(DRAFT_KEY + id); } catch { /* storage full or disabled */ }
+  }, 400));
+}
+
+export function applyHelloState(hello) {
+  serverQueues.clear();
+  for (const [sid, items] of Object.entries((hello && hello.queues) || {})) if (Array.isArray(items)) serverQueues.set(sid, items);
+  serverSteers.clear();
+  for (const st of (hello && hello.steers) || []) noteSteer(st);
+  for (const c of chats.values()) c.setServerQueue(serverQueues.get(c.id) || []);
+  // no drain here: app.js applies this BEFORE the hello's herd, whose change event drains against fresh run states
+}
+export function queueUpdated(p) {
+  if (!p || !p.sessionId) return;
+  const items = Array.isArray(p.items) ? p.items : [];
+  if (items.length) serverQueues.set(p.sessionId, items); else serverQueues.delete(p.sessionId);
+  const c = chats.get(p.sessionId);
+  if (c) c.setServerQueue(items);
+  drainIdleQueues();
+}
+function noteSteer(st) {
+  if (!st || !st.sessionId || !st.messageId) return;
+  let m = serverSteers.get(st.sessionId);
+  if (st.state === 'pending') { if (!m) serverSteers.set(st.sessionId, m = new Map()); m.set(st.messageId, st); }
+  else if (m) { m.delete(st.messageId); if (!m.size) serverSteers.delete(st.sessionId); }
+}
+export function steerUpdated(p) {
+  if (!p || !p.sessionId) return;
+  noteSteer(p);
+  const c = chats.get(p.sessionId);
+  if (c && c.loaded) c.onSteerState(p);
+}
+export function pendingSteers(sid) { return [...((serverSteers.get(sid) || new Map()).values())]; }
+export function hasLocalQueue() { return [...chats.values()].some((c) => c.queue.some((q) => q.local)); }
+// A queued message waits for its chat's run to end. Any tab may send it (the gateway hands each item to one tab);
+// chats this tab has not opened are opened in the background for that.
+function drainIdleQueues() {
+  if (rpc.profileParam) return;   // an administrator viewing someone else's profile never sends their messages
+  for (const [sid, items] of serverQueues) {
+    if (!items.some((q) => !q.held)) continue;
+    const a = agentFor(sid);
+    if (a && (a.status === 'working' || a.status === 'needs_you')) continue;
+    const c = chats.get(sid);
+    if (c && (c.running || c.promptPending)) continue;
+    (c || getChat(sid)).drainQueue();
+  }
+}
 
 export function getChat(id, info) {
   let c = chats.get(id);
@@ -86,7 +147,7 @@ export class ChatSession extends Emitter {
     this.running = false;
     this.promptPending = false;
     this.activeRunId = null;
-    this.queue = [];
+    this.queue = (serverQueues.get(id) || []).slice();   // [{id, blocks, held?, steer?, note?, local?}]
     this.commands = [];
     this.loaded = false;
     this.loading = false;
@@ -94,7 +155,39 @@ export class ChatSession extends Emitter {
     this.progress = null;
     this.touched = Date.now();
     this.transcript = new Transcript(this);
-    this.draft = '';
+    this.draft = loadDraft(id);
+  }
+
+  // ---- composer queue, mirrored from the gateway (spec 019)
+  setServerQueue(items) {
+    this.queue = [...(items || []), ...this.queue.filter((q) => q.local)];
+    this.emit('queue');
+  }
+  async enqueue(blocks) {
+    const local = { id: 'local-' + (++localSeq), blocks, local: true };
+    this.queue.push(local); this.emit('queue');
+    try {
+      const r = await rpc.call('_gw/queue', { sessionId: this.id, op: 'add', blocks });
+      this.queue = this.queue.filter((q) => q !== local);
+      if (r && Array.isArray(r.items)) this.queue = [...r.items, ...this.queue.filter((q) => q.local)];
+      this.emit('queue');
+      if (!this.running && !this.promptPending) this.drainQueue();   // the run ended meanwhile
+    } catch (e) {
+      this.transcript.sys('This message is queued in this tab only (' + errMsg(e) + '): it is lost if you close the tab.', 'warn');
+    }
+  }
+  // Claim a queued item before sending it: with several tabs open, the gateway gives each item to one tab only.
+  async takeQueued(item, manual = false) {
+    if (!item) return null;
+    if (item.local) { this.queue = this.queue.filter((q) => q !== item); this.emit('queue'); return item; }
+    this.queue = this.queue.filter((q) => q !== item); this.emit('queue');
+    try {
+      const r = await rpc.call('_gw/queue', { sessionId: this.id, op: 'take', id: item.id, manual });
+      return r && r.ok ? (r.item || item) : null;
+    } catch {
+      this.setServerQueue(serverQueues.get(this.id) || []);
+      return null;
+    }
   }
 
   applyInfo(info) {
@@ -143,6 +236,7 @@ export class ChatSession extends Emitter {
         }
         this.applySessionResult(res);
         for (const a of asksForSession(this.id)) this.transcript.addAsk(a);
+        for (const st of pendingSteers(this.id)) this.onSteerState(st);   // sent from another tab / before a refresh
         const ag = agentFor(this.id);
         if (ag && (ag.status === 'working' || ag.status === 'needs_you')) this.setRunning(true);
         this.loaded = true;
@@ -180,9 +274,14 @@ export class ChatSession extends Emitter {
     const t = this.transcript;
     const meta = u._meta;
     switch (u.sessionUpdate) {
-      case 'user_message_chunk':
-        t.addUser([u.content], { messageId: u.messageId || (meta && meta.goose && meta.goose.messageId) || null, time: meta && meta.goose && meta.goose.created ? new Date(meta.goose.created * 1000) : null, created: (meta && meta.goose && meta.goose.created) || null });
+      case 'user_message_chunk': {
+        const g = (meta && meta.goose) || {};
+        const mid = u.messageId || g.messageId || null;
+        // Goose marks a steer the agent has just read with _meta.goose.steer (its id starts with "steer_")
+        const steer = !!g.steer || (typeof mid === 'string' && mid.startsWith('steer_'));
+        t.addUser([u.content], { messageId: mid, steer, delivered: steer, time: g.created ? new Date(g.created * 1000) : null, created: g.created || null });
         break;
+      }
       case 'agent_message_chunk':
         t.agentChunk(u.content, u.messageId || (meta && meta.goose && meta.goose.messageId), meta);
         if (!this.replaying && !this.running) this.setRunning(true);
@@ -258,7 +357,7 @@ export class ChatSession extends Emitter {
   }
 
   async send(blocks) {
-    if (this.running) { this.queue.push(blocks); this.emit('queue'); return; }
+    if (this.running || this.promptPending) { this.enqueue(blocks); return; }
     const item = this.transcript.addUser(blocks, { pending: true });
     this.lastSent = item;
     this.promptPending = true;
@@ -321,36 +420,81 @@ export class ChatSession extends Emitter {
     return this.id;
   }
 
-  drainQueue() {
-    if (this.running || !this.queue.length) return;
-    const next = this.queue.shift();
-    this.emit('queue');
-    setTimeout(() => this.send(next), 50);
+  // The run ended: send the first queued message that is not held (returned steers wait for the user).
+  async drainQueue() {
+    if (this.running || this.promptPending || this.draining) return;
+    const next = this.queue.find((q) => !q.held);
+    if (!next) return;
+    this.draining = true;
+    try {
+      const item = await this.takeQueued(next);
+      if (item && item.blocks) setTimeout(() => this.send(item.blocks), 50);
+    } finally { this.draining = false; }
   }
-  removeQueued(i) { this.queue.splice(i, 1); this.emit('queue'); }
+  async removeQueued(i) {
+    const q = this.queue[i];
+    if (!q) return;
+    if (q.local) { this.queue.splice(i, 1); this.emit('queue'); return; }
+    this.queue.splice(i, 1); this.emit('queue');
+    try { await rpc.call('_gw/queue', { sessionId: this.id, op: 'remove', id: q.id }); } catch (e) { this.transcript.sys('Could not remove the queued message: ' + errMsg(e), 'warn'); this.setServerQueue(serverQueues.get(this.id) || []); }
+  }
+  // A queued message the user sends by hand: as a steer while the run is active, otherwise as the next prompt.
+  async sendQueued(i) {
+    const item = await this.takeQueued(this.queue[i], true);
+    if (!item || !item.blocks) return;
+    if (this.running && this.activeRunId) this.steer(item.blocks); else this.send(item.blocks);
+  }
+  steerQueued(i) { return this.sendQueued(i); }
+  // Move a queued message back into the composer for editing.
+  async editQueued(i) {
+    const item = await this.takeQueued(this.queue[i], true);
+    if (item && item.blocks) this.emit('edit', item.blocks);
+  }
 
   cancel() {
-    rpc.notify('session/cancel', { sessionId: this.id });
+    if (!rpc.notify('session/cancel', { sessionId: this.id })) {
+      this.transcript.sys('Not connected: Stop was not sent. Try again when the connection is back.', 'warn');
+      rpc.reconnectNow && rpc.reconnectNow();
+      return;
+    }
     this.emit('cancel');
   }
 
+  // Goose answers a steer at once, but the agent reads it only at its next step (after the model's reply or a tool
+  // call). The bubble shows that state; if the run ends first, the gateway puts the steer back in the queue.
   async steer(blocks) {
     if (!this.activeRunId) { return this.send(blocks); }
     const item = this.transcript.addUser(blocks, { steer: true, pending: true });
+    this.transcript.setSteerState(item, 'sending');
     try {
       const res = await rpc.call(G('session/steer'), { sessionId: this.id, prompt: blocks, expectedRunId: this.activeRunId });
       this.transcript.markUserSent(item);
-      if (res && res.messageId) { item.messageId = res.messageId; this.transcript.users.set(res.messageId, item); }
+      if (res && res.messageId) {
+        item.messageId = res.messageId; this.transcript.users.set(res.messageId, item);
+        if (item.steerState === 'sending') this.transcript.setSteerState(item, 'pending');
+      }
     } catch (e) {
-      this.transcript.sys('Steer failed: ' + errMsg(e) + ' (queued instead)', 'warn');
       if (item.el) item.el.remove();
-      this.queue.unshift(blocks); this.emit('queue');
+      if (e && e.code === -32003) { this.transcript.sys('Steer refused: ' + errMsg(e), 'error'); return; }
+      this.transcript.sys('Steer failed: ' + errMsg(e) + ' (queued instead)', 'warn');
+      this.enqueue(blocks);
     }
   }
-  steerQueued(i) {
-    const b = this.queue.splice(i, 1)[0];
-    this.emit('queue');
-    if (b) this.steer(b);
+  // _gw/steer_update from the gateway (also replayed after a load): pending / delivered / returned.
+  onSteerState(p) {
+    const t = this.transcript;
+    let item = p.messageId ? t.users.get(p.messageId) : null;
+    if (p.state === 'pending') {
+      if (!item) { item = t.addUser(p.blocks || [], { steer: true, time: p.at ? new Date(p.at * 1000) : null }); item.local = false; item.messageId = p.messageId; t.users.set(p.messageId, item); }
+      if (item.steerState !== 'delivered') t.setSteerState(item, 'pending');
+    } else if (p.state === 'delivered') {
+      if (item) t.setSteerState(item, 'delivered');
+    } else if (p.state === 'returned') {
+      if (item) t.setSteerState(item, 'returned');
+      const msg = 'Steer not delivered. ' + (p.note || '') + ' It is back in the queue below: send it, edit it, or remove it.';
+      t.sys(msg, 'warn');
+      if (currentId === this.id) toast(msg, { kind: 'warn', timeout: 12000 });
+    }
   }
 
   async setMode(modeId) {
@@ -394,4 +538,5 @@ store.on('change:herd', () => {
     else if ((a.status === 'working' || a.status === 'needs_you') && !c.running && c.loaded) c.setRunning(true);
     if (a.title && a.title !== c.title) { c.title = a.title; c.emit('state'); }
   }
+  if (serverQueues.size) drainIdleQueues();
 });
