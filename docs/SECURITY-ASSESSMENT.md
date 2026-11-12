@@ -624,12 +624,12 @@ native profile stay unsandboxed (GW-01 unchanged: one OS account).
 | Threat | Mitigation |
 |---|---|
 | A member's agent reads or writes another member's profile, the database, keys, logs or the native profile | Not in the policy; such grants are refused even when configured (junction-aware); kernel-enforced by MXC. E2E test: outside file `PermissionError`, also from a child process. |
-| The agent changes the code the gateway runs or the executor | Never granted for writing; the install folder is restricted by the installer; the executor's SHA-256 is checked before every launch and the file is write-locked until it runs. |
-| A tampered or substituted `wxc-exec.exe` | Never executed: pin (integrity, SHA-256, size, signer) at install, SHA-256 at every launch, signature at start; mismatch = fail closed. Unit test with a tampered executor. |
+| The agent changes the code the gateway runs or the executor | Never granted for writing (Goose Web's code, its venv and base Python, the goose CLI folder, the MXC folder - in any path spelling, 1.19.1); every pinned file's SHA-256 is checked before every launch and write-locked until it runs. The install folder's ACL is not changed by Goose Web (SB-8: on the reference box Authenticated Users may modify it - accepted by the owner). |
+| A tampered or substituted `wxc-exec.exe`, or a DLL planted next to it | Never executed: pin (integrity, SHA-256, size, signer) at install; at every launch and probe (1.19.1) every pinned file hashed through a write-denied handle held until the process runs, the version folder must hold nothing but the pinned files and `install.json` (checked before the start and again while the executor is suspended), and the executor is created with PreferSystem32Images + MicrosoftSignedOnly + NoRemoteImages, so a planted `userenv.dll` and the like is not loaded; signature at start; mismatch = fail closed. Unit and e2e tests. |
 | A member's agent reaches local services (browser debugging port, other workers, the gateway, a database on loopback or on this machine's LAN address) | The container reaches only its proxy; the proxy refuses loopback except `sandbox.relays`, every address of this machine, link-local/metadata, and names resolving to them; the resolved address is the one connected to. Relays on the gateway's or a proxy's own port are ignored. E2E: direct loopback blocked, another loopback port through the proxy 403. |
 | Another local process or member uses a member's proxy | 127.0.0.1 only, random port, per-member credential (HTTP Basic, constant-time compare, new per worker start); other containers can only reach their own proxy. A local process of the gateway's account could read the policy file (as it could read the database): GW-01. |
 | Request smuggling / host switching through a kept-alive connection | Plain HTTP is forwarded as one request with `Connection: close`; `Proxy-*` and hop-by-hop headers removed; CONNECT tunnels go to the vetted address only. |
-| Proxy exhaustion | Per-member connection limit (503), header size (16 KB) and time (30 s) limits, idle timeout, connect timeout; the proxy runs on the gateway's event loop without blocking calls (resolution is asynchronous with a 10 s timeout). |
+| Proxy exhaustion | Per-member connection limit (503), header size (16 KB) and time (30 s) limits, idle timeout, connect timeout; the proxy runs on the gateway's event loop without blocking calls. Since 1.19.1 name lookups run in the proxies' own 4-thread pool (never the gateway's default executor, which sign-in, MFA and provisioning use), at most 2 per member in flight (503), 5 s each, 30 s negative cache, single-label and `.local` names refused unlooked-up (MX-2); the activity log gets at most 30 egress lines per member and minute plus one summary (MX-4). |
 | Data exfiltration over the allowed internet | Same as before (a member allowed `internet` can send data out); now every destination is in the activity log (`sandbox.egress`, host:port and decision, never content). |
 | A member's agent starts unsandboxed because MXC is unavailable | Never: fail closed with an admin-visible reason; the only alternative is the explicit, audited AppContainer fallback. |
 | Secrets in logs | The policy (with the proxy credential) stays in the gateway's system folder and is deleted at stop; logs and audit show the proxy as `127.0.0.1:<port>` only; egress audit has no paths or headers; the worker environment is the allow-list of section 8.2 (no gateway secrets). |
@@ -643,3 +643,39 @@ native profile stay unsandboxed (GW-01 unchanged: one OS account).
 - Programs inside the container that send requests without the proxy credential are refused (407); Windows'
   certificate-revocation lookups are among them (HTTPS still works).
 - Learning mode / denial capture is not used (it fails on the tested build).
+- **A relay forwards everything** the relayed service exposes on its `host:port` (MX-13): every path and, behind a
+  local reverse proxy, every virtual host (the agent chooses the `Host` header and the TLS name). The proxy filters
+  by destination, not by URL. Relay only services every sandboxed member may use in full.
+- **MXC grants are path policy** (MX-3): a hard link that already exists in a member's read/write folders reaches a
+  file outside them. Contained processes cannot create hard links or junctions, so such links come from outside MXC
+  (an agent on the AppContainer backend/fallback, or the host). Since 1.19.1 a bounded scan (5 s / 200,000 entries,
+  per set of folders, again after any AppContainer run) refuses the MXC start when a file has a name outside the
+  read/write folders; a scan that hits its bound lets the start go ahead (logged) and runs again at the next start -
+  accepted, as is a link planted by the host between the scan and the start.
+- **DLL planting next to the executor** (MX-8): the folder content check runs before the start and while the
+  executor is suspended; a file planted in the moment between that check and the loader's search is not loaded for
+  System32 DLLs (PreferSystem32Images, MicrosoftSignedOnly). Whoever can write the install folder can also edit
+  `goose_web\*.py` (SB-8, accepted).
+
+### 13.4 Security review 2026-11-12 (MXC, 1.19.0) - fixed in 1.19.1
+
+Independent adversarial review of the 1.19.0 MXC code with a real executor (0 Critical, 0 High, 2 Medium, 6 Low,
+6 Info); the review record and its PoCs are kept with the project's records. Regression tests:
+`tests/test_mxc_review_fixes.py` (one or more per finding) and `tests/test_mxc_e2e.py`.
+
+| ID | Sev | Finding | Fix in 1.19.1 |
+|---|---|---|---|
+| MX-1 | Medium | Own-address check compared strings: an upper-case or uncompressed IPv6 literal of this machine passed (`internet+lan` members reached SSH/SMB/RDP) | Every candidate parsed with `ipaddress` (scope dropped, IPv4-mapped unwrapped; IPv4-compatible, NAT64, 6to4 and Teredo embeddings checked too) and compared with the parsed own addresses; the checked, normalised address is connected |
+| MX-2 | Medium | Lookups in the gateway's default executor: one member's slow names stalled sign-in, MFA, provisioning (~9 s) | Own 4-thread resolver pool, 2 lookups per member in flight (503), 5 s per lookup, 30 s negative cache, shared in-flight lookups, single-label and `.local` names refused (unless a relay target) |
+| MX-3 | Low | Pre-existing hard links reach files outside the grants (path policy) | Bounded scan before an MXC start; a link to a name outside the read/write folders refuses the start (fail closed, admin-visible, audited); see 13.3 |
+| MX-4 | Low | ~780 `sandbox.egress` lines/s from one member could rotate the activity log in minutes | Per member: 30 decisions a minute verbatim, the rest as one summary line (counts per destination); same for `gateway.log` |
+| MX-5 | Low | A CONNECT target with LF forged a `gateway.log` line | Method, version and target validated (400); host names must be valid; every member- or container-controlled string passes `activity.clean_text` (control characters escaped, length capped) before gateway.log, the activity log, the audit and an admin's last-error text |
+| MX-6 | Low | `\\?\` and UNC forms of the system folder / another profile passed the grant filter; base Python and goose folder writable | Canonical paths (`\\?\`, `/`, case, trailing dots/spaces, 8.3, junctions), UNC and device paths refused; base Python, venv and goose CLI folder never writable; `sandbox.read_dirs` checked the same way for both backends and listed by `sandbox status` / `check` |
+| MX-7 | Low | A `sandbox.enabled` typo turned the sandbox off (fail open) | Only `auto`, `true/false`, `yes/no`, `on/off`, `1/0` (not set = `auto`); anything else counts as on and is a configuration problem: members' agents do not start |
+| MX-8 | Low | Pin did not cover DLLs loaded from the executor's folder; `--probe` ran unpinned | All pinned files hashed through held write-denied handles, exact folder content checked twice, image-load mitigations, probe through the same path; install-folder ACLs left as they are (SB-8) |
+| MX-9 | Info | Failing to join a kill-on-close job was only a warning | The executor is ended and the start fails |
+| MX-10 | Info | The proxy credential lived on after the worker | Revoked when the worker stops or crashes, new at every start; the proxy is closed when the user is deleted or no longer sandboxed |
+| MX-11 | Info | `fec0::/10`, Azure WireServer, 6to4 classified as public/LAN | Refused: site-local, 6to4, Teredo, local-use NAT64, IPv4-compatible, `0.0.0.0/8`; metadata adds `168.63.129.16`, `169.254.170.2`, `192.0.0.192` (`100.100.100.200`, `fd00:ec2::254` already) |
+| MX-12 | Info | A > 63-character label dropped the connection without an answer | 400 with a reason, no lookup |
+| MX-13 | Info | A relay is a whole host:port (virtual hosts) | Documented (13.3, ADMINISTRATION 11.6) |
+| MX-14 | Info | Docstring/comment drift, dead `redacted()`, container text as admin last error | Wording fixed, `redacted()` removed, `explain_exit` output cleaned (MX-5) |

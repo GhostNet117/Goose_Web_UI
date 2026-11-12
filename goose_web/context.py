@@ -212,6 +212,12 @@ class Ctx:
         from .config import default_native_goose_root, sandbox_backend, sandbox_config_problems
         root = str(self.profiles.root_for(user))
         read_dirs = [str(d) for d in (self.settings.get("sandbox", "read_dirs") or []) if d]
+        from . import mxc
+        native = [default_native_goose_root(), str(self.db.get_setting("native_root") or "")]
+        # MX-6: a read_dir naming the system folder, the profiles root, a member's profile or the native profile
+        # (in any spelling) is left out for both backends
+        refused = {d for d, _ in mxc.read_dir_problems(self.settings, native)}
+        read_dirs = [d for d in read_dirs if d not in refused]
         net = str(self.settings.get("sandbox", "network") or "internet").strip().lower()
         from . import relay as rl
         name = sb.container_name(str(self.settings.profiles_root), user["username"])
@@ -221,8 +227,6 @@ class Ctx:
         mxc_grants = sb.desired_grants(root, roots, read_dirs, self.settings.goose_binary)
         if relays:   # the AppContainer relay forwarder runs on the gateway's base Python (not needed with MXC)
             read_dirs = read_dirs + [rl.python_for_container()[1]]
-        from . import mxc
-        native = [default_native_goose_root(), str(self.db.get_setting("native_root") or "")]
         # Spec 025: both backends' facts; the worker picks the backend at start (MXC, or the AppContainer fallback).
         # Every value is stable between calls: a changed spec marks the worker for a restart when it is quiet.
         return {"name": name, "profile_root": root, "relays": relays,

@@ -104,6 +104,9 @@ async def test_mxc_contains_files_children_network_and_reaches_relays_via_proxy(
         errf = open(tmp_path / "err.log", "wb")
         t0 = time.monotonic()
         p = mxc.launch(mxc.exe_path(s), pf, errf, [gj, wj])
+        if hasattr(mxc, "process_mitigations"):                                    # MX-8 (1.19.1)
+            assert mxc.process_mitigations(p) == {"microsoftSignedOnly": True, "noRemoteImages": True,
+                                                  "preferSystem32Images": True}
         out, _ = await asyncio.to_thread(p.communicate, None, 120)
         errf.close()
         assert p.returncode == 0, (tmp_path / "err.log").read_text(errors="replace")
@@ -121,6 +124,66 @@ async def test_mxc_contains_files_children_network_and_reaches_relays_via_proxy(
         other_srv.close()
         wj.close()
         gj.close()
+
+
+def _private_copy(s: Settings, tmp_path) -> Settings:
+    """The installed executor copied into a folder of the test's own (files may be planted next to it there)."""
+    import shutil
+    d = tmp_path / "mxc-copy"
+    (d / mxc.MXC_PIN["version"]).mkdir(parents=True)
+    for name in (mxc.MXC_PIN["exe"], "install.json"):
+        shutil.copyfile(mxc.version_dir(s) / name, d / mxc.MXC_PIN["version"] / name)
+    return Settings(_deep_merge(DEFAULTS, {"paths": {"profiles_root": str(tmp_path / "profiles")},
+                                           "sandbox": {"mxc_dir": str(d)}}), None)
+
+
+def _wxc_pids() -> set[int]:
+    r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq wxc-exec.exe", "/NH", "/FO", "CSV"], capture_output=True,
+                       text=True)
+    return {int(line.split('","')[1]) for line in r.stdout.splitlines() if line.startswith('"wxc-exec.exe"')}
+
+
+def test_mx8_a_dll_planted_next_to_the_executor_is_not_loaded(tmp_path, monkeypatch):
+    """Security review 2026-11-12, MX-8: even when a DLL appears after the folder check (simulated by switching the
+    check off), wxc-exec loads the System32 one (PreferSystem32Images / MicrosoftSignedOnly)."""
+    s = _private_copy(_ready(tmp_path), tmp_path)
+    exe = mxc.exe_path(s)
+    import ctypes
+    old_mode = ctypes.windll.kernel32.SetErrorMode(0x8003)     # no loader error dialog if the DLL were loaded
+    try:
+        monkeypatch.setattr(mxc, "folder_problem", lambda v: "", raising=False)
+        (exe.parent / "userenv.dll").write_bytes(b"MZ" + b"\0" * 4096)
+        data, problem = mxc.run_probe(exe)
+        assert problem == "" and data.get("tier") == "base-container", problem
+    finally:
+        ctypes.windll.kernel32.SetErrorMode(old_mode)
+
+
+def test_mx9_an_executor_that_cannot_join_its_job_is_ended(tmp_path):
+    """Security review 2026-11-12, MX-9: no container may run outside the kill-on-close jobs."""
+    s = _ready(tmp_path)
+    g = tmp_path / "g"
+    g.mkdir()
+    py = sys.base_prefix
+    pf = tmp_path / "p.json"
+    mxc.write_policy(pf, mxc.build_policy(
+        command=[os.path.join(py, "python.exe"), "-I", "-c", "import time; time.sleep(60)"], cwd=str(g),
+        env={"SystemRoot": os.environ["SystemRoot"], "LOCALAPPDATA": os.environ["LOCALAPPDATA"]},
+        grants={str(g): "modify", py: "read"}))
+
+    class NoJob:
+        def add(self, proc):
+            return False
+    before = _wxc_pids()
+    p = None
+    try:
+        with pytest.raises(mxc.MxcError, match="kill-on-close job"):
+            p = mxc.launch(mxc.exe_path(s), pf, subprocess.DEVNULL, [NoJob()])
+    finally:
+        if p is not None:
+            p.kill()
+    time.sleep(0.5)
+    assert not (_wxc_pids() - before)
 
 
 def _alive(pid: int) -> bool:

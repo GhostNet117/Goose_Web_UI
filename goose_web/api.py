@@ -992,8 +992,11 @@ async def _reprovision(c: Ctx, users: list[dict]) -> dict:
 
 
 async def _drop_sandbox(c: Ctx, u: dict) -> None:
-    """Spec 012: stop the user's sandboxed worker, revoke its folder grants and delete its AppContainer."""
+    """Spec 012: stop the user's sandboxed worker, revoke its folder grants and delete its AppContainer. Spec 025
+    (MX-10): the user's MXC egress proxy is closed too (deleted, or no longer sandboxed)."""
     from . import sandbox as sb
+    if hasattr(c.workers, "proxies"):
+        await c.workers.proxies.drop(u["username"].lower())
     name = sb.container_name(str(c.settings.profiles_root), u["username"])
     state_dir = str(c.settings.system_dir / "sandbox")
     # A container under the 1.11 name (C-5) is revoked and deleted too.

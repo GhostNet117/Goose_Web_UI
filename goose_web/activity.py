@@ -43,6 +43,22 @@ def enabled() -> bool:
     return _state["enabled"]
 
 
+_CONTROL = {c: f"\\x{c:02x}" for c in (*range(0x20), 0x7f, *range(0x80, 0xa0))}
+_CONTROL.update({0x2028: "\\u2028", 0x2029: "\\u2029"})
+
+
+def clean_text(value: Any, limit: int = 300) -> str:
+    """A string from outside the gateway (a member's request, a container's output, a file name) made safe for
+    gateway.log, the activity log and the audit: control characters (CR, LF, TAB, ESC, C1, the Unicode line
+    separators) shown escaped (\\x0a), so one value is always one line; at most `limit` characters (security review
+    2026-11-12, MX-5)."""
+    s = str(value if value is not None else "")
+    if len(s) > limit * 4:
+        s = s[:limit * 4]
+    s = s.translate(_CONTROL)
+    return s if len(s) <= limit else s[:max(0, limit - 3)] + "..."
+
+
 def record(action: str, *, user: dict | None = None, username: str = "", ip: str = "", target: str = "",
            detail: dict | None = None, ok: bool = True) -> None:
     if not _state["enabled"]:

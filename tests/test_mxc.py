@@ -174,7 +174,7 @@ def test_availability_is_computed_once_and_rechecked_after_a_failure(tmp_path, m
         return dict(GOOD_PROBE), ""
     monkeypatch.setattr(mxc, "IS_WINDOWS", True)
     monkeypatch.setattr(mxc, "windows_build", lambda: (26100, 9974))
-    monkeypatch.setattr(mxc, "verify_exe", lambda p, pinned=None: "")
+    monkeypatch.setattr(mxc, "verify_install", lambda vdir: "")
     monkeypatch.setattr(mxc, "authenticode", lambda p, timeout=60: SIGNED)
     monkeypatch.setattr(mxc, "run_probe", probe)
     st = mxc.availability(s)
@@ -280,8 +280,7 @@ def test_policy_is_deterministic_and_locked_down(tmp_path):
     none = mxc.build_policy(**{**kw, "proxy_url": ""})
     assert none["network"] == {"egress": {"default": "deny"}, "ingress": {"default": "deny", "hostLoopback": "deny"}}
     assert "runtimeConfig" not in none and "NODE_USE_ENV_PROXY=1" not in none["process"]["env"]
-    red = mxc.redacted(a)
-    assert "tok" not in json.dumps(red) and red["runtimeConfig"]["networkProxy"] == "http://***@127.0.0.1:5555"
+    assert not hasattr(mxc, "redacted")                                           # MX-14: dead code removed
     pf = tmp_path / "sys" / "sandbox" / "mxc" / "x.json"
     mxc.write_policy(pf, a)
     assert json.loads(pf.read_text(encoding="utf-8")) == a and [p.name for p in pf.parent.iterdir()] == ["x.json"]

@@ -316,6 +316,7 @@ class WorkerManager:
         self.on_sandbox_event = None
         from .egress import ProxyRegistry
         self.proxies = ProxyRegistry(settings)   # MXC members' egress proxies (spec 025 R6)
+        self._links_checked: dict[str, tuple] = {}   # MX-3: read/write folder sets scanned for outside hard links
         # MXC policy files of a gateway that ended without stopping its workers (they died with its job object)
         for f in (settings.system_dir / "sandbox" / "mxc").glob("*.json") \
                 if (settings.system_dir / "sandbox" / "mxc").is_dir() else []:
@@ -522,7 +523,9 @@ class WorkerManager:
 
     def _fail_closed(self, w: Worker, reason: str) -> None:
         """Spec 025 R3: the worker is not started; never run a member's agent unsandboxed."""
+        from .activity import clean_text
         from .mxc import SANDBOX_UNAVAILABLE_MSG
+        reason = clean_text(reason, 1200)      # MX-5: may carry container output or member file names
         if w.last_error != reason:
             self._sandbox_event("sandbox.unavailable", w, {"reason": reason[:300]})
         w.state, w.last_error, w.backend = "crashed", reason, ""
@@ -557,6 +560,7 @@ class WorkerManager:
         from . import sandbox as sb
         w.state = "starting"
         w.backend = "appcontainer"
+        self._links_checked.pop(w.key, None)   # MX-3: the agent can make hard links here; rescan before MXC again
         w.scheduler, _ = self.wants_scheduler(w)
         spec = w.sandbox or {}
         try:
@@ -635,6 +639,24 @@ class WorkerManager:
             protected_any=spec.get("protected_any") or [])
         for p, why in refused:
             log.warning("sandbox mxc: %s: grant %s refused: %s", w.username, p, why)
+        # MX-3: MXC grants are path-based - a file in a read/write folder hard-linked to a file outside them would
+        # give the agent that file. Scanned once per set of read/write folders (again after any AppContainer run).
+        rw = sorted(p for p, m in grants.items() if m == "modify")
+        if self._links_checked.get(w.key) != tuple(rw):
+            found, complete, seen = await asyncio.to_thread(mxc.hardlink_escapes, rw)
+            if found:
+                from .activity import clean_text
+                sample = "; ".join(f"{clean_text(a, 200)} = {clean_text(b, 200)}" for a, b in found[:3])
+                self._fail_closed(w, f"MXC sandbox not started: {len(found)}{'+' if len(found) >= 20 else ''} file(s) "
+                                     "in the member's folders are hard links to files outside them, which the MXC "
+                                     f"container could read and write ({sample}). Remove those links (fsutil hardlink "
+                                     "list <file> shows every name of a file), then start again.")
+            if complete:
+                self._links_checked[w.key] = tuple(rw)
+            else:
+                log.warning("sandbox mxc: %s: hard-link scan of the member's folders stopped after %s entries / %.0f s;"
+                            " starting anyway (scanned again at the next start)", w.username, seen,
+                            mxc.HARDLINK_SCAN_SECONDS)
         network = spec.get("network") or "internet"
         targets = list(spec.get("relay_targets") or [])
         proxy_url = ""
@@ -765,6 +787,7 @@ class WorkerManager:
                 j.close()
 
     def _kill(self, w: Worker) -> None:
+        self.proxies.revoke(w.key)     # MX-10: the stopped container's proxy credential stops working now
         p = w.proc
         if w.backend == "mxc" and p and p.poll() is None:
             # spec 025: end of input first - goose acp exits cleanly (sessions flushed) and MXC removes the container
@@ -846,6 +869,7 @@ class WorkerManager:
                     # crashed while it was needed -> restart with backoff
                     if w.state == "ready" and w.proc and w.proc.poll() is not None:
                         w.state = "crashed"
+                        self.proxies.revoke(w.key)      # MX-10: nothing may use the dead container's credential
                         w.last_error = f"goose serve exited with code {w.proc.returncode}"
                         log.warning("worker %s crashed: %s", w.key, w.last_error)
                     if w.state == "crashed" and (clients or (has_sched and want_sched)):

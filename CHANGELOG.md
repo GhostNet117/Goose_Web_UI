@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.19.1 - 2026-11-12
+
+**Security review of the MXC backend: a sturdier egress proxy, grant filter and executor launch.** FIX of the security
+review 2026-11-12 (MX-1 to MX-14, SECURITY-ASSESSMENT 13.4). No database schema change, no new setting.
+
+- **Egress proxy.** Own addresses, loopback, link-local and metadata are compared as parsed, normalised addresses
+  (upper-case, uncompressed, scope-id, IPv4-mapped/compatible, NAT64, 6to4 and Teredo forms no longer slip past the
+  "this machine" check) and the checked address is the one connected (MX-1). Name lookups run in the proxies' own
+  4-thread pool, at most 2 per member at once (503), 5 s each, with a 30 s negative cache; names without a dot and
+  `.local` names are not looked up unless they are a relay target, so a member can no longer stall sign-in, MFA and
+  provisioning with slow lookups (MX-2). Site-local `fec0::/10`, 6to4, Teredo, local-use NAT64, IPv4-compatible and
+  `0.0.0.0/8` addresses are refused; Azure WireServer `168.63.129.16`, `169.254.170.2` and `192.0.0.192` join the
+  metadata addresses (MX-11). Malformed or over-long host names, methods and versions get 400 (MX-5, MX-12).
+- **Logs.** Per member, the first 30 `sandbox.egress` decisions of a minute are logged one by one, the rest as one
+  summary line with counts per destination (MX-4). Everything a member or a container controls is cleaned
+  (control characters escaped, length capped) before it reaches `gateway.log`, the activity log, the audit or an
+  admin's last-error text (MX-5).
+- **Grants.** Paths are compared in canonical form (`\\?\`, `/`, case, trailing dots/spaces, 8.3, junctions); UNC and
+  device paths are never granted; the base Python, the venv and the goose CLI folder are never writable;
+  `sandbox.read_dirs` entries naming a refused folder are left out for both backends and listed by `sandbox status`
+  and `check` (MX-6). Before an MXC start a bounded scan refuses to start a worker whose read/write folders hold a
+  hard link to a file outside them (MX-3).
+- **`sandbox.enabled`.** Only `auto` (also when not set), `true/false`, `yes/no`, `on/off`, `1/0`; any other value
+  counts as on and is a configuration error, so members' agents do not start instead of running unsandboxed (MX-7).
+- **Executor launch.** Every pinned file (`MXC_PIN`, today `wxc-exec.exe`) is hashed through a write-denied handle held
+  until the executor runs, the version folder must hold nothing else (checked before the start and while suspended),
+  and `wxc-exec` is created with the PreferSystem32Images, MicrosoftSignedOnly and NoRemoteImages mitigations;
+  `--probe` goes through the same path (MX-8). A kill-on-close job that cannot be joined ends the executor and fails
+  the start (MX-9). The member's proxy credential is revoked when the worker stops or crashes and the proxy closed when
+  the user is deleted or no longer sandboxed (MX-10).
+- **Docs.** A relay forwards everything on its port (every path, every virtual host) (MX-13); docstring/comment drift
+  fixed and the unused `mxc.redacted()` removed (MX-14).
+
 ## 1.19.0 - 2026-11-12
 
 **Members' agents run in Microsoft Execution Containers (MXC) by default.** Spec 025. No database schema change.

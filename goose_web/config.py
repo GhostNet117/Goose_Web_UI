@@ -38,14 +38,38 @@ def _find_goose() -> str:
 
 
 def sandbox_on(settings: "Settings") -> bool:
-    """sandbox.enabled: true / false, or "auto" (default) = on for Windows, where the AppContainer sandbox exists."""
-    v = settings.get("sandbox", "enabled")
-    if isinstance(v, str):
-        v = v.strip().lower()
-        if v == "auto":
-            return IS_WINDOWS
-        return v in ("1", "true", "yes", "on")
-    return bool(v)
+    """sandbox.enabled: true / false (also yes/no, on/off, 1/0), or "auto" (default, also when not set) = on for
+    Windows, where the sandbox exists.
+
+    MX-7 (security review 2026-11-12): any other value (a typo such as "ture") counts as ON and is reported by
+    sandbox_config_problems, so members' workers refuse to start (fail closed) instead of running unsandboxed."""
+    v = _sandbox_enabled_value(settings)
+    if v == "auto":
+        return IS_WINDOWS
+    return v in ("on", "invalid")
+
+
+SANDBOX_ENABLED_ON = ("1", "true", "yes", "on")
+SANDBOX_ENABLED_OFF = ("0", "false", "no", "off")
+
+
+def _sandbox_enabled_value(settings: "Settings") -> str:
+    """'auto' | 'on' | 'off' | 'invalid' for sandbox.enabled (not set / null / "" = auto, the default)."""
+    v = settings.get("sandbox", "enabled", "auto")
+    if v is None:
+        return "auto"
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    if isinstance(v, int) and v in (0, 1):
+        return "on" if v else "off"
+    s = str(v).strip().lower()
+    if s in ("", "auto"):
+        return "auto"
+    if s in SANDBOX_ENABLED_ON:
+        return "on"
+    if s in SANDBOX_ENABLED_OFF:
+        return "off"
+    return "invalid"
 
 
 SANDBOX_BACKENDS = ("mxc", "appcontainer")
@@ -68,6 +92,9 @@ def sandbox_fallback(settings: "Settings") -> str:
 def sandbox_config_problems(settings: "Settings") -> list[str]:
     """Configuration errors of the sandbox section; each one makes sandboxed workers fail closed."""
     out = []
+    if _sandbox_enabled_value(settings) == "invalid":
+        out.append(f"sandbox.enabled is {settings.get('sandbox', 'enabled')!r}; use one of: auto, true, false "
+                   "(members' agents do not start until it is fixed)")
     if sandbox_backend(settings) == "invalid":
         out.append(f"sandbox.backend is {settings.get('sandbox', 'backend')!r}; use one of: "
                    + ", ".join(SANDBOX_BACKENDS))

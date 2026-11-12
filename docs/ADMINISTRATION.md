@@ -1323,18 +1323,38 @@ from a policy Goose Web builds at every start:
   folders; read and run on the goose CLI's folder and `sandbox.read_dirs`; nothing else. Refused even when a setting
   names them (logged as `sandbox mxc: <user>: grant <path> refused: <why>`): the gateway's system folder, the profiles
   root or a folder above it, other users' profiles, the native Goose profile, a drive or share root, and - for
-  writing - Goose Web's own code (`goose_web`, `.venv`, `.git`, `scripts`) and the MXC folder. Paths are compared as
-  written and after resolving junctions, links and 8.3 names. Folder *names* (not contents) on the drives of the
-  granted folders can be listed (`enumeratePaths`; node and cmd need it).
+  writing - Goose Web's own code (`goose_web`, `.venv`, `.git`, `scripts`), the Python installation the gateway runs
+  on (venv and base Python), the goose CLI's folder and the MXC folder. Paths are compared in canonical form
+  (`\\?\` prefixes, `/`, case, trailing dots and spaces do not matter) and after resolving junctions, links and 8.3
+  names; network (UNC, `\\server\share`, also `\\localhost\C$`) and device paths are never granted. A
+  `sandbox.read_dirs` entry naming a refused folder is left out for both backends and listed by `goose-web sandbox
+  status` / `check`. Folder *names* (not contents) on the drives of the granted folders can be listed
+  (`enumeratePaths`; node and cmd need it).
+- **Hard links:** MXC grants are path-based. A file in a member's read/write folders that is hard-linked to a file
+  outside them would give the agent that outside file, so before an MXC start (once per set of folders, and again
+  after the member ran in the AppContainer backend, where agents can make such links) Goose Web looks for them
+  (at most 5 s / 200,000 entries) and **does not start** the worker when it finds one: the reason names the files
+  (`fsutil hardlink list <file>` shows every name; delete the link). Links between two of the member's own folders are
+  fine. Processes inside an MXC container cannot create hard links or junctions.
 - **Desktop:** clipboard, input injection, desktop and system-settings control and IME are blocked (Win32k stays on:
   goose.exe and node.exe need it).
 - **Network:** the container has none of its own. When `network` is not `none` or `relays` are set, the gateway runs
   an **egress proxy for this member** (127.0.0.1, its own port and credential) and MXC gives it to the agent and
   everything it starts as `HTTP_PROXY` / `HTTPS_PROXY`. The proxy forwards the `sandbox.relays` services (at their real
   address: provider URLs are **not** rewritten), public internet addresses (`internet`, `internet+lan`) and private LAN
-  addresses (`internet+lan` only). It refuses every other port on 127.0.0.1, this machine's own addresses, link-local
-  and cloud-metadata addresses, and host names that resolve to any of these. Every destination asked for is recorded
-  in the activity log as `sandbox.egress` (host:port and the decision; never a path or content).
+  addresses (`internet+lan` only). It refuses every other port on 127.0.0.1, this machine's own addresses (in any
+  spelling: upper case, uncompressed, IPv4-mapped, NAT64), link-local and site-local addresses, cloud-metadata
+  addresses (AWS, Azure WireServer `168.63.129.16`, GCP, Alibaba, Oracle), 6to4/Teredo tunnel addresses, and host
+  names that resolve to any of these. Host names without a dot and `.local` names are not looked up (LLMNR, NetBIOS
+  and mDNS are slow and local); use the full name or a relay. Name lookups run in the proxies' own small thread pool
+  (never the one sign-in uses), at most two per member at a time (more: `503`), 5 s each, and a failed name is not
+  looked up again for 30 s. A malformed or over-long host name gets `400`. Every destination asked for is recorded in
+  the activity log as `sandbox.egress` (host:port and the decision; never a path or content): per member the first 30
+  of a minute one by one, the rest as one summary line per minute with counts per destination
+  (`decision: summary`). The proxy's credential is new at every worker start and stops working when the worker stops.
+- **A relay forwards everything** the relayed service exposes on that `host:port`: every path, and - for a local
+  reverse proxy - every virtual host behind it (the `Host` header and TLS name are the agent's choice). Relay only
+  services every sandboxed member may use in full; put a separate port in front of anything with an admin interface.
 - **HTTP/HTTPS only:** programs that do not use `HTTP(S)_PROXY` have no network in an MXC container: ssh and git over
   ssh, database clients, raw TCP, and Node 22's built-in `fetch` (Node 24+ uses it with `NODE_USE_ENV_PROXY=1`,
   which Goose Web sets). Goose itself, npm/npx, uv/uvx, pip, git over https, curl and Python honour it.
@@ -1350,15 +1370,23 @@ status` shows the build and MXC's own probe). No administrator rights, service, 
 **The executor** is pinned: `wxc-exec.exe` 1.0.1 from the npm package `@microsoft/mxc-sdk` 1.0.1. `goose-web sandbox
 install-mxc` downloads the package (38 MB) from `registry.npmjs.org` (`HTTPS_PROXY` is honoured), checks its npm
 sha512 integrity, takes only `wxc-exec.exe` out of it, checks its size, SHA-256 and Authenticode signature
-(Microsoft Corporation) and installs it atomically into `<install>\vendor\mxc\1.0.1\` (not in git; it inherits the
-install folder's restricted permissions). `install.ps1` and `upgrade.ps1` run it with `--if-missing`. Without internet
-access: `npm pack @microsoft/mxc-sdk@1.0.1` on another computer, copy the `.tgz`, then `goose-web sandbox install-mxc
---file <tgz>` (the same checks apply). `--force` reinstalls. Before every launch the gateway checks the SHA-256 again
-and keeps the file locked against writes until it has started; the signature and the probe are checked at gateway
-start and by `sandbox status` / `check`.
+(Microsoft Corporation) and installs it atomically into `<install>\vendor\mxc\1.0.1\` (not in git; the folder keeps
+the permissions it inherits from the install folder - Goose Web does not change them; the pin below is the control).
+`install.ps1` and `upgrade.ps1` run it with `--if-missing`. Without internet access: `npm pack
+@microsoft/mxc-sdk@1.0.1` on another computer, copy the `.tgz`, then `goose-web sandbox install-mxc --file <tgz>` (the
+same checks apply). `--force` reinstalls. Before every launch - a worker's and `wxc-exec --probe` alike - the gateway
+opens every pinned file of `vendor\mxc\1.0.1\` locked against writes, deletes and renames, checks its SHA-256
+through that handle and keeps it locked until the executor runs; the folder must hold **nothing but** `wxc-exec.exe`
+and `install.json` (Windows loads a DLL placed next to a program before the System32 one): anything else stops every
+start (`... holds files that are not part of the pinned executor (userenv.dll) ...`; `install-mxc --if-missing`
+or `--force` puts back a clean folder). The executor is created with the image-load mitigations *prefer System32*,
+*Microsoft-signed only* and *no remote images*, so a DLL dropped next to it is not loaded. It must join both
+kill-on-close jobs, or it is ended and the start fails. The signature and the probe are checked at gateway start and
+by `sandbox status` / `check`.
 
 **Fail closed:** when MXC cannot run (executor missing or altered, Windows too old, probe failed, invalid
-`sandbox.*` setting) sandboxed users' agents **do not start**. The user sees "The sandbox is unavailable, so your agent
+`sandbox.*` setting - `sandbox.enabled` too: anything but `auto`, `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`
+counts as on and stops members' agents until it is corrected) sandboxed users' agents **do not start**. The user sees "The sandbox is unavailable, so your agent
 cannot start. Contact your administrator."; the reason is in Admin > System > Sandbox (with a red banner), in
 `gateway.log` (`sandbox mxc: UNAVAILABLE: ...`), in the audit log (`sandbox.unavailable`) and in `goose-web sandbox
 status` / `check`. An unavailable MXC is checked again at most every 30 seconds, so `install-mxc` takes effect without
@@ -1425,7 +1453,8 @@ Admin > System (the Sandbox column shows **AppContainer** for sandboxed workers)
 
 A model proxy or another service that listens only on 127.0.0.1 of this machine is out of reach of sandboxed
 agents. List the ones they may use (both backends; with MXC the member's egress proxy forwards to them and nothing
-below this paragraph applies):
+below the example applies). A relay forwards everything the service exposes on that port - every path and, for a
+local reverse proxy, every virtual host behind it - to every sandboxed member; it is not filtered by URL:
 
 ```yaml
 sandbox:

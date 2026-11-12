@@ -5,9 +5,13 @@ starts) runs inside an MXC process container, started by Microsoft's executor `w
 this module builds from the member's sandbox spec (context.Ctx.sandbox_spec):
 
 - the member's profile, team folder and the team's extra folders: read/write; the program folders
-  (`sandbox.read_dirs`) and the Goose folder: read and run; nothing else (the gateway's system folder, the database,
-  the profiles root, other members' profiles, the native profile and the install folder are refused even when a
-  setting names them);
+  (`sandbox.read_dirs`) and the Goose folder: read and run; nothing else. Refused even when a setting names them
+  (in any spelling: `\\\\?\\`, UNC, 8.3, trailing dots/spaces, junctions, case): the gateway's system folder (the
+  database, keys, logs), the profiles root, other members' profiles and the native profile - for reading and
+  writing; Goose Web's code folders (package, .git, scripts), its venv and base Python, the goose binary folder and
+  the MXC folder - for writing (reading the install folder is allowed: program folders; spec 025 D3). Network (UNC)
+  and device paths are never granted. A file in a read/write folder that is hard-linked to a file outside the
+  read/write folders stops the start (MXC grants are path-based);
 - network: nothing, or - when the member may use the internet or relayed local services - only the member's own
   egress proxy in the gateway (egress.py), which decides every destination;
 - UI: clipboard, input injection, desktop/system-settings control and IME locked (Win32k stays on: goose.exe and
@@ -16,8 +20,13 @@ this module builds from the member's sandbox spec (context.Ctx.sandbox_spec):
 The executor is pinned (MXC_PIN): `wxc-exec.exe` 1.0.1 from the npm package @microsoft/mxc-sdk 1.0.1, installed by
 `goose-web sandbox install-mxc` into `<install>/vendor/mxc/<version>/` after checking the package's npm sha512
 integrity, the file's SHA-256 and its Authenticode signature (Microsoft Corporation). It is never committed to git.
-Before every launch its SHA-256 is checked again through a handle that denies writes until the executor runs, so an
-unverified binary is never executed. `wxc-exec --probe` and the Windows build tell whether this machine can run MXC.
+Before every launch - the worker's and `--probe` alike - every pinned file of the version folder (pinned_files) is
+opened with writes and deletes denied, hashed through that handle and held until the executor runs; the folder must
+hold nothing but the pinned files and install.json (a DLL next to wxc-exec.exe would be loaded by it), checked before
+the start and again while the executor is still suspended; and the executor is created with the image-load
+mitigations PreferSystem32Images + MicrosoftSignedOnly + NoRemoteImages, so a DLL planted in its folder is not loaded
+in place of the System32 one (security review 2026-11-12, MX-8; the install folder's ACL is left as it is, SB-8).
+`wxc-exec --probe` and the Windows build tell whether this machine can run MXC.
 When it cannot, members' workers do not start (fail closed) unless `sandbox.fallback: appcontainer` is set.
 
 The request contract is pinned to "1.0.0" (telemetry off unless a run opts in; Goose Web never does).
@@ -54,7 +63,17 @@ MXC_PIN: dict[str, Any] = {
     "exe_sha256": "090f5d1f7bb93104ab08dcd4e8034ef954aeefcdaf6658dde5f7dff4cfc12f3a",
     "exe_size": 12_152_632,
     "signer": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+    # Further files installed next to wxc-exec.exe (name -> [sha256, size]). None today: a lone wxc-exec.exe is
+    # enough (spec 025 converge), the package's mxc_ffi.dll / wslcsdk.dll are not installed. Anything added to the
+    # install must be listed here, or the folder check refuses to run the executor.
+    "extra_files": {},
 }
+INSTALL_RECORD = "install.json"    # written by install(); data, never loaded as code
+# CreateProcess image-load mitigations for wxc-exec (MX-8): PreferSystem32Images | MicrosoftSignedOnly |
+# NoRemoteImages (PROCESS_CREATION_MITIGATION_POLICY_*_ALWAYS_ON)
+EXEC_MITIGATIONS = (1 << 60) | (1 << 44) | (1 << 52)
+HARDLINK_SCAN_SECONDS = 5.0        # MX-3: bounded scan of a member's read/write folders before an MXC start
+HARDLINK_SCAN_ENTRIES = 200_000
 DOWNLOAD_HOSTS = {"registry.npmjs.org"}
 MIN_BUILD = (26100, 9278)          # Windows 11 24H2 process isolation (MXC docs, os-version-support)
 PROBE_TIMEOUT = 30.0
@@ -86,10 +105,21 @@ def mxc_dir(settings) -> Path:
 
 
 def protected_write_paths(settings) -> list[str]:
-    """Folders a member's agent may never write: the code the gateway runs (package, venv, git metadata, scripts)
-    and the MXC executor folder. A grant of a folder above one of them is refused too."""
+    """Folders a member's agent may never write: the code the gateway runs (package, venv, git metadata, scripts),
+    the Python it runs on (venv and base installation, MX-6), the goose binary's folder (admins' agents run it
+    unsandboxed) and the MXC executor folder. A grant of a folder above one of them is refused too."""
     root = install_root()
-    out = [root / "goose_web", root / ".git", root / "scripts", Path(sys.prefix), mxc_dir(settings)]
+    out = [root / "goose_web", root / ".git", root / "scripts", mxc_dir(settings)]
+    for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix, os.path.dirname(sys.executable),
+              os.path.dirname(getattr(sys, "_base_executable", "") or "")):
+        if p and os.path.isabs(p):
+            out.append(Path(p))
+    try:
+        goose = str(settings.goose_binary or "")
+    except Exception:
+        goose = ""
+    if goose and os.path.isabs(goose):
+        out.append(Path(os.path.dirname(goose)))
     return sorted({str(p) for p in out}, key=os.path.normcase)
 
 
@@ -159,9 +189,11 @@ class PinnedFile:
         self.close()
 
 
-def verify_exe(path: Path, pinned: PinnedFile | None = None) -> str:
-    """'' when `path` is the pinned executor (size + SHA-256), else the problem."""
+def verify_exe(path: Path, pinned: PinnedFile | None = None, expected: tuple[str, int] | None = None) -> str:
+    """'' when `path` is the pinned executor (size + SHA-256; or `expected` for another pinned file), else the
+    problem."""
     path = Path(path)
+    want_sha, want_size = expected or (MXC_PIN["exe_sha256"], MXC_PIN["exe_size"])
     if not path.is_file():
         return f"{path} is not installed (run: goose-web sandbox install-mxc)"
     own = pinned is None
@@ -174,11 +206,90 @@ def verify_exe(path: Path, pinned: PinnedFile | None = None) -> str:
     finally:
         if own:
             pf.close()
-    if size != MXC_PIN["exe_size"] or digest != MXC_PIN["exe_sha256"]:
-        return (f"{path} does not match the pinned wxc-exec.exe {MXC_PIN['version']} (SHA-256 {digest[:16]}..., "
-                f"{size:,} bytes; expected {MXC_PIN['exe_sha256'][:16]}..., {MXC_PIN['exe_size']:,} bytes); it is "
+    if size != want_size or digest != want_sha:
+        return (f"{path} does not match the pinned {path.name} of wxc-exec {MXC_PIN['version']} (SHA-256 "
+                f"{digest[:16]}..., {size:,} bytes; expected {want_sha[:16]}..., {want_size:,} bytes); it is "
                 "not run. Reinstall: goose-web sandbox install-mxc --force")
     return ""
+
+
+def pinned_files() -> dict[str, tuple[str, int]]:
+    """Every file of the version folder the executor may load: name -> (SHA-256, size). wxc-exec.exe plus
+    MXC_PIN['extra_files'] (none today)."""
+    out = {MXC_PIN["exe"]: (MXC_PIN["exe_sha256"], MXC_PIN["exe_size"])}
+    for name, (digest, size) in (MXC_PIN.get("extra_files") or {}).items():
+        out[name] = (digest, size)
+    return out
+
+
+def folder_problem(vdir: Path) -> str:
+    """'' when the version folder holds exactly the pinned files (+ install.json), else the problem (MX-8: Windows
+    loads a DLL from the executable's own folder before System32 unless it is a KnownDLL)."""
+    vdir = Path(vdir)
+    allowed = {n.lower() for n in pinned_files()} | {INSTALL_RECORD}
+    try:
+        entries = list(os.scandir(vdir))
+    except FileNotFoundError:
+        return f"{vdir} is not installed (run: goose-web sandbox install-mxc)"
+    except OSError as e:
+        return f"{vdir} cannot be listed ({e})"
+    extra = sorted(e.name for e in entries if e.name.lower() not in allowed or e.is_symlink()
+                   or not e.is_file(follow_symlinks=False))
+    if extra:
+        from .activity import clean_text
+        return (f"{vdir} holds files that are not part of the pinned executor ({clean_text(', '.join(extra[:5]), 300)}"
+                f"{', ...' if len(extra) > 5 else ''}); wxc-exec.exe would load a DLL placed next to it, so it is not "
+                "run. Remove them, or reinstall: goose-web sandbox install-mxc --force")
+    names = {e.name.lower() for e in entries}
+    missing = sorted(n for n in pinned_files() if n.lower() not in names)
+    if missing:
+        return f"{vdir / missing[0]} is not installed (run: goose-web sandbox install-mxc)"
+    return ""
+
+
+class PinnedSet:
+    """Every pinned file of the version folder opened like PinnedFile (writes, deletes and renames denied) for as
+    long as the set is open; problem() hashes each one through its handle."""
+
+    def __init__(self, vdir: Path):
+        self.vdir = Path(vdir)
+        self.files: dict[str, PinnedFile] = {}
+        try:
+            for name in pinned_files():
+                self.files[name] = PinnedFile(self.vdir / name)
+        except BaseException:
+            self.close()
+            raise
+
+    def problem(self) -> str:
+        for name, pf in self.files.items():
+            p = verify_exe(pf.path, pinned=pf, expected=pinned_files()[name])
+            if p:
+                return p
+        return ""
+
+    def close(self) -> None:
+        for pf in self.files.values():
+            pf.close()
+        self.files = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+def verify_install(vdir: Path) -> str:
+    """'' when the version folder is exactly the pinned install (folder content + every pinned file's SHA-256)."""
+    problem = folder_problem(vdir)
+    if problem:
+        return problem
+    try:
+        with PinnedSet(vdir) as ps:
+            return ps.problem()
+    except OSError as e:
+        return f"{vdir} cannot be opened for verification ({e})"
 
 
 def authenticode(path: Path, timeout: float = SIGNATURE_TIMEOUT) -> dict:
@@ -270,15 +381,18 @@ def install(settings, *, file: str | None = None, force: bool = False, if_missin
         raise MxcError(problem)
     final = version_dir(settings)
     exe = final / MXC_PIN["exe"]
-    if not force and exe.is_file() and not verify_exe(exe):
-        sig_problem = signature_problem(sign(exe))
+    if not force and exe.is_file():
+        folder = verify_install(final)
+        sig_problem = folder or signature_problem(sign(exe))
         if not sig_problem:
             log(f"wxc-exec.exe {MXC_PIN['version']} is installed and verified ({exe}); nothing to do.")
             return installed_info(settings) or {"exe": str(exe)}
         if if_missing:
-            log(f"The installed executor fails its signature check ({sig_problem}); installing it again.")
+            log(f"The installed executor fails its check ({sig_problem}); installing it again.")
     d.mkdir(parents=True, exist_ok=True)
-    stage = d / f".stage-{secrets.token_hex(6)}"     # os.mkdir: inherits the install folder's (restricted) ACL
+    # os.mkdir: the stage inherits the ACL of the MXC folder (by default that of the install folder; not changed
+    # here - SB-8). The pin (pinned_files, folder_problem, PinnedSet) is the control, checked before every launch.
+    stage = d / f".stage-{secrets.token_hex(6)}"
     stage.mkdir()
     try:
         tgz = stage / "package.tgz"
@@ -361,20 +475,38 @@ def build_problem(build: tuple[int, int]) -> str:
 
 
 def run_probe(exe: Path, timeout: float = PROBE_TIMEOUT) -> tuple[dict, str]:
-    """(probe JSON, problem) from `wxc-exec --probe`."""
+    """(probe JSON, problem) from `wxc-exec --probe`, started like a worker's executor (MX-8): every pinned file
+    verified through write-denied handles held until it runs, the folder checked, the image-load mitigations on,
+    in a kill-on-close job of its own."""
+    from .activity import clean_text
+    from .workers import _Job
+    job = _Job() if IS_WINDOWS else None
     try:
-        r = subprocess.run([str(exe), "--probe"], capture_output=True, text=True, timeout=timeout,  # nosec B603
-                           stdin=subprocess.DEVNULL, creationflags=0x08000000 if IS_WINDOWS else 0,
-                           env=host_env())
-    except subprocess.TimeoutExpired:
-        return {}, f"wxc-exec --probe did not answer within {timeout:.0f} s"
+        p = start_verified(Path(exe), ["--probe"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, jobs=[job] if IS_WINDOWS else [])
+    except MxcError as e:
+        if job is not None:
+            job.close()
+        return {}, str(e)
     except OSError as e:
+        if job is not None:
+            job.close()
         return {}, f"wxc-exec --probe could not run ({e})"
     try:
-        data = json.loads(r.stdout or "")
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        return {}, f"wxc-exec --probe did not answer within {timeout:.0f} s"
+    finally:
+        if job is not None:
+            job.close()
+    out_s, err_s = out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+    try:
+        data = json.loads(out_s or "")
     except ValueError:
-        tail = (r.stderr or r.stdout or "").strip().splitlines()[-1:] or ["no output"]
-        return {}, f"wxc-exec --probe exited with {r.returncode}: {tail[0][:300]}"
+        tail = (err_s or out_s or "").strip().splitlines()[-1:] or ["no output"]
+        return {}, f"wxc-exec --probe exited with {p.returncode}: {clean_text(tail[0], 300)}"
     return (data if isinstance(data, dict) else {}), ""
 
 
@@ -466,7 +598,7 @@ class Availability:
         if bp:
             st["reason"] = bp
             return st
-        vp = verify_exe(exe)
+        vp = verify_install(exe.parent)
         if vp:
             st["reason"] = vp
             return st
@@ -502,7 +634,8 @@ def summary(settings, refresh: bool = False) -> dict:
         "enabled": on, "backend": backend, "configuredBackend": str(settings.get("sandbox", "backend") or "mxc"),
         "fallback": sandbox_fallback(settings), "network": str(settings.get("sandbox", "network") or "internet"),
         "relays": [str(t) for t in (settings.get("sandbox", "relays") or [])], "problems": sandbox_config_problems(settings),
-        "mxcDir": str(mxc_dir(settings)), "membersCanStart": True, "reason": ""}
+        "mxcDir": str(mxc_dir(settings)), "membersCanStart": True, "reason": "",
+        "readDirProblems": [{"path": p, "why": w} for p, w in read_dir_problems(settings)]}
     if backend == "mxc" or out["fallback"] == "appcontainer":
         st = availability(settings, refresh)
         out["mxc"] = {k: st.get(k) for k in ("available", "reason", "exe", "version", "contract", "build", "probe",
@@ -523,13 +656,62 @@ def _norm(p: str) -> str:
     return os.path.normcase(os.path.normpath(p))
 
 
-def _forms(p: str) -> set[str]:
-    out = {_norm(os.path.abspath(p))}
+UNC_REFUSED = "a network (UNC) path; MXC grants only local folders (a share on this machine could be another name " \
+              "for a protected folder)"
+
+
+def canonical_path(p: str) -> tuple[str, str]:
+    """(canonical absolute local path, '') or ('', why it cannot be granted). MX-6: \\\\?\\X:\\ prefixes removed,
+    '/' -> '\\', trailing dots and spaces of every component removed (Windows ignores them), normalised; device
+    paths (\\\\.\\, \\\\?\\GLOBALROOT, volume GUIDs), UNC paths (\\\\server\\share, \\\\?\\UNC\\...) and alternate
+    data streams refused."""
+    raw = str(p or "").strip()
+    if not raw or "\x00" in raw:
+        return "", "an empty path"
+    s = raw.replace("/", "\\")
+    if s.startswith("\\\\"):
+        if s[2:4] == "?\\":
+            rest = s[4:]
+            if rest[:4].upper() == "UNC\\":
+                return "", UNC_REFUSED
+            if not (len(rest) >= 3 and rest[0].isalpha() and rest[1:3] == ":\\"):
+                return "", "a device path"
+            s = rest
+        elif s[2:4] == ".\\":
+            return "", "a device path"
+        else:
+            return "", UNC_REFUSED
+    drive, tail = os.path.splitdrive(s)
+    if not (len(drive) == 2 and drive[0].isalpha() and drive[1] == ":") or not tail.startswith("\\"):
+        return "", "not an absolute path"
+    if ":" in tail:
+        return "", "the path contains ':' (alternate data stream)"
+    parts = [c if c in (".", "..") else c.rstrip(" .") for c in tail.split("\\")]
+    return os.path.normpath(drive.upper() + "\\".join(parts)), ""
+
+
+def _strip_prefix(r: str) -> str:
+    if r.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + r[8:]
+    if r.startswith("\\\\?\\"):
+        return r[4:]
+    return r
+
+
+def _real(p: str) -> str:
     try:
-        out.add(_norm(os.path.realpath(p)))
+        return os.path.normpath(_strip_prefix(os.path.realpath(p)))
     except (OSError, ValueError):
-        pass
-    return out
+        return os.path.normpath(p)
+
+
+def _forms(p: str) -> set[str]:
+    """The canonical form of `p` and its link-resolved form (junctions, symlinks, 8.3 names), normalised; a path
+    that cannot be canonicalised is compared as written (abspath)."""
+    c, why = canonical_path(p)
+    if why:
+        return {_norm(os.path.abspath(p))}
+    return {_norm(c), _norm(_real(c))}
 
 
 def _under(a: str, b: str) -> bool:
@@ -538,28 +720,29 @@ def _under(a: str, b: str) -> bool:
 
 
 def resolved(p: str) -> str:
-    """The long, link-resolved form MXC gets (junctions and 8.3 names resolved; \\\\?\\ prefixes removed)."""
-    try:
-        r = os.path.realpath(p)
-    except (OSError, ValueError):
-        r = os.path.abspath(p)
-    if r.startswith("\\\\?\\UNC\\"):
-        r = "\\\\" + r[8:]
-    elif r.startswith("\\\\?\\"):
-        r = r[4:]
-    return os.path.normpath(r)
+    """The canonical, long, link-resolved form MXC gets (the very form grant_problem checked)."""
+    c, why = canonical_path(p)
+    return _real(c if not why else p)
 
 
 def grant_problem(path: str, mode: str, *, profile_root: str, profiles_root: str, system_dir: str,
                   protected_write: list[str] = (), protected_any: list[str] = ()) -> str:
     """'' when `path` may be granted with `mode` ('modify' | 'read') to the member whose profile is `profile_root`,
-    else why not. Compared as written and after resolving links (junctions, symlinks, 8.3 names)."""
-    if not path or not os.path.isabs(path):
+    else why not. Compared in canonical form (canonical_path: \\\\?\\, case, trailing dots/spaces, '/') and after
+    resolving links (junctions, symlinks, 8.3 names); UNC and device paths are refused (MX-6)."""
+    if not path:
         return "not an absolute path"
-    drive, rest = os.path.splitdrive(os.path.normpath(path))
-    if rest in ("", "\\", "/"):
-        return "a drive or share root"
-    forms = _forms(path)
+    canon, why = canonical_path(path)
+    if why:
+        return why
+    real = _real(canon)
+    if real.startswith("\\\\"):
+        return "it resolves to a network (UNC) or device path"
+    for c in (canon, real):
+        drive, rest = os.path.splitdrive(c)
+        if rest in ("", "\\", "/"):
+            return "a drive or share root"
+    forms = {_norm(canon), _norm(real)}
     sysd = _forms(system_dir)
     if any(_under(f, s) or _under(s, f) for f in forms for s in sysd):
         return "the gateway's system folder (database, keys, logs) or a folder above it"
@@ -580,6 +763,29 @@ def grant_problem(path: str, mode: str, *, profile_root: str, profiles_root: str
             if p and any(_under(f, q) or _under(q, f) for f in forms for q in _forms(p)):
                 return "the Goose Web install or MXC folder (never writable for members) or a folder above it"
     return ""
+
+
+_READ_DIR_LOGGED: set[tuple[str, str]] = set()
+
+
+def read_dir_problems(settings, native_roots: list[str] | None = None) -> list[tuple[str, str]]:
+    """[(read_dir, why)] for `sandbox.read_dirs` entries no member may be granted, whatever the backend (MX-6): the
+    gateway's system folder or above, the profiles root or above, anything inside it but the team folders, the native
+    Goose profile, UNC and device paths - in any spelling. Each is logged once and left out of every member's
+    sandbox (context.Ctx.sandbox_spec); `sandbox status` and `check` list them."""
+    from .config import default_native_goose_root
+    natives = [p for p in [default_native_goose_root(), *(native_roots or [])] if p]
+    ctx = dict(profile_root=os.path.join(str(settings.profiles_root), "_teams"), profiles_root=str(settings.profiles_root),
+               system_dir=str(settings.system_dir), protected_write=[], protected_any=natives)
+    out = []
+    for d in [str(x) for x in (settings.get("sandbox", "read_dirs") or []) if x]:
+        why = grant_problem(d, "read", **ctx)
+        if why:
+            out.append((d, why))
+            if (d, why) not in _READ_DIR_LOGGED:
+                _READ_DIR_LOGGED.add((d, why))
+                log.error("sandbox: sandbox.read_dirs entry %r is never granted to members: %s", d, why)
+    return out
 
 
 def filter_grants(grants: dict[str, str], **ctx) -> tuple[dict[str, str], list[tuple[str, str]]]:
@@ -646,13 +852,80 @@ def write_policy(path: Path, policy: dict) -> None:
     os.replace(tmp, path)
 
 
-def redacted(policy: dict) -> dict:
-    """The policy without the proxy credential (for logs and status)."""
-    p = json.loads(json.dumps(policy))
-    url = (p.get("runtimeConfig") or {}).get("networkProxy")
-    if url and "@" in url:
-        p["runtimeConfig"]["networkProxy"] = "http://***@" + url.rsplit("@", 1)[1]
-    return p
+def _link_names(path: str) -> list[str]:
+    """Every name of the file at `path` (all its hard links), as full paths (Windows: FindFirstFileNameW)."""
+    if not IS_WINDOWS:
+        return [path]
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.FindFirstFileNameW.restype = wintypes.HANDLE
+    k32.FindFirstFileNameW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                       wintypes.LPWSTR]
+    k32.FindNextFileNameW.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR]
+    k32.FindClose.argtypes = [wintypes.HANDLE]
+    drive = os.path.splitdrive(_strip_prefix(os.path.abspath(path)))[0]
+    out: list[str] = []
+    n = wintypes.DWORD(32768)
+    buf = ctypes.create_unicode_buffer(32768)
+    h = k32.FindFirstFileNameW(path, 0, ctypes.byref(n), buf)
+    if not h or h == wintypes.HANDLE(-1).value:
+        return [path]
+    try:
+        while True:
+            out.append(drive + buf.value)
+            n = wintypes.DWORD(32768)
+            if not k32.FindNextFileNameW(h, ctypes.byref(n), buf):
+                break
+            if len(out) >= 64:
+                break
+    finally:
+        k32.FindClose(h)
+    return out
+
+
+def hardlink_escapes(rw_paths: list[str], seconds: float = HARDLINK_SCAN_SECONDS,
+                     max_entries: int = HARDLINK_SCAN_ENTRIES) -> tuple[list[tuple[str, str]], bool, int]:
+    """MX-3: files in the read/write folders `rw_paths` that are hard-linked to a name outside all of them.
+    MXC grants are path policy: such a link reads and writes a file outside every grant (links can only be made
+    outside MXC - by an agent on the AppContainer backend/fallback, or on the host). Bounded walk (`seconds`,
+    `max_entries`), reparse points (junctions, symlinks, mount points) not followed.
+    Returns ([(file, outside name)] - at most 20, complete, entries seen)."""
+    roots = [_norm(_real(p)) for p in rw_paths if p]
+    found: list[tuple[str, str]] = []
+    end = time.monotonic() + seconds
+    seen = 0
+    stack = list(rw_paths)
+    while stack:
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                seen += 1
+                if seen > max_entries or time.monotonic() > end:
+                    return found, False, seen
+                try:
+                    if e.is_symlink() or e.is_junction():
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        if getattr(e.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400:
+                            continue                      # FILE_ATTRIBUTE_REPARSE_POINT (mount point and the like)
+                        stack.append(e.path)
+                        continue
+                    if not e.is_file(follow_symlinks=False) or os.lstat(e.path).st_nlink < 2:
+                        continue
+                    for other in _link_names(e.path):
+                        if not any(_under(_norm(other), r) for r in roots):
+                            found.append((e.path, other))
+                            break
+                    if len(found) >= 20:
+                        return found, True, seen
+                except OSError:
+                    continue
+    return found, True, seen
 
 
 # ------------------------------------------------------------------ launch
@@ -669,23 +942,60 @@ def host_env() -> dict:
 
 
 def launch(exe: Path, policy_file: Path, stderr_file, jobs: list) -> subprocess.Popen:
-    """Start `wxc-exec <policy>` with stdin/stdout pipes. Verified first (SHA-256 through a write-denied handle kept
-    open until the process runs); on Windows started suspended, put in every job of `jobs` (kill-on-close: the
-    gateway's, then the worker's) and only then resumed, so nothing it starts can run outside the jobs."""
-    with PinnedFile(exe) as pf:
-        problem = verify_exe(exe, pinned=pf)
+    """Start `wxc-exec <policy>` with stdin/stdout pipes (start_verified)."""
+    return start_verified(Path(exe), [str(policy_file)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=stderr_file, jobs=jobs)
+
+
+def start_verified(exe: Path, args: list[str], *, stdin, stdout, stderr, jobs: list) -> subprocess.Popen:
+    """The one way the executor is started (worker launch and --probe). Every pinned file of its folder is opened
+    with writes/deletes/renames denied and hashed through that handle, and the folder must hold nothing else
+    (MX-8); the handles stay open until the process runs. On Windows it is created suspended with the image-load
+    mitigations (EXEC_MITIGATIONS), put in every job of `jobs` (kill-on-close: the gateway's, then the worker's) -
+    a job it cannot join kills it and fails the start (MX-9) -, the folder is checked once more, and only then it is
+    resumed, so nothing it starts can run outside the jobs."""
+    exe = Path(exe)
+    vdir = exe.parent
+    if exe.name.lower() != str(MXC_PIN["exe"]).lower():
+        raise MxcError(f"{exe} is not the pinned executor {MXC_PIN['exe']}")
+    problem = folder_problem(vdir)
+    if problem:
+        AVAILABILITY.mark_failed(problem)
+        raise MxcError(problem)
+    try:
+        pins = PinnedSet(vdir)
+    except OSError as e:
+        problem = f"{exe} cannot be opened for verification ({e})"
+        AVAILABILITY.mark_failed(problem)
+        raise MxcError(problem) from e
+    with pins:
+        problem = pins.problem() or folder_problem(vdir)
         if problem:
             AVAILABILITY.mark_failed(problem)
             raise MxcError(problem)
         flags = (0x08000000 | 0x00000004) if IS_WINDOWS else 0   # CREATE_NO_WINDOW | CREATE_SUSPENDED
-        proc = subprocess.Popen([str(exe), str(policy_file)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,  # nosec B603
-                                stderr=stderr_file, env=host_env(), creationflags=flags,
-                                cwd=os.environ.get("SystemRoot") if IS_WINDOWS else None)
-    if not IS_WINDOWS:
-        return proc
-    for j in jobs:
-        if j is not None and not j.add(proc):
-            log.warning("sandbox mxc: wxc-exec (pid %s) could not join a kill-on-close job", proc.pid)
+        popen = _HardenedPopen if IS_WINDOWS else subprocess.Popen
+        proc = popen([str(exe), *args], stdin=stdin, stdout=stdout, stderr=stderr, env=host_env(),  # nosec B603
+                     creationflags=flags, cwd=os.environ.get("SystemRoot") if IS_WINDOWS else None)
+        if not IS_WINDOWS:
+            return proc
+        try:
+            for j in jobs:
+                if j is None or not j.add(proc):
+                    raise MxcError("wxc-exec could not be put in a kill-on-close job; it is not started (a container "
+                                   "outside the job could outlive the gateway)")
+            problem = folder_problem(vdir)      # nothing appeared next to it while it was created (still suspended)
+            if problem:
+                AVAILABILITY.mark_failed(problem)
+                raise MxcError(problem)
+            _resume(proc)
+        except BaseException:
+            _kill_quietly(proc)
+            raise
+    return proc
+
+
+def _resume(proc: subprocess.Popen) -> None:
     import ctypes
     from ctypes import wintypes
     ntdll = ctypes.WinDLL("ntdll")
@@ -693,9 +1003,128 @@ def launch(exe: Path, policy_file: Path, stderr_file, jobs: list) -> subprocess.
     ntdll.NtResumeProcess.restype = ctypes.c_long
     rc = ntdll.NtResumeProcess(int(proc._handle))  # type: ignore[attr-defined]
     if rc != 0:
-        proc.kill()
         raise MxcError(f"wxc-exec could not be resumed (NTSTATUS 0x{rc & 0xFFFFFFFF:08X})")
-    return proc
+
+
+def _kill_quietly(proc: subprocess.Popen) -> None:
+    try:
+        proc.kill()
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+    for s in (proc.stdin, proc.stdout, proc.stderr):
+        try:
+            if s is not None:
+                s.close()
+        except Exception:
+            pass
+
+
+if IS_WINDOWS:
+    class _HardenedPopen(subprocess.Popen):
+        """subprocess.Popen whose CreateProcessW gets a PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY (EXEC_MITIGATIONS)
+        and an explicit handle list (only the child's standard handles are inherited). Everything else - pipes,
+        wait(), kill(), communicate() - is Popen's own (MX-8)."""
+
+        def _execute_child(self, args, executable, preexec_fn, close_fds, pass_fds, cwd, env, startupinfo,
+                           creationflags, shell, p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite, *unused):
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            class STARTUPINFOW(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR), ("lpDesktop", wintypes.LPWSTR),
+                            ("lpTitle", wintypes.LPWSTR), ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+                            ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD),
+                            ("dwXCountChars", wintypes.DWORD), ("dwYCountChars", wintypes.DWORD),
+                            ("dwFillAttribute", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                            ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD),
+                            ("lpReserved2", ctypes.c_void_p), ("hStdInput", wintypes.HANDLE),
+                            ("hStdOutput", wintypes.HANDLE), ("hStdError", wintypes.HANDLE)]
+
+            class STARTUPINFOEXW(ctypes.Structure):
+                _fields_ = [("StartupInfo", STARTUPINFOW), ("lpAttributeList", ctypes.c_void_p)]
+
+            class PROCESS_INFORMATION(ctypes.Structure):
+                _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
+                            ("dwProcessId", wintypes.DWORD), ("dwThreadId", wintypes.DWORD)]
+
+            k32.InitializeProcThreadAttributeList.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                                              ctypes.POINTER(ctypes.c_size_t)]
+            k32.UpdateProcThreadAttribute.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t,
+                                                      ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                                                      ctypes.c_void_p]
+            k32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+            k32.CreateProcessW.argtypes = [wintypes.LPCWSTR, ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_void_p,
+                                           wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR,
+                                           ctypes.c_void_p, ctypes.c_void_p]
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            app = os.fsdecode(executable) if executable is not None else (
+                os.fsdecode(args[0]) if not isinstance(args, (str, bytes)) else None)
+            cmd = args if isinstance(args, str) else subprocess.list2cmdline(args)
+            handles = self._filter_handle_list([int(h) for h in (p2cread, c2pwrite, errwrite)
+                                                if h is not None and int(h) != -1])
+            attrs = ctypes.c_void_p()
+            size = ctypes.c_size_t(0)
+            buf = None
+            try:
+                k32.InitializeProcThreadAttributeList(None, 2, 0, ctypes.byref(size))
+                buf = ctypes.create_string_buffer(size.value)
+                if not k32.InitializeProcThreadAttributeList(buf, 2, 0, ctypes.byref(size)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                attrs = ctypes.cast(buf, ctypes.c_void_p)
+                policy = ctypes.c_uint64(EXEC_MITIGATIONS)
+                if not k32.UpdateProcThreadAttribute(attrs, 0, 0x00020007, ctypes.byref(policy),
+                                                     ctypes.sizeof(policy), None, None):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                harr = (wintypes.HANDLE * max(1, len(handles)))(*handles)
+                if handles and not k32.UpdateProcThreadAttribute(attrs, 0, 0x00020002, harr,
+                                                                 ctypes.sizeof(wintypes.HANDLE) * len(handles),
+                                                                 None, None):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                si = STARTUPINFOEXW()
+                si.StartupInfo.cb = ctypes.sizeof(STARTUPINFOEXW)
+                if -1 not in (p2cread, c2pwrite, errwrite):
+                    si.StartupInfo.dwFlags = 0x100                       # STARTF_USESTDHANDLES
+                    si.StartupInfo.hStdInput = int(p2cread)
+                    si.StartupInfo.hStdOutput = int(c2pwrite)
+                    si.StartupInfo.hStdError = int(errwrite)
+                si.lpAttributeList = attrs
+                block = None
+                if env is not None:
+                    text = "".join(f"{k}={v}\0" for k, v in sorted(env.items(), key=lambda kv: kv[0].upper())) + "\0"
+                    block = (ctypes.c_wchar * len(text))(*text)
+                cmdbuf = ctypes.create_unicode_buffer(cmd)
+                pi = PROCESS_INFORMATION()
+                flags = int(creationflags) | 0x00080000 | 0x00000400   # EXTENDED_STARTUPINFO_PRESENT | UNICODE_ENV
+                cwd_s = os.fsdecode(cwd) if cwd is not None else None
+                if not k32.CreateProcessW(app, cmdbuf, None, None, bool(handles), flags, block, cwd_s,
+                                          ctypes.byref(si), ctypes.byref(pi)):
+                    raise ctypes.WinError(ctypes.get_last_error())
+            finally:
+                if attrs.value:
+                    k32.DeleteProcThreadAttributeList(attrs)
+                self._close_pipe_fds(p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite)
+            self._child_created = True
+            self._handle = subprocess.Handle(pi.hProcess)
+            self.pid = pi.dwProcessId
+            k32.CloseHandle(pi.hThread)
+
+
+def process_mitigations(proc: subprocess.Popen) -> dict:
+    """The image-load / signature mitigations of a running process (Windows; for checks and tests)."""
+    if not IS_WINDOWS:
+        return {}
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetProcessMitigationPolicy.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+    sig, img = wintypes.DWORD(), wintypes.DWORD()
+    h = int(proc._handle)  # type: ignore[attr-defined]
+    ok1 = k32.GetProcessMitigationPolicy(h, 8, ctypes.byref(sig), 4)      # ProcessSignaturePolicy
+    ok2 = k32.GetProcessMitigationPolicy(h, 10, ctypes.byref(img), 4)     # ProcessImageLoadPolicy
+    return {"microsoftSignedOnly": bool(ok1 and sig.value & 1), "noRemoteImages": bool(ok2 and img.value & 1),
+            "preferSystem32Images": bool(ok2 and img.value & 4)}
 
 
 # ------------------------------------------------------------------ errors
@@ -709,16 +1138,20 @@ NTSTATUS_TEXT = {
 
 
 def explain_exit(code: int | None, stderr_text: str) -> str:
-    """A readable reason for a wxc-exec that ended early, from its exit code and the stderr it wrote."""
+    """A readable reason for a wxc-exec that ended early, from its exit code and the stderr it wrote. The stderr is
+    written by the container side too, so it is shown as text only, one line, control characters escaped (MX-5;
+    the admin UI escapes it as HTML as well)."""
+    from .activity import clean_text
     for line in reversed([x.strip() for x in (stderr_text or "").splitlines() if x.strip()]):
         if line.startswith("{") and '"error"' in line:
             try:
                 err = json.loads(line)["error"]
-                return f"MXC refused to start the sandbox ({err.get('code')}): {str(err.get('message'))[:400]}"
-            except (ValueError, KeyError, TypeError):
+                return (f"MXC refused to start the sandbox ({clean_text(err.get('code'), 60)}): "
+                        f"{clean_text(err.get('message'), 400)}")
+            except (ValueError, KeyError, TypeError, AttributeError):
                 continue
     c = (code or 0) & 0xFFFFFFFF
     if c in NTSTATUS_TEXT:
         return NTSTATUS_TEXT[c]
     tail = [x.strip() for x in (stderr_text or "").splitlines() if x.strip()][-1:]
-    return f"wxc-exec exited with code {code}" + (f": {tail[0][:300]}" if tail else "")
+    return f"wxc-exec exited with code {code}" + (f": {clean_text(tail[0], 300)}" if tail else "")

@@ -382,6 +382,8 @@ def _print_sandbox_summary(settings, refresh: bool = True) -> bool:
           f"{settings.get('sandbox', 'proxy_idle_seconds')} s; running proxies: Admin > System")
     print(f"Relayed local services (sandbox.relays): {settings.get('sandbox', 'relays') or '-'}")
     print(f"Extra program folders (sandbox.read_dirs): {settings.get('sandbox', 'read_dirs') or '-'}")
+    for p in sm.get("readDirProblems") or []:
+        print(f"[!!] sandbox.read_dirs entry {p['path']!r} is never granted to members: {p['why']}")
     if not sm["membersCanStart"]:
         print(f"[!!] sandboxed members' agents do NOT start (fail closed): {sm['reason']}")
     elif sm["reason"]:
@@ -875,6 +877,8 @@ def cmd_check(args, settings) -> int:
         from . import mxc
         sm = mxc.summary(settings, refresh=True)
         m = sm.get("mxc") or {}
+        for p in sm.get("readDirProblems") or []:
+            line("sandbox.read_dirs", f"{p['path']} is never granted to members: {p['why']}", False)
         if not sm["membersCanStart"]:
             line("sandbox", f"backend {sm['backend']}: isolated non-admin workers will NOT start (fail closed): "
                  f"{sm['reason']}. See goose-web sandbox status; MXC: goose-web sandbox install-mxc", False)
