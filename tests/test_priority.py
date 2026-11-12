@@ -40,7 +40,11 @@ CHILD = textwrap.dedent("""
     assert k32.SetProcessInformation(h, 0, ctypes.byref(v), ctypes.sizeof(v))
     started = winsec.process_priority()
     result = winsec.ensure_normal_priority()
-    print(json.dumps({"started": started, "result": result, "now": winsec.process_priority()}))
+    import subprocess
+    child = subprocess.run([sys.executable, "-c", "import json; from goose_web import winsec; "
+                            "print(json.dumps(winsec.process_priority()))"], capture_output=True, text=True, timeout=120)
+    print(json.dumps({"started": started, "result": result, "now": winsec.process_priority(),
+                      "child_started_afterwards": json.loads(child.stdout.strip().splitlines()[-1])}))
 """)
 
 
@@ -59,6 +63,14 @@ def test_a_process_started_like_a_scheduled_task_is_raised_to_normal():
     assert r["result"]["errors"] == []
     assert r["result"]["before"] == r["started"]
     assert r["now"] == r["result"]["after"] == {"cpu": "normal", "io": "normal", "memory": "normal"}
+
+
+@windows_only
+def test_a_process_started_after_the_repair_gets_normal_priority():
+    # a child gets its parent's CPU class, I/O priority and memory priority when it is created (measured: a child of
+    # the lowered process has all three low), so the agents the gateway starts follow the gateway
+    r = run_child(0x4000, 1, 2)
+    assert r["child_started_afterwards"] == {"cpu": "normal", "io": "normal", "memory": "normal"}
 
 
 @windows_only

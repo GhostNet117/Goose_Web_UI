@@ -68,7 +68,7 @@ recipes); Goose Web now configures them where Goose reads them. No database sche
   not answer within Goose's 5 s, so Goose fell back to its patterns. The gateway now raises what is below normal to
   normal at every start (`server.priority`, default `normal`; `inherit` leaves it) and logs it, which also covers
   tasks registered by earlier versions; `register-service.ps1` registers new tasks with priority 4. Measured after
-  the fix, same load: `/healthz` 2 to 12 ms, a classification in about half a second.
+  the fix, same load: `/healthz` in 2 to 33 ms, a classification in 0.4 to 0.7 s.
 - **Command line:** `goose-web security status | on | off | rotate-tokens`; `goose-web check` shows the state.
   **API:** `GET/PUT /api/admin/goose-security`, `POST .../check`, `POST .../rotate`.
 - **Fix:** `goose-web check` reported the gateway's port as free when `server.host` is a LAN address (it probed
