@@ -236,7 +236,7 @@ async def test_goose_acp_initializes_in_an_mxc_worker(tmp_path, monkeypatch):
         (prof / "workspace").mkdir(parents=True)
         specs[n] = {"name": f"GooseWeb.e2e.{n}", "profile_root": str(prof), "relays": [], "grants": {}, "caps": [],
                     "backend": "mxc", "config_problems": [], "network": "internet",
-                    "relay_targets": ["127.0.0.1:8317"], "mxc_grants": {str(prof): "modify",
+                    "relay_targets": ["127.0.0.1:4000"], "mxc_grants": {str(prof): "modify",
                                                                          os.path.dirname(goose): "read"},
                     "profiles_root": str(tmp_path / "profiles"), "system_dir": str(s.system_dir),
                     "protected_write": mxc.protected_write_paths(s), "protected_any": []}

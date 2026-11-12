@@ -4,7 +4,7 @@ An MXC member's container has no network of its own: MXC (proxy mode, `runtimeCo
 exactly one loopback endpoint, this member's proxy in the gateway, and sets HTTP_PROXY / HTTPS_PROXY for the agent
 and everything it starts (MCP servers, npm, uv, pip, git, curl). The proxy then decides every destination:
 
-- `sandbox.relays` targets (for example the local model proxy 127.0.0.1:8317): allowed, connected to the configured
+- `sandbox.relays` targets (for example the local model proxy 127.0.0.1:4000): allowed, connected to the configured
   target (localhost, 127.0.0.1 and ::1 are the same host). A relay forwards everything the relayed service exposes on
   that port (every path, every virtual host behind a local reverse proxy);
 - public internet addresses: allowed when the member's network is `internet` or `internet+lan`;

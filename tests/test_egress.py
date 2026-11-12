@@ -20,7 +20,7 @@ def test_classify_addresses():
 
 def test_parse_hostport():
     assert eg.parse_hostport("example.org:443") == ("example.org", 443)
-    assert eg.parse_hostport("[::1]:8317") == ("::1", 8317)
+    assert eg.parse_hostport("[::1]:4000") == ("::1", 4000)
     assert eg.parse_hostport("example.org", 80) == ("example.org", 80)
     for bad in ("example.org", "x:0", "x:70000", ":80", "[::1]"):
         with pytest.raises(ValueError):
@@ -43,14 +43,14 @@ async def test_decision_matrix():
     names = {"api.example.org": ["140.82.112.3"], "nas.lan": ["192.168.1.20"], "rebind.example": ["127.0.0.1"],
              "mixed.example": ["140.82.112.3", "10.0.0.50"], "meta.example": ["169.254.169.254"],
              "self.example": ["10.0.0.50"]}
-    p = _proxy("internet", ["127.0.0.1:8317"], names)
+    p = _proxy("internet", ["127.0.0.1:4000"], names)
 
     async def ok(host, port):
         return (await p.decide(host, port)).allowed
     # relays: localhost, 127.0.0.1 and ::1 are one host; only the listed port
-    assert await ok("127.0.0.1", 8317) and await ok("localhost", 8317) and await ok("::1", 8317)
-    d = await p.decide("localhost", 8317)
-    assert (d.host, d.port, d.kind) == ("127.0.0.1", 8317, "relay")     # connected to the configured target
+    assert await ok("127.0.0.1", 4000) and await ok("localhost", 4000) and await ok("::1", 4000)
+    d = await p.decide("localhost", 4000)
+    assert (d.host, d.port, d.kind) == ("127.0.0.1", 4000, "relay")     # connected to the configured target
     assert not await ok("127.0.0.1", 9222) and not await ok("localhost", 8318)
     assert await ok("api.example.org", 443) and await ok("140.82.112.3", 22)
     assert not await ok("nas.lan", 445) and not await ok("192.168.1.20", 80)       # LAN needs internet+lan
@@ -58,17 +58,17 @@ async def test_decision_matrix():
     assert not await ok("mixed.example", 443)                                        # any refused address refuses
     assert not await ok("meta.example", 80) and not await ok("169.254.169.254", 80)
     assert not await ok("self.example", 80) and not await ok("10.0.0.50", 8710)      # this machine's own address
-    assert not await ok("::ffff:127.0.0.1", 8317 + 1)
+    assert not await ok("::ffff:127.0.0.1", 4000 + 1)
     assert not await ok("unknown.example", 443)
-    p.update("internet+lan", ["127.0.0.1:8317"])
+    p.update("internet+lan", ["127.0.0.1:4000"])
     assert await ok("nas.lan", 445) and not await ok("self.example", 80)
-    p.update("none", ["127.0.0.1:8317"])
-    assert await ok("127.0.0.1", 8317) and not await ok("api.example.org", 443)
+    p.update("none", ["127.0.0.1:4000"])
+    assert await ok("127.0.0.1", 4000) and not await ok("api.example.org", 443)
 
 
 async def test_relay_on_a_protected_port_is_dropped():
-    p = _proxy("internet", ["127.0.0.1:8710", "127.0.0.1:8317", "bad"], protected={8710})
-    assert set(p.relays) == {("loopback", 8317)}
+    p = _proxy("internet", ["127.0.0.1:8710", "127.0.0.1:4000", "bad"], protected={8710})
+    assert set(p.relays) == {("loopback", 4000)}
 
 
 # ------------------------------------------------------------------ live proxy
@@ -187,10 +187,10 @@ async def test_registry_keeps_port_and_rotates_credential():
             return {("server", "port"): 8710, ("sandbox", "proxy_max_connections"): 8,
                     ("sandbox", "proxy_idle_seconds"): 60}.get((section, key), default)
     reg = eg.ProxyRegistry(S(), audit=lambda *a: None)
-    a = await reg.ensure("alice", "alice", "internet", ["127.0.0.1:8317", "127.0.0.1:8710"])
+    a = await reg.ensure("alice", "alice", "internet", ["127.0.0.1:4000", "127.0.0.1:8710"])
     tok, port = a.token, a.port
     assert ("loopback", 8710) not in a.relays and 8710 in reg.protected_ports() and port in reg.protected_ports()
-    b = await reg.ensure("alice", "alice", "internet+lan", ["127.0.0.1:8317"])
+    b = await reg.ensure("alice", "alice", "internet+lan", ["127.0.0.1:4000"])
     assert b is a and b.port == port and b.token != tok and b.network == "internet+lan"
     assert reg.describe()["alice"]["port"] == port
     await reg.drop("alice")

@@ -310,7 +310,7 @@ def _spec(tmp_path, s, backend="mxc", **extra):
     ctx = _layout(tmp_path)
     return {"name": "GooseWeb.t.alice.x", "profile_root": ctx["profile_root"], "relays": [], "grants": {},
             "caps": [], "backend": backend, "config_problems": [], "network": "internet",
-            "relay_targets": ["127.0.0.1:8317"], "mxc_grants": {ctx["profile_root"]: "modify",
+            "relay_targets": ["127.0.0.1:4000"], "mxc_grants": {ctx["profile_root"]: "modify",
                                                                  str(tmp_path / "goose"): "read",
                                                                  ctx["system_dir"]: "modify"},
             "profiles_root": ctx["profiles_root"], "system_dir": str(s.system_dir),
@@ -395,10 +395,10 @@ async def test_mxc_worker_starts_talks_and_stops(tmp_path, monkeypatch):
     # an earlier AppContainer relay rewrite is undone for an MXC member (R7)
     cfgd = Path(spec["profile_root"]) / "config"
     cfgd.mkdir(parents=True, exist_ok=True)
-    (cfgd / "config.yaml").write_text("OPENAI_HOST: http://127.64.0.2:8317\n", encoding="utf-8")
+    (cfgd / "config.yaml").write_text("OPENAI_HOST: http://127.64.0.2:4000\n", encoding="utf-8")
     (s.system_dir / "sandbox").mkdir(parents=True, exist_ok=True)
     (s.system_dir / "sandbox" / f"{spec['name']}.relays.json").write_text(
-        json.dumps({"127.0.0.1:8317": "127.64.0.2:8317"}), encoding="utf-8")
+        json.dumps({"127.0.0.1:4000": "127.64.0.2:4000"}), encoding="utf-8")
     launched = []
 
     def fake_launch(exe, policy_file, stderr_file, jobs):
@@ -408,7 +408,7 @@ async def test_mxc_worker_starts_talks_and_stops(tmp_path, monkeypatch):
     monkeypatch.setattr(mxc, "launch", fake_launch)
     await wm.ensure("alice")
     assert w.state == "ready" and w.backend == "mxc" and w.transport == "stdio" and w.proxy_port
-    assert (cfgd / "config.yaml").read_text(encoding="utf-8") == "OPENAI_HOST: http://127.0.0.1:8317\n"
+    assert (cfgd / "config.yaml").read_text(encoding="utf-8") == "OPENAI_HOST: http://127.0.0.1:4000\n"
     pol = launched[0]
     assert pol["runtimeConfig"]["networkProxy"].endswith(f"@127.0.0.1:{w.proxy_port}")
     assert os.path.realpath(spec["profile_root"]) in pol["filesystem"]["readwritePaths"]
