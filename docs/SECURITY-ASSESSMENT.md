@@ -714,7 +714,7 @@ and the prompt guard of section 11 remain the controls that do not depend on the
 | A sandboxed agent uses the endpoint to reach the gateway | The relay target is the classifier port only; the web application's port is not reachable from the sandbox, as before |
 | Chat text leaks through the endpoint | Nothing is logged or audited; the cache holds a SHA-256 of the text and a score; requests stay on the loopback interface |
 | The gateway points Goose at a port someone else holds | A profile gets the endpoint only while the gateway itself holds the socket (exclusive bind on Windows); otherwise the classifier is switched off in the plan |
-| The feature breaks or overrides the administrator's Goose | The native profile is changed through Goose's own configuration API, key by key, each write read back; a request Goose could not be asked is a failure, never "not there"; a failure is recorded and nothing else is changed (`adversary.md` is touched only after the settings went in). Goose Web remembers what it wrote and replaces or removes only that: a value the administrator set (a stricter threshold, an own classifier with its token) is kept and reported, and "off" removes only Goose Web's own values. One exception, on purpose: a value Goose Web wrote that is later changed to something that protects less (detection or the classifier switched off, a higher threshold) is put back at the next start, audited and shown to administrators (14.5 R-3). Neither those nor an `adversary.md` Goose Web did not write is taken over without an explicit choice and a backup; a file it cannot read is left alone |
+| The feature breaks or overrides the administrator's Goose | The native profile is changed through Goose's own configuration API, key by key, each write read back; a request Goose could not be asked is a failure, never "not there"; a failure is recorded and nothing else is changed (`adversary.md` is touched only after the settings went in). Goose Web remembers what it wrote and replaces or removes only that: a value the administrator set (a stricter threshold, an own classifier with its token) is kept and reported, and "off" removes only Goose Web's own values. What is kept is what was there before Goose Web first wrote the key. A key Goose Web wrote stays its own: if it is later changed or removed in the file, it is put back at the next start whatever the new value is, with the changed value saved, an audit entry and a notice (14.5, R-3 and T-1). Limit: this is detection after the fact, between two gateway starts, against something that already runs under the administrator's Windows account; such a program has other ways to weaken Goose that Goose Web does not see (the environment, the secret store, the Goose binary itself). Neither those nor an `adversary.md` Goose Web did not write is taken over without an explicit choice and a backup; a file it cannot read is left alone |
 | A long text ties up the classifier | Body cap; at most `classifier_max_pieces` pieces, and a text that cannot be scored completely is answered `413`, never "safe"; a deadline below Goose's timeout; the bounded backlog above. Limit: the bound is on pieces, not on time; see 14.3, "One profile can make the endpoint unavailable to the others" |
 | The rules text or a token ends up in a log | The audit holds switches and sizes only (`goosesec.summary`); the state holds a 16-hex-digit fingerprint of the token, not the token |
 
@@ -807,7 +807,7 @@ published lines, and nothing that fails on Python 3.11. It found two regressions
 |---|---|---|---|
 | R-1 | Medium | The endpoint's bound counts pieces, not thread time: one profile can keep the endpoint's thread busy (14.3 had said three colluding profiles are needed) | **Open.** 14.3 corrected, with measurements |
 | R-2 | Medium | Regression of the E-6 fix: an MXC start after an AppContainer fallback built its environment from the previous start's backend, so the worker was given the relay forwarder's address, which no MXC worker can reach; the classifier was unreachable for that worker's whole life | The start passes its own backend; test for fallback, then MXC |
-| R-3 | Medium | Regression of the E-3 fix: in the native profile a value Goose Web wrote and something later weakened was treated as the administrator's own: no drift, no audit, no notice | A key Goose Web wrote that holds something else is looked at once: a weaker value is put back, another is kept; both are audited and administrators are told |
+| R-3 | Medium | Regression of the E-3 fix: in the native profile a value Goose Web wrote and something later weakened was treated as the administrator's own: no drift, no audit, no notice | A key Goose Web wrote stays its own: changed or removed outside, it is put back, audited and administrators are told (see T-1 below for why not only "weaker" values) |
 | R-4 | Low | A value the administrator had set that happened to equal Goose Web's was recorded as Goose Web's, so a later "off" removed it | Only what Goose Web wrote (or took over on request) is its own |
 | R-5 | Low | On take-over the backup of the replaced values was written last, so a failure in between lost them | Written before the first value is replaced |
 | R-6 | Low | The new re-validation of a WebSocket's rights kept the socket when the check itself failed | The socket is closed; the browser reconnects |
@@ -819,5 +819,22 @@ published lines, and nothing that fails on Python 3.11. It found two regressions
 | R-12 | Info | `taskkill` was still started by bare name | Full path |
 | R-13 | Info | A `guard.native_profile` value that is neither true nor false means "not managed", silently | Said in the log at every start |
 
-The fixes of this table were not reviewed a third time. They are covered by tests (`tests/test_goosesec.py`), the
-whole suite on Python 3.11 and 3.13, and a throwaway gateway run with the real Goose binary.
+**Third review, of those fixes.** The first fix for R-3 judged whether the outside change protected less, put
+only such a value back, and let go of the key otherwise. A third reviewer read that commit and showed two ways
+round it, and several lesser defects in the same logic and in the set-aside:
+
+| ID | Severity | Finding in the first fix of R-3 to R-10 | Now |
+|---|---|---|---|
+| T-1 | Medium | Two steps (a harmless-looking change first, so that Goose Web let go of the key, then the real one), or another endpoint together with the classifier switch, ended with the protection down and nothing said | No judgement any more: a key Goose Web wrote is put back whatever it was changed to |
+| T-2 | Low | What was written was recorded before the read-back; after a mismatch the next apply blamed a change "outside" | What Goose really holds is remembered; a mismatch stays a failure of its own |
+| T-3 | Low | A write that landed while the apply was interrupted (gateway stopping, a lost answer) belonged to nobody afterwards | What is about to be written is recorded first; an interrupted apply is recorded too |
+| T-4 | Low | The notice was lost when a later step of the same apply failed, and reached only administrators connected at that moment | Sent whenever something was put back; also in the audit and, until the next time, on the page |
+| T-5 | Low | A false "changed outside" notice for the classifier switch | That category no longer exists |
+| T-6 | Low | A removed key was restored without saying so | Reported like a changed one |
+| T-7, T-8 | Low | Set-aside pruning went by the file's own date, which the member's agent controls, and stopped at the first file it could not delete | The file is dated when it is set aside and never pruned in the same step; attributes are cleared; one failure does not stop the rest |
+| T-9 | Low | The other half of R-6: the hub kept a socket when the check itself raised | Closed |
+
+These last fixes were not reviewed again. They are covered by tests in `tests/test_goosesec.py` (checked by running
+them against the code as it was before each round of fixes: every test of an R or T finding fails there), the whole
+suite on Python 3.11 and 3.13, and a throwaway gateway run with the real Goose binary. Not tested against a real
+Goose: how Goose returns value types other than the ones Goose Web writes.

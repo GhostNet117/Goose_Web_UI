@@ -73,12 +73,16 @@ recipes); Goose Web now configures them where Goose reads them. No database sche
   first review had been read by nobody but their author, so they were reviewed again before release. Two of the
   fixes had introduced regressions, both corrected: an agent started in an MXC container after an AppContainer
   fallback was pointed at a classifier address it could not reach; and in the administrator's Goose profile a
-  setting Goose Web had written and something later weakened was silently accepted as the administrator's own. Such
-  a setting is now put back, audited and shown (a stricter one is still kept). Also: a setting that merely equals
-  Goose Web's is no longer treated as Goose Web's; the backup on take-over is written first; a WebSocket whose
-  rights cannot be re-checked is closed; refused change-password requests write one audit row per window; set-aside
-  profile files get unique names and the newest five are kept; every YAML parser error leads to the set-aside;
-  `taskkill` by full path. **Known and open:** one profile can keep the classification endpoint busy so that other
+  setting Goose Web had written and something later weakened was silently accepted as the administrator's own. A
+  third review of that fix showed ways round a rule that only put "weaker" values back, so the rule is now simple:
+  **a setting Goose Web wrote in the administrator's Goose profile stays Goose Web's.** Changed or removed in the
+  file, it is put back at the next start, with the changed value saved, an audit entry, a notice and a line on the
+  page. What was there before Goose Web first wrote a setting is still kept. Also: a setting that merely equals
+  Goose Web's is no longer treated as Goose Web's; the backup on take-over is written first; an interrupted apply
+  no longer leaves values that belong to nobody; a WebSocket whose sign-in or rights cannot be re-checked is closed;
+  refused change-password requests write one audit row per window; set-aside profile files get unique names, the
+  newest five are kept and the pruning cannot be steered by the file's date or attributes; every YAML parser error
+  leads to the set-aside; `taskkill` by full path. **Known and open:** one profile can keep the classification endpoint busy so that other
   profiles' requests end in `503` and Goose uses its patterns only for those calls (14.3, with measurements).
 - **Command line:** `goose-web security status | on | off | rotate-tokens`; `goose-web check` shows the state.
   **API:** `GET/PUT /api/admin/goose-security`, `POST .../check`, `POST .../rotate`.

@@ -2018,8 +2018,11 @@ class Hub:
                 try:
                     ok = c.still_valid()
                 except Exception:
+                    # fail closed (reviews of 2026-11-12, R-6 / T-9): while the check itself fails (the database
+                    # cannot be read), a disabled user's or a revoked session's socket must not stay open. The
+                    # browser reconnects, and the new socket is authenticated from scratch.
                     log.exception("socket re-validation")
-                    ok = True
+                    ok = False
                 if not ok:
                     log.info("closing a socket of %s: its sign-in is no longer valid", c.user.get("username"))
                     c.disconnect("sign-in no longer valid")

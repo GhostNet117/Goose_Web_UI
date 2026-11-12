@@ -1168,18 +1168,20 @@ managed). Set it for any second or throwaway gateway on the same computer whose 
 folder: every gateway applies these settings to its administrator's Goose profile when it starts.
 
 That profile is the administrator's own Goose, so Goose Web only manages what it wrote there itself. It remembers
-the values it set and replaces or removes only those. A value you set yourself is kept and listed on the page as
-"kept": a stricter threshold, your own classifier endpoint with its switch and token, a setting you made stricter in
-Goose Desktop after Goose Web wrote it. *Take them over* replaces them with Goose Web's values after saving the
-previous ones (never the token) to `<system_dir>\backups\native-security\`. If the feature is off and Goose Web never
-wrote anything, it does not touch that profile at all.
+the values it set and replaces or removes only those. A value that was there **before** Goose Web first wrote that
+setting is kept and listed on the page as "kept": a threshold of your own, your own classifier endpoint with its
+switch and token. *Take them over* replaces them with Goose Web's values after saving the previous ones (never the
+token) to `<system_dir>\backups\native-security\`. If the feature is off and Goose Web never wrote anything, it does
+not touch that profile at all.
 
-One thing is not kept: a value Goose Web wrote that is later changed to something that protects **less** (detection
-or the classifier switched off, a threshold above the one set here). Anything that can write your Goose
-configuration could otherwise switch the protection off without anyone noticing. At its next start, or at *Apply
-now*, the gateway puts the value back, saves the changed one to `<system_dir>\backups\native-security\`, writes an
-audit entry (`goosesec.native`, `reasserted`) and tells administrators. To really turn the protection down for that
-profile, do it here: the page, `goose-web security off`, or `guard.native_profile: false`.
+A setting Goose Web **did** write stays Goose Web's. If it is later changed or removed in the file (in Goose
+Desktop's settings, by hand, by anything that can write your Goose configuration), the gateway puts its own value
+back at its next start or at *Apply now*, whatever the new value was. It saves the changed value to
+`<system_dir>\backups\native-security\`, writes an audit entry (`goosesec.native`, `reasserted`), tells the
+administrators who are connected, and shows "Put back on ..." on the page. The reason: otherwise anything running
+under your Windows account could switch the protection off, or weaken it in two harmless-looking steps, without
+anyone noticing. To change these settings for that profile, do it here: the page, `goose-web security off`, or
+`guard.native_profile: false` to manage that profile entirely by yourself.
 
 **The classification endpoint.** `http://127.0.0.1:<guard.classifier_port>/classify` (default 8711), a listener of
 its own that answers only classification requests:

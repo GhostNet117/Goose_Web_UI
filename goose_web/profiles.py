@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import time
 from pathlib import Path
 from typing import Any
@@ -456,14 +457,31 @@ class Profiles:
         while dst.exists():
             n += 1
             dst = dst_dir / f"{p.name}.{stamp}-{n}.unreadable"
+        # The member's agent owns the file's attributes and times (third review, T-7 / T-8): a read-only file could
+        # not be moved across volumes or pruned later, and a back-dated one would be pruned at once.
+        try:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
         shutil.move(str(p), str(dst))   # also across volumes (system_dir may be on another disk)
         try:
-            old = sorted((f for f in dst_dir.glob(f"{p.name}.*.unreadable") if f.is_file()),
-                         key=lambda f: f.stat().st_mtime, reverse=True)[self.SET_ASIDE_KEEP:]
-            for f in old:
-                f.unlink()
+            os.utime(dst)               # set aside NOW, whatever date the file carried
         except OSError:
-            log.exception("profile %s: pruning old set-aside files", user.get("username"))
+            pass
+        others = []
+        for f in dst_dir.glob(f"{p.name}.*.unreadable"):
+            try:
+                if f != dst and f.is_file() and not f.is_symlink():
+                    others.append((f.stat().st_mtime, f))
+            except OSError:
+                continue
+        for _, f in sorted(others, key=lambda t: t[0], reverse=True)[max(0, self.SET_ASIDE_KEEP - 1):]:
+            try:   # one file that cannot be deleted must not end the pruning of the others
+                os.chmod(f, stat.S_IWRITE | stat.S_IREAD)
+                f.unlink()
+            except OSError as e:
+                log.warning("profile %s: an old set-aside file could not be removed (%s: %s)", user.get("username"),
+                            f.name, e.__class__.__name__)
         log.warning("profile %s: %s was not readable (%s); moved to %s and rebuilt", user.get("username"), p.name,
                     problem, dst)
         self.db.audit("profile.file.set_aside", user=user, target=str(user.get("username") or ""),

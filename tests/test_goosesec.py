@@ -414,19 +414,23 @@ async def test_native_values_the_administrator_set_are_kept(env, tmp_path):
     assert st["ok"] and up.cfg() == {"GOOSE_MODE": "auto"} and up.secrets == {} and st["written"] == {}
 
 
-async def test_native_changed_by_hand_after_goose_web_wrote_it_is_kept(env, tmp_path):
+async def test_native_changed_by_hand_after_goose_web_wrote_it_is_put_back(env, tmp_path):
+    """A key Goose Web wrote stays Goose Web's (reviews R-3, T-1): also a change that looks stricter is put back,
+    because a key Goose Web let go of could be weakened later without anyone noticing. What is kept is what was
+    there before Goose Web first wrote the key (test_native_values_the_administrator_set_are_kept)."""
     s, db, pr, c = env
     admin, cdir = native_admin(db, tmp_path)
     up = FakeUp(cdir)
     assert (await apply(s, db, up, admin, cdir))["ok"]
     cfg = up.cfg()
-    cfg["SECURITY_PROMPT_THRESHOLD"] = 0.4                                  # the administrator makes it stricter in Goose Desktop
+    cfg["SECURITY_PROMPT_THRESHOLD"] = 0.4                                  # changed in Goose Desktop, or by anything else
     (cdir / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
     st = await apply(s, db, up, admin, cdir)
-    assert st["ok"] and up.cfg()["SECURITY_PROMPT_THRESHOLD"] == 0.4 and st["foreign"] == [KEYS[1]]
+    assert st["ok"] and up.cfg()["SECURITY_PROMPT_THRESHOLD"] == 0.8 and st["foreign"] == []
+    assert st["reasserted"] == [KEYS[1]] and json.loads(Path(st["configBackup"]).read_text(encoding="utf-8")) == {KEYS[1]: 0.4}
     GS.save(db, GS.clean({"enabled": False}))
     st = await apply(s, db, up, admin, cdir)
-    assert up.cfg()["SECURITY_PROMPT_THRESHOLD"] == 0.4 and KEYS[0] not in up.cfg()   # ours removed, theirs kept
+    assert not any(k in up.cfg() for k in KEYS) and st["written"] == {}     # all Goose Web's: all removed
 
 
 async def test_native_off_while_goose_cannot_be_asked_is_a_failure_not_done(env, tmp_path):
@@ -629,11 +633,13 @@ async def test_native_sync_applies_only_on_drift_and_restarts_the_worker(env, tm
     cfg = up.cfg()
     cfg.pop("SECURITY_PROMPT_ENABLED")                                    # someone removed a key
     (cdir / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
-    assert "SECURITY_PROMPT_ENABLED" in GS.native_drift(cdir, GS.profile_plan(GS.load(db), native=True,
-                                                        token=GS.token_for(db, admin["id"]), endpoint=ENDPOINT),
-                                                        GS.native_state(db))
+    assert GS.native_drift(cdir, GS.profile_plan(GS.load(db), native=True, token=GS.token_for(db, admin["id"]),
+                                                 endpoint=ENDPOINT), GS.native_state(db)) == \
+        ["SECURITY_PROMPT_ENABLED removed outside Goose Web"]
     st = await GS.sync_native(fc)
-    assert st["changed"] == ["SECURITY_PROMPT_ENABLED"] and up.cfg()["SECURITY_PROMPT_ENABLED"] is True
+    assert st["changed"] == ["SECURITY_PROMPT_ENABLED put back (it had been removed outside Goose Web)"]
+    assert up.cfg()["SECURITY_PROMPT_ENABLED"] is True and st["reasserted"] == ["SECURITY_PROMPT_ENABLED"]
+    assert len(notices) == 1 and "put back: SECURITY_PROMPT_ENABLED" in notices[0]["params"]["message"]   # T-6
     GS.rotate_key(db)                                                     # new tokens: drift, the secret is rewritten
     up.calls.clear()
     assert (await GS.sync_native(fc))["ok"] and ("upsert", TOKEN_KEY, True) in up.calls
@@ -688,24 +694,40 @@ async def test_native_value_weakened_after_goose_web_wrote_it_is_put_back(env, t
     assert up.cfg()[KEYS[1]] == 0.8 and st["reasserted"] == [KEYS[1]]
 
 
-async def test_native_value_made_stricter_or_another_classifier_is_kept_and_looked_at_once(env, tmp_path):
-    """R-3, the other direction: what protects more, or cannot be judged, stays the administrator's choice - but it
-    is drift once, so it is recorded instead of passing unnoticed."""
+async def test_native_key_goose_web_wrote_is_put_back_whatever_it_was_changed_to(env, tmp_path):
+    """T-1: judging "weaker or stricter" left ways round it. Two steps (a harmless-looking change first, so that
+    Goose Web let go of the key, then the real one) and the classifier group (another endpoint together with the
+    switch) both ended with the protection down and nothing said."""
     s, db, pr, c = env
     admin, cdir = native_admin(db, tmp_path)
     up = FakeUp(cdir)
     st = await apply(s, db, up, admin, cdir)
-    rewrite(cdir, **{KEYS[1]: 0.4, KEYS[3]: THEIRS})
-    assert GS.native_drift(cdir, native_plan(db, admin), st) == [f"{KEYS[1]} changed outside Goose Web",
+    tok = up.secrets[TOKEN_KEY]
+    rewrite(cdir, **{KEYS[1]: 0.79})                                         # step 1: a little stricter
+    st = await apply(s, db, up, admin, cdir)
+    assert up.cfg()[KEYS[1]] == 0.8 and st["reasserted"] == [KEYS[1]] and KEYS[1] in st["written"]
+    rewrite(cdir, **{KEYS[1]: 1.0})                                          # step 2: off in all but name
+    assert GS.native_drift(cdir, native_plan(db, admin), st) == [f"{KEYS[1]} changed outside Goose Web"]
+    st = await apply(s, db, up, admin, cdir)
+    assert up.cfg()[KEYS[1]] == 0.8 and st["reasserted"] == [KEYS[1]]
+    rewrite(cdir, **{KEYS[0]: "true"})                                       # a string where Goose wants a boolean
+    st = await apply(s, db, up, admin, cdir)
+    assert up.cfg()[KEYS[0]] is True and st["reasserted"] == [KEYS[0]]
+    rewrite(cdir, **{KEYS[3]: ENDPOINT + "?x", KEYS[2]: False})              # the group: another endpoint + switch off
+    assert GS.native_drift(cdir, native_plan(db, admin), st) == [f"{KEYS[2]} changed outside Goose Web",
                                                                  f"{KEYS[3]} changed outside Goose Web"]
     st = await apply(s, db, up, admin, cdir)
-    assert st["ok"] and up.cfg()[KEYS[1]] == 0.4 and up.cfg()[KEYS[3]] == THEIRS
-    assert st["foreign"] == [KEYS[1], KEYS[3]] and st["reasserted"] == [] and "configBackup" not in st
-    assert GS.native_drift(cdir, native_plan(db, admin), st) == []          # theirs now: not asked again
-    assert GS._weaker(KEYS[1], 0.4, 0.8) is False and GS._weaker(KEYS[1], 0.8, 0.8) is False
-    assert GS._weaker(KEYS[1], 0.9, 0.8) and GS._weaker(KEYS[1], True, 0.8) and GS._weaker(KEYS[1], None, 0.8)
-    assert GS._weaker(KEYS[0], False, True) and GS._weaker(KEYS[0], "false", True) and not GS._weaker(KEYS[0], "true", True)
-    assert not GS._weaker(KEYS[0], False, False) and not GS._weaker(KEYS[3], THEIRS, ENDPOINT)
+    assert st["ok"] and [up.cfg()[k] for k in KEYS] == [True, 0.8, True, ENDPOINT] and st["foreign"] == []
+    assert st["reasserted"] == [KEYS[2], KEYS[3]] and set(st["written"]) == set(KEYS) and up.secrets[TOKEN_KEY] == tok
+    assert GS.native_drift(cdir, native_plan(db, admin), st) == []
+    assert st["putBack"]["keys"] == [KEYS[2], KEYS[3]]
+    st = await apply(s, db, up, admin, cdir)                                 # nothing to do: the last put-back stays on record
+    assert st["reasserted"] == [] and st["changed"] == [] and st["putBack"]["keys"] == [KEYS[2], KEYS[3]]
+
+
+def test_same_takes_an_integer_and_a_float_for_one_number_and_nothing_else_loosely():
+    assert GS._same(1, 1.0) and GS._same(0.8, 0.8) and GS._same("a", "a") and not GS._same(0.8, 0.79)
+    assert not GS._same(True, 1) and not GS._same("true", True) and not GS._same("0.8", 0.8) and not GS._same(None, 0)
 
 
 async def test_native_sync_audits_and_tells_administrators_about_a_change_made_outside(env, tmp_path):
@@ -721,13 +743,85 @@ async def test_native_sync_audits_and_tells_administrators_about_a_change_made_o
     assert len(notices) == 1 and f"put back: {KEYS[0]}" in notices[0]["params"]["message"]
     rows = db.query("SELECT ok, detail FROM audit WHERE action='goosesec.native' ORDER BY id")
     assert len(rows) == 2 and rows[1]["ok"] and rows[1]["detail"]["reasserted"] == [KEYS[0]]
-    rewrite(cdir, **{KEYS[1]: 0.4})                                          # stricter: kept, but said and audited
-    st = await GS.sync_native(fc)
-    assert st["ok"] and st["changed"] == [] and up.cfg()[KEYS[1]] == 0.4 and st["foreign"] == [KEYS[1]]
-    assert len(notices) == 2 and f"kept as changed: {KEYS[1]}" in notices[1]["params"]["message"]
-    assert len(db.query("SELECT id FROM audit WHERE action='goosesec.native'")) == 3
     up.calls.clear()
-    assert (await GS.sync_native(fc))["ok"] and up.calls == [] and len(notices) == 2     # looked at once
+    assert (await GS.sync_native(fc))["ok"] and up.calls == [] and len(notices) == 1     # settled: Goose is not asked
+    assert GS.native_state(db)["putBack"]["keys"] == [KEYS[0]]                            # for Admin > Prompt guard
+
+
+async def test_native_put_back_is_said_even_when_a_later_step_of_the_apply_fails(env, tmp_path):
+    """T-4: the notice was only sent after a completely successful apply, and never again afterwards."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    fc, notices, worker = fake_ctx(s, db, pr, FakeUp(cdir))
+    assert (await GS.sync_native(fc))["ok"]
+
+    class TokenFails(FakeUp):
+        async def request(self, method, params=None, timeout=None):
+            if method.endswith("config/upsert") and (params or {}).get("isSecret"):
+                raise TimeoutError("goose did not answer")
+            return await super().request(method, params, timeout)
+
+    up = TokenFails(cdir)
+    fc.upstream_for = lambda u: up
+    rewrite(cdir, **{KEYS[2]: False})
+    st = await GS.sync_native(fc)
+    assert st["ok"] is False and up.cfg()[KEYS[2]] is True and st["reasserted"] == [KEYS[2]]
+    said = [n["params"]["message"] for n in notices]
+    assert any(f"put back: {KEYS[2]}" in m for m in said) and any("could not be applied" in m for m in said)
+    row = db.query("SELECT ok, detail FROM audit WHERE action='goosesec.native' ORDER BY id DESC LIMIT 1")[0]
+    assert not row["ok"] and row["detail"]["reasserted"] == [KEYS[2]]
+
+
+async def test_native_read_back_mismatch_is_a_failure_of_its_own_not_a_change_made_outside(env, tmp_path):
+    """T-2: `written` was recorded before the read-back, so the next apply found "its" value changed and blamed
+    someone else: a false notice, or a put-back that failed again at every start with a backup file each time."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+
+    class StoresAnotherType(FakeUp):
+        async def request(self, method, params=None, timeout=None):
+            if method.endswith("config/upsert") and (params or {}).get("key") == KEYS[1]:
+                params = {**params, "value": str(params["value"])}          # Goose keeps "0.8" where 0.8 was sent
+            return await super().request(method, params, timeout)
+
+    up = StoresAnotherType(cdir)
+    for _ in range(3):
+        st = await apply(s, db, up, admin, cdir)
+        assert st["ok"] is False and "did not read back" in st["error"]
+        assert st["reasserted"] == [] and "configBackup" not in st and st["written"][KEYS[1]] == "0.8"
+    assert not (s.system_dir / "backups" / "native-security").exists()
+
+
+@pytest.mark.parametrize("how", ["the gateway stops", "the answer is lost"])
+async def test_native_apply_that_is_interrupted_keeps_what_it_wrote_as_its_own(env, tmp_path, how):
+    """T-3: with R-4 (an equal value Goose Web never wrote is not its own) a write that landed while the apply was
+    interrupted belonged to nobody afterwards: "off" left detection on, a new threshold was never applied."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+
+    class Interrupted(FakeUp):
+        async def request(self, method, params=None, timeout=None):
+            r = await super().request(method, params, timeout)              # the write lands in Goose ...
+            if method.endswith("config/upsert") and (params or {}).get("key") == KEYS[1]:
+                raise asyncio.CancelledError() if how == "the gateway stops" else TimeoutError("no answer")
+            return r
+
+    up = Interrupted(cdir)
+    if how == "the gateway stops":
+        with pytest.raises(asyncio.CancelledError):
+            await apply(s, db, up, admin, cdir)
+        assert GS.native_state(db)["error"] == "interrupted"
+    else:
+        assert (await apply(s, db, up, admin, cdir))["ok"] is False
+    st = GS.native_state(db)
+    assert st["ok"] is False and st["written"] == {KEYS[0]: True} and up.cfg()[KEYS[1]] == 0.8
+    assert st["pending"] == {KEYS[1]: 0.8, KEYS[2]: True, KEYS[3]: ENDPOINT}
+    st = await apply(s, db, FakeUp(cdir), admin, cdir)                      # the next start finishes the job
+    assert st["ok"] and set(st["written"]) == set(KEYS) and st["pending"] == {} and st["foreign"] == []
+    assert st["reasserted"] == [] and sorted(st["changed"]) == sorted([KEYS[2], KEYS[3], f"{TOKEN_KEY} set"])
+    GS.save(db, GS.clean({"enabled": False}))
+    assert (await apply(s, db, FakeUp(cdir), admin, cdir))["ok"]
+    assert not any(k in FakeUp(cdir).cfg() for k in KEYS)                   # "off" removes all of it
 
 
 async def test_native_value_equal_to_the_plan_that_goose_web_never_wrote_stays_the_administrators(env, tmp_path):
@@ -784,9 +878,22 @@ def test_env_mxc_start_after_an_appcontainer_fallback_gets_the_real_address(env,
     assert wm._sandbox_env(w, "appcontainer")[KEYS[3]] == "http://127.64.0.9:8711/classify"
 
 
-def test_a_socket_whose_rights_cannot_be_checked_is_closed():
-    """R-6: the re-validation failed open (any exception kept the socket with its old rights)."""
+def test_a_socket_whose_check_fails_is_closed_not_kept():
+    """R-6 / T-9: both halves of the re-validation failed open - the hub when the check raised (its sign-in part:
+    the database cannot be read), and the check itself when only its rights part raised."""
     import re
+    from goose_web.hub import Hub
+    closed = []
+
+    def boom():
+        raise RuntimeError("database is locked")
+    clients = [SimpleNamespace(still_valid=boom, closed=False, user={"username": "x"}, disconnect=closed.append),
+               SimpleNamespace(still_valid=lambda: True, closed=False, user={"username": "y"}, disconnect=closed.append),
+               SimpleNamespace(still_valid=lambda: False, closed=False, user={"username": "z"}, disconnect=closed.append),
+               SimpleNamespace(still_valid=None, closed=False, user={"username": "n"}, disconnect=closed.append)]
+    Hub.revalidate_clients(SimpleNamespace(upstreams={"k": SimpleNamespace(clients=clients)}))
+    assert len(closed) == 2                                                  # the failing check and the invalid one
+    # the rights part is a closure of the WebSocket handler: its except branch is checked in the source
     src = (Path(wk.__file__).parent / "app.py").read_text(encoding="utf-8")
     m = re.search(r'log\.exception\("socket re-validation \(rights\)"\)\s*\n\s*return (\w+)', src)
     assert m and m.group(1) == "False"
@@ -809,7 +916,32 @@ def test_set_aside_files_get_unique_names_and_only_the_newest_are_kept(env):
     assert len(db.query("SELECT id FROM audit WHERE action='profile.file.set_aside'")) == total
 
 
-@pytest.mark.parametrize("text", ["x: 2001-99-99\n", "a: " + "[" * 3000 + "]" * 3000 + "\n", "\x00\x01 not text"])
+def test_set_aside_pruning_cannot_be_steered_by_the_file_s_date_or_attributes(env):
+    """T-7 / T-8: the member's agent owns the file's date and attributes. A back-dated file was pruned at once (the
+    log and the audit then named a path that was gone); a read-only one could never be pruned, and that ended the
+    bound for good."""
+    import os
+    import stat
+    s, db, pr, c = env
+    alice = member(db)
+    pr.provision(alice)
+    p = pr.config_dir(alice) / "config.yaml"
+    folder = s.system_dir / "backups" / "profiles" / "alice"
+    for i in range(pr.SET_ASIDE_KEEP + 2):
+        p.write_text(f"GOOSE_MODE: [read-only-{i}-\n", encoding="utf-8")
+        os.chmod(p, stat.S_IREAD)
+        pr.provision(alice)
+    assert len(list(folder.glob("config.yaml.*.unreadable"))) == pr.SET_ASIDE_KEEP
+    p.write_text("GOOSE_MODE: [back-dated-\n", encoding="utf-8")
+    os.utime(p, (1_000_000_000, 1_000_000_000))                              # 2001: older than everything kept
+    pr.provision(alice)
+    kept = [f.read_text(encoding="utf-8") for f in folder.glob("config.yaml.*.unreadable")]
+    assert len(kept) == pr.SET_ASIDE_KEEP and "GOOSE_MODE: [back-dated-\n" in kept
+    last = db.query("SELECT detail FROM audit WHERE action='profile.file.set_aside' ORDER BY id DESC LIMIT 1")[0]
+    assert Path(last["detail"]["movedTo"]).is_file()
+
+
+@pytest.mark.parametrize("text", ["x: 2001-99-99\n", "a: " + "[" * 3000 + "]" * 3000 + "\n"])
 def test_every_parser_error_leads_to_the_set_aside(env, text):
     """R-10: a bad date is a ValueError and deep nesting a RecursionError, not a YAMLError; each still blocked every
     start of that member's agent."""
@@ -824,6 +956,7 @@ def test_every_parser_error_leads_to_the_set_aside(env, text):
 
 
 def test_something_that_is_not_a_file_in_place_of_config_yaml_still_fails_the_start(env):
+    """Unchanged behaviour, pinned: a folder (or a link to one) is not moved anywhere; the start fails."""
     s, db, pr, c = env
     alice = member(db)
     pr.provision(alice)
