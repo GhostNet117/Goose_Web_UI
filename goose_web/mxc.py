@@ -908,11 +908,11 @@ def hardlink_escapes(rw_paths: list[str], seconds: float = HARDLINK_SCAN_SECONDS
                 if seen > max_entries or time.monotonic() > end:
                     return found, False, seen
                 try:
-                    if e.is_symlink() or e.is_junction():
+                    # FILE_ATTRIBUTE_REPARSE_POINT covers junctions, symlinks and mount points on every Python
+                    # (DirEntry.is_junction() exists only from 3.12; Goose Web supports 3.11).
+                    if e.is_symlink() or getattr(e.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400:
                         continue
                     if e.is_dir(follow_symlinks=False):
-                        if getattr(e.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400:
-                            continue                      # FILE_ATTRIBUTE_REPARSE_POINT (mount point and the like)
                         stack.append(e.path)
                         continue
                     if not e.is_file(follow_symlinks=False) or os.lstat(e.path).st_nlink < 2:

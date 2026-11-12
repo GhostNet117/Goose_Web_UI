@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.19.2 - 2026-11-12
+
+- **Fix: Python 3.11 support for the MXC backend.** The hard-link check before an MXC start (MX-3) used `DirEntry.is_junction()`, which exists only from Python 3.12, so on 3.11 every sandboxed member's start failed (CI, Python 3.11). It now skips junctions, symlinks and mount points by their reparse-point attribute on every Python version.
+
 ## 1.19.1 - 2026-11-12
 
 **Security review of the MXC backend: a sturdier egress proxy, grant filter and executor launch.** FIX of the security
