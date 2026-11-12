@@ -19,6 +19,8 @@ logs/
 backups/
 profiles/
 _system/
+# Spec 025: the pinned MXC executor (goose-web sandbox install-mxc), never committed
+/vendor/
 secrets.yaml
 config.local.yaml
 config.yaml

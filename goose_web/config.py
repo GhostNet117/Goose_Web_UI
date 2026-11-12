@@ -48,6 +48,45 @@ def sandbox_on(settings: "Settings") -> bool:
     return bool(v)
 
 
+SANDBOX_BACKENDS = ("mxc", "appcontainer")
+SANDBOX_FALLBACKS = ("none", "appcontainer")
+
+
+def sandbox_backend(settings: "Settings") -> str:
+    """sandbox.backend (spec 025): "mxc" (default, Microsoft Execution Containers) or "appcontainer" (spec 012).
+    Anything else is "invalid": sandboxed workers then refuse to start (fail closed), never run unsandboxed."""
+    v = str(settings.get("sandbox", "backend") or "mxc").strip().lower()
+    return v if v in SANDBOX_BACKENDS else "invalid"
+
+
+def sandbox_fallback(settings: "Settings") -> str:
+    """sandbox.fallback (spec 025): "none" (default: MXC unavailable = fail closed) or "appcontainer"."""
+    v = str(settings.get("sandbox", "fallback") or "none").strip().lower()
+    return v if v in SANDBOX_FALLBACKS else "invalid"
+
+
+def sandbox_config_problems(settings: "Settings") -> list[str]:
+    """Configuration errors of the sandbox section; each one makes sandboxed workers fail closed."""
+    out = []
+    if sandbox_backend(settings) == "invalid":
+        out.append(f"sandbox.backend is {settings.get('sandbox', 'backend')!r}; use one of: "
+                   + ", ".join(SANDBOX_BACKENDS))
+    if sandbox_fallback(settings) == "invalid":
+        out.append(f"sandbox.fallback is {settings.get('sandbox', 'fallback')!r}; use one of: "
+                   + ", ".join(SANDBOX_FALLBACKS))
+    net = str(settings.get("sandbox", "network") or "internet").strip().lower()
+    if net not in ("none", "internet", "internet+lan"):
+        out.append(f"sandbox.network is {net!r}; use one of: none, internet, internet+lan")
+    for key, lo, hi in (("proxy_max_connections", 1, 4096), ("proxy_idle_seconds", 10, 86400)):
+        try:
+            n = int(settings.get("sandbox", key))
+            if not lo <= n <= hi:
+                raise ValueError
+        except (TypeError, ValueError):
+            out.append(f"sandbox.{key} is {settings.get('sandbox', key)!r}; use a number from {lo} to {hi}")
+    return out
+
+
 def default_native_goose_root() -> str:
     """Where Goose keeps its profile when GOOSE_PATH_ROOT is not set (config/ and data/ live below it)."""
     if IS_WINDOWS:
@@ -100,12 +139,23 @@ DEFAULTS: dict[str, Any] = {
         "extra_env": {},
         "default_workdir_native": "",     # admin native profile: default folder for new chats (default: home)
     },
-    # Windows: run every isolated non-admin user's worker in its own AppContainer (sandbox.py, spec 012).
+    # Windows: run every isolated non-admin user's worker in a sandbox of its own (spec 012, spec 025).
     "sandbox": {
         "enabled": "auto",                # auto = on for Windows, off elsewhere; true | false
+        # mxc = Microsoft Execution Containers (mxc.py, spec 025, default) | appcontainer = Goose Web's own
+        # AppContainer backend (sandbox.py, spec 012)
+        "backend": "mxc",
+        # MXC unavailable (not installed, altered, Windows too old, probe failed): none = members' agents do not
+        # start (fail closed) | appcontainer = they start in the AppContainer backend (logged and audited)
+        "fallback": "none",
         "network": "internet",            # none | internet | internet+lan (loopback is never reachable)
         "read_dirs": [],                  # extra program folders the workers may read and run (Python, node, uv, git)
-        "relays": [],                     # local services sandboxed workers may reach, e.g. ["127.0.0.1:4000"] (relay.py)
+        # local services sandboxed workers may reach, e.g. ["127.0.0.1:4000"]: AppContainer through relay.py, MXC
+        # through the member's egress proxy (egress.py)
+        "relays": [],
+        "mxc_dir": "",                    # default: <install folder>/vendor/mxc (goose-web sandbox install-mxc)
+        "proxy_max_connections": 64,      # MXC egress proxy: concurrent connections per member
+        "proxy_idle_seconds": 900,        # MXC egress proxy: a connection without traffic this long is closed
     },
     # Prompt guard (guard.py, spec 018): the local Prompt Guard 2 22M classifier. Teams switch the guard on in
     # Admin > Teams; these are the classifier's knobs. Nothing loads while no team (and not the admins) uses it.

@@ -1,5 +1,5 @@
 // Goose Web service worker: caches the app shell only. Never caches /api/* or /ws.
-const VERSION = 'gw-shell-v28';
+const VERSION = 'gw-shell-v29';
 const SHELL = [
   '/',
   '/manifest.webmanifest',

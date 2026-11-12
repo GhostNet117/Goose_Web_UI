@@ -24,6 +24,9 @@
     5b. Installs the Prompt Guard 2 22M model if it is missing ("goose-web guard install-model --if-missing": the
        pinned package from the project's GitHub release, SHA-256 checked; a warning, not a failure, when the
        download fails - then install it later, or offline with --file <zip>).
+    5c. Installs the pinned MXC sandbox executor if it is missing ("goose-web sandbox install-mxc --if-missing":
+       wxc-exec.exe from the npm package @microsoft/mxc-sdk, integrity/SHA-256/signature checked, into
+       <install>\vendor\mxc). Without it the next step fails while sandbox.backend is mxc (members would not start).
     6. Runs "goose-web check".
     7. Drains the gateway (new prompts refused for a moment, users told), checks once more that nothing runs, restarts
        the task and waits until /healthz answers; prints the old and new version. If a chat started meanwhile it
@@ -253,6 +256,14 @@ try {
     $r = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'guard', 'install-model', '--if-missing')
     $r.out | Where-Object { $_ } | ForEach-Object { Say "guard: $_" }
     if ($r.code) { Say "WARNING: the Prompt Guard model is not installed; the prompt guard fails open until it is (goose-web guard install-model, or --file <zip> without internet access; docs/ADMINISTRATION.md, Prompt guard)." }
+
+    # 5c. MXC sandbox executor (spec 025): the pinned wxc-exec.exe from the npm package @microsoft/mxc-sdk (npm
+    # integrity, SHA-256 and Microsoft signature checked) into <install>\vendor\mxc if it is missing. Without it
+    # sandboxed members' agents do not start (sandbox.backend: mxc fails closed), so "check" below then fails and the
+    # gateway is not restarted.
+    $r = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'sandbox', 'install-mxc', '--if-missing')
+    $r.out | Where-Object { $_ } | ForEach-Object { Say "mxc: $_" }
+    if ($r.code) { Say "WARNING: the MXC executor is not installed (goose-web sandbox install-mxc, or --file <tgz> without internet access; docs/ADMINISTRATION.md, MXC sandbox)." }
 
     # 6. check (the gateway still runs; "port in use" is expected)
     $r = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'check')

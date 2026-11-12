@@ -209,18 +209,30 @@ class Ctx:
         if not self.sandboxed(user):
             return None
         from . import sandbox as sb
+        from .config import default_native_goose_root, sandbox_backend, sandbox_config_problems
         root = str(self.profiles.root_for(user))
         read_dirs = [str(d) for d in (self.settings.get("sandbox", "read_dirs") or []) if d]
-        net = str(self.settings.get("sandbox", "network") or "internet").lower()
+        net = str(self.settings.get("sandbox", "network") or "internet").strip().lower()
         from . import relay as rl
         name = sb.container_name(str(self.settings.profiles_root), user["username"])
         targets = [str(t) for t in (self.settings.get("sandbox", "relays") or []) if t]
         relays = rl.relay_specs(name, int(user["id"]), targets) if targets else []
-        if relays:   # the forwarder inside the container runs on the gateway's base Python
+        roots = self.roots_for(user)
+        mxc_grants = sb.desired_grants(root, roots, read_dirs, self.settings.goose_binary)
+        if relays:   # the AppContainer relay forwarder runs on the gateway's base Python (not needed with MXC)
             read_dirs = read_dirs + [rl.python_for_container()[1]]
+        from . import mxc
+        native = [default_native_goose_root(), str(self.db.get_setting("native_root") or "")]
+        # Spec 025: both backends' facts; the worker picks the backend at start (MXC, or the AppContainer fallback).
+        # Every value is stable between calls: a changed spec marks the worker for a restart when it is quiet.
         return {"name": name, "profile_root": root, "relays": relays,
-                "grants": sb.desired_grants(root, self.roots_for(user), read_dirs, self.settings.goose_binary),
-                "caps": sb.NETWORK_CAPS.get(net, sb.NETWORK_CAPS["internet"])}
+                "grants": sb.desired_grants(root, roots, read_dirs, self.settings.goose_binary),
+                "caps": sb.NETWORK_CAPS.get(net, sb.NETWORK_CAPS["internet"]),
+                "backend": sandbox_backend(self.settings), "config_problems": sandbox_config_problems(self.settings),
+                "network": net, "relay_targets": [r["target"] for r in relays], "mxc_grants": mxc_grants,
+                "profiles_root": str(self.settings.profiles_root), "system_dir": str(self.settings.system_dir),
+                "protected_write": mxc.protected_write_paths(self.settings),
+                "protected_any": sorted({p for p in native if p})}
 
     def public_user(self, u: dict) -> dict:
         return {"id": u["id"], "username": u["username"], "displayName": u["display_name"] or u["username"],

@@ -123,6 +123,8 @@ The main ideas:
 | `activity.py` | Spec 015: user activity log, JSON lines in `<system_dir>/logs/activity.jsonl` (every audit event + connections). |
 | `logjanitor.py` | Spec 015: keeps all logs under `logs.max_disk_percent` of the volume (oldest unused files first, copytruncate for a live worker log), prunes the audit table. |
 | `relay.py` | Spec 014: relays from sandboxed workers to allow-listed local services: per-user loopback address, the forwarder that runs inside the container (TCP to named pipe), `PipeRelayServer` (named pipe with a container-only DACL to TCP), and the provider URL rewrite/restore. 1.18.1: `state_mapping` reads the worker's relay record (`<system_dir>/sandbox/<container>.relays.json`) and `Profiles.provision` writes team provider and extension URLs with it applied (`rewrite_text`), so re-provisioning a sandboxed member is a no-op instead of putting the real loopback URL back (the member's chats timed out until the worker restarted). |
+| `mxc.py` | Spec 025: the MXC sandbox backend (default). `MXC_PIN` (npm package, integrity, `wxc-exec.exe` SHA-256/size/signer), `install` (download or `--file`, verify, atomic swap into `<install>/vendor/mxc/<version>`), `PinnedFile` / `verify_exe` (hash through a write-denied handle kept until launch), `authenticode`, `run_probe` / `probe_problems` / `build_problem`, `Availability` (thread-safe cache: success for the gateway's life, failure re-checked every 30 s), `filter_grants` / `grant_problem` (never the system folder, profiles root, other profiles, native profile, code folders for writing; junction-aware), `build_policy` (deterministic contract-1.0.0 request), `launch` (suspended start, job objects, `NtResumeProcess`), `explain_exit`, `summary`. |
+| `egress.py` | Spec 025: `EgressProxy`, the per-member loopback HTTP/CONNECT proxy of MXC workers (Basic credential compared in constant time; relays, public, LAN per `sandbox.network`; loopback, own addresses, link-local/metadata refused; DNS answers vetted and pinned; limits; `sandbox.egress` activity lines), and `ProxyRegistry` (one proxy per member key, kept across worker restarts). |
 | `sandbox.py` | Spec 012: per-user AppContainer (create/derive, folder grants with icacls, `CreateProcess` with `SECURITY_CAPABILITIES` and an inherited-handle allow-list, suspended start + job object) and `StdioChannel`, the newline-delimited JSON-RPC transport the hub uses instead of a WebSocket for sandboxed (`goose acp`) workers. |
 | `hub.py` | `Hub`, `Upstream`, `Client`, `SessionState`: relays ACP, rewrites ids, buffers and replays session updates, fans out asks, derives herd status, watches for external changes, audits calls. `broadcast_user` (1.18.2): one message to every socket of a user (the `_gw/prefs` notification). |
 | `control.py` | 1.16.0: the local control channel in `<system_dir>/run/` (`gateway.json`, `req-*.json` / `resp-*.json`): the gateway answers "what is running" (`Hub.busy_report`) and drains before a restart; the client side of `goose-web gateway status|drain|undrain`, with the fallback for gateways older than 1.16 (herd marks in the database). Section [7.8](#78-deploy-busy-check-and-drain-controlpy). |
@@ -254,6 +256,25 @@ if scheduler:
   `crashed`.
 
 Worker states: `stopped`, `starting`, `ready`, `crashed`.
+
+**Sandboxed workers (spec 012, spec 025).** For an isolated non-admin user `Ctx.sandbox_spec(user)` returns the
+facts of both backends (container name, profile root, AppContainer grants and capabilities, relay specs, and for MXC:
+`backend`, `config_problems`, `network`, `relay_targets`, `mxc_grants`, the protected folders). Every value is stable,
+so a changed spec (team folders, network, backend) sets `restart_pending`. `_start_sandboxed` picks the backend:
+
+1. invalid configuration -> `_fail_closed` (state `crashed`, `last_error` = the reason for administrators, the member
+   gets `mxc.SANDBOX_UNAVAILABLE_MSG` through `SandboxUnavailable`, audit `sandbox.unavailable` once per reason);
+2. `mxc` and `mxc.availability()` ok -> `_start_mxc`: undo AppContainer relay rewrites, `filter_grants`, ensure the
+   member's `EgressProxy` (new credential), `build_policy` with the allow-listed `_sandbox_env`, write
+   `<system_dir>/sandbox/mxc/<container>.json`, `mxc.launch` into the gateway job and a fresh worker job,
+   `StdioChannel`, 0.3 s early-exit check (`explain_exit` on the log tail);
+3. `mxc` unavailable -> `_fail_closed`, or with `sandbox.fallback: appcontainer` an audited `sandbox.fallback` and
+   `_start_appcontainer` (the spec 012 path); the monitor's `_back_to_mxc` sets `restart_pending` once MXC is back;
+4. `appcontainer` -> `_start_appcontainer`.
+
+`_kill` of an MXC worker closes stdin first (up to 3 s), removes the policy file, then ends the worker job. The egress
+proxies are closed at shutdown or when a member's worker starts without MXC; stale policy files are removed when the
+`WorkerManager` is created.
 
 ### 3.3 Logs
 

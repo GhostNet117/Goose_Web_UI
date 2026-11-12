@@ -14,7 +14,7 @@
     4. where Goose Web keeps its own data (users, teams, per-user profiles),
     5. which Windows account runs the gateway: you, starting when you sign in; or a service account (or gMSA)
        that starts it at boot without anyone signing in,
-    6. whether non-admin users' agents are sandboxed (Windows AppContainer, recommended).
+    6. whether non-admin users' agents are sandboxed (Microsoft Execution Containers, MXC; recommended).
   It shows a summary and asks before changing anything. Every question also has a parameter, so the same install
   can be scripted with -NonInteractive.
 
@@ -241,7 +241,7 @@ if (-not $service) { $RunAs = $id.Name }
 
 if (-not $NonInteractive -and -not $Sandbox) {
     Write-Host ""
-    Write-Host "6/6  Sandbox non-admin users' agents in a Windows AppContainer? Each one can then reach only its own"
+    Write-Host "6/6  Sandbox non-admin users' agents (MXC process containers)? Each one can then reach only its own"
     Write-Host "     profile, its team folder and the team's approved folders (administrators are never sandboxed)."
     $Sandbox = if ((Ask '     Sandbox (Y/n)' 'Y') -match '^[nN]') { 'off' } else { 'on' }
 }
@@ -348,7 +348,9 @@ if (-not (Test-Path $cfg)) {
         '  idle_minutes: 30',
         '  native_scheduler: auto   # auto = only while Goose Desktop is closed (prevents double-firing)',
         'sandbox:',
-        "  enabled: $(if ($Sandbox -eq 'off') { 'false' } else { 'true' })   # non-admin users' agents in a Windows AppContainer",
+        "  enabled: $(if ($Sandbox -eq 'off') { 'false' } else { 'true' })   # non-admin users' agents in a sandbox of their own",
+        '  backend: mxc             # mxc (Microsoft Execution Containers) | appcontainer',
+        '  fallback: none           # MXC unavailable: none = members do not start (fail closed) | appcontainer',
         '  network: internet        # none | internet | internet+lan (loopback is never reachable)',
         '  read_dirs: []            # extra program folders agents may run (Python, node, uv installs)'
     )
@@ -379,6 +381,13 @@ $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'   # its m
 try { & $venvPy -m goose_web --config $cfg guard install-model --if-missing; $guardRc = $LASTEXITCODE }
 finally { $ErrorActionPreference = $prevEap }
 if ($guardRc) { Warn "The Prompt Guard model is not installed (see above); the prompt guard fails open until it is. Run goose-web guard install-model later, or --file <zip> without internet access (docs/ADMINISTRATION.md, Prompt guard)." }
+# MXC sandbox executor (spec 025): the pinned wxc-exec.exe from the npm package @microsoft/mxc-sdk (about 38 MB
+# download; npm integrity, SHA-256 and Microsoft signature checked) into <install>\vendor\mxc. Without it sandboxed
+# members' agents do not start (fail closed) and "check" below fails. Offline: sandbox install-mxc --file <tgz>.
+$prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+try { & $venvPy -m goose_web --config $cfg sandbox install-mxc --if-missing; $mxcRc = $LASTEXITCODE }
+finally { $ErrorActionPreference = $prevEap }
+if ($mxcRc) { Warn "The MXC executor is not installed (see above). Run goose-web sandbox install-mxc (or --file <tgz> without internet access), or install with -Sandbox off / set sandbox.backend: appcontainer (docs/ADMINISTRATION.md, MXC sandbox)." }
 & $venvPy -m goose_web --config $cfg check
 if ($LASTEXITCODE) {
     throw "goose-web check failed (see the [!!] lines above). If the goose CLI was not found, re-run with -GooseBinary <path to goose.exe>."

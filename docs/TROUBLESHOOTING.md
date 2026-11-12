@@ -41,6 +41,7 @@ Examples in this guide use the address `https://goose.example.org`, the LAN addr
 17. [Reporting security issues](#17-reporting-security-issues)
 18. [Prompt guard](#18-prompt-guard)
 19. [Steer, Stop and state after a refresh](#19-steer-stop-and-state-after-a-refresh)
+20. [MXC sandbox (since 1.19.0)](#20-mxc-sandbox-since-1190)
 
 ---
 
@@ -715,6 +716,7 @@ The gateway sends these files with `Cache-Control: no-cache`.
 | Service-account gateway: `Access is denied` for the venv, Goose or the appdata folder in the gateway log | The account cannot read the install, Python or Goose folders, or write the appdata. | Re-run the installer with `-RunAs` (it grants them), or grant Read & execute / Modify yourself; prefer installs outside user profiles. |
 | A sandboxed user's chat fails with a provider or connection error, other users are fine | The container cannot reach 127.0.0.1; the provider runs on this machine's loopback. | Use a provider reachable over the network (set `sandbox.network: internet+lan` for a LAN server), or keep that user unsandboxed (administrator). ADMINISTRATION 11.6. |
 | A sandboxed agent says `Access is denied` for a folder it should use | The folder is not the user's profile, the team folder or one of the team's extra folders, or it did not exist when the worker started. | Add it to the team's extra folders (Experience > Folders); the grant is applied at the worker's next start (Admin > System > Restart). Programs: `sandbox.read_dirs`. Check with `goose-web sandbox status`. |
+| Chat: `The sandbox is unavailable, so your agent cannot start. Contact your administrator.` | MXC cannot run, so sandboxed members' agents do not start (fail closed). Admin > System (Sandbox card and the worker's last error), `gateway.log` (`sandbox mxc: UNAVAILABLE: ...`) and the audit (`sandbox.unavailable`) give the reason. | See section 20 (MXC sandbox). |
 | Worker error `sandbox: ...` / `cannot start goose in the sandbox` | Creating the AppContainer, changing a folder's ACL or starting the process failed (for example the gateway's account may not change permissions on an approved folder). | Read `worker-<user>.log` and the gateway log; fix the folder's permissions. |
 | Your hints changed in Goose Desktop too after `native-hints enable` | That is the point of managed native hints: one `.goosehints` for the native profile. | `native-hints disable` stops it; earlier versions are in `<system_dir>/backups/native-hints/`. |
 | `upgrade.ps1`: `Expected one gateway task for this install, found 0` | The install has no logon task (installed with `-NoService`, or the task was deleted). | Register it (`scripts\register-service.ps1`, elevated) or pass `-TaskName '\Folder\Name'`. |
@@ -817,3 +819,32 @@ steer-lost-on-slow-turn, 2026-11-10).
 | A chat that finished in Goose Desktop / the CLI / a scheduled job stays in **Done** although I looked at it | Done (since 1.16, administrators) is cleared only by an interaction in Goose Web: Goose Web cannot see what you open in Desktop or the CLI. | Open it in Goose Web, click **Clear** on its card, or **Mark all read** in the Herd's Done column. |
 | `upgrade.ps1` / a deploy says *Something is running in Goose Web* and lists chats (`gateway: BUSY: ...`) | Since 1.16.0 the busy check asks the gateway, which also sees turns waiting for long tool calls or sub-agents (the CPU check before 1.16 missed them and restarted anyway). | Wait, use `upgrade.ps1 -WaitHours 12`, or `-Force` to interrupt them (they then show *Interrupted*). `goose-web gateway status` shows what runs. |
 | The busy check says *state unknown: the gateway (pid N) did not answer* | A 1.16+ gateway did not answer its control channel (`<system_dir>\run\`) within 20 s: overloaded, hung, or the folder is not writable. | Check `gateway.log`; restart the gateway yourself when it is safe (users see *Interrupted* on running chats). |
+
+## 20. MXC sandbox (since 1.19.0)
+
+Start with `goose-web sandbox status` (exit 1 when sandboxed members cannot start) and `goose-web check`. The
+reason is also in Admin > System > Sandbox, in `gateway.log` (`sandbox mxc: ...` lines) and, for each refused
+start, in the audit log (`sandbox.unavailable`). Fix the cause; the gateway checks MXC again within 30 seconds, no
+restart needed. To keep members working meanwhile: `sandbox.fallback: appcontainer` (or `sandbox.backend:
+appcontainer`) in `config.yaml`, then restart the gateway.
+
+| Reason shown | Cause | Fix |
+| --- | --- | --- |
+| `...\wxc-exec.exe is not installed (run: goose-web sandbox install-mxc)` | The executor was never installed (an upgrade whose download failed, a new `sandbox.mxc_dir`). | `goose-web sandbox install-mxc`; offline: `npm pack @microsoft/mxc-sdk@1.0.1` elsewhere, then `install-mxc --file <tgz>`. |
+| `... does not match the pinned wxc-exec.exe 1.0.1 (SHA-256 ...); it is not run` | The file was changed or replaced (or a different version copied in by hand). Goose Web never runs it. | Find out who changed the install folder (`goose-web check` reports writable install folders), then `goose-web sandbox install-mxc --force`. |
+| `the Authenticode signature of wxc-exec.exe is 'NotSigned' / 'HashMismatch' / 'UnknownError'`, or `signed by '...', not by 'CN=Microsoft Corporation, ...'` | The signature check failed. `UnknownError` can mean that PowerShell could not check the certificate chain. | `install-mxc --force`; run `powershell Get-AuthenticodeSignature <path>` to see the details. |
+| `Windows build 26100.NNNN is older than 26100.9278 ...` | MXC process containers need Windows 11 24H2 / Server 2025 code base with the 2026 updates. | Install the Windows updates, or use `sandbox.backend: appcontainer`. |
+| `probe tier is '...'`, `this Windows lacks baseContainerSupports...`, `wxc-exec --probe did not answer` | MXC's own capability probe failed (`wxc-exec --probe` prints it). | Install the Windows updates; meanwhile use the AppContainer backend. |
+| `MXC refused to start the sandbox (policy_validation): ...` (worker last error) | MXC rejected the policy, for example a folder in `sandbox.read_dirs` or a team folder it cannot use. | Read `worker-<user>.log` from the last `==== ... (sandbox mxc` line; correct the folder setting. |
+| `a program in the container could not initialise (STATUS_DLL_INIT_FAILED ...)` | A program the agent starts needs a DLL from a folder the container cannot read. | Add the program's folder to `sandbox.read_dirs`. |
+| `sandbox configuration: sandbox.backend is 'xyz' ...` | A typo in `sandbox.backend`, `sandbox.fallback`, `sandbox.network` or the proxy limits. | Correct `config.yaml` and restart. |
+
+**Network inside MXC.** The agent's network goes through its egress proxy (HTTP/HTTPS only). In a member's chat:
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `403 Forbidden` from the proxy: `Goose Web sandbox: <host:port> is not allowed: ...` | The destination is not allowed for this member: loopback or this machine (only `sandbox.relays`), a LAN address with `network: internet`, a link-local/metadata address, or `network: none`. | Add the local service to `sandbox.relays`, or set `sandbox.network: internet+lan`. The refusal is in the activity log (`sandbox.egress`, `decision: refused`) and in `gateway.log`. |
+| `407 Proxy Authentication Required` | A program sent a request without the member's credential, for example Windows' own certificate-revocation download (harmless: HTTPS still works) or a tool that strips credentials from the proxy URL. | Use a tool that keeps the credential from `HTTP_PROXY`; revocation lookups need nothing. |
+| `503 ... too many connections` | More than `sandbox.proxy_max_connections` open connections for this member. | Raise the limit; look for a tool that opens connections in a loop. |
+| ssh, git over ssh, a database client or a Node 22 `fetch` time out or are refused | No HTTP proxy support: those have no network in an MXC container (accepted for MXC). | Use HTTPS remotes; Node 24+ honours the proxy (`NODE_USE_ENV_PROXY=1` is set); otherwise the AppContainer backend. |
+| A model provider on this machine is unreachable | Its `host:port` is not in `sandbox.relays`. | Add it (for example `127.0.0.1:4000`); provider URLs stay unchanged with MXC. |

@@ -1779,7 +1779,11 @@ async def admin_system(request: Request):
         d["clients"], d["activeRuns"] = up.activity() if up else (0, 0)
         workers.append(d)
     native = c.db.get_setting("native_root") or ""
+    from . import mxc
+    sandbox = await asyncio.to_thread(mxc.summary, c.settings)
+    sandbox["proxies"] = c.workers.proxies.describe() if hasattr(c.workers, "proxies") else {}
     return ok({"version": c.version, "gooseVersion": c.goose_version, "gooseBinary": c.settings.goose_binary,
+               "sandbox": sandbox,
                "integrity": winsec.integrity_level(), "elevated": winsec.is_elevated(), "user": winsec.current_user(),
                "profilesRoot": str(c.settings.profiles_root), "nativeRoot": native,
                "desktopRunning": c.workers.desktop_running(), "nativeScheduler": c.settings.get("goose", "native_scheduler"),

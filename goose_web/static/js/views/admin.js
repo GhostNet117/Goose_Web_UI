@@ -690,6 +690,7 @@ function systemTab(body) {
         section('Versions', iconBtn('refresh', 'Refresh', () => load()), h('div', { class: 'card kv-grid' },
           kv('Gateway', s.version), kv('Goose', s.gooseVersion), kv('Goose binary', s.gooseBinary), kv('Runs as', s.user), kv('Integrity', (s.integrity || '') + (s.elevated ? ' · elevated' : '')),
           kv('Profiles root', s.profilesRoot), kv('Native root', s.nativeRoot), kv('Desktop running', s.desktopRunning ? 'yes' : 'no'), kv('Scheduler owner', s.scheduler && s.scheduler.owner))),
+        sandboxSection(s.sandbox, kv),
         section('Workers', null, table([
           { label: 'Profile', render: (w) => h('div', null, h('div', { class: 'strong' }, w.username || w.key), h('div', { class: 'muted small mono' }, w.key)) },
           { label: 'State', render: (w) => h('span', { class: 'row' }, h('span', { class: 'sdot s-' + (w.state === 'ready' ? 'done' : w.state === 'starting' ? 'working' : w.state === 'error' || w.state === 'down' ? 'error' : 'idle') }), w.state) },
@@ -697,7 +698,9 @@ function systemTab(body) {
           { label: 'Up', render: (w) => w.startedAt ? relTime(w.startedAt) : '—' },
           { label: 'Clients', key: 'clients' }, { label: 'Runs', key: 'activeRuns' },
           { label: 'Scheduler', render: (w) => w.scheduler ? badge('owner', 'accent') : '' },
-          { label: 'Sandbox', render: (w) => w.sandboxed ? h('span', { title: 'AppContainer ' + (w.sandboxSid || '') + ' - talks to the gateway over stdio, no network port' }, badge('AppContainer', 'ok')) : (w.native ? badge('native', '') : '') },
+          { label: 'Sandbox', render: (w) => w.sandboxed ? (w.sandboxBackend === 'mxc'
+            ? h('span', { title: 'MXC process container - talks to the gateway over stdio; network only through its egress proxy' + (w.proxyPort ? ' (127.0.0.1:' + w.proxyPort + ')' : ' (none)') }, badge('MXC', 'ok'))
+            : h('span', { title: 'AppContainer ' + (w.sandboxSid || '') + ' - talks to the gateway over stdio, no network port' }, badge('AppContainer', w.sandboxBackend === 'appcontainer' ? 'ok' : ''))) : (w.native ? badge('native', '') : '') },
           { label: 'Restarts', render: (w) => h('span', { title: w.lastError || '' }, String(w.restarts || 0), w.lastError ? h('span', { class: 'badge badge-err' }, 'error') : null) },
           { label: '', class: 'right', render: (w) => h('span', { class: 'row' },
             btn('Restart', async () => { if (w.activeRuns && !(await confirmDialog({ title: 'Restart ' + (w.username || w.key) + '?', message: w.activeRuns + ' run(s) are active and will be interrupted.', confirmText: 'Restart', danger: true }))) return; try { await POST('/api/admin/system/workers/' + encodeURIComponent(w.key) + '/restart', {}); toast('Restarting', { kind: 'success' }); setTimeout(load, 1500); } catch (e) { toastError(e); } }, { size: 'sm' }),
@@ -711,6 +714,27 @@ function systemTab(body) {
   load();
   timer = setInterval(() => { if (document.visibilityState === 'visible') load(); }, 10000);
   return { destroy() { clearInterval(timer); } };
+}
+
+// Sandbox (spec 025): backend, MXC availability (probe, pinned executor) and the members' egress proxies.
+function sandboxSection(sb, kv) {
+  if (!sb) return null;
+  const m = sb.mxc || null;
+  const probe = (m && m.probe) || {};
+  const proxies = Object.entries(sb.proxies || {});
+  return section('Sandbox', null,
+    !sb.membersCanStart ? banner('error', 'Sandboxed members\u2019 agents cannot start (fail closed): ' + (sb.reason || 'unknown reason') + '. See goose-web sandbox status and docs/TROUBLESHOOTING.md.')
+      : (sb.reason ? banner('warn', sb.reason) : null),
+    h('div', { class: 'card kv-grid' },
+      kv('Enabled', sb.enabled ? 'yes (isolated non-admin members)' : 'no'),
+      kv('Backend', sb.backend + (sb.backend !== sb.configuredBackend ? ' (configured: ' + sb.configuredBackend + ')' : '')),
+      kv('Fallback', sb.fallback),
+      kv('Network', sb.network + ((sb.relays || []).length ? '; relays ' + sb.relays.join(', ') : '')),
+      m ? kv('MXC', (m.available ? 'available' : 'UNAVAILABLE') + ' - wxc-exec ' + m.version + ', contract ' + m.contract + ', Windows ' + m.build) : null,
+      m ? kv('MXC probe', probe.tier ? probe.tier : '-') : null,
+      m ? kv('MXC executor', m.exe) : null,
+      m && m.signature && m.signature.status ? kv('Signature', m.signature.status + (m.signature.subject ? ' - ' + m.signature.subject : '')) : null,
+      kv('Egress proxies', proxies.length ? proxies.map(([k, p]) => k + ' :' + p.port + ' (' + p.network + ', ' + p.connections + ' open, ' + p.allowed + ' allowed, ' + p.refused + ' refused)').join('; ') : 'none running')));
 }
 
 // HTTPS (spec 015): built-in self-signed certificate (local CA, renewed automatically), own files, or off (proxy).

@@ -18,7 +18,8 @@
 - **Reporting:** see [SECURITY.md](../SECURITY.md).
 - **Addendum:** [section 7](#7-addendum-goose-web-150-team-profiles-with-least-privilege) records the
   security-relevant changes of goose-web 1.5.0 (team profiles with least privilege) and the known risk that
-  remains. Sections 1 to 6 describe v1.0.0.
+  remains. Sections 1 to 6 describe v1.0.0. [Section 13](#13-addendum-mxc-sandbox-backend-2026-11-12-1190) covers
+  the MXC sandbox backend of 1.19.0 (threat model, change from the AppContainer backend, accepted trade-offs).
 
 ## 1. Summary
 
@@ -597,3 +598,48 @@ covers); the bypass detector notices a tool that ran without asking after it sta
 profile is never rewritten (its chats are cancelled instead while the admin guard is on); a guarded member who
 keeps both rule matchers busy can make other guarded users' checks time out (blocked, never allowed) until the
 burst limit stops them; queued messages are still plaintext in the database.
+
+## 13. Addendum: MXC sandbox backend (2026-11-12), 1.19.0
+
+Since 1.19.0 isolated non-admin members' agents run in **Microsoft Execution Containers** (MXC) by default;
+the AppContainer backend of section 8.2 stays selectable (`sandbox.backend: appcontainer`). Administrators and the
+native profile stay unsandboxed (GW-01 unchanged: one OS account).
+
+### 13.1 What changed compared with the AppContainer backend
+
+| Aspect | AppContainer (1.8.0 - 1.18) | MXC (1.19.0) |
+|---|---|---|
+| Containment | Goose Web's own code: `CreateAppContainerProfile`, capabilities, ACL grants with icacls, grant/revoke state in `<system_dir>/sandbox` | OS policy (process containers, PSEC) driven by Microsoft's `wxc-exec.exe`; no ACL is changed, nothing to revoke; a new container (and SID) per start |
+| Files | Modify/Read&execute ACEs on granted folders | read/write and read-only paths in the policy; Goose Web refuses grants of its own system folder, the profiles root, other profiles, the native profile, its code (write) and drive roots, also through junctions and 8.3 names |
+| Folder names | not listable outside grants | listable (names only, no contents) on the drives of granted folders (`enumeratePaths`; node and cmd need it) - **accepted (Q2)** |
+| Network | capabilities: `internetClient` (+ `privateNetworkClientServer`), any protocol; loopback closed; relays through an in-container forwarder and a named pipe; provider URLs rewritten | no own network; one loopback endpoint, the member's **egress proxy** in the gateway, which decides every destination and audits it; **HTTP/HTTPS only** - **accepted (Q1)**; provider URLs unchanged |
+| UI | AppContainer defaults | clipboard, input injection, desktop/system-settings control and IME blocked (Win32k on) |
+| Process | suspended start in the gateway's kill-on-close job | `wxc-exec` suspended, joined to the gateway's and the worker's kill-on-close jobs, then resumed |
+| Supply chain | none (Windows API) | pinned `wxc-exec.exe` 1.0.1 (npm sha512 integrity, file SHA-256, Microsoft Authenticode), re-hashed before every launch through a write-denied handle |
+| Telemetry | none | request contract 1.0.0, telemetry opt-in, never opted in - **accepted (Q3)**; a later contract with required telemetry may be adopted later |
+| Requirements | Windows 10/11, Server 2019+ | Windows build 26100.9278+; otherwise fail closed or the AppContainer fallback |
+
+### 13.2 Threat model (MXC specific)
+
+| Threat | Mitigation |
+|---|---|
+| A member's agent reads or writes another member's profile, the database, keys, logs or the native profile | Not in the policy; such grants are refused even when configured (junction-aware); kernel-enforced by MXC. E2E test: outside file `PermissionError`, also from a child process. |
+| The agent changes the code the gateway runs or the executor | Never granted for writing; the install folder is restricted by the installer; the executor's SHA-256 is checked before every launch and the file is write-locked until it runs. |
+| A tampered or substituted `wxc-exec.exe` | Never executed: pin (integrity, SHA-256, size, signer) at install, SHA-256 at every launch, signature at start; mismatch = fail closed. Unit test with a tampered executor. |
+| A member's agent reaches local services (browser debugging port, other workers, the gateway, a database on loopback or on this machine's LAN address) | The container reaches only its proxy; the proxy refuses loopback except `sandbox.relays`, every address of this machine, link-local/metadata, and names resolving to them; the resolved address is the one connected to. Relays on the gateway's or a proxy's own port are ignored. E2E: direct loopback blocked, another loopback port through the proxy 403. |
+| Another local process or member uses a member's proxy | 127.0.0.1 only, random port, per-member credential (HTTP Basic, constant-time compare, new per worker start); other containers can only reach their own proxy. A local process of the gateway's account could read the policy file (as it could read the database): GW-01. |
+| Request smuggling / host switching through a kept-alive connection | Plain HTTP is forwarded as one request with `Connection: close`; `Proxy-*` and hop-by-hop headers removed; CONNECT tunnels go to the vetted address only. |
+| Proxy exhaustion | Per-member connection limit (503), header size (16 KB) and time (30 s) limits, idle timeout, connect timeout; the proxy runs on the gateway's event loop without blocking calls (resolution is asynchronous with a 10 s timeout). |
+| Data exfiltration over the allowed internet | Same as before (a member allowed `internet` can send data out); now every destination is in the activity log (`sandbox.egress`, host:port and decision, never content). |
+| A member's agent starts unsandboxed because MXC is unavailable | Never: fail closed with an admin-visible reason; the only alternative is the explicit, audited AppContainer fallback. |
+| Secrets in logs | The policy (with the proxy credential) stays in the gateway's system folder and is deleted at stop; logs and audit show the proxy as `127.0.0.1:<port>` only; egress audit has no paths or headers; the worker environment is the allow-list of section 8.2 (no gateway secrets). |
+
+### 13.3 Residual risks
+
+- GW-01 (one OS account) is unchanged; MXC is an AppContainer-class boundary inside that account.
+- MXC is young (GA 2026-10-07); the executor is documented by Microsoft for testing or when the SDK cannot be
+  embedded. Pinned and re-verified; a new version is a new pin after review.
+- Folder names on the drives of granted folders are visible to members' agents (Q2).
+- Programs inside the container that send requests without the proxy credential are refused (407); Windows'
+  certificate-revocation lookups are among them (HTTPS still works).
+- Learning mode / denial capture is not used (it fails on the tested build).

@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.19.0 - 2026-11-12
+
+**Members' agents run in Microsoft Execution Containers (MXC) by default.** Spec 025. No database schema change.
+Needs Windows build 26100.9278 or later and the pinned executor: `upgrade.ps1` / `install.ps1` install it
+(`goose-web sandbox install-mxc --if-missing`); on older Windows set `sandbox.backend: appcontainer` or
+`sandbox.fallback: appcontainer` before upgrading, or members' agents will not start (fail closed).
+
+- **MXC sandbox backend (`sandbox.backend: mxc`, the default).** Every isolated non-admin member's worker runs in an
+  MXC process container built from their sandbox settings: read/write on their profile, team folder and team extra
+  folders, read and run on the Goose folder and `sandbox.read_dirs`; the system folder, profiles root, other profiles,
+  the native profile, Goose Web's code and drive roots are refused even when configured (junction- and 8.3-aware);
+  clipboard, input injection, desktop/system-settings control and IME locked. The AppContainer backend stays
+  available (`sandbox.backend: appcontainer`) and tested; its containers and grants are kept while MXC is used.
+- **Per-member egress proxy.** MXC members reach the network only through their own loopback proxy in the gateway
+  (per-member credential, constant-time check): public internet and, with `internet+lan`, the LAN; `sandbox.relays`
+  services such as a local model proxy at their real address (provider URLs are no longer rewritten for MXC members);
+  everything else on this machine refused. HTTP/HTTPS only. Every destination is audited in the activity log
+  (`sandbox.egress`, host:port and decision). Limits: `sandbox.proxy_max_connections`, `sandbox.proxy_idle_seconds`.
+- **Pinned, verified executor.** `goose-web sandbox install-mxc [--if-missing] [--file TGZ] [--force]` installs
+  `wxc-exec.exe` 1.0.1 from `@microsoft/mxc-sdk` 1.0.1 (npm sha512 integrity, SHA-256, Microsoft Authenticode
+  signature) into `<install>\vendor\mxc\` (not in git). Its SHA-256 is checked again before every launch, with the
+  file locked against writes until it runs.
+- **Fail closed, with diagnostics.** `wxc-exec --probe` and the Windows build are checked at gateway start, by
+  `goose-web sandbox status` and `goose-web check`. When MXC cannot run, members' agents do not start ("The sandbox is
+  unavailable ... Contact your administrator."); the reason is in Admin > System (new Sandbox card), gateway.log and
+  the audit (`sandbox.unavailable`). Opt-in `sandbox.fallback: appcontainer` starts them in the AppContainer backend
+  instead (audited `sandbox.fallback`) and moves them back to MXC when it is available again, never during a run.
+  Invalid `sandbox.*` values also fail closed.
+- Admin > System: Sandbox card (backend, MXC state, probe, signature, egress proxies); the Workers table shows MXC or
+  AppContainer. `goose-web sandbox remove --all` also removes MXC policy files.
+- Docs: ADMINISTRATION 11.6, CONFIGURATION, ARCHITECTURE, SECURITY-ASSESSMENT 13 (MXC threat model; accepted:
+  HTTP/HTTPS-only egress, folder-name listing, opt-in telemetry contract), TROUBLESHOOTING 20, USER-GUIDE, README.
+
 ## 1.18.3 - 2026-11-12
 
 **Skills load with `load` as well as `load_skill` in members' chats.** No database schema change.

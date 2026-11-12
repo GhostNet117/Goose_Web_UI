@@ -70,8 +70,9 @@ Goose Web runs on Windows only: Windows 10/11 or Windows Server 2019 and later, 
 installer prefers `uv` with Python 3.13 when `uv` is available). `goose-web serve` refuses to start on any other
 system.
 
-Why: on Windows each isolated non-admin user's agent runs in its own AppContainer (section 11.6), so the operating
-system enforces the folder boundaries between users and blocks loopback. Linux and macOS have no equivalent per-user
+Why: on Windows each isolated non-admin user's agent runs in its own container - Microsoft Execution Containers
+(MXC, the default since 1.19.0, Windows build 26100.9278 or later) or Goose Web's AppContainer backend (section
+11.6) - so the operating system enforces the folder boundaries between users and blocks loopback. Linux and macOS have no equivalent per-user
 sandbox in Goose Web yet. There, every team member's agent would run under one shared OS account with full access to
 the other profiles, the database and the admin's Goose profile (the accepted risk GW-01, see
 [SECURITY-ASSESSMENT.md](SECURITY-ASSESSMENT.md#72-known-risk-one-windows-account-for-all-team-profiles) 7.2).
@@ -118,7 +119,8 @@ summary and changes nothing until you confirm:
 4. **Goose Web's own data folder** (users, teams, per-user profiles; default `C:\Goose_Web_Profiles`).
 5. **Which Windows account runs the gateway** - [1] you, starting when you sign in, or [2] a **service account** or
    gMSA, starting at boot without anyone signing in (section 5.1).
-6. **Sandbox** non-admin users' agents (default yes; section 11.6).
+6. **Sandbox** non-admin users' agents (default yes; MXC since 1.19.0, section 11.6). The installer also installs
+   the pinned MXC executor (`goose-web sandbox install-mxc --if-missing`).
 
 The same answers can be given as parameters with `-NonInteractive`: `-GooseBinary`, `-GooseAppData` (+ `-Fresh` to
 create it), `-SessionsDir`, `-Admin`, `-ProfilesRoot`, `-RunAs`, `-Sandbox on|off`.
@@ -1287,7 +1289,7 @@ in the profile you are signed in to; for isolated profiles each user's own `conf
   extensions dialog): it removes them from the chat and adds the current definition, through Goose.
 - **Goose 1.50 to 1.54** have no `GOOSE_AUTO_COMPACT_TOKEN_LIMIT` (11.7).
 
-### 11.6 Sandboxing users' agents (Windows AppContainer)
+### 11.6 Sandboxing users' agents (MXC; Windows AppContainer)
 
 All workers run as the one OS account the gateway runs as. Goose Web's own file browser keeps users inside their
 folders, but an agent's shell, scripts and command (stdio) extensions run as that account and could otherwise read
@@ -1298,12 +1300,88 @@ boundaries:
 ```yaml
 sandbox:
   enabled: auto              # default: on; true | false
+  backend: mxc               # mxc (default since 1.19.0) | appcontainer
+  fallback: none             # MXC unavailable: none = members' agents do not start | appcontainer
   network: internet          # none | internet | internet+lan
   read_dirs: []              # extra program folders agents may run, e.g. C:\Program Files\nodejs, a Python install
   relays: []                 # local services sandboxed agents may use, e.g. ["127.0.0.1:4000"] (a local model proxy)
+  mxc_dir: ""                # default: <install folder>\vendor\mxc
+  proxy_max_connections: 64  # MXC egress proxy, per member
+  proxy_idle_seconds: 900
 ```
 
-What it does, for every **isolated, non-admin** user (administrators and the native profile are never sandboxed):
+Administrators and the native profile are never sandboxed. Two backends exist; **MXC is the default** since 1.19.0,
+the AppContainer backend of 1.8.0 - 1.18 stays available (`sandbox.backend: appcontainer`) and tested.
+
+#### MXC backend (default since 1.19.0)
+
+Every **isolated, non-admin** user's worker - `goose acp` and everything it starts: shells, scripts, MCP servers -
+runs in a **Microsoft Execution Containers (MXC)** process container, started by Microsoft's executor `wxc-exec.exe`
+from a policy Goose Web builds at every start:
+
+- **Files:** read/write on the user's profile folder (workspace included), the team folder and the team's extra
+  folders; read and run on the goose CLI's folder and `sandbox.read_dirs`; nothing else. Refused even when a setting
+  names them (logged as `sandbox mxc: <user>: grant <path> refused: <why>`): the gateway's system folder, the profiles
+  root or a folder above it, other users' profiles, the native Goose profile, a drive or share root, and - for
+  writing - Goose Web's own code (`goose_web`, `.venv`, `.git`, `scripts`) and the MXC folder. Paths are compared as
+  written and after resolving junctions, links and 8.3 names. Folder *names* (not contents) on the drives of the
+  granted folders can be listed (`enumeratePaths`; node and cmd need it).
+- **Desktop:** clipboard, input injection, desktop and system-settings control and IME are blocked (Win32k stays on:
+  goose.exe and node.exe need it).
+- **Network:** the container has none of its own. When `network` is not `none` or `relays` are set, the gateway runs
+  an **egress proxy for this member** (127.0.0.1, its own port and credential) and MXC gives it to the agent and
+  everything it starts as `HTTP_PROXY` / `HTTPS_PROXY`. The proxy forwards the `sandbox.relays` services (at their real
+  address: provider URLs are **not** rewritten), public internet addresses (`internet`, `internet+lan`) and private LAN
+  addresses (`internet+lan` only). It refuses every other port on 127.0.0.1, this machine's own addresses, link-local
+  and cloud-metadata addresses, and host names that resolve to any of these. Every destination asked for is recorded
+  in the activity log as `sandbox.egress` (host:port and the decision; never a path or content).
+- **HTTP/HTTPS only:** programs that do not use `HTTP(S)_PROXY` have no network in an MXC container: ssh and git over
+  ssh, database clients, raw TCP, and Node 22's built-in `fetch` (Node 24+ uses it with `NODE_USE_ENV_PROXY=1`,
+  which Goose Web sets). Goose itself, npm/npx, uv/uvx, pip, git over https, curl and Python honour it.
+- **Process:** `wxc-exec.exe` starts suspended, joins the gateway's and the worker's kill-on-close job objects, and
+  only then runs; stdin/stdout carry ACP, stderr goes to `worker-<user>.log`. A stop first closes stdin (Goose exits
+  cleanly, MXC removes the container), then ends the job. No ACL is changed, no container profile stays behind. The
+  policy is `<system_dir>\sandbox\mxc\<container>.json` while the worker runs (it holds the proxy credential; the
+  system folder is the gateway's own).
+
+**Requirements:** Windows 11 24H2 / Windows Server 2025 code base, **build 26100.9278 or later** (`goose-web sandbox
+status` shows the build and MXC's own probe). No administrator rights, service, driver or Windows feature.
+
+**The executor** is pinned: `wxc-exec.exe` 1.0.1 from the npm package `@microsoft/mxc-sdk` 1.0.1. `goose-web sandbox
+install-mxc` downloads the package (38 MB) from `registry.npmjs.org` (`HTTPS_PROXY` is honoured), checks its npm
+sha512 integrity, takes only `wxc-exec.exe` out of it, checks its size, SHA-256 and Authenticode signature
+(Microsoft Corporation) and installs it atomically into `<install>\vendor\mxc\1.0.1\` (not in git; it inherits the
+install folder's restricted permissions). `install.ps1` and `upgrade.ps1` run it with `--if-missing`. Without internet
+access: `npm pack @microsoft/mxc-sdk@1.0.1` on another computer, copy the `.tgz`, then `goose-web sandbox install-mxc
+--file <tgz>` (the same checks apply). `--force` reinstalls. Before every launch the gateway checks the SHA-256 again
+and keeps the file locked against writes until it has started; the signature and the probe are checked at gateway
+start and by `sandbox status` / `check`.
+
+**Fail closed:** when MXC cannot run (executor missing or altered, Windows too old, probe failed, invalid
+`sandbox.*` setting) sandboxed users' agents **do not start**. The user sees "The sandbox is unavailable, so your agent
+cannot start. Contact your administrator."; the reason is in Admin > System > Sandbox (with a red banner), in
+`gateway.log` (`sandbox mxc: UNAVAILABLE: ...`), in the audit log (`sandbox.unavailable`) and in `goose-web sandbox
+status` / `check`. An unavailable MXC is checked again at most every 30 seconds, so `install-mxc` takes effect without
+a restart. With `sandbox.fallback: appcontainer` the agents start in the AppContainer backend instead (logged as an
+error, audited as `sandbox.fallback`) and move back to MXC by themselves once it is available (when no run is active).
+
+**Telemetry:** Goose Web uses MXC's request contract 1.0.0, in which telemetry is opt-in; Goose Web never opts in.
+Administrators can block MXC telemetry for every program with `HKLM\SOFTWARE\Policies\Mxc\AllowTelemetry`.
+
+**Check:** `goose-web check` (`[OK] sandbox: on: isolated non-admin workers run in MXC ...`), `goose-web sandbox
+status`, Admin > System (the Sandbox card; the Workers table shows **MXC** with the member's proxy port).
+
+#### Switching backends and rollback
+
+Set `sandbox.backend` (`mxc` or `appcontainer`) in `config.yaml` and restart the gateway the usual way (it drains
+first: running turns are never cut). Every sandboxed worker then starts on the new backend. The AppContainer
+backend's containers and folder grants stay in place while MXC is used and are reused when you switch back;
+`goose-web sandbox remove --all` removes them (and leftover MXC policy files). Provider URLs that the AppContainer
+relays rewrote are restored at an MXC worker's start.
+
+#### AppContainer backend (`sandbox.backend: appcontainer`)
+
+What it does, for every **isolated, non-admin** user:
 
 - The user's worker - `goose acp` and everything it starts: shells, scripts, MCP servers - runs inside the user's own
   Windows **AppContainer** (`GooseWeb.<id>.<username>`; created without administrator rights, same name = same
@@ -1346,7 +1424,8 @@ Admin > System (the Sandbox column shows **AppContainer** for sandboxed workers)
 #### Local services for sandboxed users (relays)
 
 A model proxy or another service that listens only on 127.0.0.1 of this machine is out of reach of sandboxed
-agents. List the ones they may use:
+agents. List the ones they may use (both backends; with MXC the member's egress proxy forwards to them and nothing
+below this paragraph applies):
 
 ```yaml
 sandbox:
@@ -1911,6 +1990,9 @@ the command):
 | `ip list` | addresses blocked after failed sign-ins, and addresses collecting failures |
 | `ip unblock ADDRESS` / `ip unblock --all` | end a block and clear the count (an IPv6 address unblocks its /64) |
 | `check` | diagnostics; exit code 1 if something is wrong |
+| `sandbox status` | sandbox backend, MXC availability (executor, signature, Windows build, probe) and AppContainer grants; exit 1 when sandboxed workers cannot start |
+| `sandbox install-mxc [--if-missing] [--file TGZ] [--force]` | install the pinned MXC executor `wxc-exec.exe` 1.0.1 (npm integrity, SHA-256 and signature checked) |
+| `sandbox remove USER` / `sandbox remove --all` | revoke AppContainer grants and delete the containers (`--all`: also leftover MXC policy files) |
 | `version` | print the version |
 
 Admin console tabs: Users, Teams & policy, Hints library, Auth providers, Settings, System, Ownership check, Host

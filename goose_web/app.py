@@ -686,9 +686,19 @@ def create_app(settings: Settings) -> Starlette:
             ok=False)
         c.guard.on_health = lambda h: hub.broadcast_admins({"jsonrpc": "2.0", "method": "_gw/guard", "params": h})
         wire_security_hooks(c)
+
+        def sandbox_event(action: str, w, detail: dict) -> None:
+            # spec 025: MXC fallbacks and fail-closed refusals of members' workers are audited (admin-visible)
+            db.audit(action, user=db.user_by_name(w.username), target=w.username, detail=detail, ok=False)
+        workers.on_sandbox_event = sandbox_event
         app.state.ctx = c
         hub.start()
         workers.start_monitor()
+        from .config import sandbox_backend, sandbox_on
+        if sandbox_on(settings) and sandbox_backend(settings) != "appcontainer":
+            # spec 025 R3: probe MXC at start (logged: "sandbox mxc: available ..." / "UNAVAILABLE: <reason>")
+            from . import mxc
+            asyncio.get_running_loop().run_in_executor(None, mxc.availability, settings, True)
         # FIX deploy-interrupts-running-turns: local scripts ask "is anything running?" and drain before a restart
         from .control import ControlChannel
         control = ControlChannel(hub, settings, __version__)

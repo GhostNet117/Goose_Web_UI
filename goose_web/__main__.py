@@ -352,24 +352,71 @@ def cmd_native_hints(args, settings) -> int:
     return 0
 
 
+def _print_sandbox_summary(settings, refresh: bool = True) -> bool:
+    """Spec 025 R1/R3: backend, fallback, MXC executor / signature / Windows build / probe, proxy settings. True when
+    sandboxed members' agents can start."""
+    from . import mxc
+    sm = mxc.summary(settings, refresh=refresh)
+    print(f"Sandbox: {'ON' if sm['enabled'] else 'off'} (sandbox.enabled); backend: {sm['backend']}"
+          + (f" (configured {sm['configuredBackend']!r})" if sm["backend"] != sm["configuredBackend"] else "")
+          + f"; fallback: {sm['fallback']}; network: {sm['network']}")
+    for p in sm["problems"]:
+        print(f"[!!] configuration: {p}")
+    m = sm.get("mxc")
+    if m:
+        sig = m.get("signature") or {}
+        inst = m.get("installed") or {}
+        print(f"[{'OK' if m['available'] else '!!'}] MXC: {'available' if m['available'] else 'UNAVAILABLE'}"
+              + ("" if m["available"] else f" - {m['reason']}"))
+        print(f"     executor: {m['exe']} (pinned wxc-exec {m['version']} from {mxc.MXC_PIN['package']}, request "
+              f"contract {m['contract']}" + (f", installed {inst.get('installed')}" if inst.get("installed") else "")
+              + ")")
+        if sig:
+            print(f"     signature: {sig.get('status')} - {sig.get('subject') or '-'}")
+        probe = m.get("probe") or {}
+        print(f"     Windows build: {m['build']} (MXC needs {mxc.MIN_BUILD[0]}.{mxc.MIN_BUILD[1]}+); probe: "
+              + (f"tier {probe.get('tier')}" + (f", warnings {probe.get('warnings')}" if probe.get("warnings") else "")
+                 if probe else "not run"))
+    print(f"Egress proxy (MXC): one per member on 127.0.0.1 (OS-assigned port, per-member credential); at most "
+          f"{settings.get('sandbox', 'proxy_max_connections')} connections per member, idle timeout "
+          f"{settings.get('sandbox', 'proxy_idle_seconds')} s; running proxies: Admin > System")
+    print(f"Relayed local services (sandbox.relays): {settings.get('sandbox', 'relays') or '-'}")
+    print(f"Extra program folders (sandbox.read_dirs): {settings.get('sandbox', 'read_dirs') or '-'}")
+    if not sm["membersCanStart"]:
+        print(f"[!!] sandboxed members' agents do NOT start (fail closed): {sm['reason']}")
+    elif sm["reason"]:
+        print(f"[--] {sm['reason']}")
+    return sm["membersCanStart"]
+
+
 def cmd_sandbox(args, settings) -> int:
-    """Spec 012: show the per-user AppContainers and their folder grants, or remove one user's."""
+    """Spec 012/025: show the sandbox state (backend, MXC, AppContainer grants), install the pinned MXC executor, or
+    remove one user's (or every) AppContainer."""
     from . import sandbox as sb
     state_dir = str(settings.system_dir / "sandbox")
+    if args.action == "install-mxc":
+        from . import mxc
+        try:
+            mxc.install(settings, file=args.file, force=args.force, if_missing=args.if_missing,
+                        log=lambda m: print(m, flush=True))
+        except mxc.MxcError as e:
+            print(f"MXC not installed: {e}", file=sys.stderr)
+            return 3
+        except Exception as e:   # network, disk
+            print(f"MXC not installed: {e.__class__.__name__}: {e}", file=sys.stderr)
+            return 4
+        return 0
     if args.action == "status":
-        from .config import sandbox_on
-        on = sandbox_on(settings)
-        print(f"Sandbox: {'ON' if on else 'off'} (sandbox.enabled), network: {settings.get('sandbox', 'network')}, "
-              f"platform: {'Windows AppContainer' if sb.IS_WINDOWS else 'not supported (fail closed when on)'}")
-        print(f"Extra program folders (sandbox.read_dirs): {settings.get('sandbox', 'read_dirs') or '-'}")
-        print(f"Relayed local services (sandbox.relays): {settings.get('sandbox', 'relays') or '-'}")
+        can_start = _print_sandbox_summary(settings)
+        print("AppContainer backend (spec 012): containers and folder grants recorded"
+              + ("" if sb.IS_WINDOWS else " (not supported on this system)") + ":")
         for st in sb.all_states(state_dir):
             print(f"  {st.get('name')}  {st.get('sid')}")
             for p, r in sorted((st.get("grants") or {}).items()):
                 print(f"      {r:6}  {p}")
             for p, r in sorted((st.get("pending") or {}).items()):
                 print(f"      {r:6}  {p}  (folder missing now; revoked when it is back)")
-        return 0
+        return 0 if can_start else 1
     from .db import Database
     db = Database(settings.system_dir / "goose-web.db")
     from . import relay as rl
@@ -395,8 +442,13 @@ def cmd_sandbox(args, settings) -> int:
                 print(f"Removed {name}{' (' + usr['username'] + ')' if usr else ''}: revoked "
                       f"{len({**(st.get('pending') or {}), **(st.get('grants') or {})}) - len(kept)} grant(s)"
                       + (f"; {len(kept)} on missing folders stay recorded" if kept else ""))
-        db.audit("sandbox.remove", target="*", detail={"containers": done, "via": "cli"})
-        print(f"Removed {done} sandbox container(s).")
+        # spec 025: MXC keeps no container or grant state; only the policy files of running/crashed workers
+        policies = sorted((Path(state_dir) / "mxc").glob("*.json")) if (Path(state_dir) / "mxc").is_dir() else []
+        for f in policies:
+            f.unlink(missing_ok=True)
+        db.audit("sandbox.remove", target="*", detail={"containers": done, "mxcPolicies": len(policies), "via": "cli"})
+        print(f"Removed {done} sandbox container(s)" + (f" and {len(policies)} MXC policy file(s)" if policies else "")
+              + ".")
         return 0
     if not args.user:
         print("error: give a user name, or --all", file=sys.stderr)
@@ -820,9 +872,21 @@ def cmd_check(args, settings) -> int:
     line(f"port {port}", "free" if free else "in use (gateway already running?)")
     from .config import sandbox_on
     if sandbox_on(settings):
-        from . import sandbox as sb
-        line("sandbox", "on: isolated non-admin workers run in their own AppContainer" if sb.IS_WINDOWS else
-             "on, but this system is not Windows: isolated non-admin workers will not start", sb.IS_WINDOWS)
+        from . import mxc
+        sm = mxc.summary(settings, refresh=True)
+        m = sm.get("mxc") or {}
+        if not sm["membersCanStart"]:
+            line("sandbox", f"backend {sm['backend']}: isolated non-admin workers will NOT start (fail closed): "
+                 f"{sm['reason']}. See goose-web sandbox status; MXC: goose-web sandbox install-mxc", False)
+        elif sm["backend"] == "mxc" and m.get("available"):
+            line("sandbox", f"on: isolated non-admin workers run in MXC (wxc-exec {m.get('version')}, probe "
+                 f"{(m.get('probe') or {}).get('tier')}, Windows {m.get('build')}); network through per-member "
+                 "egress proxies")
+        elif sm["backend"] == "mxc":
+            print(f"[--] sandbox: {sm['reason']}")
+        else:
+            line("sandbox", "on: isolated non-admin workers run in their own AppContainer (sandbox.backend: "
+                 "appcontainer)")
     from . import logjanitor, tls
     try:
         st = tls.status(settings, _tls_override(settings))
@@ -928,11 +992,16 @@ def main(argv: list[str] | None = None) -> int:
     nh.add_argument("--adopt", action="store_true",
                     help="enable: keep the current .goosehints as a hints document (on --team, else on the user)")
     nh.add_argument("--doc-name", help="name for the adopted document (default '<user> goose hints')")
-    sbx = sub.add_parser("sandbox", help="per-user AppContainer sandbox: status, or remove one user's (or all)")
-    sbx.add_argument("action", choices=["status", "remove"])
+    sbx = sub.add_parser("sandbox", help="per-user sandbox: status, install-mxc (the pinned MXC executor), or remove "
+                                         "one user's (or all) AppContainers")
+    sbx.add_argument("action", choices=["status", "install-mxc", "remove"])
     sbx.add_argument("user", nargs="?")
     sbx.add_argument("--all", action="store_true",
                      help="remove: every recorded container, its folder grants and relay rewrites (before an uninstall)")
+    sbx.add_argument("--file", help="install-mxc: a local @microsoft/mxc-sdk package .tgz instead of the download "
+                                    "(its npm integrity, the executable's SHA-256 and signature are still checked)")
+    sbx.add_argument("--if-missing", action="store_true", help="install-mxc: do nothing if a verified executor is there")
+    sbx.add_argument("--force", action="store_true", help="install-mxc: reinstall even if a verified executor is there")
     tl = sub.add_parser("tls", help="built-in HTTPS certificate: status, renew, export-ca PATH, trust")
     tl.add_argument("action", choices=["status", "renew", "export-ca", "trust"])
     tl.add_argument("path", nargs="?")

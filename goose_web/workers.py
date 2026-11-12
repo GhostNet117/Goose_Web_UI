@@ -207,6 +207,18 @@ def rotate_log(path: Path, max_bytes: int = WORKER_LOG_MAX_BYTES, backups: int =
         return False
 
 
+def _log_tail_after(path: Path, marker: str, max_bytes: int = 32768) -> str:
+    """What a process wrote into its worker log after `marker` (the start line), from the last `max_bytes`."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, path.stat().st_size - max_bytes))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    i = text.rfind(marker)
+    return text[i + len(marker):] if i >= 0 else text[-4000:]
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -254,6 +266,9 @@ class Worker:
     relay_procs: list = field(default_factory=list)     # forwarders inside the container (relay.py)
     relay_servers: list = field(default_factory=list)   # gateway-side pipe servers
     job: Any = None                  # the worker's own kill-on-close job object (_Job), Windows
+    backend: str = ""                # sandbox backend the running worker uses: mxc | appcontainer (spec 025)
+    policy_file: str = ""            # MXC: the policy wxc-exec was started with (<system_dir>/sandbox/mxc)
+    proxy_port: int = 0              # MXC: the member's egress proxy (egress.py)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
@@ -269,7 +284,18 @@ class Worker:
                 "port": self.port, "state": self.state, "startedAt": self.started_at, "scheduler": self.scheduler,
                 "restarts": self.restarts, "lastError": self.last_error, "native": self.native,
                 "pathRoot": self.path_root, "restartPending": self.restart_pending, "transport": self.transport,
-                "sandboxed": bool(self.sandbox), "sandboxSid": self.sandbox_sid}
+                "sandboxed": bool(self.sandbox), "sandboxSid": self.sandbox_sid,
+                "sandboxBackend": (self.backend or (self.sandbox or {}).get("backend") or "") if self.sandbox else "",
+                "proxyPort": self.proxy_port if self.backend == "mxc" else 0}
+
+
+class SandboxUnavailable(RuntimeError):
+    """A sandboxed worker was not started (fail closed). str() is what the member sees; admin_reason is the detail
+    for administrators (worker lastError in Admin > System, gateway.log)."""
+
+    def __init__(self, member_message: str, admin_reason: str):
+        super().__init__(member_message)
+        self.admin_reason = admin_reason
 
 
 class WorkerManager:
@@ -286,6 +312,17 @@ class WorkerManager:
         # callable(worker) set by the app: runs before EVERY start of a worker (security review 2026-11-11, SA-1:
         # re-provisions an isolated profile so nothing the agent wrote into its own config survives a restart)
         self.pre_start = None
+        # callable(action, worker, detail) set by the app: sandbox fallbacks / refusals into the audit log (spec 025)
+        self.on_sandbox_event = None
+        from .egress import ProxyRegistry
+        self.proxies = ProxyRegistry(settings)   # MXC members' egress proxies (spec 025 R6)
+        # MXC policy files of a gateway that ended without stopping its workers (they died with its job object)
+        for f in (settings.system_dir / "sandbox" / "mxc").glob("*.json") \
+                if (settings.system_dir / "sandbox" / "mxc").is_dir() else []:
+            try:
+                f.unlink()
+            except OSError:
+                pass
         self._monitor_task: asyncio.Task | None = None
 
     # ---------------------------------------------------------- scheduler ownership
@@ -411,6 +448,8 @@ class WorkerManager:
     async def _start(self, w: Worker) -> None:
         if w.sandbox:
             return await self._start_sandboxed(w)
+        w.backend = ""
+        await self.proxies.drop(w.key)
         if w.path_root and not w.native and IS_WINDOWS:
             # Sandboxed before (sandbox switched off since)? Point relayed provider URLs back at the real services.
             from . import relay as rl
@@ -474,10 +513,50 @@ class WorkerManager:
         w.state, w.started_at, w.restart_pending, w.last_error = "ready", time.time(), False, ""
         log.info("worker %s ready on port %s (pid %s, scheduler=%s)", w.key, w.port, w.proc.pid, w.scheduler)
 
+    def _sandbox_event(self, action: str, w: Worker, detail: dict) -> None:
+        if self.on_sandbox_event is not None:
+            try:
+                self.on_sandbox_event(action, w, detail)
+            except Exception:
+                log.exception("sandbox event %s", action)
+
+    def _fail_closed(self, w: Worker, reason: str) -> None:
+        """Spec 025 R3: the worker is not started; never run a member's agent unsandboxed."""
+        from .mxc import SANDBOX_UNAVAILABLE_MSG
+        if w.last_error != reason:
+            self._sandbox_event("sandbox.unavailable", w, {"reason": reason[:300]})
+        w.state, w.last_error, w.backend = "crashed", reason, ""
+        log.error("worker %s: not started (fail closed): %s", w.key, reason)
+        raise SandboxUnavailable(SANDBOX_UNAVAILABLE_MSG, reason)
+
     async def _start_sandboxed(self, w: Worker) -> None:
+        """Spec 025: the member's sandbox backend - MXC (default) or the AppContainer of spec 012. MXC unavailable
+        -> fail closed, or the AppContainer backend with `sandbox.fallback: appcontainer`."""
+        from .config import sandbox_fallback
+        spec = w.sandbox or {}
+        problems = spec.get("config_problems") or []
+        backend = spec.get("backend") or "appcontainer"
+        if problems or backend not in ("mxc", "appcontainer"):
+            self._fail_closed(w, "sandbox configuration: " + "; ".join(problems or [f"backend {backend!r}"]))
+        if backend == "mxc":
+            from . import mxc
+            st = await asyncio.to_thread(mxc.availability, self.s)
+            if st["available"]:
+                return await self._start_mxc(w)
+            if sandbox_fallback(self.s) != "appcontainer":
+                self._fail_closed(w, f"sandbox unavailable (MXC): {st['reason']}")
+            log.error("sandbox mxc: worker %s starts in the AppContainer backend instead (sandbox.fallback): %s",
+                      w.key, st["reason"])
+            self._sandbox_event("sandbox.fallback", w, {"from": "mxc", "to": "appcontainer",
+                                                        "reason": st["reason"][:300]})
+        await self.proxies.drop(w.key)
+        await self._start_appcontainer(w)
+
+    async def _start_appcontainer(self, w: Worker) -> None:
         """`goose acp` inside the user's AppContainer; the hub talks to it over stdin/stdout (spec 012)."""
         from . import sandbox as sb
         w.state = "starting"
+        w.backend = "appcontainer"
         w.scheduler, _ = self.wants_scheduler(w)
         spec = w.sandbox or {}
         try:
@@ -531,6 +610,95 @@ class WorkerManager:
         w.port, w.secret = 0, ""
         w.state, w.started_at, w.restart_pending, w.last_error = "ready", time.time(), False, ""
         log.info("worker %s ready in sandbox %s (pid %s, scheduler=%s)", w.key, spec["name"], w.proc.pid, w.scheduler)
+
+    async def _start_mxc(self, w: Worker) -> None:
+        """Spec 025: `goose acp` inside an MXC process container (wxc-exec + a policy built from the member's sandbox
+        spec), over stdin/stdout like the AppContainer worker; network only through the member's egress proxy."""
+        from . import mxc
+        from . import relay as rl
+        from . import sandbox as sb
+        spec = w.sandbox or {}
+        w.state = "starting"
+        w.scheduler, _ = self.wants_scheduler(w)
+        state_dir = self.s.system_dir / "sandbox"
+        # R7: an MXC member reaches relayed services at their real address through the proxy: undo the AppContainer
+        # backend's provider-URL rewrite (its grants and profile stay in place for a switch back)
+        try:
+            for name in (spec["name"], sb.legacy_container_name(str(self.s.profiles_root), w.username)):
+                if await asyncio.to_thread(rl.undo_relays, str(state_dir), name, spec["profile_root"]):
+                    log.info("worker %s: restored relayed URLs (MXC reaches them through the egress proxy)", w.key)
+        except Exception as e:
+            log.warning("worker %s: could not restore relayed URLs: %s", w.key, e)
+        grants, refused = mxc.filter_grants(
+            spec.get("mxc_grants") or {}, profile_root=spec["profile_root"], profiles_root=spec["profiles_root"],
+            system_dir=spec["system_dir"], protected_write=spec.get("protected_write") or [],
+            protected_any=spec.get("protected_any") or [])
+        for p, why in refused:
+            log.warning("sandbox mxc: %s: grant %s refused: %s", w.username, p, why)
+        network = spec.get("network") or "internet"
+        targets = list(spec.get("relay_targets") or [])
+        proxy_url = ""
+        if network != "none" or targets:
+            try:
+                proxy = await self.proxies.ensure(w.key, w.username, network, targets)
+            except Exception as e:
+                self._fail_closed(w, f"sandbox unavailable (MXC): the egress proxy could not start: {e}")
+            proxy_url, w.proxy_port = proxy.url(), proxy.port
+        else:
+            await self.proxies.drop(w.key)
+            w.proxy_port = 0
+        args = [self.s.goose_binary, "acp"]
+        if w.scheduler:
+            args.append("--enable-scheduler")
+        cwd = os.path.join(spec["profile_root"], "workspace")
+        if not os.path.isdir(cwd):
+            cwd = spec["profile_root"]
+        policy = mxc.build_policy(command=args, cwd=cwd, env=self._sandbox_env(w), grants=grants, proxy_url=proxy_url,
+                                  system_drive=os.environ.get("SystemDrive", "C:"))
+        pfile = state_dir / "mxc" / f"{spec['name']}.json"
+        await asyncio.to_thread(mxc.write_policy, pfile, policy)
+        logp = self.log_dir / f"worker-{w.key}.log"
+        rotate_log(logp)
+        logf = open_append_log(logp)
+        marker = (f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} start {' '.join(args[1:])} (sandbox mxc {spec['name']}, "
+                  f"wxc-exec {mxc.MXC_PIN['version']}, network {network}, proxy "
+                  f"{'127.0.0.1:' + str(w.proxy_port) if proxy_url else 'none'}, {len(policy['filesystem']['readwritePaths'])} "
+                  f"read/write + {len(policy['filesystem']['readonlyPaths'])} read-only folders) root={w.path_root}\n")
+        logf.write(marker.encode())
+        self._close_job(w)
+        w.job = _Job()       # the worker's own job (wxc-exec and the container's processes), nested in self.job
+        try:
+            w.proc = await asyncio.to_thread(mxc.launch, mxc.exe_path(self.s), pfile, logf, [self.job, w.job])
+        except Exception as e:
+            self._close_job(w)
+            self._fail_closed(w, f"sandbox unavailable (MXC): {e}")
+        finally:
+            logf.close()
+        w.channel = sb.StdioChannel(w.proc, asyncio.get_running_loop())
+        w.backend, w.policy_file, w.sandbox_sid = "mxc", str(pfile), ""
+        await asyncio.sleep(0.3)
+        if w.proc.poll() is not None:
+            reason = mxc.explain_exit(w.proc.returncode, _log_tail_after(logp, marker.strip()))
+            self._close_job(w)
+            w.proc, w.channel = None, None
+            self._fail_closed(w, f"MXC sandbox did not start: {reason} (see worker-{w.key}.log)")
+        w.port, w.secret = 0, ""
+        w.state, w.started_at, w.restart_pending, w.last_error = "ready", time.time(), False, ""
+        log.info("worker %s ready in MXC sandbox %s (pid %s, proxy %s, scheduler=%s)", w.key, spec["name"], w.proc.pid,
+                 w.proxy_port or "none", w.scheduler)
+
+    async def _back_to_mxc(self, w: Worker) -> bool:
+        """A worker that started on the AppContainer fallback is marked for a restart (when no run is active) once
+        MXC is available again. True when it was marked."""
+        if not (w.state == "ready" and w.sandbox and w.sandbox.get("backend") == "mxc"
+                and w.backend == "appcontainer" and not w.restart_pending):
+            return False
+        from . import mxc
+        if not (await asyncio.to_thread(mxc.availability, self.s))["available"]:
+            return False
+        log.info("worker %s: MXC is available again; moves from the AppContainer fallback when idle", w.key)
+        w.restart_pending = True
+        return True
 
     def _start_relays(self, w: Worker, sid: str) -> None:
         """Spec 014: pipe server (gateway) + forwarder (inside the container) per allow-listed local service, and
@@ -597,6 +765,20 @@ class WorkerManager:
                 j.close()
 
     def _kill(self, w: Worker) -> None:
+        p = w.proc
+        if w.backend == "mxc" and p and p.poll() is None:
+            # spec 025: end of input first - goose acp exits cleanly (sessions flushed) and MXC removes the container
+            try:
+                p.stdin.close()
+                p.wait(timeout=3)
+            except Exception:
+                pass
+        if w.policy_file:
+            try:
+                Path(w.policy_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+            w.policy_file = ""
         self._stop_relays(w)
         self._close_job(w)
         p = w.proc
@@ -643,6 +825,7 @@ class WorkerManager:
             self._monitor_task.cancel()
         for k in list(self.workers):
             await self.stop(k, "(shutdown)")
+        await self.proxies.close_all()
 
     # ---------------------------------------------------------- monitor
     def start_monitor(self) -> None:
@@ -672,7 +855,7 @@ class WorkerManager:
                             try:
                                 await self.restart(w.key)
                             except Exception as e:
-                                w.last_error = str(e)
+                                w.last_error = getattr(e, "admin_reason", "") or str(e)
                         continue
                     if w.state != "ready":
                         # a stopped profile that has schedules (and owns its scheduler) must be running
@@ -682,8 +865,11 @@ class WorkerManager:
                                 if self.on_restart:
                                     await self.on_restart(w)
                             except Exception as e:
-                                w.last_error = str(e)
+                                w.last_error = getattr(e, "admin_reason", "") or str(e)
                         continue
+                    # spec 025: started on the AppContainer fallback while MXC was unavailable -> back to MXC when
+                    # it is available again (restarted below like any pending change: never during a run)
+                    await self._back_to_mxc(w)
                     # scheduler hand-over (Desktop started/stopped) or pending config -> restart when quiet
                     if (w.scheduler != want_sched or w.restart_pending) and not runs:
                         log.info("worker %s restarting (scheduler %s -> %s, pending=%s)", w.key, w.scheduler,

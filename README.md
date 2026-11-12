@@ -8,19 +8,24 @@ it, on a desktop or a phone.
 
 - **Each person gets an isolated Goose profile.** Their worker runs with `GOOSE_PATH_ROOT=<profiles_root>/<user>`,
   so their chats, recipes, skills, extensions, providers and secrets stay in their own folder. All workers run as
-  the same OS account, and each non-admin user's worker runs in its own Windows AppContainer sandbox.
+  the same OS account, and each non-admin user's worker runs in a sandbox of its own (Microsoft Execution
+  Containers, MXC; or Goose Web's AppContainer backend).
 - **The admin keeps their native Goose profile.** The admin is bound to the existing Goose profile (for example
   `%APPDATA%\Block\goose`) with all of its chats, recipes and settings. Nothing gets copied around, and Goose
   Desktop keeps working on the same profile.
 
-`goose-web 1.18.2` - Python 3.11+ - Windows 10/11 and Windows Server 2019+ - Apache-2.0
+`goose-web 1.19.0` - Python 3.11+ - Windows 10/11 and Windows Server 2019+ - Apache-2.0
 
 ## Windows only
 
 Goose Web currently runs on **Windows only** (Windows 10/11 and Windows Server 2019 or later); `goose-web serve`
 refuses to start on other systems. The reason is the sandbox: on Windows each non-admin user's agent runs in its own
-AppContainer, so the operating system enforces the folder boundaries between users and blocks loopback
-([ADMINISTRATION 11.6](docs/ADMINISTRATION.md)). Linux and macOS have no equivalent per-user sandbox in Goose Web
+container, so the operating system enforces the folder boundaries between users and blocks loopback
+([ADMINISTRATION 11.6](docs/ADMINISTRATION.md)). Since 1.19.0 the default backend is Microsoft Execution Containers
+(MXC): it needs **Windows build 26100.9278 or later** (Windows 11 24H2 / Server 2025 code base) and the pinned
+executor (`goose-web sandbox install-mxc`, run by the installer and the upgrade script). On older Windows set
+`sandbox.backend: appcontainer` (or `sandbox.fallback: appcontainer`); without either, sandboxed users' agents do not
+start (fail closed). Linux and macOS have no equivalent per-user sandbox in Goose Web
 yet, so team members there would share one OS account with full access to each other's files (the accepted risk
 GW-01, [SECURITY-ASSESSMENT 7.2](docs/SECURITY-ASSESSMENT.md)).
 
@@ -188,8 +193,8 @@ Every key, the CLI, policies, profile layout, scheduler rules and scripts are de
   (accounts bound to issuer + subject) are supported. API tokens are sent only in the `Authorization` header.
 - Non-admins go through a default-deny ACP firewall with folder confinement (symlinks resolved). Shell extensions
   are off unless `allow_shell` is set. MCP Apps can only call tools of their own extension.
-  Their agents run in their own Windows AppContainer (on by default), which limits them to their folders and
-  closes loopback.
+  Their agents run in their own MXC container (on by default; AppContainer as an alternative), which limits them to
+  their folders, closes loopback and sends their network through an audited per-user egress proxy.
 - HTTPS out of the box: a built-in local CA and server certificate for every local name and address, renewed
   automatically; or your own certificate; or off behind a reverse proxy (Admin > System > HTTPS).
 - Every user action is attributable (user, client address, time): sign-ins, admin changes, agent calls and everyday
@@ -207,7 +212,7 @@ vulnerability, see [SECURITY.md](SECURITY.md).
 ## Limitations
 
 - **Without the sandbox, profile isolation is a privacy boundary, not a hard security boundary.** All workers run
-  as one OS user. The AppContainer sandbox (on by default) confines non-admin users' agents; without it, a tool that
+  as one OS user. The sandbox (MXC, on by default) confines non-admin users' agents; without it, a tool that
   can read files or run commands can reach other profiles. That is why the shell/developer extensions are
   off for non-admins unless their policy sets `allow_shell`. Admins have the full power of that OS account.
   Team folders and team policies are enforced by the gateway, not by OS permissions, so keep Shell and raw config

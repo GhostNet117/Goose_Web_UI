@@ -168,35 +168,39 @@ MAX_REDIRECTS = 5
 PINNED_HOSTS = {"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
 
 
-def _check_hop(url, pinned: bool) -> None:
-    """Every address of the download, the first and each redirect (security review 2026-11-11, SB-3)."""
+def _check_hop(url, pinned: bool, hosts: set | None = None) -> None:
+    """Every address of the download, the first and each redirect (security review 2026-11-11, SB-3). `hosts`
+    replaces the GitHub host set for other pinned downloads (spec 025: the npm registry)."""
     if url.scheme != "https":
         raise InstallError(f"the download was redirected to a non-https address ({url.scheme}://{url.host}); refused")
-    if pinned and str(url.host or "").lower() not in PINNED_HOSTS:
-        raise InstallError(f"the download was redirected to {url.host}, which is not a GitHub download host; refused")
+    allowed = PINNED_HOSTS if hosts is None else hosts
+    if pinned and str(url.host or "").lower() not in allowed:
+        what = "a GitHub download host" if hosts is None else "a pinned download host (" + ", ".join(sorted(allowed)) + ")"
+        raise InstallError(f"the download was redirected to {url.host}, which is not {what}; refused")
 
 
-def _download_once(url: str, dest: Path, *, expected_size: int, timeout: float, log, pinned: bool = False) -> None:
+def _download_once(url: str, dest: Path, *, expected_size: int, timeout: float, log, pinned: bool = False,
+                   hosts: set | None = None, agent: str = "prompt guard model install") -> None:
     import httpx
     from . import __version__
     cap = expected_size or MAX_ZIP_BYTES
     n = 0
 
     def on_response(resp):
-        _check_hop(resp.request.url, pinned)
+        _check_hop(resp.request.url, pinned, hosts)
         if resp.is_redirect and resp.next_request is not None:
-            _check_hop(resp.next_request.url, pinned)
+            _check_hop(resp.next_request.url, pinned, hosts)
     # trust_env (the default) = HTTPS_PROXY / ALL_PROXY / NO_PROXY and the system CA settings apply.
     with httpx.Client(transport=_TRANSPORT, follow_redirects=True, max_redirects=MAX_REDIRECTS, trust_env=True,
                       timeout=httpx.Timeout(timeout, connect=30.0), event_hooks={"response": [on_response]},
-                      headers={"User-Agent": f"goose-web/{__version__} (prompt guard model install)"}) as client:
+                      headers={"User-Agent": f"goose-web/{__version__} ({agent})"}) as client:
         try:
             stream = client.stream("GET", url)          # GitHub release assets redirect to a CDN
             r = stream.__enter__()
         except httpx.TooManyRedirects:
             raise InstallError(f"the download was redirected more than {MAX_REDIRECTS} times; refused")
         try:
-            _check_hop(r.url, pinned)
+            _check_hop(r.url, pinned, hosts)
             if r.status_code == 429 or r.status_code >= 500:
                 raise _Retry(f"HTTP {r.status_code}")
             if r.status_code != 200:
@@ -227,17 +231,19 @@ def _download_once(url: str, dest: Path, *, expected_size: int, timeout: float, 
 
 
 def download(url: str, dest: Path, *, expected_size: int = 0, timeout: float = 60, log=print,
-             attempts: int = DOWNLOAD_ATTEMPTS, pinned: bool = False) -> None:
+             attempts: int = DOWNLOAD_ATTEMPTS, pinned: bool = False, hosts: set | None = None,
+             agent: str = "prompt guard model install") -> None:
     """HTTPS download with a size cap, retries and progress (installers / CLI only; never at gateway run time).
     `timeout` applies to each read (no data for that long = a failed attempt), not to the whole transfer. Every
-    redirect must be https (at most MAX_REDIRECTS); pinned = only GitHub's download hosts (SB-3)."""
+    redirect must be https (at most MAX_REDIRECTS); pinned = only GitHub's download hosts (SB-3), or `hosts`."""
     import httpx
     if not url.lower().startswith("https://"):
         raise InstallError("the model URL must be https://")
     last = ""
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            _download_once(url, dest, expected_size=expected_size, timeout=timeout, log=log, pinned=pinned)
+            _download_once(url, dest, expected_size=expected_size, timeout=timeout, log=log, pinned=pinned,
+                           hosts=hosts, agent=agent)
             return
         except _Retry as e:
             last = str(e)
