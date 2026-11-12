@@ -572,7 +572,32 @@ def test_env_appcontainer_gets_the_relay_address_whatever_backend_was_configured
     assert KEYS[3] not in wm._env(w) and wm._env(w)["SECURITY_PROMPT_ENABLED"] == "true"   # no relay: patterns only
 
 
-def fake_ctx(s, db, pr, up, endpoint=ENDPOINT):
+def test_the_test_session_never_manages_a_real_native_profile(env, tmp_path):
+    """A gateway started by a test must not touch the developer's Goose profile (conftest.py): with
+    guard.native_profile false, sync_native asks nothing and changes nothing."""
+    import os
+    s, db, pr, c = env
+    assert os.environ.get("GOOSE_WEB__GUARD__NATIVE_PROFILE") == "false" and GS.native_managed(s) is False
+    admin, cdir = native_admin(db, tmp_path)
+    before = (cdir / "config.yaml").read_bytes()
+    up = FakeUp(cdir)
+    fc, notices, worker = fake_ctx(s, db, pr, up, managed=False)
+    assert await_(GS.sync_native(fc, force=True)) is None and await_(GS.sync_native(fc, adopt=True)) is None
+    assert up.calls == [] and (cdir / "config.yaml").read_bytes() == before and GS.native_state(db) is None
+    from goose_web.config import DEFAULTS, Settings
+    import copy
+    assert GS.native_managed(Settings(copy.deepcopy(DEFAULTS), None)) is True      # the product default is on
+    for v, want in (("true", True), ("off", False), (0, False), ("", False), (None, False)):
+        s.data["guard"]["native_profile"] = v
+        assert GS.native_managed(s) is want
+
+
+def await_(coro):
+    return asyncio.run(coro)
+
+
+def fake_ctx(s, db, pr, up, endpoint=ENDPOINT, managed=True):
+    s.data["guard"]["native_profile"] = managed    # the test session's default is off (conftest.py)
     notices, worker = [], SimpleNamespace(state="ready", restart_pending=False)
     c = SimpleNamespace(db=db, settings=s, profiles=pr, classify=SimpleNamespace(endpoint=endpoint),
                         goose_version="1.57.0", upstream_for=lambda u: up,
@@ -616,7 +641,7 @@ async def test_native_sync_failure_tells_administrators_and_never_raises(env, tm
     assert db.query("SELECT ok FROM audit WHERE action='goosesec.native'")[0]["ok"] == 0
     fc.upstream_for = lambda u: (_ for _ in ()).throw(RuntimeError("no worker"))
     assert (await GS.sync_native(fc))["ok"] is False
-    assert await GS.sync_native(SimpleNamespace(profiles=SimpleNamespace(_native_admin=lambda: None))) is None
+    assert await GS.sync_native(SimpleNamespace(settings=s, profiles=SimpleNamespace(_native_admin=lambda: None))) is None
 
 
 # ------------------------------------------------------------------ API
@@ -625,6 +650,7 @@ def test_api_get_put_validate_and_audit(env, tmp_path):
     admin, cdir = native_admin(db, tmp_path)
     alice = member(db)
     up = FakeUp(cdir)
+    s.data["guard"]["native_profile"] = True       # this test is about the native apply (temporary profile)
     c.upstream_for = lambda u: up
     c.hub = SimpleNamespace(broadcast_admins=lambda m: None)
     c.classify = SimpleNamespace(endpoint=ENDPOINT, describe=lambda: {"state": "listening", "port": 8711},
@@ -660,8 +686,11 @@ def test_api_get_put_validate_and_audit(env, tmp_path):
 
 
 # ------------------------------------------------------------------ CLI
-def test_cli_security_status_on_off_rotate(env, capsys):
+def test_cli_security_status_on_off_rotate(env, capsys, monkeypatch):
     s, db, pr, c = env
+    # the command line reads its own settings; these commands only read and write Goose Web's database (no gateway,
+    # no Goose), so the test session's "never manage a native profile" default can be lifted for what they print
+    monkeypatch.setenv("GOOSE_WEB__GUARD__NATIVE_PROFILE", "true")
     (s.system_dir).mkdir(parents=True, exist_ok=True)
     assert cli(["security", "status"]) == 2 and "init" in capsys.readouterr().err   # no database yet
     from goose_web.db import Database
@@ -701,3 +730,6 @@ def test_cli_security_status_on_off_rotate(env, capsys):
     assert cli(["security", "status"]) == 0
     out = capsys.readouterr().out
     assert "native profile: NOT applied" in out and "error: method not found" in out
+    monkeypatch.setenv("GOOSE_WEB__GUARD__NATIVE_PROFILE", "false")
+    assert cli(["security", "status"]) == 0
+    assert "native profile: not managed (guard.native_profile is false)" in capsys.readouterr().out

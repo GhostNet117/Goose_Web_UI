@@ -40,6 +40,11 @@ recipes); Goose Web now configures them where Goose reads them. No database sche
   profile only Goose Web's own values are ever replaced or removed (yours are kept, "off" leaves them alone); text
   that cannot be scored completely is refused, never reported safe; a tampered `adversary.md` path fails the
   member's start and is audited.
+- **`guard.native_profile` (default `true`).** `false` = Goose Web never changes the administrator's own Goose
+  profile. Found while verifying the release: a real gateway applies the settings to its administrator's Goose
+  profile when it starts, and the test suite starts a real gateway whose administrator is the developer's real Goose
+  folder, so running the tests wrote the settings into that profile. The test session now sets
+  `GOOSE_WEB__GUARD__NATIVE_PROFILE=false` (`tests/conftest.py`), with a test that proves nothing is asked or changed.
 - **Other fixes from the same day's review of the whole product:**
   - Open WebSockets are closed when the caller's role, policy or folders change (a demoted administrator, or a
     member whose team lost a permission, kept the old rights until the tab was closed). The browser reconnects.

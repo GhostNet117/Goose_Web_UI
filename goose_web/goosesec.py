@@ -529,6 +529,19 @@ def native_state(db) -> dict | None:
     return n if isinstance(n, dict) else None
 
 
+def native_managed(settings) -> bool:
+    """guard.native_profile (default true): may Goose Web change the administrator's own Goose profile at all?
+
+    Found the hard way (2026-11-12): any real gateway whose administrator uses the default Goose folder applies
+    these settings to it when it starts - also a gateway started by a test, on the developer's real Goose profile.
+    tests/conftest.py therefore switches this off for the whole test session; only an explicit true counts as on
+    when the value is not a boolean."""
+    v = settings.get("guard", "native_profile", True)
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
 def token_fingerprint(token: str | None) -> str:
     """Enough of a hash to notice that the token changed; not enough to be the token."""
     return hashlib.sha256((token or "").encode()).hexdigest()[:16] if token else ""
@@ -598,6 +611,8 @@ async def sync_native(c, *, adopt: bool = False, force: bool = False) -> dict | 
         _native_lock = asyncio.Lock()
     async with _native_lock:
         try:
+            if not native_managed(c.settings):
+                return None   # guard.native_profile: false - the administrator's own Goose profile is never changed
             admin = c.profiles._native_admin()
             if not admin or admin.get("disabled"):
                 return None

@@ -72,8 +72,9 @@ class ClassifyService:
             except (TypeError, ValueError):
                 log.warning("classification endpoint: guard.%s is %r, not a number; using %s", key, v, default)
                 return default
-        self.port = goosesec.classifier_port(settings) if port is None else int(port)
-        self.ephemeral = ephemeral   # tests: bind an OS-assigned port (port 0)
+        self.ephemeral = ephemeral   # tests: an OS-assigned port (0), never the configured one - a gateway on this
+        # computer may hold that port, and a test must not depend on it being free
+        self.port = 0 if ephemeral else (goosesec.classifier_port(settings) if port is None else int(port))
         self.budget = num("classifier_timeout_ms", 4000, 200, 4900) / 1000.0
         self.max_pieces = int(num("classifier_max_pieces", 4, 1, 64))
         self.max_body = int(num("classifier_max_body_kb", 256, 4, 8192)) * 1024

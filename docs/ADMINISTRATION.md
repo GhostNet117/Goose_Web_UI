@@ -1147,6 +1147,10 @@ find that nothing changed). The page and `goose-web check` show when it was last
 version. If it fails, Goose keeps running with what it had, administrators get a notice, the audit log gets
 `goosesec.native`, and the gateway tries again at its next start.
 
+`guard.native_profile: false` in config.yaml stops Goose Web from changing that profile at all (members are still
+managed). Set it for any second or throwaway gateway on the same computer whose administrator uses your real Goose
+folder: every gateway applies these settings to its administrator's Goose profile when it starts.
+
 That profile is the administrator's own Goose, so Goose Web only manages what it wrote there itself. It remembers
 the values it set and replaces or removes only those. A value you set yourself is kept and listed on the page as
 "kept": a stricter threshold, your own classifier endpoint with its switch and token, a setting you changed in Goose

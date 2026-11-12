@@ -881,7 +881,10 @@ def cmd_security(args, settings) -> int:
           f"{'on' if adv['native'] else 'off'}")
     print(f"  reviewed tools: {', '.join(adv['tools'])}")
     print(f"  rules: {len(adv['rules'])} characters" + ("" if adv["rules"] else " (Goose's built-in rules)"))
-    if state:
+    if not goosesec.native_managed(settings):
+        print("native profile: not managed (guard.native_profile is false): Goose Web does not change the "
+              "administrator's own Goose profile")
+    elif state:
         when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(state.get("at") or 0)))
         print(f"native profile: {'applied' if state.get('ok') else 'NOT applied'} {when} (goose "
               f"{state.get('goose') or '?'}; adversary.md: {state.get('adversary') or 'off'})")
@@ -1020,7 +1023,9 @@ def cmd_check(args, settings) -> int:
                 cfree = True
             print(f"[OK] classification endpoint: 127.0.0.1:{cport} "
                   + ("free" if cfree else "in use (gateway already running?)"))
-        if sstate:
+        if not goosesec.native_managed(settings):
+            print("[--] goose security, native profile: not managed (guard.native_profile is false)")
+        elif sstate:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(sstate.get("at") or 0)))
             if sstate.get("ok"):
                 print(f"[OK] goose security, native profile: applied {when} (goose {sstate.get('goose') or '?'}; "

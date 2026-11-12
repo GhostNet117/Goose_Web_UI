@@ -619,6 +619,7 @@ function gooseSecurity(el) {
       draw();
     };
     const nativeLine = !data.hasNative ? 'No administrator uses a native Goose profile.'
+      : data.nativeManaged === false ? 'Not managed: guard.native_profile is false in config.yaml, so Goose Web does not change that profile.'
       : !n ? 'Not applied yet (done when the gateway starts, or with Apply now).'
         : (n.ok ? 'Applied ' : 'NOT applied ') + fmtDateTime(n.at * 1000) + ' (Goose ' + (n.goose || '?') + ')' + (n.error ? ': ' + n.error : '');
     el.replaceChildren(h('div', { class: 'stack-sm' },

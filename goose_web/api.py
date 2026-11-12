@@ -1548,6 +1548,7 @@ def _goosesec_view(c: Ctx) -> dict:
     return {"settings": goosesec.load(c.db), "chosen": goosesec.chosen(c.db), "defaults": goosesec.DEFAULTS,
             "listener": c.classify.describe() if c.classify is not None else None,
             "native": goosesec.native_state(c.db), "hasNative": bool(c.profiles._native_admin()),
+            "nativeManaged": goosesec.native_managed(c.settings),
             "members": len(members), "gooseVersion": c.goose_version,
             "limits": {"rulesChars": goosesec.MAX_RULES_CHARS, "tools": goosesec.MAX_TOOLS}}
 

@@ -206,6 +206,10 @@ DEFAULTS: dict[str, Any] = {
         # every profile (Goose Web chats, Goose Desktop, the goose CLI, scheduled recipes). Loopback only, its own
         # port, one token per profile. 0 = no endpoint (Goose-native detection then uses patterns only).
         "classifier_port": 8711,
+        # Goose-native security also for the administrator's own (native) Goose profile, the one Goose Desktop, the
+        # CLI and scheduled recipes share. false = Goose Web never changes that profile; members' profiles are still
+        # managed. The test suite sets it to false, so a gateway started by a test never touches a real Goose profile.
+        "native_profile": True,
         "classifier_timeout_ms": 4000,    # answer within this or 503 (Goose waits 5 s and does not retry)
         "classifier_max_pieces": 4,       # a text longer than max_input_chars is scored in this many pieces at most
         "classifier_max_body_kb": 256,    # larger request bodies are refused (413)
