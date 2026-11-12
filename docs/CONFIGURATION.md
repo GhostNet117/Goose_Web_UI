@@ -159,6 +159,16 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 | `guard.model_dir` | `<system_dir>/models/prompt-guard-2-22m` | Where the model package is installed. |
 | `guard.model_url` / `guard.model_sha256` | empty | Override of the pinned package (the GitHub release asset `prompt-guard-2-22m-onnx-1`, see ADMINISTRATION 9.10), for example an internal https mirror; set both. |
 
+Classification endpoint (since 1.20.0, ADMINISTRATION 9.11). Goose's own prompt injection detection asks it:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `guard.classifier_port` | `8711` | Loopback port of the classification endpoint (`http://127.0.0.1:<port>/classify`). `0` = no endpoint: Goose-native detection then uses its patterns only. The address is always `127.0.0.1`. |
+| `guard.classifier_timeout_ms` | `4000` | The endpoint answers within this or with `503` (Goose waits 5 s and does not retry; 200 to 4900). A slow answer does not mark the classifier unavailable; the score is cached for Goose's next request. |
+| `guard.classifier_max_pieces` | `4` | A text longer than `guard.max_input_chars` is scored in this many consecutive pieces at most; the rest is not scored. |
+| `guard.classifier_max_body_kb` | `256` | Larger request bodies get `413`. |
+| `guard.classifier_rate_per_minute` | `600` | Requests per profile per minute; beyond it `429`. |
+
 ### `elsewhere` keys (Working elsewhere, since 1.16.0)
 
 Administrators of the native profile see, read-only, the sessions Goose Desktop, the goose CLI or a scheduled job is
@@ -255,6 +265,7 @@ vendor's, not Goose's:
 | `native-hints` | `status \| enable USER [--team NAME] [--adopt] [--doc-name NAME] \| disable` | Managed native hints (ADMINISTRATION 10.1): Goose Web writes the native admin's composed hints (personal, assigned, team documents) into the native profile's `config/.goosehints`, which Goose Desktop, the CLI and schedules on that account load too. `--team` puts the user in that team (created if missing); `--adopt` keeps the current file as a library document. Audit `hints.native.managed` / `hints.native.unmanaged`. |
 | `native-root` | `[PATH]` | Without PATH: show the native Goose profile (Goose appdata folder). With PATH: move the native profile to that folder (must contain `config\`), update every native user that used the old one, audit `system.native_root`. Files are not copied. Restart the gateway afterwards. |
 | `gateway` | `status \| drain \| undrain`, `--seconds N` (drain, default 120, max 900), `--reason TEXT`, `--timeout S` (default 20), `--json` | 1.16.0: asks the running gateway what is running (every turn in every worker, pending permission requests, direct tool calls, scheduler jobs inside a gateway worker), through files in `<system_dir>/run/`. `drain` also refuses new prompts for N seconds and tells every tab (before a restart); `undrain` ends it. Exit 0 = idle (or not running), 3 = busy or unknown (no answer). A gateway older than 1.16 is judged by its herd marks in the database. Used by `scripts\upgrade.ps1` (ADMINISTRATION 20.1). |
+| `security` | `status \| on \| off \| rotate-tokens` | 1.20.0, Goose-native security (ADMINISTRATION 9.11): `status` shows Goose's prompt injection detection (threshold, classifier, endpoint), adversary mode and when the native profile was last brought in line (read-only, safe next to a running gateway). `on` / `off` store the choice (`off` also turns adversary mode off, so everything Goose Web wrote is removed); `rotate-tokens` replaces every classifier token. They take effect when the gateway starts (members: at the next start of their agent), or at once with Admin > Prompt guard > Apply now. Audited as `goosesec.update` / `goosesec.rotate`. |
 | `version` | | Prints the version. |
 
 ## 4. Settings stored in the database
@@ -269,6 +280,9 @@ Admins change these in the UI (Admin > Settings / Sign-in). They are stored in t
 | `brand` | `{name: "Goose Web", tagline: ...}` | `name`, `tagline`, `machine` (shown in Herd). |
 | `session_hours` | config `auth.session_hours` | 1 to 720. |
 | `guard_admin` | off | The administrators' prompt guard (Admin > Prompt guard): `enabled`, `check_input`, `rulesets`, `on_block`. Prompt-guard rule sets are in the `guard_rulesets` table. |
+| `goose_security` | not stored = the defaults | Goose-native security (1.20.0, Admin > Prompt guard, `goose-web security`): `enabled` (default `true`), `threshold` (`0.8`, 0.01-1.0, lower = stricter), `classifier` (`true`), `adversary: {members: false, native: false, tools: ["shell"], rules: ""}`. Not stored until an administrator or the installer chooses; a stored choice survives upgrades. |
+| `goose_security_key` | created on first use | Key the classifier tokens are derived from (HMAC-SHA256). It never leaves the database; `goose-web security rotate-tokens` replaces it. Treat a database copy as a secret, as before. |
+| `goose_security_state` | - | Outcome of the last apply to the native profile: `{native: {ok, error, at, goose, changed, adversary, adversaryHash, tokenFp}}`. No token, no rules text. |
 | `allow_self_totp` | `true` | When false, non-admins cannot set up or enable TOTP themselves (`403 totp_self_disabled`). Admins can always enrol. |
 | `require_totp_admins` | `false` | Admins cannot turn off their TOTP. It can only be switched on by an admin who already uses TOTP (`409 totp_needed_first`). The login response and `/api/me` report `totpEnrolmentRequired` for an admin without TOTP. Enrolment is not yet forced at sign-in. |
 | `peers` | `[]` | Herd peers: `{name, url, token, verifyTls}` (max 50). The gateway calls `<url>/api/herd` with `Bearer <token>`. Tokens are masked in reads. |

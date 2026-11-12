@@ -134,6 +134,8 @@ The main ideas:
 | `policy.py` | Least-privilege default, legacy (1.4) and admin policies, `effective_policy` (one team + overrides), chat gating (`chat_block`, `check_session_choice`), team warnings (`team_warnings`), roots (`user_roots`), path containment (`path_allowed`), and the ACP method firewall (`check`). |
 | `guard.py` | Prompt guard (spec 018): rule sets (validation, SPL-aware pipeline parser, globs, defaults), `GuardContext` per user (team or admin guard), `Classifier` (Prompt Guard 2 22M on ONNX Runtime: windows, cache, lazy load), `GuardService` (contexts cached per user, `check_prompt`, `check_tool`, health, fail open, `guard.unavailable`). |
 | `guardmodel.py` | The model package: folder, pin (`MODEL_PIN` = the GitHub release asset, or `guard.model_url/sha256`), download (proxy environment, retries, size cap, progress), SHA-256-verified install from the pin or a local zip (safe extract, integrity check against `export.json`), remove. |
+| `goosesec.py` | Spec 026 (1.20.0): Goose-native security. The administrators' settings (`goose_security`: prompt injection detection, threshold, classifier; adversary mode for members / the native profile, tools, rules) with validation and defaults; the per-profile classifier tokens (HMAC of the user id with `goose_security_key`); `adversary_text`; `profile_plan` (config keys, secret, `adversary.md`, worker environment), the one source for `Profiles.provision`, the worker environment and the native apply; `apply_native` / `sync_native` (the native profile through Goose's `config/read`, `config/upsert`, `config/remove`; `native_drift` reads `config.yaml` only, so Goose is not started when nothing differs); `read_only` for the CLI. Section [12.12](#1212-goose-native-security-goosesecpy-classifyapipy-spec-026). |
+| `classifyapi.py` | Spec 026: `ClassifyService`, the classification endpoint Goose's prompt injection detection asks. A Starlette app with one route (`POST /classify`, Goose's Classification API format) on a uvicorn server over a socket the gateway binds itself to `127.0.0.1:<guard.classifier_port>` (exclusive on Windows; a failed bind = `unavailable`, never an exception); Bearer token per profile, per-profile rate limit, body cap, `GuardService.score_external` with a deadline below Goose's 5 s; counters, `self_test`. |
 | `auth.py` | `AuthService`: local passwords, LDAP/Active Directory, OIDC (authorization code with PKCE), TOTP, lockout and rate limits, cookie sessions, API tokens. |
 | `ipblock.py` | `IPBlocker`: counts failed sign-ins per client address (IPv4, or IPv6 /64) in the `ip_blocks` table, blocks after `auth.ip_block_threshold` in a row within the window, expiry, unblock, listing; in-memory cache of blocked keys refreshed every 15 s. |
 | `security.py` | Stdlib-only primitives: scrypt password hashing, strong-password rules, `ip_in`, tokens, constant-time compare, TOTP, `RateLimiter`, `safe_name`. |
@@ -1798,6 +1800,47 @@ position, so they are guarded:
   capped at the pinned size) runs only from `goose-web guard install-model` and the installers, never in the
   gateway. Tests inject `guardmodel._TRANSPORT` (an `httpx.MockTransport`); `tests/conftest.py` makes any other
   download fail the test.
+
+### 12.12 Goose-native security (`goosesec.py`, `classifyapi.py`, spec 026)
+
+Goose's own prompt injection detection and adversary mode run inside the agent, so they also cover chats that never
+pass through the gateway. Goose Web writes their settings; it does not implement them.
+
+- **Settings.** `goosesec.load(db)`: the `goose_security` setting over `DEFAULTS` (detection on, threshold 0.8,
+  classifier on, adversary mode off). `clean` validates; `summary` is what an audit row holds (never the rules).
+- **Plan.** `profile_plan(cfg, native, token, endpoint)` returns the config keys to set and to remove, the secret,
+  the `adversary.md` text and the worker environment. `endpoint` is `ClassifyService.endpoint`, which is `None` unless
+  the gateway holds the port; then the plan has `SECURITY_PROMPT_CLASSIFIER_ENABLED: false` and no token.
+- **Isolated profiles.** `Profiles.provision` -> `_apply_security`: keys into `config.yaml`, the token into
+  `secrets.yaml` (never `config.yaml`), `config/adversary.md` (not through a link; its hash in the manifest; removed
+  when off if the gateway ever wrote one). An exception here is logged and leaves the profile as it was instead of
+  failing the provisioning. `pre_start` (app.py) sets `Worker.security_env` from the same plan; `_env` and
+  `_sandbox_env` add it last, after `goose.extra_env`. Goose ranks the environment above `config.yaml` and the secret
+  store. For the AppContainer backend the endpoint is left out of the environment: `config.yaml` carries the relay
+  forwarder's address.
+- **Firewall.** `policy.check` refuses a non-admin's `config/upsert` / `config/remove` of a key starting with
+  `SECURITY_` (`MANAGED_CONFIG_PREFIXES`). `adversary.md` is in `HINT_FILE_NAMES` (file endpoints).
+- **Native profile.** `sync_native(ctx)` (start-up task after 5 s, every settings change, *Apply now*): `native_drift`
+  compares the plan with the native `config.yaml` (read only), the recorded token fingerprint and the
+  `adversary.md` hash; without drift nothing is asked. Otherwise `apply_native` uses `Upstream.request` with
+  `_goose/unstable/config/read|upsert|remove` (`isSecret` for the token; a read that fails counts as "unknown", so
+  a Goose that answers a missing key with an error still works) and `apply_adversary_file` (a file with another hash
+  than the one recorded is `foreign` and kept unless `adopt`; backups in `<system_dir>/backups/native-security/`).
+  The outcome goes to `goose_security_state`, the audit (`goosesec.native`, only on a change or a failure) and, on
+  failure, a `_gw/notice` to administrators. A change marks the native worker `restart_pending`.
+- **Classification endpoint.** `ClassifyService.start()` binds the socket itself, then runs a `uvicorn.Server`
+  subclass without signal handling on it (`log_config=None`, `lifespan="off"`, `access_log=False`); a start-up that
+  ends in `SystemExit` is caught in `_serve`. `classify()`: token (`goosesec.verify_token`, constant time, user not
+  disabled, cached 15 s) -> rate limit -> body cap while reading -> `{"inputs": str | [str]}` ->
+  `GuardService.score_external(text, budget, max_pieces)` -> `[[{label, score}, ...]]`, highest first.
+  `score_external` splits a long text into pieces of `max_input_chars` (overlap 256), halves a piece the classifier
+  refuses as too long (three times at most), and returns `busy` at the deadline while the work goes on in the
+  classifier thread (shielded), so the cache answers Goose's next request. `busy` does not call `_unavailable`.
+  `GuardService.extra_in_use = ClassifyService.in_use` makes the model warm up at start.
+- **Sandbox.** `Ctx.sandbox_spec` adds `127.0.0.1:<port>` to the relay targets while the endpoint listens and is in
+  use: MXC members reach it through their egress proxy at the real address, AppContainer members through a relay.
+- **Tests.** `tests/test_goosesec.py`, `tests/test_classifyapi.py`; `tests/test_goosesec_e2e.py` runs the real goose
+  binary against a fake provider (`GOOSE_WEB_TEST_GOOSE`), including `apply_native` over `goose acp`.
 
 ## 13. Configuration loading
 

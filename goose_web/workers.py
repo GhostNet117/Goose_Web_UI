@@ -269,6 +269,10 @@ class Worker:
     backend: str = ""                # sandbox backend the running worker uses: mxc | appcontainer (spec 025)
     policy_file: str = ""            # MXC: the policy wxc-exec was started with (<system_dir>/sandbox/mxc)
     proxy_port: int = 0              # MXC: the member's egress proxy (egress.py)
+    # Spec 026: Goose's own security settings (SECURITY_PROMPT_*) for an isolated worker, set by the app's pre_start
+    # hook. Applied last: Goose ranks the environment above config.yaml and the secret store, so a member or an
+    # agent editing the profile cannot switch the detection off. Never set for the native profile.
+    security_env: dict = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
@@ -393,6 +397,8 @@ class WorkerManager:
         for k, v in (self.s.get("goose", "extra_env") or {}).items():
             env[str(k)] = str(v)
         env["CONTEXT_FILE_NAMES"] = json.dumps([ISOLATED_HINTS_FILENAME])
+        for k, v in (w.security_env or {}).items():   # spec 026: beats config.yaml, secrets.yaml and extra_env
+            env[str(k)] = str(v)
         # The container cannot reach the account's home, TEMP or caches: keep them in the profile (granted Modify).
         for k, sub in (("TEMP", "tmp"), ("TMP", "tmp"), ("UV_CACHE_DIR", "cache/uv"), ("PIP_CACHE_DIR", "cache/pip"),
                        ("npm_config_cache", "cache/npm"), ("XDG_CACHE_HOME", "cache"),
@@ -424,6 +430,8 @@ class WorkerManager:
             # Spec 009: Goose loads only the gateway-written hints file (config/.goose-web-hints.md), never an
             # AGENTS.md / .goosehints in a working folder. The env var beats config.yaml and extra_env.
             env["CONTEXT_FILE_NAMES"] = json.dumps([ISOLATED_HINTS_FILENAME])
+            for k, v in (w.security_env or {}).items():   # spec 026: beats config.yaml, secrets.yaml and extra_env
+                env[str(k)] = str(v)
         env["GOOSE_SERVER__SECRET_KEY"] = w.secret
         return env
 

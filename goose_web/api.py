@@ -1523,6 +1523,72 @@ async def admin_hint(request: Request):
     return ok({"updatedUsers": [u["username"] for u in users]})
 
 
+# ====================================================================== admin: Goose-native security (spec 026)
+def _goosesec_view(c: Ctx) -> dict:
+    """Goose's own prompt injection detection and adversary mode: the settings, where they apply and their state."""
+    from . import goosesec
+    members = [u for u in c.db.users() if not u["disabled"] and not c.profiles.is_native(u)]
+    return {"settings": goosesec.load(c.db), "chosen": goosesec.chosen(c.db), "defaults": goosesec.DEFAULTS,
+            "listener": c.classify.describe() if c.classify is not None else None,
+            "native": goosesec.native_state(c.db), "hasNative": bool(c.profiles._native_admin()),
+            "members": len(members), "gooseVersion": c.goose_version,
+            "limits": {"rulesChars": goosesec.MAX_RULES_CHARS, "tools": goosesec.MAX_TOOLS}}
+
+
+async def _goosesec_apply(c: Ctx, adopt: bool = False) -> dict:
+    """Settings or tokens changed: members' profiles are provisioned again (a running worker restarts when it is
+    idle, Goose reads these settings at start), and the native profile is brought in line through Goose itself."""
+    from . import goosesec
+    if c.classify is not None:
+        c.classify.invalidate()
+    members = [u for u in c.db.users() if not u["disabled"] and not c.profiles.is_native(u)]
+    changed = await _reprovision(c, members)
+    native = await goosesec.sync_native(c, adopt=adopt, force=True)
+    return {"members": {name: len(ch) for name, ch in changed.items() if ch}, "native": native}
+
+
+async def admin_goose_security(request: Request):
+    from . import goosesec
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    if request.method == "PUT":
+        b = await body_json(request)
+        body = b.get("settings") if isinstance(b.get("settings"), dict) else b
+        try:
+            cfg = goosesec.clean({k: v for k, v in body.items() if k != "adoptNative"}, goosesec.load(c.db))
+        except goosesec.SettingsError as e:
+            raise HTTPError(400, "bad_settings", str(e))
+        goosesec.save(c.db, cfg)
+        c.audit(request, "goosesec.update", admin, detail=goosesec.summary(cfg))   # never the rules text
+        applied = await _goosesec_apply(c, adopt=bool(b.get("adoptNative")))
+        return ok({**_goosesec_view(c), "applied": applied})
+    return ok(_goosesec_view(c))
+
+
+async def admin_goose_security_check(request: Request):
+    """A real request to the classification endpoint, the way Goose makes it (token, format, scores)."""
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    if c.classify is None:
+        raise HTTPError(503, "unavailable", "The classification endpoint is not available")
+    res = await c.classify.self_test(admin)
+    c.audit(request, "goosesec.check", admin, detail={"ok": bool(res.get("ok")), "state": res["listener"]["state"],
+                                                     "error": str(res.get("error") or "")[:200]},
+            ok=bool(res.get("ok")))
+    return ok(res)
+
+
+async def admin_goose_security_rotate(request: Request):
+    """Replace every classifier token (a token may have leaked). Profiles get new ones at once."""
+    from . import goosesec
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    goosesec.rotate_key(c.db)
+    c.audit(request, "goosesec.rotate", admin)
+    applied = await _goosesec_apply(c)
+    return ok({**_goosesec_view(c), "applied": applied})
+
+
 # ====================================================================== admin: prompt guard (spec 018)
 def _guard_changed(c: Ctx) -> None:
     """Rule sets, a team's guard or the admin guard changed: contexts are rebuilt on next use, and the model is
@@ -1999,6 +2065,9 @@ routes = [
     Route("/api/admin/library", admin_library),
     Route("/api/admin/hints", admin_hints, methods=["GET", "POST"]),
     Route("/api/admin/hints/{hid:int}", admin_hint, methods=["GET", "PUT", "DELETE"]),
+    Route("/api/admin/goose-security", admin_goose_security, methods=["GET", "PUT"]),
+    Route("/api/admin/goose-security/check", admin_goose_security_check, methods=["POST"]),
+    Route("/api/admin/goose-security/rotate", admin_goose_security_rotate, methods=["POST"]),
     Route("/api/admin/guard", admin_guard, methods=["GET", "PUT"]),
     Route("/api/admin/guard/check", admin_guard_check, methods=["POST"]),
     Route("/api/admin/guard/test", admin_guard_test, methods=["POST"]),

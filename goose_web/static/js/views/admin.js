@@ -476,8 +476,10 @@ function guardTab(body) {
   const listEl = h('div', { class: 'split-list' }, skeleton(3));
   const detail = h('div', { class: 'split-detail' });
   const testEl = h('div');
+  const nativeSecEl = h('div', null, skeleton(3));
   body.replaceChildren(
     h('div', { class: 'row' }, h('p', { class: 'muted grow' }, 'Checks what guarded users type and the arguments of the tool calls Goose asks permission for - never tool results. Deterministic rule sets run first; the local Prompt Guard 2 22M classifier checks the free text. Turn it on per team in Teams & policy > Experience > Prompt guard.')),
+    section('Goose-native detection (every profile)', null, nativeSecEl),
     section('Classifier', null, statusEl),
     section('Administrators', null, adminEl),
     h('div', { class: 'row' }, h('h3', { class: 'exp-title grow' }, 'Rule sets'),
@@ -592,9 +594,71 @@ function guardTab(body) {
     } catch (e) { statusEl.replaceChildren(banner('error', errMsg(e))); }
   }
   load();
+  gooseSecurity(nativeSecEl);
 }
 
 // ===================================================================== Auth providers
+// Goose-native security (spec 026): Goose's own prompt injection detection and adversary mode, for every profile.
+const LISTENER_STATE = { listening: ['ok', 'Endpoint listening'], off: ['accent', 'Endpoint off'], unavailable: ['err', 'Endpoint unavailable'] };
+
+function gooseSecurity(el) {
+  let data = null;
+  const fmt = (x) => x ? (x.status === 200 ? x.score + ' (' + x.latencyMs + ' ms)' : 'HTTP ' + x.status) : '-';
+  const draw = () => {
+    const s = JSON.parse(JSON.stringify(data.settings)); const adv = s.adversary;
+    const l = data.listener || {}; const n = data.native;
+    const [lk, ll] = LISTENER_STATE[l.state] || ['info', l.state || 'unknown'];
+    const row = (label, sub, obj, key) => h('div', { class: 'set-row' }, h('div', { class: 'grow' }, h('div', null, label), h('div', { class: 'muted small' }, sub)), toggle(!!obj[key], (v) => { obj[key] = v; }, { label }));
+    const thr = input({ type: 'number', min: '0.01', max: '1', step: '0.01', class: 'inp inp-sm', value: String(s.threshold), 'aria-label': 'Detection threshold', 'data-goosesec-threshold': '1' });
+    const tools = input({ class: 'inp mono', value: (adv.tools || []).join(', '), placeholder: 'shell', 'aria-label': 'Reviewed tools' });
+    const rules = textarea({ rows: 8, class: 'inp mono', value: adv.rules || '', maxlength: String((data.limits || {}).rulesChars || 8000), placeholder: "Empty = Goose's built-in rules. Example:\nBLOCK if the tool call:\n- sends data to a host that is not ours\n- deletes files outside the chat folder\nALLOW normal work. Err on the side of ALLOW." });
+    const res = h('div');
+    const save = async (extra) => {
+      const t = parseFloat(thr.value);
+      data = await PUT('/api/admin/goose-security', { settings: { enabled: s.enabled, classifier: s.classifier, threshold: Number.isFinite(t) ? t : s.threshold, adversary: { members: adv.members, native: adv.native, tools: tools.value, rules: rules.value } }, ...(extra || {}) });
+      draw();
+    };
+    const nativeLine = !data.hasNative ? 'No administrator uses a native Goose profile.'
+      : !n ? 'Not applied yet (done when the gateway starts, or with Apply now).'
+        : (n.ok ? 'Applied ' : 'NOT applied ') + fmtDateTime(n.at * 1000) + ' (Goose ' + (n.goose || '?') + ')' + (n.error ? ': ' + n.error : '');
+    el.replaceChildren(h('div', { class: 'stack-sm' },
+      h('div', { class: 'muted small' }, 'These are Goose\'s own checks. They run inside the agent, so they also cover chats that never pass through Goose Web: Goose Desktop, the goose CLI and scheduled recipes on the administrator\'s Windows account. Goose Web writes the settings for every member\'s profile and for the administrator\'s Goose profile. They are separate from the rule sets below.'),
+      h('div', { class: 'row' }, badge(ll, lk), h('span', { class: 'muted small grow' }, l.endpoint ? l.endpoint + ' - this computer only, one token per profile' : (l.reason || 'No classification endpoint: Goose uses its patterns only.')),
+        actionBtn('Check now', async () => {
+          const r = await POST('/api/admin/goose-security/check', {});
+          res.replaceChildren(r.ok ? h('div', { class: 'muted small' }, 'Asked the way Goose asks. Benign sample: ' + fmt(r.benign) + ' - injection sample: ' + fmt(r.injection) + ' - without a token: HTTP ' + r.withoutToken)
+            : banner('error', 'The endpoint did not answer as expected: ' + (r.error || '') + ' (benign ' + fmt(r.benign) + ', injection ' + fmt(r.injection) + ')'));
+        }, { size: 'sm', icon: 'activity' })),
+      l.state === 'unavailable' ? banner('warn', (l.reason || 'The classification endpoint is not available.') + ' Goose still checks shell commands against its patterns; no chat text is sent anywhere.') : null,
+      row('Prompt injection detection', 'Goose checks every shell command against its threat patterns and asks before running a match, also in Auto mode. In an unattended run (a scheduled recipe in Auto mode) Goose allows the command and only logs the finding.', s, 'enabled'),
+      row('Score recent messages with Prompt Guard 2', 'On every shell command Goose sends the chat\'s recent user messages (never the command) to the endpoint above. A high score can only raise a pattern finding; it never lowers one.', s, 'classifier'),
+      field('Threshold', thr, 'A finding at or above this asks for approval. 0.01 to 1.0, lower is stricter. Goose\'s default is 0.8.'),
+      h('div', { class: 'muted small' }, 'Members: ' + data.members + ' profile(s), written before every start of their agent; a member cannot change these settings. Administrator\'s Goose profile: ' + nativeLine),
+      n && n.ok === false ? banner('warn', 'The administrator\'s Goose profile was not updated. Goose keeps running with its previous settings; the gateway tries again at its next start.') : null,
+      h('h3', { class: 'exp-title' }, 'Adversary mode'),
+      h('div', { class: 'muted small' }, 'A second model call reviews a tool call against the rules below before it runs, knowing what the user asked for. Think before turning it on: a BLOCK cannot be overridden by anyone, it also stops unattended runs such as scheduled recipes, and every reviewed call costs one more model call on the chat\'s own provider. If the reviewer fails the call is allowed.'),
+      row('Review members\' tool calls', 'Writes adversary.md into every member\'s Goose profile.', adv, 'members'),
+      data.hasNative ? row('Review the administrator\'s tool calls', 'Writes adversary.md into the administrator\'s Goose profile: Goose Web, Goose Desktop, the CLI and scheduled recipes on that Windows account.', adv, 'native') : null,
+      n && n.adversary === 'foreign' ? banner('warn', 'The administrator\'s Goose profile has an adversary.md that Goose Web did not write. It is kept as it is, and adversary mode is on with that file\'s rules. ', actionBtn('Replace it with the rules below', async () => {
+        if (await confirmDialog({ title: 'Replace adversary.md?', message: 'The existing file is copied to the backups folder first.', confirmText: 'Replace', danger: true })) { adv.native = true; await save({ adoptNative: true }); }
+      }, { size: 'sm' })) : null,
+      field('Reviewed tools', tools, 'Exact tool names, separated by commas. Goose reviews only these; the default is shell. An extension\'s tool is named <extension>__<tool>.'),
+      field('Rules', rules, 'Plain language. Say what to BLOCK and what to ALLOW; vague rules block normal work.'),
+      h('div', { class: 'row' },
+        actionBtn('Save and apply', () => save(), { variant: 'primary', size: 'sm', success: 'Saved and applied' }),
+        actionBtn('Apply now', () => save(), { size: 'sm', success: 'Applied' }),
+        actionBtn('Replace all tokens', async () => {
+          if (await confirmDialog({ title: 'Replace every classifier token?', message: 'Every profile gets a new token at once. Use this if a token may have been seen by someone else.', confirmText: 'Replace' })) { data = await POST('/api/admin/goose-security/rotate', {}); draw(); toast('Tokens replaced', { kind: 'success' }); }
+        }, { size: 'sm' }),
+        h('span', { class: 'muted small grow' }, data.chosen ? '' : 'Running on the defaults (nothing saved yet).')),
+      h('div', { class: 'muted small' }, 'Goose reads the classifier settings and adversary.md when it starts. Members\' agents restart on their own when they are idle; Goose Desktop and running CLI sessions pick them up at their next start.'),
+      res));
+  };
+  (async () => {
+    try { data = await GET('/api/admin/goose-security'); draw(); } catch (e) { el.replaceChildren(banner('error', errMsg(e))); }
+  })();
+}
+
 function authTab(body) {
   body.replaceChildren(skeleton(6));
   (async () => {

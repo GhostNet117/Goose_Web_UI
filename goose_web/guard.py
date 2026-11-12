@@ -839,6 +839,8 @@ class GuardService:
         # the profile is really the team's (SA-8: config entry fingerprint); None = name only (tests)
         self.profile_paths: Callable[[str], list[str]] | None = None
         self.ext_identity: Callable[[str, str], bool] | None = None
+        # spec 026: True while Goose-native detection uses the classifier (the model is then loaded at start-up)
+        self.extra_in_use: Callable[[], bool] | None = None
         self._last_good: dict[str, GuardContext | None] = {}
         self._blocks: dict[str, deque] = {}
         self._burst_until: dict[str, float] = {}
@@ -936,6 +938,9 @@ class GuardService:
                     if clean_team_guard((t.get("policy") or {}).get("guard"))["enabled"]:
                         used = True
                         break
+            if not used and self.extra_in_use is not None:
+                # spec 026: Goose-native detection asks the classifier through the classification endpoint
+                used = bool(self.extra_in_use())
         except Exception:
             log.exception("guard: reading whether a guard is in use failed")
             return self._in_use[2] if self._in_use else True
@@ -1072,6 +1077,81 @@ class GuardService:
             log.exception("guard classifier")
             self._unavailable(f"classifier error: {e.__class__.__name__}: {str(e)[:200]}", point, who)
         return None, "unavailable"
+
+    # ------------------------------------------------------------------ classification endpoint (spec 026)
+    EXTERNAL_OVERLAP = 256    # characters consecutive pieces of a long text share
+
+    def external_pieces(self, text: str, max_pieces: int) -> tuple[list[str], bool]:
+        """A text of any length as pieces of at most max_input_chars characters (overlapping, so an instruction cut
+        at a boundary is still seen whole) -> (pieces, complete). More than max_pieces = the rest is not scored."""
+        size = self.max_input_chars
+        if len(text) <= size:
+            return [text], True
+        step = size - self.EXTERNAL_OVERLAP
+        pieces = [text[i:i + size] for i in range(0, len(text) - self.EXTERNAL_OVERLAP, step)]
+        limit = max(1, int(max_pieces or 1))
+        return pieces[:limit], len(pieces) <= limit
+
+    def _score_piece(self, text: str, depth: int = 0) -> float:
+        """Runs in the classifier thread. A piece with more tokens than the classifier scores in one call (dense
+        text) is halved, three times at most; what still does not fit is not scored (0)."""
+        try:
+            return self.classifier.score(text)
+        except TextTooLong:
+            if depth >= 3 or len(text) < 64:
+                return 0.0
+            mid = len(text) // 2
+            return max(self._score_piece(text[:mid + 128], depth + 1), self._score_piece(text[mid - 128:], depth + 1))
+
+    async def score_external(self, text: str, *, budget: float, max_pieces: int = 4) -> tuple[float | None, str]:
+        """(score, status) for the classification endpoint: ok | busy | unavailable.
+
+        Goose waits 5 s for the endpoint, does not retry, and asks again with the same text at the next shell call.
+        So the answer must come within `budget` seconds: when it does not, the status is `busy` and the scoring
+        carries on in the classifier thread, where the result is cached for the next request. A slow answer is not
+        a broken classifier: only a missing or failing model sets the guard's state (and its audit)."""
+        if not text or len(text) < self.min_chars:
+            return 0.0, "ok"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.05, float(budget))
+        pieces, _complete = self.external_pieces(text, max_pieces)
+        try:
+            self._drop_if_removed()
+            if not self.classifier.loaded:
+                await asyncio.wait_for(self.ensure_loaded(), max(0.05, deadline - loop.time()))
+        except asyncio.TimeoutError:
+            return None, "busy"   # still loading: ensure_loaded keeps going
+        except ClassifierUnavailable as e:
+            self._unavailable(str(e), "classify-api")
+            return None, "unavailable"
+        except Exception as e:
+            log.exception("guard classifier (classification endpoint, load)")
+            self._unavailable(f"classifier error: {e.__class__.__name__}: {str(e)[:200]}", "classify-api")
+            return None, "unavailable"
+        best = 0.0
+        t0 = time.perf_counter()
+        for piece in pieces:
+            left = deadline - loop.time()
+            if left <= 0:
+                return None, "busy"
+            fut = loop.run_in_executor(self._pool, self._score_piece, piece)
+            try:
+                best = max(best, await asyncio.wait_for(asyncio.shield(fut), left))
+            except asyncio.TimeoutError:
+                fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)   # no "never retrieved"
+                return None, "busy"
+            except ClassifierUnavailable as e:
+                self._unavailable(str(e), "classify-api")
+                return None, "unavailable"
+            except Exception as e:
+                log.exception("guard classifier (classification endpoint)")
+                self._unavailable(f"classifier error: {e.__class__.__name__}: {str(e)[:200]}", "classify-api")
+                return None, "unavailable"
+        self.last_latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+        self.last_ok = time.time()
+        if self.state != "ok":
+            self._set_state("ok")
+        return best, "ok"
 
     async def self_test(self) -> dict:
         """Load the model (if needed) and score two samples; for Admin > Prompt guard > Check now and the CLI."""

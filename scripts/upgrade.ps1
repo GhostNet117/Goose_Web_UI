@@ -265,6 +265,13 @@ try {
     $r.out | Where-Object { $_ } | ForEach-Object { Say "mxc: $_" }
     if ($r.code) { Say "WARNING: the MXC executor is not installed (goose-web sandbox install-mxc, or --file <tgz> without internet access; docs/ADMINISTRATION.md, MXC sandbox)." }
 
+    # 5d. Goose-native security (spec 026, 1.20.0+): nothing to install. The administrators' choice (Admin > Prompt
+    # guard, "goose-web security on|off") is kept. An installation that never chose gets Goose's prompt injection
+    # detection ON for every Goose profile when the gateway starts (the administrator's Goose profile included, through
+    # Goose's own configuration API); adversary mode stays off. "goose-web security off" before the restart skips it.
+    $r = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'security', 'status')
+    $r.out | Where-Object { $_ } | Select-Object -First 1 | ForEach-Object { Say "goose security: $_" }
+
     # 6. check (the gateway still runs; "port in use" is expected)
     $r = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'check')
     $r.out | Where-Object { $_ -match '^\[' } | ForEach-Object { Say "check $_" }

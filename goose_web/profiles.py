@@ -55,7 +55,8 @@ NATIVE_HINTS_HEADER = ("# Managed by Goose Web (managed native hints). Goose Des
 NATIVE_HINTS_SETTING = "native_hints_owner"
 LEGACY_HINTS_FILENAME = ".goosehints"
 # File names a non-admin may not upload or create: Goose's default context files and ours (lower case).
-HINT_FILE_NAMES = frozenset({".goosehints", "agents.md", GW_HINTS_FILENAME.lower()})
+# adversary.md (spec 026): Goose's adversary mode is on when <config dir>/adversary.md exists; Goose Web writes it.
+HINT_FILE_NAMES = frozenset({".goosehints", "agents.md", GW_HINTS_FILENAME.lower(), "adversary.md"})
 # Platform extensions every new profile starts with (copied from the admin profile when present there).
 BASE_EXTENSIONS = ["todo", "skills", "apps", "chatrecall", "summarize", "extensionmanager", "analyze", "memory",
                    "summon", "tom"]
@@ -200,6 +201,9 @@ class Profiles:
         self.db = db
         self.root = settings.profiles_root
         self.library_dir = settings.system_dir / "library"
+        # spec 026: the classification endpoint's URL while the gateway holds its port (set by the app); None =
+        # Goose-native detection uses patterns only
+        self.security_endpoint: Any = None
 
     # ------------------------------------------------------------ paths
     def is_native(self, user: dict) -> bool:
@@ -390,6 +394,8 @@ class Profiles:
             for k in ("pinned", "parked"):
                 if isinstance(data.get(k), dict):
                     out[k] = data[k]
+            if isinstance(data.get("adversary"), str):   # spec 026: hash of the adversary.md the gateway wrote
+                out["adversary"] = data["adversary"]
         else:
             # guarded extension keys from an untrusted manifest are never removed (Goose would turn them on)
             out["extensions"] = [x for x in out["extensions"] if ext_key(x) not in _GUARDED]
@@ -423,6 +429,54 @@ class Profiles:
         from . import relay as rl
         from . import sandbox as sb
         return rl.state_mapping(self.s.system_dir / "sandbox", sb.container_name(str(self.root), user["username"]))
+
+    def security_plan(self, user: dict, relays: dict[str, str] | None = None) -> dict:
+        """Spec 026: what this profile gets of Goose's own security settings (goosesec.profile_plan). A sandboxed
+        AppContainer member reaches the classification endpoint at its relay forwarder's address (`relays`)."""
+        from . import goosesec
+        from . import relay as rl
+        cfg = goosesec.load(self.db)
+        endpoint = self.security_endpoint() if callable(self.security_endpoint) else None
+        if endpoint and relays:
+            endpoint = rl.rewrite_text(endpoint, relays)
+        token = goosesec.token_for(self.db, user["id"]) if endpoint else None
+        return goosesec.profile_plan(cfg, native=self.is_native(user), token=token, endpoint=endpoint)
+
+    def _apply_security(self, user: dict, cfg: dict, secrets: dict, cfg_dir: Path, root: Path, old: dict,
+                        new_manifest: dict, changes: list[str], relays: dict[str, str]) -> None:
+        """Spec 026: Goose's prompt injection detection keys, the classifier token (the profile's secret store) and
+        config/adversary.md, written from the administrators' settings and removed again when they are off."""
+        from . import goosesec
+        plan = self.security_plan(user, relays)
+        for k, v in plan["config"].items():
+            if cfg.get(k) != v or type(cfg.get(k)) is not type(v):
+                cfg[k] = v
+                changes.append(f"goose security: {k}")
+        for k in plan["remove"]:
+            if k in cfg:
+                cfg.pop(k)
+                changes.append(f"goose security: {k} removed")
+        cfg.pop(goosesec.CLS_TOKEN, None)   # Goose reads the token from the secret store only; never in config.yaml
+        if plan["secret"]:
+            if secrets.get(goosesec.CLS_TOKEN) != plan["secret"]:
+                secrets[goosesec.CLS_TOKEN] = plan["secret"]
+                changes.append("goose security: classifier token")
+        elif goosesec.CLS_TOKEN in secrets:
+            secrets.pop(goosesec.CLS_TOKEN)
+            changes.append("goose security: classifier token removed")
+        adv = cfg_dir / goosesec.ADVERSARY_FILE
+        if not _inside_profile(adv, root) or _is_reparse(adv):
+            return   # a junction / link planted in the profile: never write through it (C-3)
+        if plan["adversary"] is not None:
+            want = plan["adversary"]
+            if not adv.is_file() or goosesec.file_hash(adv) != goosesec.text_hash(want):
+                _atomic_write(adv, want)
+                changes.append("goose security: adversary.md")
+            new_manifest["adversary"] = goosesec.text_hash(want)
+        elif old.get("adversary") and adv.is_file():
+            # the gateway wrote one for this profile before: off means gone, whatever was done to the file since
+            adv.unlink()
+            changes.append("goose security: adversary.md removed")
 
     def provision(self, user: dict) -> list[str]:
         """Apply teams, hints and policy to an isolated profile. Idempotent. Returns a change list.
@@ -620,6 +674,14 @@ class Profiles:
             changes.append(f"thinking effort {DEFAULT_EFFORT} (default)")
         if guard_on(pol) and strip_always_allow(cfg_dir / "permission.yaml"):
             changes.append("prompt guard: 'always allow' tool permissions removed")
+        try:
+            self._apply_security(user, cfg, secrets, cfg_dir, root, old, new_manifest, changes, relays)
+        except Exception:
+            # Goose-native detection is an addition to the policy above: a failure here leaves the profile as it
+            # was (and says so) instead of stopping the member's worker
+            log.exception("profile %s: Goose security settings not applied", user.get("username"))
+            if old.get("adversary"):
+                new_manifest["adversary"] = old["adversary"]
 
         _write_yaml(cfg_path, cfg)
         if secrets or secrets_path.exists():

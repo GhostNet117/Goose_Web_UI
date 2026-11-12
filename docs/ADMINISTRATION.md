@@ -1090,6 +1090,120 @@ result then also lists every guarded team with its own threshold and whether the
 higher threshold also lets more real injections through: raise it only as far as the team's real prompts need. It
 applies to the team's prompts and tool-call arguments; the administrators' guard always uses `guard.threshold`.
 
+### 9.11 Goose-native detection and adversary mode (since 1.20.0)
+
+The prompt guard of 9.10 runs in the gateway: it sees what a guarded user types and the permission requests of
+guarded chats. A chat that does not pass through the gateway is not covered: Goose Desktop, the goose CLI, a scheduled
+recipe on the administrator's Windows account. Goose has two security features of its own that run inside the agent,
+in every front end. Goose Web configures them where Goose reads them, for every profile it knows: each member's
+isolated profile and the administrator's native profile. The two layers are independent; you can use either or both.
+
+**Admin > Prompt guard > Goose-native detection (every profile)** shows and changes all of it.
+
+#### Prompt injection detection (on by default)
+
+Goose checks every `shell` command against its threat patterns (recursive deletion of system folders, downloads piped
+into a shell, reads of SSH keys and so on). A match at or above the threshold stops and asks, also in Auto mode. With
+*Score recent messages with Prompt Guard 2* on, Goose also sends the chat's recent user messages to Goose Web's
+classification endpoint, which scores them with the Prompt Guard 2 model of 9.10 on this computer.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Prompt injection detection | on | `SECURITY_PROMPT_ENABLED` in every profile. |
+| Threshold | `0.8` | `SECURITY_PROMPT_THRESHOLD`, 0.01 to 1.0. Lower is stricter. Goose's pattern scores are 0.95 (critical), 0.75 (high), 0.60 (medium) and 0.45 (low), so 0.8 asks for critical patterns only; 0.7 adds the high ones. |
+| Score recent messages with Prompt Guard 2 | on | `SECURITY_PROMPT_CLASSIFIER_ENABLED`, `..._ENDPOINT` (`http://127.0.0.1:8711/classify`) and `..._TOKEN`. |
+
+What it does and does not do. This is how Goose 1.57 and 1.59 behave (read in their source and measured), and it
+differs from Goose's public guides in places:
+
+- Only the tool named `shell` is inspected. Other tools, and extensions' own tools, are not.
+- The classifier is sent the last 10 **user messages** of the chat, one request each, on every shell command. It is
+  never sent the command. Its score can only raise a pattern finding; the result is never below the pattern score. On
+  its own it does not flag anything.
+- A finding becomes an approval request. In Goose Web it appears like any permission request. In an unattended run
+  (a scheduled recipe, `goose run` in Auto mode) Goose **allows the command and only logs the finding**
+  (`prompt injection scan: finding above threshold` in Goose's log); in Approve or Smart approve the unattended run
+  ends with an error instead.
+- If the endpoint does not answer within 5 seconds, or answers with an error, Goose uses its patterns only for that
+  command and logs a warning. Nothing is blocked because the classifier is down.
+- Goose reads the token from its secret store (the keyring, or `secrets.yaml` when the keyring is off) or from the
+  environment. A token written into `config.yaml`, as Goose's guide shows, is ignored. Goose Web never writes it there.
+- The threshold and the on/off switch are read at every command. The classifier settings are read when Goose
+  starts: members' agents restart on their own when they are idle; Goose Desktop and CLI sessions that were already
+  running pick them up at their next start.
+
+**Members.** The settings are written into the member's profile before every start of their agent, and the agent's
+process also gets them in its environment, which Goose ranks above its files. So a member, or an agent that was
+talked into it, cannot switch the detection off by editing the profile; a request to change a `SECURITY_*` setting
+through Goose's configuration API is refused ("managed by Goose Web").
+
+**The administrator's Goose profile.** Goose Web changes it through Goose's own configuration API, never by rewriting
+its files, so Goose decides the file format and where the secret is stored. It does so when the gateway starts and
+when the settings change, and only if something differs (the administrator's Goose worker is not started just to
+find that nothing changed). The page and `goose-web check` show when it was last applied and with which Goose
+version. If it fails, Goose keeps running with what it had, administrators get a notice, the audit log gets
+`goosesec.native`, and the gateway tries again at its next start.
+
+**The classification endpoint.** `http://127.0.0.1:<guard.classifier_port>/classify` (default 8711), a listener of
+its own that answers only classification requests:
+
+- It listens on the loopback address only, so it is not reachable from another computer, and it is not part of the
+  web application. A sandboxed member's agent can reach this one port and nothing else of the gateway.
+- Every request needs the profile's token. A token is good for classification and nothing else; *Replace all tokens*
+  (or `goose-web security rotate-tokens`) replaces them all.
+- Request text is never logged or audited. The classifier remembers scores by a hash of the text only.
+- If the port is taken when the gateway starts, the gateway starts all the same, the page says so, and Goose uses its
+  patterns only. Profiles are never pointed at a port the gateway does not hold.
+- *Check now* asks the endpoint the way Goose does (with a real token, then without one) and shows the scores.
+- One classifier thread serves this endpoint and the prompt guard of 9.10. A very long message of one user can delay
+  another's answer; the endpoint then answers `503` in time, Goose uses its patterns for that command, and the score
+  is ready for Goose's next request.
+
+Limits: `guard.classifier_*` in CONFIGURATION.md. Set `guard.classifier_port: 0` to run without the endpoint.
+
+#### Adversary mode (off until you turn it on)
+
+Before a reviewed tool call runs, Goose asks the chat's own model, in a separate call, whether the call fits what
+the user asked for and the rules you wrote. The reviewer answers ALLOW or BLOCK.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Review members' tool calls | off | Writes `adversary.md` into every member's Goose profile (`<profile>\config`). |
+| Review the administrator's tool calls | off | Writes it into the administrator's Goose profile: Goose Web, Goose Desktop, the CLI and scheduled recipes on that account. |
+| Reviewed tools | `shell` | Exact tool names. An extension's tool is named `<extension>__<tool>`. |
+| Rules | empty | Plain language. Empty = Goose's built-in rules (block data exfiltration, destruction beyond the project, malware, needless privilege escalation, downloading and running remote scripts; allow normal development work). |
+
+Read this before turning it on:
+
+- **A BLOCK cannot be overridden**, by the user or by an administrator. The agent is told only that the call was
+  declined; the reviewer's reason is written to Goose's log (`adversary review: BLOCK`). Vague rules block normal work.
+- **It also stops unattended runs.** With it on for the administrator's profile, a scheduled recipe whose shell
+  command is blocked does not get that command run. Try your rules in a chat first.
+- **Every reviewed call costs one more model call** on the chat's provider and model, and waits for it.
+- If the reviewer fails (provider error, timeout), the call is allowed.
+- Goose reads `adversary.md` when it starts (see above), so a change reaches a running Goose Desktop or CLI session
+  at its next start.
+
+An `adversary.md` in the administrator's profile that Goose Web did not write (you made it yourself) is kept as it
+is; the page says so and offers to replace it, after copying it to `<system_dir>\backups\native-security\`. Goose
+Web's own file is backed up there too before it is replaced or removed. In a member's profile the file is Goose Web's:
+it is written again at every start of the member's agent, and members cannot create a file of that name.
+
+#### Turning it off
+
+Admin > Prompt guard, or `goose-web security off` (which also turns adversary mode off). Everything Goose Web wrote
+is then removed: the four settings and the token in every profile, and the `adversary.md` files it wrote. The rest
+of each profile is not touched. `scripts\install.ps1 -GooseSecurity off` installs with it off. The choice is kept by
+upgrades; an installation that never chose gets prompt injection detection on at the first start of 1.20.0.
+
+`goose-web security status` prints the settings and the state of the native profile; it only reads.
+
+#### After a Goose upgrade
+
+Run `set GOOSE_WEB_TEST_GOOSE=<path to goose.exe>` and `python -m pytest tests\test_goosesec_e2e.py` in the install
+folder. With a local fake model and no credentials it checks that the new Goose still asks the endpoint with the
+profile's token, still honours `adversary.md`, and still accepts Goose Web's changes through its configuration API.
+
 ## 10. Shared goose hints
 
 The **Admin > Hints library** holds shared hints documents. Assign a document to a team (on the team's Experience page,

@@ -94,6 +94,9 @@ is a number.
 
 | Method | Path | Notes |
 |---|---|---|
+| GET/PUT | `/api/admin/goose-security` | Goose-native security (1.20.0): `{settings: {enabled, threshold, classifier, adversary: {members, native, tools:[name], rules}}, chosen, defaults, listener: {state: listening\|off\|unavailable, reason, port, endpoint, timeoutMs, stats}, native: {ok, error, at, goose, changed, adversary: on\|off\|foreign\|error} or null, hasNative, members, gooseVersion, limits}`. PUT any subset of `settings` (flat, or under `settings`), optional `adoptNative: true` to replace an `adversary.md` Goose Web did not write (backed up first); validates (`400 bad_settings`), stores, re-provisions every member profile and brings the native profile in line -> the same object plus `applied: {members: {username: changes}, native}`. Audit `goosesec.update` (switches and sizes, never the rules text) |
+| POST | `/api/admin/goose-security/check` | A real request to the classification endpoint with the caller's token, then without one -> `{ok, listener, benign: {status, score, latencyMs}, injection: {...}, withoutToken: 401, error?}` (audit `goosesec.check`) |
+| POST | `/api/admin/goose-security/rotate` | Replaces every classifier token and applies as PUT does (audit `goosesec.rotate`) |
 | GET/PUT | `/api/admin/guard` | Prompt guard (1.14.0): `{health, admin, settings, model, hfRepo, hfRevision, rulesets, defaults}`. PUT `{admin: {enabled, check_input, rulesets:[id], on_block}}` sets the administrators' guard (audit `guard.admin.update`) |
 | POST | `/api/admin/guard/check` | Loads the model if needed and scores a benign and an injection sample → `{benign, injection, health}` (audit `guard.check`) |
 | POST | `/api/admin/guard/test` | Dry run, nothing audited: `{rulesets:[id], tool?, extension?, args?: object or JSON text, text?, classify?}` → `{tool?, prompt?, classifier?}` with `blocked`, `rule`, `ruleset`, `message` |

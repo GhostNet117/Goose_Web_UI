@@ -573,6 +573,18 @@ def wire_security_hooks(c: Ctx) -> None:
         if u.get("role") == "admin" and c.guard is not None and c.guard.admin_config()["enabled"]:
             if strip_always_allow(c.profiles.config_dir(u) / "permission.yaml"):
                 changes.append("prompt guard: 'always allow' tool permissions removed")
+        # Spec 026: Goose's own security settings also go into the worker's environment, which Goose ranks above
+        # the profile's files. An AppContainer member reaches the classification endpoint at its relay forwarder's
+        # address, which the relay code writes into config.yaml at start: no endpoint in the environment then.
+        try:
+            from . import goosesec
+            env = dict(c.profiles.security_plan(u)["env"])
+            if (w.sandbox or {}).get("backend") == "appcontainer":
+                env.pop(goosesec.CLS_ENDPOINT, None)
+            w.security_env = env
+        except Exception:
+            log.exception("worker %s: Goose security environment not set", w.key)
+            w.security_env = {}
         if changes:
             log.info("worker %s: provisioned before start (%s)", w.key, "; ".join(changes)[:500])
     c.workers.pre_start = pre_start
@@ -686,6 +698,14 @@ def create_app(settings: Settings) -> Starlette:
             ok=False)
         c.guard.on_health = lambda h: hub.broadcast_admins({"jsonrpc": "2.0", "method": "_gw/guard", "params": h})
         wire_security_hooks(c)
+        # Spec 026: the classification endpoint Goose's own prompt injection detection asks (loopback, its own
+        # port). Started before any worker is registered, so profiles and sandbox policies get its address; a port
+        # that cannot be bound is logged and Goose-native detection then uses patterns only.
+        from .classifyapi import ClassifyService
+        c.classify = ClassifyService(settings, db, c.guard)
+        c.guard.extra_in_use = c.classify.in_use
+        profiles.security_endpoint = lambda: c.classify.endpoint
+        await c.classify.start()
 
         def sandbox_event(action: str, w, detail: dict) -> None:
             # spec 025: MXC fallbacks and fail-closed refusals of members' workers are audited (admin-visible)
@@ -715,12 +735,22 @@ def create_app(settings: Settings) -> Starlette:
                                           "https": tls.ACTIVE.get("mode") if tls.is_active() else "off"})
         maintenance = asyncio.create_task(_maintenance_loop(c))
         warm = asyncio.create_task(c.guard.warm_up()) if settings.get("guard", "warm_up") else None
+
+        async def native_security() -> None:
+            # Spec 026: the administrator's own Goose profile (shared with Goose Desktop, the CLI and scheduled
+            # recipes) gets the same settings, through Goose's configuration API, only when something differs.
+            from . import goosesec
+            await asyncio.sleep(5)
+            await goosesec.sync_native(c)
+        native_sec = asyncio.create_task(native_security())
         log.info("Goose Web %s ready (goose %s)", __version__, c.goose_version or "?")
         try:
             yield
         finally:
             control.stop()
             maintenance.cancel()
+            native_sec.cancel()
+            await c.classify.stop()
             if warm is not None:
                 warm.cancel()
             c.guard.shutdown()

@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -820,6 +821,60 @@ def cmd_guard(args, settings) -> int:
     return 0 if healthy else 1
 
 
+def cmd_security(args, settings) -> int:
+    """Spec 026: Goose's own prompt injection detection and adversary mode - status, on, off, rotate-tokens.
+
+    `on` / `off` store the choice; members' profiles get it at their next worker start and the administrator's
+    Goose profile when the gateway starts (or at once: Admin > Prompt guard > Apply now). `off` also turns
+    adversary mode off: everything Goose Web wrote is then removed."""
+    from . import goosesec
+    from .db import Database
+    dbp = settings.system_dir / "goose-web.db"
+    if not dbp.exists():
+        print("No database yet: run 'goose-web init' first.", file=sys.stderr)
+        return 2
+    if args.action == "status":
+        cfg, state, chosen = goosesec.read_only(dbp)
+    else:
+        db = Database(dbp)
+        try:
+            if args.action == "rotate-tokens":
+                goosesec.rotate_key(db)
+                db.audit("goosesec.rotate", detail={"via": "cli"})
+                print("Every classifier token was replaced.")
+            else:
+                change = {"enabled": True} if args.action == "on" else \
+                    {"enabled": False, "adversary": {"members": False, "native": False}}
+                cfg = goosesec.save(db, goosesec.clean(change, goosesec.load(db)))
+                db.audit("goosesec.update", detail={**goosesec.summary(cfg), "via": "cli"})
+                print(f"Goose security is {'ON' if args.action == 'on' else 'OFF'}.")
+            print("It takes effect when the gateway starts (members: at their next worker start), or at once with "
+                  "Admin > Prompt guard > Apply now.")
+        finally:
+            db.close()
+        cfg, state, chosen = goosesec.read_only(dbp)
+    adv = cfg["adversary"]
+    print(f"prompt injection detection: {'on' if cfg['enabled'] else 'off'}"
+          + ("" if chosen else "  (default: no choice stored yet)"))
+    print(f"  threshold: {cfg['threshold']}  (lower = stricter; Goose's default is 0.8)")
+    print(f"  classifier (Prompt Guard 2): {'on' if cfg['classifier'] else 'off'}")
+    port = goosesec.classifier_port(settings)
+    print("  classification endpoint: " + (goosesec.classifier_url(port) if port else "off (guard.classifier_port: 0)"))
+    print(f"adversary mode: members {'on' if adv['members'] else 'off'}, native profile "
+          f"{'on' if adv['native'] else 'off'}")
+    print(f"  reviewed tools: {', '.join(adv['tools'])}")
+    print(f"  rules: {len(adv['rules'])} characters" + ("" if adv["rules"] else " (Goose's built-in rules)"))
+    if state:
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(state.get("at") or 0)))
+        print(f"native profile: {'applied' if state.get('ok') else 'NOT applied'} {when} (goose "
+              f"{state.get('goose') or '?'}; adversary.md: {state.get('adversary') or 'off'})")
+        if state.get("error"):
+            print(f"  error: {str(state['error'])[:300]}")
+    else:
+        print("native profile: not applied yet (done when the gateway starts)")
+    return 0
+
+
 def cmd_check(args, settings) -> int:
     from . import winsec
     from .workers import desktop_running, goose_version
@@ -869,9 +924,16 @@ def cmd_check(args, settings) -> int:
     if os.name == "nt":
         line("goose desktop running", desktop_running(gb))
     port = int(settings.get("server", "port"))
-    with socket.socket() as s:
-        free = s.connect_ex(("127.0.0.1", port)) != 0
-    line(f"port {port}", "free" if free else "in use (gateway already running?)")
+    # the address the gateway binds (server.host); 0.0.0.0 / :: also answer on the loopback address. Probing
+    # 127.0.0.1 only reported "free" for a gateway bound to a LAN address.
+    bind = str(settings.get("server", "host") or "127.0.0.1").strip()
+    probe = "127.0.0.1" if bind in ("0.0.0.0", "::", "") else bind
+    try:
+        with socket.create_connection((probe, port), timeout=2):
+            free = False
+    except OSError:
+        free = True
+    line(f"port {port}", (f"free on {probe}" if free else f"in use on {probe} (gateway already running?)"))
     from .config import sandbox_on
     if sandbox_on(settings):
         from . import mxc
@@ -918,6 +980,41 @@ def cmd_check(args, settings) -> int:
     print(f"[{'OK' if gpin['url'] and gpin['sha256'] else '--'}] prompt guard package source ({gpin['source']}): "
           + (f"{gpin['url']} sha256 {gpin['sha256'][:16]}..." if gpin["url"] and gpin["sha256"] else
              "none; set guard.model_url and guard.model_sha256 together, or install with --file"))
+    # Spec 026: Goose's own prompt injection detection and adversary mode. Information only: none of it stops the
+    # gateway (a classifier that cannot be reached makes Goose fall back to its patterns).
+    try:
+        from . import goosesec
+        scfg, sstate, _chosen = goosesec.read_only(settings.system_dir / "goose-web.db")
+        adv = scfg["adversary"]
+        print(f"[OK] goose security: prompt injection detection {'on' if scfg['enabled'] else 'off'}"
+              + (f" (threshold {scfg['threshold']}, classifier {'on' if scfg['classifier'] else 'off'})"
+                 if scfg["enabled"] else "")
+              + f"; adversary mode: members {'on' if adv['members'] else 'off'}, native profile "
+                f"{'on' if adv['native'] else 'off'} (goose-web security status)")
+        cport = goosesec.classifier_port(settings)
+        if not cport:
+            print("[--] classification endpoint: off (guard.classifier_port is 0); Goose-native detection uses "
+                  "patterns only")
+        else:
+            try:
+                with socket.create_connection(("127.0.0.1", cport), timeout=2):
+                    cfree = False
+            except OSError:
+                cfree = True
+            print(f"[OK] classification endpoint: 127.0.0.1:{cport} "
+                  + ("free" if cfree else "in use (gateway already running?)"))
+        if sstate:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(sstate.get("at") or 0)))
+            if sstate.get("ok"):
+                print(f"[OK] goose security, native profile: applied {when} (goose {sstate.get('goose') or '?'}; "
+                      f"adversary.md {sstate.get('adversary') or 'off'})")
+            else:
+                print(f"[--] goose security, native profile: NOT applied at {when}: "
+                      f"{str(sstate.get('error') or 'unknown error')[:200]} (retried when the gateway starts)")
+        else:
+            print("[--] goose security, native profile: not applied yet (done when the gateway starts)")
+    except Exception as e:
+        print(f"[--] goose security: cannot read the settings ({e.__class__.__name__}: {e})")
     u = logjanitor.usage(settings)
     print(f"[OK] logs: {u['bytes'] / 2**20:.1f} MB of {u['budget'] / 2**20:.0f} MB "
           f"({u['percent']}% of the disk) in {u['files']} file(s)")
@@ -1025,6 +1122,9 @@ def main(argv: list[str] | None = None) -> int:
     gw.add_argument("--reason", default="", help="drain: shown in the gateway log")
     gw.add_argument("--timeout", type=float, default=20, help="seconds to wait for the gateway's answer")
     gw.add_argument("--json", action="store_true", help="print the full answer as JSON")
+    sec = sub.add_parser("security", help="Goose's own prompt injection detection and adversary mode for every "
+                                          "profile: status, on, off (also turns adversary mode off), rotate-tokens")
+    sec.add_argument("action", choices=["status", "on", "off", "rotate-tokens"])
     sub.add_parser("check", help="diagnostics")
     sub.add_parser("version")
     args = p.parse_args(argv)
@@ -1037,7 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
         args.host, args.port = None, None
     return {"serve": cmd_serve, "init": cmd_init, "user": cmd_user, "ip": cmd_ip, "check": cmd_check,
             "native-root": cmd_native_root, "native-hints": cmd_native_hints, "sandbox": cmd_sandbox, "tls": cmd_tls,
-            "guard": cmd_guard, "gateway": cmd_gateway}[cmd](args, settings)
+            "guard": cmd_guard, "gateway": cmd_gateway, "security": cmd_security}[cmd](args, settings)
 
 
 if __name__ == "__main__":

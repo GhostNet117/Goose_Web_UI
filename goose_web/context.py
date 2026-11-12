@@ -52,6 +52,7 @@ class Ctx:
     goose_version: str = ""
     started_at: float = field(default_factory=time.time)
     guard: Any = None                 # guard.GuardService (spec 018)
+    classify: Any = None              # classifyapi.ClassifyService (spec 026): Goose's classification endpoint
 
     # ---------------------------------------------------------- cookies / origin
     @property
@@ -222,6 +223,13 @@ class Ctx:
         from . import relay as rl
         name = sb.container_name(str(self.settings.profiles_root), user["username"])
         targets = [str(t) for t in (self.settings.get("sandbox", "relays") or []) if t]
+        # Spec 026: Goose's prompt injection detection inside the sandbox asks the gateway's classification endpoint
+        # (loopback, its own port). It is the only part of the gateway a sandboxed agent can reach.
+        cls = self.classify
+        if cls is not None and cls.listening and cls.in_use():
+            t = f"127.0.0.1:{cls.bound_port}"
+            if t not in targets:
+                targets.append(t)
         relays = rl.relay_specs(name, int(user["id"]), targets) if targets else []
         roots = self.roots_for(user)
         mxc_grants = sb.desired_grants(root, roots, read_dirs, self.settings.goose_binary)

@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.20.0 - 2026-11-12
+
+**Goose-native security: Goose's own prompt injection detection and adversary mode, for every profile.** Spec 026.
+The prompt guard of 1.14.0 runs in the gateway and sees only chats that pass through it. Goose has two security
+features of its own that run inside the agent in every front end (Goose Web, Goose Desktop, the goose CLI, scheduled
+recipes); Goose Web now configures them where Goose reads them. No database schema change.
+
+- **Prompt injection detection, on by default.** Every member's profile and the administrator's Goose profile get
+  `SECURITY_PROMPT_ENABLED`, `SECURITY_PROMPT_THRESHOLD` (0.8) and the classifier settings. Goose then checks every
+  `shell` command against its threat patterns and asks before running a match, also in Auto mode. An installation
+  that never chose gets this at the first start after the upgrade; `goose-web security off`, Admin > Prompt guard or
+  `install.ps1 -GooseSecurity off` turn it off, and the choice survives upgrades.
+- **Prompt Guard 2 as Goose's classifier.** New classification endpoint (`classifyapi.py`) that follows Goose's
+  Classification API specification, served by the classifier the gateway already runs. Loopback only
+  (`127.0.0.1:8711`, `guard.classifier_port`, `0` = off), its own listener, one single-purpose token per profile,
+  no request text logged. A port that cannot be bound is reported and Goose then uses its patterns only: profiles are
+  never pointed at a port the gateway does not hold. A sandboxed member's agent reaches this port and nothing else of
+  the gateway.
+- **Members cannot weaken it.** The settings are written before every start of a member's agent and are also in the
+  worker's environment, which Goose ranks above its files; a member's `config/upsert` or `config/remove` of a
+  `SECURITY_*` key is refused; `adversary.md` joins the file names members cannot create.
+- **The native profile through Goose itself.** The administrator's Goose profile (shared with Goose Desktop, the CLI
+  and scheduled recipes) is changed through Goose's own configuration API, so Goose decides the file format and where
+  the secret is stored; only when something differs, at gateway start and at every change. A failure is recorded,
+  audited (`goosesec.native`) and shown, and never stops the gateway or a chat.
+- **Adversary mode, off until an administrator turns it on.** Admin > Prompt guard: rules in plain language, reviewed
+  tools, separately for members and for the native profile. Goose Web writes `adversary.md`; an `adversary.md` it did
+  not write in the native profile is kept (and can be taken over, with a backup). It is off by default because a
+  BLOCK cannot be overridden, also stops unattended runs, and every reviewed call costs one more model call.
+- **What Goose really does** (read in the source of Goose 1.57.0 and 1.59.0, measured with 1.57.0), where it differs
+  from Goose's guides - documented in ADMINISTRATION 9.11: the classifier token is read from the secret store, not
+  from `config.yaml`; the classifier is sent the chat's recent user messages, never the command, and can only raise a
+  pattern finding; only the tool named `shell` is inspected; a headless run in Auto mode allows a flagged command and
+  only logs it.
+- **Command line:** `goose-web security status | on | off | rotate-tokens`; `goose-web check` shows the state.
+  **API:** `GET/PUT /api/admin/goose-security`, `POST .../check`, `POST .../rotate`.
+- **Fix:** `goose-web check` reported the gateway's port as free when `server.host` is a LAN address (it probed
+  `127.0.0.1` only).
+- **Tests:** `tests/test_goosesec.py`, `tests/test_classifyapi.py`, and `tests/test_goosesec_e2e.py`, which drives the
+  real goose binary (set `GOOSE_WEB_TEST_GOOSE`; run it after every Goose upgrade).
+
 ## 1.19.2 - 2026-11-12
 
 - **Fix: Python 3.11 support for the MXC backend.** The hard-link check before an MXC start (MX-3) used `DirEntry.is_junction()`, which exists only from Python 3.12, so on 3.11 every sandboxed member's start failed (CI, Python 3.11). It now skips junctions, symlinks and mount points by their reparse-point attribute on every Python version.

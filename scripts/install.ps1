@@ -25,7 +25,10 @@
   initial password, shown once at the end); "goose-web check"; the gateway task + firewall rule via
   register-service.ps1 (one elevation prompt; for a service account it asks for the account's password there).
   The installer never changes files inside the Goose appdata folder; it can only add the sessions link and grant the
-  service account access.
+  service account access. The gateway, once it runs, keeps Goose's own security settings in that folder
+  (SECURITY_PROMPT_* through Goose's configuration API, so Goose Desktop, the CLI and scheduled recipes get prompt
+  injection detection too) unless you install with -GooseSecurity off or turn it off later (Admin > Prompt guard,
+  goose-web security off).
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\install.ps1
@@ -43,6 +46,9 @@ param(
     [string]$GooseBinary = '',               # goose.exe, or the folder Goose is installed in; '' = auto-detect
     [string]$RunAs = '',                     # Windows account for the gateway: '' = you (at logon); DOMAIN\svc or DOMAIN\gmsa$ = at boot
     [ValidateSet('on', 'off', '')] [string]$Sandbox = '',   # sandbox non-admin users' agents ('' = on)
+    # Goose's own prompt injection detection for every Goose profile, the administrator's included ('' = on for a new
+    # installation; an existing installation keeps its choice). off = Goose Web does not manage it.
+    [ValidateSet('on', 'off', '')] [string]$GooseSecurity = '',
     [ValidateSet('auto', 'self-signed', 'off', '')] [string]$Tls = '',   # HTTPS: built-in certificate, or off behind a proxy ('' = auto)
     [switch]$TrustCert,                      # trust the built-in certificate's CA on this computer (current user)
     [string]$BindHost = '127.0.0.1',         # use the LAN IP (or 0.0.0.0) when a reverse proxy on another host connects
@@ -255,6 +261,9 @@ Write-Host "     First admin        $Admin (Goose Web user, bound to that Goose 
 Write-Host "     Goose Web data     $ProfilesRoot"
 Write-Host "     Gateway runs as    $RunAs, $(if ($service) { 'at boot (service account)' } else { 'when you sign in' })"
 Write-Host "     Sandbox            $Sandbox for non-admin users"
+$gooseSecurityGiven = [bool]$GooseSecurity
+if (-not $GooseSecurity) { $GooseSecurity = 'on' }
+Write-Host "     Goose security     $(if ($GooseSecurity -eq 'off') { 'off - Goose Web leaves Goose''s own security settings alone' } else { 'prompt injection detection on for every Goose profile, the administrator''s Goose appdata included (Goose Desktop, the CLI, scheduled recipes); -GooseSecurity off to skip' })"
 if (-not $Tls) { $Tls = 'auto' }
 $tlsOn = $Tls -eq 'self-signed' -or ($Tls -eq 'auto' -and -not $PublicUrl)
 $scheme = if ($tlsOn) { 'https' } else { 'http' }
@@ -374,6 +383,19 @@ Say "Initialising (admin '$Admin'; a random initial password is generated and sh
 # init prints the generated password (first install only); keep its output and show it once, at the end.
 $initOut = @(& $venvPy -m goose_web --config $cfg init --admin $Admin --native-root $native)
 if ($LASTEXITCODE) { $initOut | ForEach-Object { Write-Host $_ }; throw "goose-web init failed." }
+# Goose-native security (spec 026): Goose's own prompt injection detection (SECURITY_PROMPT_* settings, scored by
+# the Prompt Guard model through the gateway's loopback classification endpoint) is ON by default for every profile.
+# Nothing is written here: the gateway applies it when it starts - members' profiles at every start of their agent,
+# the administrator's Goose profile through Goose's own configuration API. Adversary mode stays off until an
+# administrator turns it on (Admin > Prompt guard). An explicit -GooseSecurity is stored; without one an existing
+# installation keeps its choice.
+if ($gooseSecurityGiven) {
+    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { & $venvPy -m goose_web --config $cfg security $GooseSecurity | Out-Null; $secRc = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $prevEap }
+    if ($secRc) { Warn "Could not store the Goose security choice ($GooseSecurity); change it later with: goose-web security $GooseSecurity" }
+    else { Say "Goose security: $GooseSecurity (change it in Admin > Prompt guard, or with: goose-web security on|off)" }
+}
 # Prompt guard model (spec 018): downloads the pinned package (a GitHub release asset of this project, about 117 MB;
 # HTTPS_PROXY is honoured) and checks its SHA-256. Not fatal: without the model the guard fails open (rules still
 # apply) and administrators see a banner while a team uses the guard. Offline: guard install-model --file <zip>.

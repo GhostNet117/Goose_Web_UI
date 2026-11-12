@@ -202,6 +202,14 @@ DEFAULTS: dict[str, Any] = {
         "model_dir": "",                  # default: <system_dir>/models/prompt-guard-2-22m
         "model_url": "",                  # override of the pinned package URL (https)
         "model_sha256": "",               # its SHA-256 (required with model_url)
+        # Classification endpoint (classifyapi.py, spec 026): Goose's own prompt injection detection asks it, for
+        # every profile (Goose Web chats, Goose Desktop, the goose CLI, scheduled recipes). Loopback only, its own
+        # port, one token per profile. 0 = no endpoint (Goose-native detection then uses patterns only).
+        "classifier_port": 8711,
+        "classifier_timeout_ms": 4000,    # answer within this or 503 (Goose waits 5 s and does not retry)
+        "classifier_max_pieces": 4,       # a text longer than max_input_chars is scored in this many pieces at most
+        "classifier_max_body_kb": 256,    # larger request bodies are refused (413)
+        "classifier_rate_per_minute": 600,   # requests per profile per minute (429 beyond)
     },
     # Running elsewhere (spec 020, elsewhere.py): administrators see, read-only, the native profile's sessions that
     # Goose Desktop, the goose CLI or a scheduled job are writing. The native sessions.db is only read (read-only

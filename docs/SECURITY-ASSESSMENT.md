@@ -679,3 +679,60 @@ Independent adversarial review of the 1.19.0 MXC code with a real executor (0 Cr
 | MX-12 | Info | A > 63-character label dropped the connection without an answer | 400 with a reason, no lookup |
 | MX-13 | Info | A relay is a whole host:port (virtual hosts) | Documented (13.3, ADMINISTRATION 11.6) |
 | MX-14 | Info | Docstring/comment drift, dead `redacted()`, container text as admin last error | Wording fixed, `redacted()` removed, `explain_exit` output cleaned (MX-5) |
+
+## 14. Addendum: Goose-native security (2026-11-12), 1.20.0
+
+Scope: `goosesec.py`, `classifyapi.py` and their hooks in `profiles.py`, `workers.py`, `context.py`, `app.py`,
+`policy.py`, `api.py`, `__main__.py` (spec 026). Goose's own detection and reviewer are Goose's code and out of scope,
+except for how they behave: that was read in the source of Goose 1.57.0 and 1.59.0 (the security modules are identical
+in both) and measured with the real 1.57.0 binary (`tests/test_goosesec_e2e.py`). This section is the design's threat
+model. It is not an independent review.
+
+### 14.1 What it adds, and what it does not
+
+It adds a control that follows the agent instead of the gateway: Goose's pattern check of shell commands, with an
+approval request also in Auto mode, in every profile and every front end; optionally Goose's reviewer (adversary
+mode). It does not make Goose's detection stronger than it is:
+
+- only the tool named `shell` is inspected;
+- the classifier sees user messages, not commands or tool results, and can only raise a pattern finding. Text an
+  agent reads from a web page or a file, the usual carrier of an injection, is not scored by this layer;
+- an unattended run in Auto mode allows a flagged command and logs it;
+- every failure of the classifier or the reviewer allows the call (Goose's design).
+
+It is a safeguard against known dangerous commands, not a guarantee. The sandbox (section 13), the policy firewall
+and the prompt guard of section 11 remain the controls that do not depend on the model's cooperation.
+
+### 14.2 Threat model
+
+| Threat | Control |
+|---|---|
+| The endpoint is reached from the network | Bound to `127.0.0.1` only, on its own port; not a route of the web application |
+| Another program on the computer uses the classifier (CPU) or probes it | Bearer token per profile (HMAC-SHA256 of the user id, key only in the database, constant-time check, disabled users refused); rate limit per profile; body cap; 64 connections; uniform `401` |
+| A token is stolen | It authorises classification only: no chat, file, setting or account is reachable with it. *Replace all tokens* invalidates every token at once |
+| A member, or an agent that was talked into it, switches the detection off | Written before every start of the agent; also in the worker's environment, which Goose ranks above its files (measured); `config/upsert` and `config/remove` of `SECURITY_*` refused by the firewall; `adversary.md` is a refused file name and is rewritten at every start |
+| A sandboxed agent uses the endpoint to reach the gateway | The relay target is the classifier port only; the web application's port is not reachable from the sandbox, as before |
+| Chat text leaks through the endpoint | Nothing is logged or audited; the cache holds a SHA-256 of the text and a score; requests stay on the loopback interface |
+| The gateway points Goose at a port someone else holds | A profile gets the endpoint only while the gateway itself holds the socket (exclusive bind on Windows); otherwise the classifier is switched off in the plan |
+| The feature breaks the administrator's Goose | The native profile is changed through Goose's own configuration API, key by key, read back; a failure is recorded and changes nothing else; an `adversary.md` Goose Web did not write is never replaced without an explicit choice and a backup |
+| A long text ties up the classifier | Body cap, at most `classifier_max_pieces` pieces, a deadline below Goose's timeout, one request at a time in the classifier thread |
+| The rules text or a token ends up in a log | The audit holds switches and sizes only (`goosesec.summary`); the state holds a 16-hex-digit fingerprint of the token, not the token |
+
+### 14.3 Residual risks
+
+- **The port while the gateway is down.** The native profile's `config.yaml` keeps the endpoint address between
+  gateway runs. While the gateway is stopped, another Windows account on the same computer could listen on that port
+  and would be sent the recent user messages of the administrator's Goose Desktop, CLI and scheduled chats, with
+  the token. Goose's client cannot verify who answers (plain HTTP to a fixed address). A sandboxed member's agent
+  cannot do this (no loopback, section 13). Mitigations: run the gateway at boot (service account); do not give other
+  people interactive or remote-desktop access to the gateway's computer; or set `guard.classifier_port: 0`.
+- **One classifier thread.** The endpoint and the prompt guard of section 11 share it. A member's long message can
+  delay the administrator's request up to the deadline (the answer is then `503` and Goose uses its patterns).
+- **The token in a member's profile.** It is in the profile's `secrets.yaml` and in the agent's environment, readable
+  by that member's agent, like every other secret of that profile. It gives the agent nothing it does not have.
+- **An unstable Goose method.** The native apply uses `_goose/unstable/config/*`. If Goose renames it, the apply
+  fails visibly and the native profile keeps its last settings. `tests/test_goosesec_e2e.py` detects it.
+- **Adversary mode** adds a model call that sees the user's first message, recent messages and the tool call. It
+  goes to the chat's own provider, which already has that content.
+- **Not covered:** a native profile on another computer, and Goose instances started with another
+  `GOOSE_PATH_ROOT` that Goose Web does not know.

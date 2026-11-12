@@ -144,6 +144,10 @@ SOURCE_PERMISSION = {"skill": "skills_edit", "builtinSkill": "skills_edit", "age
 READABLE_CONFIG_KEYS = {"GOOSE_PROVIDER", "GOOSE_MODEL", "GOOSE_MODE", "GOOSE_THINKING_EFFORT", "GOOSE_MAX_TURNS"}
 # config keys Goose Web sets itself (spec 009: the hints file name); never writable by a non-admin
 MANAGED_CONFIG_KEYS = {"CONTEXT_FILE_NAMES"}
+# spec 026: Goose's own security settings (prompt injection detection: SECURITY_PROMPT_*, the undocumented
+# SECURITY_COMMAND_CLASSIFIER_* and the *_OVERRIDE switches) are set by Goose Web for every profile; a member
+# cannot change or remove them through Goose's configuration API
+MANAGED_CONFIG_PREFIXES = ("SECURITY_",)
 # config/upsert values checked against the team's lists
 CONFIG_LIST_KEYS = {"GOOSE_PROVIDER": "allowed_providers", "GOOSE_MODEL": "allowed_models",
                     "GOOSE_MODE": "allowed_modes"}
@@ -794,9 +798,10 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
         key = {"provider": "allowed_providers", "model": "allowed_models", "mode": "allowed_modes"}.get(cid)
         if key and not allows(policy, key, val):
             raise Denied(f"{cid} not allowed: {val}")
-    if method in (P + "config/upsert", P + "config/remove") and \
-            str(params.get("key") or "").upper() in MANAGED_CONFIG_KEYS:
-        raise Denied(f"{params.get('key')} is managed by Goose Web")
+    if method in (P + "config/upsert", P + "config/remove"):
+        managed = str(params.get("key") or "").strip().upper()
+        if managed in MANAGED_CONFIG_KEYS or managed.startswith(MANAGED_CONFIG_PREFIXES):
+            raise Denied(f"{params.get('key')} is managed by Goose Web")
     if method == P + "session/import":
         sanitize_session_import(params, policy)   # the hub checks the imported recipe (if any)
     if method == P + "tools/permissions/set" and guard_on(policy):
