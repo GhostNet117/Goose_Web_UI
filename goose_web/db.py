@@ -196,7 +196,9 @@ class Database:
             self._conn.executescript(SCHEMA)
             self._conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
             self._migrate()
-        self.purge_audit()
+        # No audit purge here (review 2026-11-12, D-4): it used the fixed 365 days at EVERY open, the command line
+        # included, so a longer logs.audit_days (kept for compliance) lost its older rows at each start. The
+        # gateway's maintenance loop (logjanitor) applies the configured retention.
 
     def _table_columns(self, table: str) -> set[str]:
         if table not in {t for t, _, _ in MIGRATIONS} | {"users"}:

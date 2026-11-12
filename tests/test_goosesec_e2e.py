@@ -234,7 +234,9 @@ class AcpStdio:
             fut = self.pending.pop(m.get("id"), None) if "method" not in m else None
             if fut is not None and not fut.done():
                 if "error" in m:
-                    fut.set_exception(RuntimeError(json.dumps(m["error"])[:300]))
+                    err = RuntimeError(json.dumps(m["error"])[:300])   # like hub.RpcError: the JSON-RPC code says
+                    err.code = m["error"].get("code") if isinstance(m["error"], dict) else None   # answer or failure
+                    fut.set_exception(err)
                 else:
                     fut.set_result(m.get("result"))
 

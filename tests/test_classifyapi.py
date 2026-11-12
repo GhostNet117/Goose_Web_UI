@@ -41,6 +41,9 @@ class FakeClassifier:
     def unload(self):
         self.loaded = False
 
+    def peek(self, text):
+        return self._cache.get(text)
+
     def score(self, text):
         if text in self._cache:
             return self._cache[text]
@@ -192,9 +195,10 @@ async def test_long_text_is_scored_in_pieces_up_to_a_limit(env):
         body = (await cl.post("/classify", json={"inputs": text}, headers=h)).json()
         assert body[0][0]["label"] == "INJECTION" and len(fake.calls) == 3 and max(fake.calls) <= 2000
         fake.calls.clear()
-        text = filler(9000, "b") + " " + INJECTION                       # beyond 3 pieces: that part is not scored
-        body = (await cl.post("/classify", json={"inputs": text}, headers=h)).json()
-        assert body[0][0]["label"] == "SAFE" and len(fake.calls) == 3
+        text = filler(9000, "b") + " " + INJECTION                       # more than 3 pieces: it cannot be scored whole
+        r = await cl.post("/classify", json={"inputs": text}, headers=h)
+        assert r.status_code == 413 and r.json()["error"] == "too_long" and fake.calls == []   # never "safe" (E-4)
+        assert svc.stats["tooLong"] == 1
     pieces, complete = g.external_pieces("x" * 3600, 3)
     assert [len(p) for p in pieces] == [2000, 1856] and complete            # consecutive, overlapping by 256
     assert pieces[0][-256:] == ("x" * 3600)[1744:2000]
@@ -207,6 +211,66 @@ async def test_dense_piece_is_halved_instead_of_dropped(env):
         body = (await cl.post("/classify", json={"inputs": text}, headers=h)).json()
         assert body[0][0]["label"] == "INJECTION" and all(n <= 600 for n in fake.calls[1:] if n <= 600)
         assert any(n <= 600 for n in fake.calls)
+
+
+async def test_a_piece_that_cannot_be_scored_is_not_reported_safe(env):
+    svc, g, fake, db, u, h = make(env, too_long=10, guard={"max_input_chars": 2000})   # nothing over 10 chars fits
+    async with client(svc) as cl:
+        r = await cl.post("/classify", json={"inputs": "d" * 1500 + " " + INJECTION}, headers=h)
+        assert r.status_code == 413 and r.json()["error"] == "too_long"
+    assert g.state != "error"
+
+
+async def test_flood_from_one_profile_is_bounded_and_never_reaches_the_gateway_guard(env):
+    """Review E-1: unique long texts from one token must not queue without bound in the classifier, and must not
+    delay GuardService.classify (the prompt guard of guarded teams, which fails open on a timeout)."""
+    svc, g, fake, db, u, h = make(env, delay=0.25, guard={"classifier_timeout_ms": 200, "classifier_rate_per_minute": 100000})
+    other = user(db, "bob")
+    ho = {"Authorization": "Bearer " + GS.token_for(db, other["id"])}
+    async with client(svc) as cl:
+        flood = [cl.post("/classify", json={"inputs": f"unique flood text number {i} " + "x" * 40}, headers=h)
+                 for i in range(40)]
+        peak = []
+
+        async def watch():
+            for _ in range(20):
+                peak.append((g._ext_total, dict(g._ext_by_key)))
+                await asyncio.sleep(0.02)
+        t0 = time.perf_counter()
+        guard_task = asyncio.create_task(g.classify("the gateway guard asks about this prompt text", point="prompt"))
+        res = await asyncio.gather(*flood, watch())
+        score, status = await guard_task
+        codes = [r.status_code for r in res[:-1]]
+        assert codes.count(503) >= 36 and set(codes) <= {200, 503}
+        assert max(p[0] for p in peak) <= g.EXTERNAL_MAX_PER_KEY                 # one profile: its own cap, not the total
+        assert all(n <= g.EXTERNAL_MAX_PER_KEY for p in peak for n in p[1].values())
+        assert status == "ok" and time.perf_counter() - t0 < 1.0                 # the guard's own thread: not queued behind it
+        await asyncio.sleep(0.6)
+        assert g._ext_total == 0 and g._ext_by_key == {}                         # every slot was given back
+        assert len([n for n in fake.calls if n > 45]) <= g.EXTERNAL_MAX_PER_KEY  # the refused ones were never scored
+        r = await cl.post("/classify", json={"inputs": INJECTION}, headers=ho)   # another profile is still served
+        assert r.status_code in (200, 503)
+        await asyncio.sleep(0.4)
+        assert (await cl.post("/classify", json={"inputs": INJECTION}, headers=ho)).status_code == 200
+
+
+async def test_odd_input_and_bad_configuration_do_not_break_anything(env):
+    s, db, pr, c = env
+    for k in ("classifier_timeout_ms", "classifier_max_pieces", "classifier_max_body_kb", "classifier_rate_per_minute"):
+        s.data["guard"][k] = "abc"                                       # a typo in config.yaml must not stop the gateway
+    s.data["guard"]["classifier_max_pieces"] = True
+    svc, g, fake, db, u, h = make(env)
+    assert svc.budget == 4.0 and svc.max_pieces == 4 and svc.max_body == 256 * 1024 and svc.limiter.limit == 600
+    seen = []
+    g.on_unavailable = lambda *a: seen.append(a)
+    async with client(svc) as cl:
+        r = await cl.post("/classify", content=b'{"inputs": "lone surrogate \\ud800 in otherwise normal text here"}',
+                          headers={**h, "Content-Type": "application/json"})
+        assert r.status_code == 200                                       # not valid text, but never an exception
+        fake.score = lambda text: (_ for _ in ()).throw(ValueError("tokenizer exploded"))
+        r = await cl.post("/classify", json={"inputs": "another text that makes the scorer raise"}, headers=h)
+        assert r.status_code == 503
+    assert seen == [] and g.state not in ("error", "not_installed")      # a caller cannot flap the guard's state
 
 
 async def test_deadline_answers_503_then_the_cached_score(env):

@@ -476,7 +476,12 @@ def test_purge_audit_and_purge_on_open(tmp_path):
     db.execute("INSERT INTO audit(ts, action) VALUES(?, 'new')", (time.time(),))
     assert db.purge_audit(days=10_000) == 0
     db.close()
-    db = Database(tmp_path / "a.db")                     # default retention applied on open
+    # Opening the database purges nothing (review 2026-11-12, D-4): the fixed 365 days at every open deleted rows a
+    # longer logs.audit_days was meant to keep. The maintenance loop applies the configured retention.
+    db = Database(tmp_path / "a.db")
+    assert [r["action"] for r in db.query("SELECT action FROM audit ORDER BY ts")] == ["old", "new"]
+    assert db.purge_audit(AUDIT_RETENTION_DAYS + 30) == 0               # a longer retention keeps the row
+    assert db.purge_audit() == 1                                         # the default retention, when asked for
     assert [r["action"] for r in db.query("SELECT action FROM audit")] == ["new"]
     assert db.purge_audit(0) == 0
     db.close()

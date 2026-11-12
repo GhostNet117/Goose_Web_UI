@@ -346,6 +346,8 @@ def apply_adversary_file(path: Path, want: str | None, ours: str | None, system_
         if path.is_symlink() or (path.exists() and not path.is_file()):
             return {**out, "state": "error", "error": f"{path.name} is not a regular file"}
         cur = file_hash(path) if path.exists() else None
+        if path.exists() and cur is None:
+            return {**out, "state": "error", "error": f"{path.name} exists but cannot be read; it was left alone"}
         mine = cur is not None and (cur == ours or (want is not None and cur == text_hash(want)))
         if want is None:
             if cur is None:
@@ -370,79 +372,151 @@ def apply_adversary_file(path: Path, want: str | None, ours: str | None, system_
         return {**out, "state": "error", "error": f"{e.__class__.__name__}: {str(e)[:200]}"}
 
 
+def _same(a: Any, b: Any) -> bool:
+    return a == b and type(a) is type(b)
+
+
+def _could_not_ask(e: BaseException) -> bool:
+    """True when a Goose request failed because Goose could not be asked (the worker is down, a timeout, the method
+    does not exist), as opposed to Goose answering that a key is not there. Only the second may count as "absent"."""
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+        return True
+    code = getattr(e, "code", None)
+    return not isinstance(code, int) or code in (-32000, -32601, -32600, -32700)
+
+
 async def apply_native(*, db, settings, upstream, config_dir: Path, user: dict, endpoint: str | None,
                        goose_version: str = "", adopt: bool = False, timeout: float = 30.0) -> dict:
     """Apply the plan to a native profile through Goose's own configuration API and record the outcome.
 
     `upstream` is the profile's hub.Upstream (its request() starts the worker when needed). Nothing here raises:
-    a failure is recorded and returned ({ok: False, error}), and Goose keeps running with what it had."""
+    a failure is recorded and returned ({ok: False, error}), and Goose keeps running with what it had.
+
+    OWNERSHIP (security review 2026-11-12, E-3). The native profile is the administrator's own Goose: they may have
+    set these keys themselves. Goose Web therefore remembers what it wrote (`written`, the token's fingerprint) and
+      - replaces or removes a value only when it is absent or still exactly what Goose Web wrote;
+      - keeps any other value and reports the key as `foreign`, unless `adopt` says to take it over (the replaced
+        values are saved to <system_dir>/backups/native-security first);
+      - treats the classifier keys as one group: an endpoint someone else configured keeps its switch and its token;
+      - when the feature is off, removes only its own values. An "off" that was never "on" touches nothing.
+    Every write is read back. A request Goose could not be asked (worker down, timeout, unknown method) is a
+    failure, never "the key is not there" (E-7)."""
     cfg = load(db)
     token = token_for(db, user["id"]) if endpoint else None
     plan = profile_plan(cfg, native=True, token=token, endpoint=endpoint)
     prev = db.get_setting(STATE_SETTING)
-    prev_native = (prev or {}).get("native") if isinstance(prev, dict) else None
-    ours = (prev_native or {}).get("adversaryHash") if isinstance(prev_native, dict) else None
+    pn = prev.get("native") if isinstance(prev, dict) and isinstance(prev.get("native"), dict) else {}
+    ours: dict = dict(pn["written"]) if isinstance(pn.get("written"), dict) else {}
+    our_token = bool(pn.get("tokenFp"))
+    our_adv = pn.get("adversaryHash")
     state: dict[str, Any] = {"ok": True, "at": time.time(), "goose": goose_version, "user": user.get("username"),
                              "detection": bool(cfg["enabled"]), "classifier": bool(plan["secret"]),
-                             "changed": [], "error": ""}
-    unknown = object()   # the key could not be read (Goose answers a missing key with an error in some versions)
+                             "changed": [], "foreign": [], "error": "", "written": dict(ours),
+                             "tokenFp": pn.get("tokenFp") or "", "adversary": pn.get("adversary") or "off",
+                             "adversaryHash": our_adv}
+    unknown = object()   # Goose answered that the key does not exist (some versions answer that with an error)
+    replaced: dict[str, Any] = {}
     try:
         async def read(key: str, secret: bool = False) -> Any:
             try:
                 r = await upstream.request(P + "config/read", {"key": key, "isSecret": secret}, timeout=timeout)
-            except asyncio.TimeoutError:
-                raise
-            except Exception:
+            except Exception as e:
+                if _could_not_ask(e):
+                    raise
                 return unknown
             return r.get("value") if isinstance(r, dict) else None
 
-        async def remove(key: str, secret: bool, have: Any) -> None:
-            if have is None:
-                return
+        async def upsert(key: str, value: Any, secret: bool = False) -> None:
+            await upstream.request(P + "config/upsert", {"key": key, "value": value, "isSecret": secret},
+                                   timeout=timeout)
+
+        async def remove(key: str, secret: bool = False) -> None:
             try:
                 await upstream.request(P + "config/remove", {"key": key, "isSecret": secret}, timeout=timeout)
-            except asyncio.TimeoutError:
-                raise
-            except Exception:
-                if have is unknown:
-                    return   # could not be read and could not be removed: it is not there
-                raise
-            if have is not unknown:
-                state["changed"].append(f"{key} removed")
+            except Exception as e:
+                if _could_not_ask(e):
+                    raise   # not removed and Goose could not say why: a failure, never "done"
 
-        for key, value in plan["config"].items():
-            if await read(key) != value:
-                await upstream.request(P + "config/upsert", {"key": key, "value": value, "isSecret": False},
-                                       timeout=timeout)
+        have = {k: await read(k) for k in CONFIG_KEYS}
+
+        def present(k: str) -> bool:
+            return have[k] is not None and have[k] is not unknown
+
+        def is_ours(k: str) -> bool:
+            return present(k) and k in ours and _same(have[k], ours[k])
+
+        # someone else's classifier endpoint: its switch and its token stay as they are
+        group_foreign = (present(CLS_ENDPOINT) and not is_ours(CLS_ENDPOINT) and not adopt
+                         and not _same(have[CLS_ENDPOINT], plan["config"].get(CLS_ENDPOINT)))
+        wrote: list[str] = []
+        for key in CONFIG_KEYS:
+            cur = have[key]
+            if key in plan["config"]:
+                want = plan["config"][key]
+                if present(key) and _same(cur, want):
+                    state["written"][key] = want
+                    continue
+                blocked = present(key) and not is_ours(key) and not adopt
+                if key in (CLS_ENABLED, CLS_ENDPOINT) and group_foreign:
+                    blocked = True
+                if blocked:
+                    state["foreign"].append(key)
+                    state["written"].pop(key, None)
+                    continue
+                if present(key) and not is_ours(key):
+                    replaced[key] = cur
+                await upsert(key, want)
+                state["written"][key] = want
                 state["changed"].append(key)
-        for key in plan["remove"]:
-            await remove(key, False, await read(key))
-        have = await read(CLS_TOKEN, True)
-        if plan["secret"]:
-            # Goose may return a masked value for a secret: the token is written whenever it cannot be shown to be
-            # the right one (writing the same token again changes nothing)
-            if have != plan["secret"]:
-                await upstream.request(P + "config/upsert", {"key": CLS_TOKEN, "value": plan["secret"],
-                                                             "isSecret": True}, timeout=timeout)
-                if have is None or have is unknown:
-                    state["changed"].append(f"{CLS_TOKEN} set")
-        else:
-            await remove(CLS_TOKEN, True, have)
-    except Exception as e:   # the Goose worker did not start, the method changed, a timeout
+                wrote.append(key)
+            else:   # the plan wants the key gone: only Goose Web's own value is removed
+                if is_ours(key):
+                    await remove(key)
+                    state["changed"].append(f"{key} removed")
+                elif present(key):
+                    state["foreign"].append(key)
+                state["written"].pop(key, None)
+        for key in wrote:   # read back
+            back = await read(key)
+            if back is unknown or not _same(back, state["written"][key]):
+                raise RuntimeError(f"{key} did not read back as written")
+        if plan["secret"] and not group_foreign:
+            have_t = await read(CLS_TOKEN, True)
+            # Goose masks a secret it returns, so the token is written at every apply (the same value changes nothing)
+            await upsert(CLS_TOKEN, plan["secret"], True)
+            fp = token_fingerprint(plan["secret"])
+            if have_t is None or have_t is unknown or fp != state["tokenFp"]:
+                state["changed"].append(f"{CLS_TOKEN} set")
+            state["tokenFp"] = fp
+        elif not plan["secret"] and our_token and not group_foreign:
+            if await read(CLS_TOKEN, True) is not None:
+                await remove(CLS_TOKEN, True)
+                state["changed"].append(f"{CLS_TOKEN} removed")
+            state["tokenFp"] = ""
+        if replaced:
+            d = Path(settings.system_dir) / "backups" / "native-security"
+            d.mkdir(parents=True, exist_ok=True)
+            bak = d / f"config-keys.{time.strftime('%Y%m%d-%H%M%S')}.json"
+            bak.write_text(json.dumps(replaced, indent=1, default=str), encoding="utf-8")
+            state["configBackup"] = str(bak)
+    except Exception as e:   # the Goose worker did not start, the method changed, a timeout, a failed read-back
         state["ok"] = False
         state["error"] = f"{e.__class__.__name__}: {str(e)[:300]}"
         log.warning("goose security: the native profile of %s was not updated: %s", user.get("username"), state["error"])
-    adv = apply_adversary_file(Path(config_dir) / ADVERSARY_FILE, plan["adversary"], ours, settings.system_dir,
-                               adopt=adopt)
-    state["adversary"] = adv["state"]
-    state["adversaryHash"] = adv.get("hash") if adv["state"] == "on" else (ours if adv["state"] == "foreign" else None)
-    if adv.get("changed"):
-        state["changed"].append("adversary.md " + ("written" if adv["state"] == "on" else "removed"))
-    if adv.get("backup"):
-        state["adversaryBackup"] = adv["backup"]
-    if adv["state"] == "error":
-        state["ok"] = False
-        state["error"] = (state["error"] + "; " if state["error"] else "") + "adversary.md: " + adv.get("error", "")
+    if state["ok"]:
+        # adversary.md only after the settings went in: a failed apply changes nothing else
+        adv = apply_adversary_file(Path(config_dir) / ADVERSARY_FILE, plan["adversary"], our_adv, settings.system_dir,
+                                   adopt=adopt)
+        state["adversary"] = adv["state"]
+        state["adversaryHash"] = adv.get("hash") if adv["state"] == "on" else \
+            (our_adv if adv["state"] in ("foreign", "error") else None)
+        if adv.get("changed"):
+            state["changed"].append("adversary.md " + ("written" if adv["state"] == "on" else "removed"))
+        if adv.get("backup"):
+            state["adversaryBackup"] = adv["backup"]
+        if adv["state"] == "error":
+            state["ok"] = False
+            state["error"] = "adversary.md: " + adv.get("error", "")
     whole = prev if isinstance(prev, dict) else {}
     whole["native"] = state
     db.set_setting(STATE_SETTING, whole)
@@ -461,39 +535,53 @@ def token_fingerprint(token: str | None) -> str:
 
 
 def native_drift(config_dir: Path, plan: dict, state: dict | None) -> list[str]:
-    """What differs between the native profile and the plan, found WITHOUT starting Goose: config.yaml is only
-    read. The secret store cannot be read from here, so the token is compared with what the last apply recorded.
-    An empty list = nothing to do (the gateway then does not start the administrator's Goose worker for it)."""
+    """What apply_native would change, found WITHOUT starting Goose: config.yaml is only read. The secret store
+    cannot be read from here, so the token is compared with what the last apply recorded. Values someone else set
+    (not what Goose Web wrote) are not drift: apply_native keeps them. An empty list = nothing to do (the gateway
+    then does not start the administrator's Goose worker for it)."""
     out: list[str] = []
-    if not state or not state.get("ok"):
-        out.append("never applied" if not state else "the last apply failed")
+    state = state or {}
+    if not state.get("ok"):
+        if not state:
+            # never applied: an "off" that was never "on" has nothing to remove
+            if not plan["config"] and plan["adversary"] is None:
+                return []
+            out.append("never applied")
+        else:
+            out.append("the last apply failed")
     try:
         import yaml
         cfg = yaml.safe_load((Path(config_dir) / "config.yaml").read_text(encoding="utf-8")) or {}
         if not isinstance(cfg, dict):
             cfg = {}
-    except (OSError, ValueError) as e:
-        if isinstance(e, FileNotFoundError):
-            cfg = {}
-        else:
-            return out + ["config.yaml could not be read"]
-    except Exception:   # yaml.YAMLError
+    except FileNotFoundError:
+        cfg = {}
+    except Exception:   # unreadable, or not YAML
         return out + ["config.yaml could not be read"]
-    for k, v in plan["config"].items():
-        if cfg.get(k) != v or type(cfg.get(k)) is not type(v):
+    ours = state.get("written") if isinstance(state.get("written"), dict) else {}
+
+    def is_ours(k: str) -> bool:
+        return k in cfg and k in ours and _same(cfg[k], ours[k])
+    group_foreign = (CLS_ENDPOINT in cfg and not is_ours(CLS_ENDPOINT)
+                     and not _same(cfg[CLS_ENDPOINT], plan["config"].get(CLS_ENDPOINT)))
+    for k in CONFIG_KEYS:
+        if k in plan["config"]:
+            if k in cfg and _same(cfg[k], plan["config"][k]):
+                continue
+            if (k in cfg and not is_ours(k)) or (group_foreign and k in (CLS_ENABLED, CLS_ENDPOINT)):
+                continue   # someone else's value: kept
             out.append(k)
-    for k in plan["remove"]:
-        if k in cfg:
+        elif is_ours(k):
             out.append(f"{k} present")
-    if token_fingerprint(plan["secret"]) != ((state or {}).get("tokenFp") or ""):
+    if not group_foreign and token_fingerprint(plan["secret"]) != (state.get("tokenFp") or ""):
         out.append(CLS_TOKEN)
     adv = Path(config_dir) / ADVERSARY_FILE
     cur = file_hash(adv) if adv.is_file() else None
-    ours = (state or {}).get("adversaryHash")
+    theirs = state.get("adversaryHash")
     if plan["adversary"] is not None:
-        if cur != text_hash(plan["adversary"]) and not (cur is not None and (state or {}).get("adversary") == "foreign"):
+        if cur != text_hash(plan["adversary"]) and not (cur is not None and state.get("adversary") == "foreign"):
             out.append(ADVERSARY_FILE)
-    elif cur is not None and ours and cur == ours:
+    elif cur is not None and theirs and cur == theirs:
         out.append(f"{ADVERSARY_FILE} present")
     return out
 
@@ -525,15 +613,10 @@ async def sync_native(c, *, adopt: bool = False, force: bool = False) -> dict | 
             state = await apply_native(db=c.db, settings=c.settings, upstream=c.upstream_for(admin),
                                        config_dir=config_dir, user=admin, endpoint=endpoint,
                                        goose_version=c.goose_version, adopt=adopt)
-            if state["ok"]:
-                state["tokenFp"] = token_fingerprint(plan["secret"])
-                whole = c.db.get_setting(STATE_SETTING)
-                whole = whole if isinstance(whole, dict) else {}
-                whole["native"] = state
-                c.db.set_setting(STATE_SETTING, whole)
             if state["changed"] or not state["ok"]:
                 c.db.audit("goosesec.native", user=admin, target=admin["username"],
-                           detail={"changed": state["changed"][:20], "adversary": state["adversary"],
+                           detail={"changed": state["changed"][:20], "foreign": state.get("foreign") or [],
+                                   "adversary": state["adversary"],
                                    "error": state["error"][:300], "goose": state["goose"]}, ok=state["ok"])
             if state["changed"]:
                 # Goose reads the classifier settings and adversary.md once per process (1.59; per chat in 1.57)

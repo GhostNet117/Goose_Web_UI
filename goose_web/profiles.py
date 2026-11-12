@@ -430,6 +430,29 @@ class Profiles:
         from . import sandbox as sb
         return rl.state_mapping(self.s.system_dir / "sandbox", sb.container_name(str(self.root), user["username"]))
 
+    def _read_profile_yaml(self, user: dict, p: Path) -> dict:
+        """config.yaml / secrets.yaml of an isolated profile. A file that is not readable YAML or not a mapping (an
+        interrupted write, or something the member's agent did) used to make every start of that member's agent
+        fail until an administrator repaired the file by hand (review 2026-11-12, B-9). It is now moved to
+        <system_dir>/backups/profiles/<user>/ (nothing is lost), the event is audited, and provisioning rebuilds
+        the file from the team's policy."""
+        try:
+            data = _read_yaml(p)
+            if isinstance(data, dict):
+                return data
+            problem = "not a mapping"
+        except (yaml.YAMLError, UnicodeDecodeError) as e:
+            problem = e.__class__.__name__
+        dst_dir = self.s.system_dir / "backups" / "profiles" / safe_name(user["username"])
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / f"{p.name}.{time.strftime('%Y%m%d-%H%M%S')}.unreadable"
+        shutil.move(str(p), str(dst))   # also across volumes (system_dir may be on another disk)
+        log.warning("profile %s: %s was not readable (%s); moved to %s and rebuilt", user.get("username"), p.name,
+                    problem, dst)
+        self.db.audit("profile.file.set_aside", user=user, target=str(user.get("username") or ""),
+                      detail={"file": p.name, "problem": problem, "movedTo": str(dst)}, ok=False)
+        return {}
+
     def security_plan(self, user: dict, relays: dict[str, str] | None = None) -> dict:
         """Spec 026: what this profile gets of Goose's own security settings (goosesec.profile_plan). A sandboxed
         AppContainer member reaches the classification endpoint at its relay forwarder's address (`relays`)."""
@@ -464,9 +487,24 @@ class Profiles:
         elif goosesec.CLS_TOKEN in secrets:
             secrets.pop(goosesec.CLS_TOKEN)
             changes.append("goose security: classifier token removed")
+        # a member's agent must not carry Goose's other security switches in its own config.yaml either (the
+        # undocumented command classifier, anything new): only what the plan sets stays
+        for k in [k for k in cfg if isinstance(k, str) and k.upper().startswith(goosesec.MANAGED_KEY_PREFIX)
+                  and k not in plan["config"]]:
+            cfg.pop(k)
+            changes.append(f"goose security: {k} removed (not set by Goose Web)")
         adv = cfg_dir / goosesec.ADVERSARY_FILE
-        if not _inside_profile(adv, root) or _is_reparse(adv):
-            return   # a junction / link planted in the profile: never write through it (C-3)
+        if not _inside_profile(adv, root) or _is_reparse(adv) or (adv.exists() and not adv.is_file()):
+            # a junction, a link or a folder where adversary.md belongs: never written through (C-3)
+            if plan["adversary"] is None and not old.get("adversary"):
+                return   # adversary mode is not on for this profile and the gateway never wrote a file here
+            # Security review 2026-11-12, E-5: this is how a member's agent would stop the reviewer's rules from
+            # being written. The control cannot be established, so the agent does not start (provisioning fails
+            # closed, like every other provisioning failure) and administrators find the reason in the audit log.
+            self.db.audit("goosesec.profile", user=user, target=str(user.get("username") or ""),
+                          detail={"problem": "adversary.md is a link or a folder, not a file"}, ok=False)
+            raise RuntimeError("adversary.md in this profile's config folder is a link or a folder; an administrator "
+                               "must remove it (adversary mode is on for members)")
         if plan["adversary"] is not None:
             want = plan["adversary"]
             if not adv.is_file() or goosesec.file_hash(adv) != goosesec.text_hash(want):
@@ -503,12 +541,12 @@ class Profiles:
                                         "updatedAt": time.time()}
 
         cfg_path = cfg_dir / "config.yaml"
-        first_time = not cfg_path.exists()
-        cfg = _read_yaml(cfg_path)
+        cfg = self._read_profile_yaml(user, cfg_path)
+        first_time = not cfg_path.exists()   # also after an unreadable file was set aside: rebuilt like a new profile
         exts: dict = cfg.setdefault("extensions", {}) if isinstance(cfg.get("extensions"), dict) else {}
         cfg["extensions"] = exts
         secrets_path = cfg_dir / "secrets.yaml"
-        secrets = _read_yaml(secrets_path)
+        secrets = self._read_profile_yaml(user, secrets_path)
 
         admin = self._native_admin()
         admin_cfg = _read_yaml(self.config_dir(admin) / "config.yaml") if admin else {}
@@ -674,14 +712,9 @@ class Profiles:
             changes.append(f"thinking effort {DEFAULT_EFFORT} (default)")
         if guard_on(pol) and strip_always_allow(cfg_dir / "permission.yaml"):
             changes.append("prompt guard: 'always allow' tool permissions removed")
-        try:
-            self._apply_security(user, cfg, secrets, cfg_dir, root, old, new_manifest, changes, relays)
-        except Exception:
-            # Goose-native detection is an addition to the policy above: a failure here leaves the profile as it
-            # was (and says so) instead of stopping the member's worker
-            log.exception("profile %s: Goose security settings not applied", user.get("username"))
-            if old.get("adversary"):
-                new_manifest["adversary"] = old["adversary"]
+        # Spec 026. A failure here fails the provisioning, like any other step (the worker then does not start): a
+        # security setting that could be skipped by making this step raise would not be one (review E-5).
+        self._apply_security(user, cfg, secrets, cfg_dir, root, old, new_manifest, changes, relays)
 
         _write_yaml(cfg_path, cfg)
         if secrets or secrets_path.exists():

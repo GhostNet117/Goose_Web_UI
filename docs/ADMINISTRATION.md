@@ -1135,7 +1135,10 @@ differs from Goose's public guides in places:
 **Members.** The settings are written into the member's profile before every start of their agent, and the agent's
 process also gets them in its environment, which Goose ranks above its files. So a member, or an agent that was
 talked into it, cannot switch the detection off by editing the profile; a request to change a `SECURITY_*` setting
-through Goose's configuration API is refused ("managed by Goose Web").
+through Goose's configuration API is refused ("managed by Goose Web"). Any other `SECURITY_*` setting found in a
+member's `config.yaml` is removed at the next start. If this step cannot be completed for a member, their agent does
+not start (the reason is in `gateway.log` and, for a tampered `adversary.md`, in the audit log as `goosesec.profile`):
+a security setting that could be skipped by making the step fail would not be one.
 
 **The administrator's Goose profile.** Goose Web changes it through Goose's own configuration API, never by rewriting
 its files, so Goose decides the file format and where the secret is stored. It does so when the gateway starts and
@@ -1143,6 +1146,13 @@ when the settings change, and only if something differs (the administrator's Goo
 find that nothing changed). The page and `goose-web check` show when it was last applied and with which Goose
 version. If it fails, Goose keeps running with what it had, administrators get a notice, the audit log gets
 `goosesec.native`, and the gateway tries again at its next start.
+
+That profile is the administrator's own Goose, so Goose Web only manages what it wrote there itself. It remembers
+the values it set and replaces or removes only those. A value you set yourself is kept and listed on the page as
+"kept": a stricter threshold, your own classifier endpoint with its switch and token, a setting you changed in Goose
+Desktop after Goose Web wrote it. *Take them over* replaces them with Goose Web's values after saving the previous
+ones (never the token) to `<system_dir>\backups\native-security\`. If the feature is off and Goose Web never wrote
+anything, it does not touch that profile at all.
 
 **The classification endpoint.** `http://127.0.0.1:<guard.classifier_port>/classify` (default 8711), a listener of
 its own that answers only classification requests:
@@ -1155,9 +1165,12 @@ its own that answers only classification requests:
 - If the port is taken when the gateway starts, the gateway starts all the same, the page says so, and Goose uses its
   patterns only. Profiles are never pointed at a port the gateway does not hold.
 - *Check now* asks the endpoint the way Goose does (with a real token, then without one) and shows the scores.
-- One classifier thread serves this endpoint and the prompt guard of 9.10. A very long message of one user can delay
-  another's answer; the endpoint then answers `503` in time, Goose uses its patterns for that command, and the score
-  is ready for Goose's next request.
+- The endpoint scores in a thread of its own, so it never makes the prompt guard of 9.10 wait. Its backlog is small
+  and bounded (8 pieces of text, 3 per profile). When it is full, or a score is not ready within 4 seconds, the answer
+  is `503` and Goose uses its patterns for that command; a score that was being worked on is ready for Goose's next
+  request.
+- A message too long to be scored completely (more than about 63,000 characters with the defaults) is answered
+  `413`, never "safe". Goose then uses its patterns for that command and writes a warning to its log.
 
 Limits: `guard.classifier_*` in CONFIGURATION.md. Set `guard.classifier_port: 0` to run without the endpoint.
 
@@ -1183,6 +1196,11 @@ Read this before turning it on:
 - If the reviewer fails (provider error, timeout), the call is allowed.
 - Goose reads `adversary.md` when it starts (see above), so a change reaches a running Goose Desktop or CLI session
   at its next start.
+- **Use Goose 1.59 or later for members.** The file lives in the member's profile, which the member's agent can
+  write. Goose 1.59 reads it once per process and Goose Web rewrites it before every start, so an agent's edit has no
+  effect. Goose 1.57 reads it for every new chat, so an edit would change the rules of that member's next chat until
+  the agent restarts. A link or a folder put in the file's place stops the member's agent from starting and is
+  audited.
 
 An `adversary.md` in the administrator's profile that Goose Web did not write (you made it yourself) is kept as it
 is; the page says so and offers to replace it, after copying it to `<system_dir>\backups\native-security\`. Goose

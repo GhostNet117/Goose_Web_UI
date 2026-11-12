@@ -383,6 +383,9 @@ Say "Initialising (admin '$Admin'; a random initial password is generated and sh
 # init prints the generated password (first install only); keep its output and show it once, at the end.
 $initOut = @(& $venvPy -m goose_web --config $cfg init --admin $Admin --native-root $native)
 if ($LASTEXITCODE) { $initOut | ForEach-Object { Write-Host $_ }; throw "goose-web init failed." }
+# Shown NOW as well as at the end: the generated initial password is printed only once by init, and a later step that
+# fails (the check below, a blocked download) used to end the script before anyone saw it.
+$initOut | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
 # Goose-native security (spec 026): Goose's own prompt injection detection (SECURITY_PROMPT_* settings, scored by
 # the Prompt Guard model through the gateway's loopback classification endpoint) is ON by default for every profile.
 # Nothing is written here: the gateway applies it when it starts - members' profiles at every start of their agent,

@@ -396,7 +396,20 @@ async def ws_endpoint(websocket: WebSocket):
         else:
             return True
         u = c.db.user_by_id(user["id"])
-        return bool(row and row["expires_at"] > now and u and not u["disabled"])
+        if not (row and row["expires_at"] > now and u and not u["disabled"]):
+            return False
+        # A-1: the rights this socket was opened with (role, policy, folders) must still be the current ones
+        try:
+            t = u if target["id"] == user["id"] else c.db.user_by_id(target["id"])
+            return t is not None and c.rights_fingerprint(u, t) == rights
+        except Exception:
+            log.exception("socket re-validation (rights)")
+            return True
+    try:
+        rights = c.rights_fingerprint(user, target)
+    except Exception:
+        log.exception("socket rights fingerprint")
+        rights = ""
     client.kick, client.still_valid = kick, still_valid
     client.start()
     c.hub.attach(up, client)
@@ -574,17 +587,9 @@ def wire_security_hooks(c: Ctx) -> None:
             if strip_always_allow(c.profiles.config_dir(u) / "permission.yaml"):
                 changes.append("prompt guard: 'always allow' tool permissions removed")
         # Spec 026: Goose's own security settings also go into the worker's environment, which Goose ranks above
-        # the profile's files. An AppContainer member reaches the classification endpoint at its relay forwarder's
-        # address, which the relay code writes into config.yaml at start: no endpoint in the environment then.
-        try:
-            from . import goosesec
-            env = dict(c.profiles.security_plan(u)["env"])
-            if (w.sandbox or {}).get("backend") == "appcontainer":
-                env.pop(goosesec.CLS_ENDPOINT, None)
-            w.security_env = env
-        except Exception:
-            log.exception("worker %s: Goose security environment not set", w.key)
-            w.security_env = {}
+        # the profile's files. (For an AppContainer the worker manager replaces the endpoint's address with the
+        # relay forwarder's when it builds the environment.) A failure fails the start, like provisioning.
+        w.security_env = dict(c.profiles.security_plan(u)["env"])
         if changes:
             log.info("worker %s: provisioned before start (%s)", w.key, "; ".join(changes)[:500])
     c.workers.pre_start = pre_start

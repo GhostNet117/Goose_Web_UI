@@ -200,6 +200,17 @@ class Ctx:
                               sandbox=self.sandbox_spec(user))
         return self.hub.upstream(key, user["username"])
 
+    def rights_fingerprint(self, user: dict, target: dict | None = None) -> str:
+        """What a WebSocket is allowed to do, as one comparable string: the caller's role and effective policy and
+        the folder roots of the profile it is attached to. A socket keeps the rights it was opened with, so the
+        gateway compares this at every re-validation and ends a socket whose rights changed (review 2026-11-12,
+        A-1: a demoted administrator, or a member whose team lost a permission or a folder, kept the old rights
+        until the tab was closed). The browser reconnects at once and gets the current ones."""
+        import json
+        policy = self.policy_for(user)
+        roots = self.roots_for(target if target is not None else user, policy)
+        return json.dumps([user.get("role"), policy, [str(r) for r in roots]], sort_keys=True, default=str)
+
     def sandboxed(self, user: dict) -> bool:
         """Spec 012: isolated non-admin users run in their own AppContainer when sandbox.enabled is on."""
         from .config import sandbox_on

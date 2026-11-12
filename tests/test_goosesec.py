@@ -254,6 +254,14 @@ def test_firewall_members_cannot_change_goose_security_keys(key):
 
 
 # ------------------------------------------------------------------ native profile (Goose's configuration API)
+class GooseSays(Exception):
+    """Goose answered with a JSON-RPC error (like hub.RpcError): `code` tells an answer from a failure to ask."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 class FakeUp:
     """Goose's configuration API over a profile folder: parameters in config.yaml, secrets in memory."""
 
@@ -273,13 +281,13 @@ class FakeUp:
         store = self.secrets if secret else self.cfg()
         if method.endswith("config/read"):
             if self.read_fails and key not in store:
-                raise RuntimeError("not found")
+                raise GooseSays(-32603, "not found")
             return {"value": ("********" if secret and key in store else store.get(key))}
         if method.endswith("config/upsert"):
             store[key] = params["value"]
         elif method.endswith("config/remove"):
             if self.read_fails and key not in store:
-                raise RuntimeError("not found")
+                raise GooseSays(-32603, "not found")
             store.pop(key, None)
         if not secret:
             (self.dir / "config.yaml").write_text(yaml.safe_dump(store), encoding="utf-8")
@@ -369,6 +377,199 @@ async def test_native_adversary_file_ours_foreign_adopt_and_off(env, tmp_path):
     assert st["adversary"] == "off" and not adv.exists() and "adversary.md removed" in st["changed"]
     backups = sorted(p.name for p in (s.system_dir / "backups" / "native-security").iterdir())
     assert len(backups) == 3 and all(n.startswith("adversary.md.") for n in backups)
+
+
+async def test_native_values_the_administrator_set_are_kept(env, tmp_path):
+    """Review E-3: the native profile is the administrator's own Goose. Goose Web replaces or removes only what it
+    wrote itself; anything else is kept and reported, unless adopt says to take it over (with a backup)."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    own = {"GOOSE_MODE": "auto", "SECURITY_PROMPT_ENABLED": True, "SECURITY_PROMPT_THRESHOLD": 0.3,
+           "SECURITY_PROMPT_CLASSIFIER_ENABLED": True, "SECURITY_PROMPT_CLASSIFIER_ENDPOINT": "https://my.own/classify"}
+    (cdir / "config.yaml").write_text(yaml.safe_dump(own), encoding="utf-8")
+    up = FakeUp(cdir)
+    up.secrets[TOKEN_KEY] = "my-own-token"
+    # OFF, never applied (install.ps1 -GooseSecurity off): nothing is touched, and nothing even needs asking
+    GS.save(db, GS.clean({"enabled": False}))
+    plan = GS.profile_plan(GS.load(db), native=True, token=None, endpoint=ENDPOINT)
+    assert GS.native_drift(cdir, plan, None) == []
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and st["changed"] == [] and up.cfg() == own and up.secrets[TOKEN_KEY] == "my-own-token"
+    assert set(st["foreign"]) == set(KEYS)
+    # ON (the default at an upgrade): the stricter threshold, the own endpoint, its switch and its token stay
+    GS.save(db, GS.clean({"enabled": True}))
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and st["changed"] == [] and up.cfg() == own and up.secrets[TOKEN_KEY] == "my-own-token"
+    assert set(st["foreign"]) == {KEYS[1], KEYS[3]} and st["tokenFp"] == ""      # enabled/classifier already as wanted
+    tok = GS.token_for(db, admin["id"])
+    assert GS.native_drift(cdir, GS.profile_plan(GS.load(db), native=True, token=tok, endpoint=ENDPOINT), st) == []
+    # adopt: taken over, the previous values saved first (never the secret)
+    st = await apply(s, db, up, admin, cdir, adopt=True)
+    assert st["ok"] and up.cfg()[KEYS[1]] == 0.8 and up.cfg()[KEYS[3]] == ENDPOINT and up.secrets[TOKEN_KEY] == tok
+    saved = json.loads(Path(st["configBackup"]).read_text(encoding="utf-8"))
+    assert saved == {KEYS[1]: 0.3, KEYS[3]: "https://my.own/classify"} and "my-own-token" not in json.dumps(saved)
+    # now they are Goose Web's: OFF removes them, and only them
+    GS.save(db, GS.clean({"enabled": False}))
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and up.cfg() == {"GOOSE_MODE": "auto"} and up.secrets == {} and st["written"] == {}
+
+
+async def test_native_changed_by_hand_after_goose_web_wrote_it_is_kept(env, tmp_path):
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    up = FakeUp(cdir)
+    assert (await apply(s, db, up, admin, cdir))["ok"]
+    cfg = up.cfg()
+    cfg["SECURITY_PROMPT_THRESHOLD"] = 0.4                                  # the administrator makes it stricter in Goose Desktop
+    (cdir / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and up.cfg()["SECURITY_PROMPT_THRESHOLD"] == 0.4 and st["foreign"] == [KEYS[1]]
+    GS.save(db, GS.clean({"enabled": False}))
+    st = await apply(s, db, up, admin, cdir)
+    assert up.cfg()["SECURITY_PROMPT_THRESHOLD"] == 0.4 and KEYS[0] not in up.cfg()   # ours removed, theirs kept
+
+
+async def test_native_off_while_goose_cannot_be_asked_is_a_failure_not_done(env, tmp_path):
+    """Review E-7: a read or remove that fails because Goose is down must never be recorded as applied."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    up = FakeUp(cdir)
+    assert (await apply(s, db, up, admin, cdir))["ok"]
+    GS.save(db, GS.clean({"enabled": False}))
+    for err in (GooseSays(-32000, "Goose is not connected"), GooseSays(-32601, "method not found"),
+                ConnectionError("worker gone"), asyncio.TimeoutError()):
+        up.fail = err
+        st = await apply(s, db, up, admin, cdir)
+        assert st["ok"] is False and st["changed"] == [] and up.cfg()[KEYS[0]] is True
+        assert st["written"][KEYS[0]] is True                             # still known as ours: the next start retries
+    up.fail = None
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and not any(k.startswith("SECURITY_") for k in up.cfg())
+
+
+async def test_native_adversary_file_that_cannot_be_read_is_left_alone(env, tmp_path, monkeypatch):
+    """Review E-8."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    adv = cdir / "adversary.md"
+    adv.write_text("locked by another program", encoding="utf-8")
+    monkeypatch.setattr(GS, "file_hash", lambda p: None)
+    GS.save(db, GS.clean({"adversary": {"native": True, "rules": "BLOCK x"}}))
+    st = await apply(s, db, FakeUp(cdir), admin, cdir, adopt=True)
+    assert st["ok"] is False and st["adversary"] == "error" and "cannot be read" in st["error"]
+    assert adv.read_text(encoding="utf-8") == "locked by another program"
+    assert not (s.system_dir / "backups" / "native-security").exists()
+
+
+def test_member_cannot_stop_the_reviewer_file_with_a_folder(env):
+    """Review E-5: a folder (or a link) where adversary.md belongs fails the provisioning (the agent does not
+    start) and is audited, instead of being skipped in silence."""
+    s, db, pr, c = env
+    alice = member(db)
+    pr.provision(alice)
+    adv = pr.config_dir(alice) / "adversary.md"
+    adv.mkdir()
+    assert pr.provision(alice) == []                                       # adversary mode off: not Goose Web's concern
+    GS.save(db, GS.clean({"adversary": {"members": True}}))
+    with pytest.raises(RuntimeError, match="link or a folder"):
+        pr.provision(alice)
+    rows = db.query("SELECT ok, target, detail FROM audit WHERE action='goosesec.profile'")
+    assert len(rows) == 1 and rows[0]["ok"] == 0 and rows[0]["target"] == "alice"
+    adv.rmdir()
+    assert "goose security: adversary.md" in pr.provision(alice) and adv.is_file()
+    adv.unlink()
+    adv.mkdir()                                                             # after the gateway wrote one: also when turned off
+    GS.save(db, GS.clean({}))
+    with pytest.raises(RuntimeError):
+        pr.provision(alice)
+
+
+def test_unreadable_profile_file_is_set_aside_and_rebuilt(env):
+    """Review B-9: a config.yaml / secrets.yaml that is not YAML must not keep the member out until someone repairs
+    it by hand. Nothing is lost: the file is moved to the gateway's backups and the event is audited."""
+    s, db, pr, c = env
+    alice = member(db)
+    pr.provision(alice)
+    cdir = pr.config_dir(alice)
+    (cdir / "config.yaml").write_text("GOOSE_MODE: [unclosed\n  - {", encoding="utf-8")
+    (cdir / "secrets.yaml").write_text("- just\n- a list\n", encoding="utf-8")
+    changes = pr.provision(alice)                                           # used to raise at every start
+    cfg, sec = read(pr, alice)
+    assert cfg["SECURITY_PROMPT_ENABLED"] is True and cfg.get("GOOSE_MODE") == "approve" and isinstance(sec, dict)
+    assert changes and pr.provision(alice) == []
+    kept = sorted(p.name.split(".2")[0] for p in (s.system_dir / "backups" / "profiles" / "alice").iterdir())
+    assert kept == ["config.yaml", "secrets.yaml"]
+    rows = db.query("SELECT ok, detail FROM audit WHERE action='profile.file.set_aside' ORDER BY id")
+    assert [r["detail"]["file"] for r in rows] == ["config.yaml", "secrets.yaml"] and not any(r["ok"] for r in rows)
+
+
+def test_socket_rights_fingerprint_is_stable_and_follows_role_policy_and_folders(env):
+    """Review A-1: a WebSocket keeps the rights it was opened with, so the gateway ends it when they change. The
+    fingerprint must not change by itself (every socket would be closed at each re-validation)."""
+    s, db, pr, c = env
+    tid = team(db, "Ops", {**ANYCHAT, "allow_shell": False})
+    alice = user(db, "alice")
+    db.execute("INSERT INTO team_members(team_id, user_id) VALUES(?,?)", (tid, alice["id"]))
+    a = c.rights_fingerprint(alice)
+    assert a == c.rights_fingerprint(db.user_by_id(alice["id"])) == c.rights_fingerprint(alice)      # stable
+    db.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps({**ANYCHAT, "allow_shell": True}), tid))
+    b = c.rights_fingerprint(db.user_by_id(alice["id"]))
+    assert b != a                                                                    # the team gained a permission
+    db.update_user(alice["id"], role="admin")
+    assert c.rights_fingerprint(db.user_by_id(alice["id"])) not in (a, b)             # promoted
+    db.update_user(alice["id"], role="user")
+    assert c.rights_fingerprint(db.user_by_id(alice["id"])) == b                      # demoted again: as before
+    db.execute("DELETE FROM team_members WHERE user_id=?", (alice["id"],))
+    assert c.rights_fingerprint(db.user_by_id(alice["id"])) != b                      # left the team
+
+
+def test_change_password_is_rate_limited_and_checks_off_the_event_loop(env):
+    """Review A-3."""
+    from goose_web import api
+    s, db, pr, c = env
+    alice = user(db, "alice")
+    api._REAUTH_LIMIT.reset(f"pw:{alice['id']}")
+    with client_for(c) as tc:
+        h = sign_in(tc, c, alice)
+        codes = [tc.post("/api/me/password", json={"current": "wrong", "new": "x"}, headers=h).status_code
+                 for _ in range(10)]
+        assert codes[:8] == [400] * 8 and codes[8:] == [429, 429]
+        assert tc.post("/api/me/password", json={"current": _tp.PW, "new": "x"}, headers=h).status_code == 429
+    api._REAUTH_LIMIT.reset(f"pw:{alice['id']}")
+
+
+def test_other_security_keys_in_a_member_profile_are_removed(env):
+    s, db, pr, c = env
+    alice = member(db)
+    pr.security_endpoint = lambda: ENDPOINT
+    pr.provision(alice)
+    cfg, _ = read(pr, alice)
+    cfg.update({"SECURITY_COMMAND_CLASSIFIER_ENABLED": True, "SECURITY_COMMAND_CLASSIFIER_ENDPOINT": "http://x.example/c",
+                "security_prompt_enabled_override": "false", "GOOSE_MAX_TURNS": 50})
+    (pr.config_dir(alice) / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    changes = pr.provision(alice)
+    cfg, _ = read(pr, alice)
+    assert sorted(k for k in cfg if k.upper().startswith("SECURITY_")) == sorted(KEYS) and cfg["GOOSE_MAX_TURNS"] == 50
+    assert sum("not set by Goose Web" in ch for ch in changes) == 3
+
+
+def test_env_appcontainer_gets_the_relay_address_whatever_backend_was_configured(env, tmp_path):
+    """Review E-6: the backend is decided at the start (MXC, or the AppContainer fallback)."""
+    s, db, pr, c = env
+    wm = wk.WorkerManager(s)
+    root = tmp_path / "sb"
+    root.mkdir()
+    sec = {"SECURITY_PROMPT_ENABLED": "true", KEYS[3]: ENDPOINT, TOKEN_KEY: "tok"}
+    spec = {"name": "x", "profile_root": str(root), "backend": "mxc",
+            "relays": [{"target": "127.0.0.1:4000", "listen": "127.64.0.9:4000"},
+                       {"target": "127.0.0.1:8711", "listen": "127.64.0.9:8711"}]}
+    w = wk.Worker(key="bob", username="bob", path_root=str(root), native=False, security_env=sec, sandbox=spec)
+    assert wm._env(w)[KEYS[3]] == ENDPOINT                                  # MXC: the real address, through its proxy
+    w.backend = "appcontainer"                                              # the fallback was taken at this start
+    e = wm._env(w)
+    assert e[KEYS[3]] == "http://127.64.0.9:8711/classify" and e[TOKEN_KEY] == "tok"
+    w.sandbox = {**spec, "relays": []}
+    assert KEYS[3] not in wm._env(w) and wm._env(w)["SECURITY_PROMPT_ENABLED"] == "true"   # no relay: patterns only
 
 
 def fake_ctx(s, db, pr, up, endpoint=ENDPOINT):

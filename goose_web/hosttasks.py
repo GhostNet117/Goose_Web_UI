@@ -52,7 +52,10 @@ switch ($env:GW_TASK_ACTION) {
 
 def _ps(script: str, env_extra: dict, timeout: int = 90) -> subprocess.CompletedProcess:
     env = {**os.environ, **env_extra}
-    return subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+    # by full path (review 2026-11-12, C-5): a bare name is looked up in the current directory before System32
+    powershell = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0",
+                              "powershell.exe")
+    return subprocess.run([powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                            "-Command", script], capture_output=True, text=True, env=env, timeout=timeout,
                           creationflags=0x08000000, encoding="utf-8", errors="replace")
 

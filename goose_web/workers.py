@@ -399,6 +399,15 @@ class WorkerManager:
         env["CONTEXT_FILE_NAMES"] = json.dumps([ISOLATED_HINTS_FILENAME])
         for k, v in (w.security_env or {}).items():   # spec 026: beats config.yaml, secrets.yaml and extra_env
             env[str(k)] = str(v)
+        if w.backend == "appcontainer":
+            # An AppContainer (the configured backend or the fallback, decided at this start: review E-6) reaches
+            # the classification endpoint at its relay forwarder's address, not at the gateway's.
+            ep_key = "SECURITY_PROMPT_CLASSIFIER_ENDPOINT"
+            ep = env.pop(ep_key, None)
+            for r in (w.sandbox or {}).get("relays") or []:
+                if ep and f"//{r.get('target')}/" in ep:
+                    env[ep_key] = ep.replace(f"//{r['target']}/", f"//{r['listen']}/", 1)
+                    break
         # The container cannot reach the account's home, TEMP or caches: keep them in the profile (granted Modify).
         for k, sub in (("TEMP", "tmp"), ("TMP", "tmp"), ("UV_CACHE_DIR", "cache/uv"), ("PIP_CACHE_DIR", "cache/pip"),
                        ("npm_config_cache", "cache/npm"), ("XDG_CACHE_HOME", "cache"),
@@ -516,7 +525,9 @@ class WorkerManager:
                     pass
                 await asyncio.sleep(0.25)
             else:
-                self._kill(w)
+                # in a thread (review 2026-11-12, B-4): taskkill and the wait take up to 25 s and used to run on the
+                # event loop, freezing every user's chat when one worker's start timed out
+                await asyncio.to_thread(self._kill, w)
                 w.state, w.last_error = "crashed", "goose serve did not become ready in time"
                 raise RuntimeError(w.last_error)
         w.state, w.started_at, w.restart_pending, w.last_error = "ready", time.time(), False, ""

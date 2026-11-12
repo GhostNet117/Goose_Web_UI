@@ -1323,7 +1323,9 @@ index.
 
 ### 10.4 Audit retention
 
-`AUDIT_RETENTION_DAYS = 365`. `purge_audit()` deletes older rows each time the
+Retention is `logs.audit_days` (default 365), applied by the maintenance loop (`logjanitor.prune_audit`, at start-up
+and every `logs.check_minutes`). Since 1.20.0 opening the database purges nothing: the fixed 365 days at every open
+deleted rows a longer `logs.audit_days` was meant to keep. Before 1.20.0 `purge_audit()` deleted older rows each time the
 database is opened. Admins read the log through
 `GET /api/admin/audit?before=&user=&action=&limit=` (at most 500 rows per page).
 

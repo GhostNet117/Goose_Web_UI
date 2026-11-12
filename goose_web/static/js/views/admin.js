@@ -635,6 +635,9 @@ function gooseSecurity(el) {
       field('Threshold', thr, 'A finding at or above this asks for approval. 0.01 to 1.0, lower is stricter. Goose\'s default is 0.8.'),
       h('div', { class: 'muted small' }, 'Members: ' + data.members + ' profile(s), written before every start of their agent; a member cannot change these settings. Administrator\'s Goose profile: ' + nativeLine),
       n && n.ok === false ? banner('warn', 'The administrator\'s Goose profile was not updated. Goose keeps running with its previous settings; the gateway tries again at its next start.') : null,
+      n && Array.isArray(n.foreign) && n.foreign.length ? banner('info', 'Kept as you set them in the administrator\'s Goose profile (Goose Web did not write these): ' + n.foreign.join(', ') + '. ', actionBtn('Take them over', async () => {
+        if (await confirmDialog({ title: 'Replace your own Goose settings?', message: 'Goose Web replaces these values with the ones on this page. The previous values are saved to the backups folder first (a token is not).', confirmText: 'Replace', danger: true })) await save({ adoptNative: true });
+      }, { size: 'sm' })) : null,
       h('h3', { class: 'exp-title' }, 'Adversary mode'),
       h('div', { class: 'muted small' }, 'A second model call reviews a tool call against the rules below before it runs, knowing what the user asked for. Think before turning it on: a BLOCK cannot be overridden by anyone, it also stops unattended runs such as scheduled recipes, and every reviewed call costs one more model call on the chat\'s own provider. If the reviewer fails the call is allowed.'),
       row('Review members\' tool calls', 'Writes adversary.md into every member\'s Goose profile.', adv, 'members'),

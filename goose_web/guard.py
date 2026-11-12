@@ -745,6 +745,15 @@ class Classifier:
             self._sess = self._tok = None
             self._cache.clear()
 
+    def peek(self, text: str) -> float | None:
+        """The remembered score of exactly this text, or None. Never loads the model, never scores."""
+        key = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+        return None
+
     def windows(self, ids: list[int]) -> list[list[int]]:
         """Every window of the text (security review 2026-11-11, SA-4: earlier versions scored only the first
         max_windows-1 and the last one, so the middle of a long text was never inspected)."""
@@ -841,6 +850,11 @@ class GuardService:
         self.ext_identity: Callable[[str, str], bool] | None = None
         # spec 026: True while Goose-native detection uses the classifier (the model is then loaded at start-up)
         self.extra_in_use: Callable[[], bool] | None = None
+        # spec 026: the classification endpoint's own thread and its bounded backlog (see score_external)
+        self._ext_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="guard-ext")
+        self._ext_lock = threading.Lock()
+        self._ext_total = 0
+        self._ext_by_key: dict[str, int] = {}
         self._last_good: dict[str, GuardContext | None] = {}
         self._blocks: dict[str, deque] = {}
         self._burst_until: dict[str, float] = {}
@@ -1093,28 +1107,66 @@ class GuardService:
         return pieces[:limit], len(pieces) <= limit
 
     def _score_piece(self, text: str, depth: int = 0) -> float:
-        """Runs in the classifier thread. A piece with more tokens than the classifier scores in one call (dense
-        text) is halved, three times at most; what still does not fit is not scored (0)."""
+        """Runs in the endpoint's classifier thread. A piece with more tokens than the classifier scores in one call
+        (dense text) is halved, three times at most; what still does not fit raises TextTooLong: the caller answers
+        "not scored", never "safe"."""
         try:
             return self.classifier.score(text)
         except TextTooLong:
             if depth >= 3 or len(text) < 64:
-                return 0.0
+                raise
             mid = len(text) // 2
             return max(self._score_piece(text[:mid + 128], depth + 1), self._score_piece(text[mid - 128:], depth + 1))
 
-    async def score_external(self, text: str, *, budget: float, max_pieces: int = 4) -> tuple[float | None, str]:
-        """(score, status) for the classification endpoint: ok | busy | unavailable.
+    # The endpoint's work is bounded and separate from the gateway guard's (security review 2026-11-12, E-1): its own
+    # single thread, at most EXTERNAL_MAX_PENDING pieces queued or running in total and EXTERNAL_MAX_PER_KEY per
+    # profile. More is refused (`busy`) before anything is queued, and work that has not started when the deadline
+    # passes is cancelled. So one profile's token cannot build a backlog, and nothing the endpoint does can make
+    # GuardService.classify (the prompt guard of guarded teams, which fails open on a timeout) wait in a queue.
+    EXTERNAL_MAX_PENDING = 8
+    EXTERNAL_MAX_PER_KEY = 3
+
+    def _ext_submit(self, key: str, piece: str):
+        """Queue one piece for the endpoint, or None when the caps are reached."""
+        with self._ext_lock:
+            if self._ext_total >= self.EXTERNAL_MAX_PENDING or self._ext_by_key.get(key, 0) >= self.EXTERNAL_MAX_PER_KEY:
+                return None
+            self._ext_total += 1
+            self._ext_by_key[key] = self._ext_by_key.get(key, 0) + 1
+
+        def done(_f) -> None:   # runs when the piece finished OR was cancelled before it started
+            with self._ext_lock:
+                self._ext_total = max(0, self._ext_total - 1)
+                n = self._ext_by_key.get(key, 0) - 1
+                if n > 0:
+                    self._ext_by_key[key] = n
+                else:
+                    self._ext_by_key.pop(key, None)
+        try:
+            cf = self._ext_pool.submit(self._score_piece, piece)
+        except RuntimeError:   # shutting down
+            done(None)
+            return None
+        cf.add_done_callback(done)
+        return cf
+
+    async def score_external(self, text: str, *, budget: float, max_pieces: int = 4,
+                             key: str = "") -> tuple[float | None, str]:
+        """(score, status) for the classification endpoint: ok | busy | too_long | unavailable.
 
         Goose waits 5 s for the endpoint, does not retry, and asks again with the same text at the next shell call.
-        So the answer must come within `budget` seconds: when it does not, the status is `busy` and the scoring
-        carries on in the classifier thread, where the result is cached for the next request. A slow answer is not
-        a broken classifier: only a missing or failing model sets the guard's state (and its audit)."""
+        So the answer must come within `budget` seconds. When it does not, the status is `busy`; a piece that is
+        already being scored finishes and is remembered for the next request, a piece that has not started is
+        dropped. `too_long` = the text cannot be scored completely (more pieces than max_pieces, or a piece the
+        classifier cannot fit): the caller must not report it as safe. A slow answer is not a broken classifier:
+        only a missing or failing model sets the guard's state (and its audit). `key` identifies the profile."""
         if not text or len(text) < self.min_chars:
             return 0.0, "ok"
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.05, float(budget))
-        pieces, _complete = self.external_pieces(text, max_pieces)
+        pieces, complete = self.external_pieces(text, max_pieces)
+        if not complete:
+            return None, "too_long"
         try:
             self._drop_if_removed()
             if not self.classifier.loaded:
@@ -1131,21 +1183,32 @@ class GuardService:
         best = 0.0
         t0 = time.perf_counter()
         for piece in pieces:
+            cached = self.classifier.peek(piece)
+            if cached is not None:
+                best = max(best, cached)
+                continue
             left = deadline - loop.time()
             if left <= 0:
                 return None, "busy"
-            fut = loop.run_in_executor(self._pool, self._score_piece, piece)
+            cf = self._ext_submit(key, piece)
+            if cf is None:
+                return None, "busy"   # the caps are reached: nothing was queued
             try:
-                best = max(best, await asyncio.wait_for(asyncio.shield(fut), left))
+                # no shield: at the deadline a piece that has not started is cancelled (and its slot freed); one that
+                # is running cannot be interrupted, finishes, and is cached
+                best = max(best, await asyncio.wait_for(asyncio.wrap_future(cf), left))
             except asyncio.TimeoutError:
-                fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)   # no "never retrieved"
+                cf.add_done_callback(lambda f: f.cancelled() or f.exception())   # no "exception was never retrieved"
                 return None, "busy"
+            except TextTooLong:
+                return None, "too_long"
             except ClassifierUnavailable as e:
                 self._unavailable(str(e), "classify-api")
                 return None, "unavailable"
-            except Exception as e:
+            except Exception:
+                # this text could not be scored; that says nothing about the model, so the guard's state and its
+                # audit are left alone (a caller must not be able to flap them with odd input)
                 log.exception("guard classifier (classification endpoint)")
-                self._unavailable(f"classifier error: {e.__class__.__name__}: {str(e)[:200]}", "classify-api")
                 return None, "unavailable"
         self.last_latency_ms = round((time.perf_counter() - t0) * 1000, 1)
         self.last_ok = time.time()
@@ -1281,6 +1344,7 @@ class GuardService:
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
+        self._ext_pool.shutdown(wait=False, cancel_futures=True)
 
 
 def seed_defaults(db, *, only: str | None = None, overwrite: bool = False) -> list[str]:

@@ -34,6 +34,29 @@ recipes); Goose Web now configures them where Goose reads them. No database sche
   from `config.yaml`; the classifier is sent the chat's recent user messages, never the command, and can only raise a
   pattern finding; only the tool named `shell` is inspected; a headless run in Auto mode allows a flagged command and
   only logs it.
+- **Reviewed before release.** An independent review of this feature found one High and several Medium problems in
+  its first version; all are fixed or documented as residual risks (SECURITY-ASSESSMENT 14.3, 14.4). In short: the
+  endpoint's work is bounded and has its own thread, so it cannot make the prompt guard fail open; in the native
+  profile only Goose Web's own values are ever replaced or removed (yours are kept, "off" leaves them alone); text
+  that cannot be scored completely is refused, never reported safe; a tampered `adversary.md` path fails the
+  member's start and is audited.
+- **Other fixes from the same day's review of the whole product:**
+  - Open WebSockets are closed when the caller's role, policy or folders change (a demoted administrator, or a
+    member whose team lost a permission, kept the old rights until the tab was closed). The browser reconnects.
+  - The change-password check runs off the event loop and is limited to 8 attempts per user in 5 minutes.
+  - The audit log is no longer purged with a fixed 365 days at every database open (every start and CLI command):
+    a longer `logs.audit_days` now really keeps its rows. The maintenance loop applies the configured retention.
+  - `goose-web check` no longer migrates the database (it runs with the new code next to the old gateway during an
+    upgrade); it reads the HTTPS setting through a read-only connection.
+  - A member's `config.yaml` or `secrets.yaml` that is not readable YAML is moved to
+    `<system_dir>\backups\profiles\<user>\` and rebuilt, audited as `profile.file.set_aside`, instead of blocking
+    every start of that member's agent until someone repaired it by hand.
+  - Session buffer accounting after a worker stop; a tie in the eviction order no longer raises.
+  - A worker start that times out no longer freezes every chat while the process is killed.
+  - `icacls` and `powershell.exe` are started by their full System32 path.
+  - `install.ps1` shows the generated initial password before any later step can fail.
+  - `.gitignore`: models, archives, key stores, environment files, journals and backups.
+  - Tests and one comment use a neutral example relay port.
 - **Command line:** `goose-web security status | on | off | rotate-tokens`; `goose-web check` shows the state.
   **API:** `GET/PUT /api/admin/goose-security`, `POST .../check`, `POST .../rotate`.
 - **Fix:** `goose-web check` reported the gateway's port as free when `server.host` is a LAN address (it probed

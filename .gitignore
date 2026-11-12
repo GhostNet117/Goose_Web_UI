@@ -36,3 +36,17 @@ DEPLOYED.json
 .idea/
 Thumbs.db
 .DS_Store
+
+# review 2026-11-12 (D-15): never commit models, archives, key stores, environment files, journals or backups
+*.onnx
+*.zip
+*.tgz
+*.pfx
+*.p12
+*.pem
+*.key
+.env
+.env.*
+*.db-journal
+*.bak
+*.bak_*

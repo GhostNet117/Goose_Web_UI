@@ -38,11 +38,28 @@ def _setup_logging(settings) -> None:
                    int(settings.get("logs", "activity_files") or 10), bool(settings.get("logs", "activity")))
 
 
-def _tls_override(settings) -> dict | None:
-    """The Admin UI's HTTPS choice (settings table), if the database exists already."""
+def _tls_override(settings, readonly: bool = False) -> dict | None:
+    """The Admin UI's HTTPS choice (settings table), if the database exists already.
+
+    readonly (review 2026-11-12, D-1): `goose-web check` runs with the NEW code next to the OLD gateway during an
+    upgrade. Opening the database the normal way would migrate it under the running gateway, before the upgrade
+    decided to go ahead; check therefore only reads it."""
     dbp = settings.system_dir / "goose-web.db"
     if not dbp.exists():
         return None
+    if readonly:
+        import json
+        import sqlite3
+        try:
+            con = sqlite3.connect(dbp.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+            try:
+                row = con.execute("SELECT value FROM settings WHERE key='tls'").fetchone()
+            finally:
+                con.close()
+            v = json.loads(row[0]) if row else None
+        except (sqlite3.Error, ValueError):
+            return None
+        return v if isinstance(v, dict) else None
     from .db import Database
     db = Database(dbp)
     try:
@@ -955,7 +972,7 @@ def cmd_check(args, settings) -> int:
                  "appcontainer)")
     from . import logjanitor, tls
     try:
-        st = tls.status(settings, _tls_override(settings))
+        st = tls.status(settings, _tls_override(settings, readonly=True))
         cert = st.get("cert") or {}
         line("https", f"{st['effective']} (mode {st['mode']}, from {st.get('source', 'config')})"
              + (f"; certificate valid {cert.get('daysLeft')} more days" if cert.get("daysLeft") is not None else ""),

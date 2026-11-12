@@ -708,14 +708,14 @@ and the prompt guard of section 11 remain the controls that do not depend on the
 | Threat | Control |
 |---|---|
 | The endpoint is reached from the network | Bound to `127.0.0.1` only, on its own port; not a route of the web application |
-| Another program on the computer uses the classifier (CPU) or probes it | Bearer token per profile (HMAC-SHA256 of the user id, key only in the database, constant-time check, disabled users refused); rate limit per profile; body cap; 64 connections; uniform `401` |
+| Another program on the computer uses the classifier (CPU) or probes it | Bearer token per profile (HMAC-SHA256 of the user id, key only in the database, constant-time check, disabled users refused within 15 s); rate limit per profile; body cap; uniform `401`. The work is bounded, not only the requests: the endpoint has its own classifier thread, at most 8 pieces queued or running in total and 3 per profile, more is refused before it is queued, and a piece that has not started at the deadline is dropped (14.4, E-1) |
 | A token is stolen | It authorises classification only: no chat, file, setting or account is reachable with it. *Replace all tokens* invalidates every token at once |
-| A member, or an agent that was talked into it, switches the detection off | Written before every start of the agent; also in the worker's environment, which Goose ranks above its files (measured); `config/upsert` and `config/remove` of `SECURITY_*` refused by the firewall; `adversary.md` is a refused file name and is rewritten at every start |
+| A member, or an agent that was talked into it, switches the detection off | Written before every start of the agent; also in the worker's environment, which Goose ranks above its files (measured), for the MXC and the AppContainer backend; `config/upsert` and `config/remove` of `SECURITY_*` refused by the firewall; other `SECURITY_*` keys removed from the member's `config.yaml` at every start; `adversary.md` is a refused file name and is rewritten at every start; a link or a folder in its place fails the start (fail closed) and is audited (`goosesec.profile`). Limit: see 14.3, "adversary.md between starts" |
 | A sandboxed agent uses the endpoint to reach the gateway | The relay target is the classifier port only; the web application's port is not reachable from the sandbox, as before |
 | Chat text leaks through the endpoint | Nothing is logged or audited; the cache holds a SHA-256 of the text and a score; requests stay on the loopback interface |
 | The gateway points Goose at a port someone else holds | A profile gets the endpoint only while the gateway itself holds the socket (exclusive bind on Windows); otherwise the classifier is switched off in the plan |
-| The feature breaks the administrator's Goose | The native profile is changed through Goose's own configuration API, key by key, read back; a failure is recorded and changes nothing else; an `adversary.md` Goose Web did not write is never replaced without an explicit choice and a backup |
-| A long text ties up the classifier | Body cap, at most `classifier_max_pieces` pieces, a deadline below Goose's timeout, one request at a time in the classifier thread |
+| The feature breaks or overrides the administrator's Goose | The native profile is changed through Goose's own configuration API, key by key, each write read back; a request Goose could not be asked is a failure, never "not there"; a failure is recorded and nothing else is changed (`adversary.md` is touched only after the settings went in). Goose Web remembers what it wrote and replaces or removes only that: a value the administrator set (a stricter threshold, an own classifier with its token) is kept and reported, and "off" removes only Goose Web's own values. Neither those nor an `adversary.md` Goose Web did not write is taken over without an explicit choice and a backup; a file it cannot read is left alone |
+| A long text ties up the classifier | Body cap; at most `classifier_max_pieces` pieces, and a text that cannot be scored completely is answered `413`, never "safe"; a deadline below Goose's timeout; the bounded backlog above |
 | The rules text or a token ends up in a log | The audit holds switches and sizes only (`goosesec.summary`); the state holds a 16-hex-digit fingerprint of the token, not the token |
 
 ### 14.3 Residual risks
@@ -726,8 +726,27 @@ and the prompt guard of section 11 remain the controls that do not depend on the
   the token. Goose's client cannot verify who answers (plain HTTP to a fixed address). A sandboxed member's agent
   cannot do this (no loopback, section 13). Mitigations: run the gateway at boot (service account); do not give other
   people interactive or remote-desktop access to the gateway's computer; or set `guard.classifier_port: 0`.
-- **One classifier thread.** The endpoint and the prompt guard of section 11 share it. A member's long message can
-  delay the administrator's request up to the deadline (the answer is then `503` and Goose uses its patterns).
+- **The classifier is shared hardware, not a shared queue.** The endpoint and the prompt guard of section 11 have a
+  thread each, so the endpoint cannot make the guard wait in a queue; both use the same processor cores, so heavy
+  endpoint use slows the guard down. One profile can hold 3 of the endpoint's 8 slots; three colluding profiles can
+  fill it, and other profiles then get `503` (Goose uses its patterns) until a slot is free.
+- **Connections.** uvicorn has no timeout for a connection that never sends a request. A program on the computer
+  that opens 1,024 connections to the endpoint and sends nothing makes every classification request `503` until it
+  stops. A sandboxed member cannot (64 connections through its proxy). Goose then uses its patterns only.
+- **adversary.md between starts.** The file is in the member's profile, which the member's agent can write. Goose
+  1.59 reads it once per process, and the gateway rewrites it before every start, so an edit has no effect there.
+  Goose 1.57 reads it per chat: an agent that edits the file changes the rules for that member's NEXT chat until the
+  agent's next start. Use Goose 1.59 or later with adversary mode for members. (The detection settings are not
+  affected: they are in the environment.)
+- **The token in the MXC policy file.** A sandboxed worker's environment is written into its policy file under
+  `<system_dir>\sandbox\mxc`, readable by the gateway's account and administrators. Since 1.20.0 that includes the
+  classifier token (classification only).
+- **Command-line token rotation on a running gateway.** `goose-web security rotate-tokens` takes effect for the
+  listener within 15 s; running agents keep the old token (Goose falls back to its patterns) until the gateway
+  restarts or an administrator clicks Apply now. Rotating in Admin > Prompt guard has no such gap.
+- **AppContainer backend.** With detection and the classifier on, every AppContainer member gets a relay forwarder
+  for the endpoint (and the read grant on the gateway's base Python that relays need), also where no relay was
+  configured before.
 - **The token in a member's profile.** It is in the profile's `secrets.yaml` and in the agent's environment, readable
   by that member's agent, like every other secret of that profile. It gives the agent nothing it does not have.
 - **An unstable Goose method.** The native apply uses `_goose/unstable/config/*`. If Goose renames it, the apply
@@ -736,3 +755,35 @@ and the prompt guard of section 11 remain the controls that do not depend on the
   goes to the chat's own provider, which already has that content.
 - **Not covered:** a native profile on another computer, and Goose instances started with another
   `GOOSE_PATH_ROOT` that Goose Web does not know.
+
+### 14.4 Independent review 2026-11-12 (before release)
+
+A second reviewer attacked the first version of this feature (read-only, code only). All findings were fixed or are
+listed as residual risks above before 1.20.0 was released; each fix has a test in `tests/test_goosesec.py` or
+`tests/test_classifyapi.py`.
+
+| ID | Severity | Finding in the first version | Now |
+|---|---|---|---|
+| E-1 | High | Work that missed the deadline carried on in the classifier thread shared with the prompt guard, with no bound: one profile's token could queue unique long texts until the guard of guarded teams timed out and failed open | Own thread for the endpoint, bounded backlog (8 pieces, 3 per profile), refused before queueing, not-started work dropped at the deadline; flood test |
+| E-2 | Medium | 64 idle connections made every request `503` | Limit 1,024, out of a sandboxed member's reach; residual for a local program (14.3) |
+| E-3 | Medium | In the native profile "off" removed, and "on" overwrote, values the administrator had set themselves | Ownership: only Goose Web's own values are replaced or removed; others kept and reported; take-over only on request, with a backup |
+| E-4 | Medium | Text beyond the piece limit, and pieces that did not fit, were answered `SAFE` | `413`; the test that asserted `SAFE` now asserts the refusal |
+| E-5 | Medium | A link or folder in place of a member's `adversary.md` was skipped in silence; an exception in this step was logged and ignored | Fails the start (fail closed), audited; other `SECURITY_*` keys scrubbed; residual for Goose 1.57 (14.3) |
+| E-6 | Medium | With the AppContainer fallback the environment pinned an address the container cannot reach | The environment is built from the backend chosen at that start, with the relay forwarder's address |
+| E-7 | Low | A removal that failed because Goose could not be asked was recorded as applied | Only Goose's answer counts as "not there"; anything else is a failure and is retried at the next start |
+| E-8 | Low | An `adversary.md` that could not be read was treated as absent | Reported as an error and left alone |
+| E-9 | Low | A disabled user keeps access for up to 15 s; command-line rotation on a running gateway | Documented (14.3) |
+| E-10 | Low | The token is in the MXC policy file | Documented (14.3) |
+| E-11 | Info | Relay forwarder for every AppContainer member | Documented (14.3) |
+| - | - | A non-numeric `guard.classifier_*` value stopped the gateway at start; a lone surrogate in the text or a failing scorer could flip the guard's state | The default is used and logged; the text is sanitised; a scoring error for one text no longer changes the guard's state |
+
+The same day's review of the rest of the product (authentication and the API, the hub and workers, the sandbox, and
+upgrade, installers and logs) led to these fixes in 1.20.0: open WebSockets are closed when the caller's role, policy
+or folders change (A-1); the change-password check runs off the event loop and is rate limited (A-3); session buffer
+accounting after a worker stop (B-1); a start that times out no longer blocks the event loop while the worker is
+killed (B-4); a member's unreadable `config.yaml` / `secrets.yaml` is set aside and rebuilt instead of blocking every
+start (B-9); `icacls` and `powershell.exe` are started by full path (C-5); `goose-web check` no longer migrates the
+database (D-1); the audit log is no longer purged with a fixed 365 days at every database open (D-4); the installer
+shows the initial password before any later step can fail (D-7). No path was found that starts a member's agent
+without its sandbox, and no upgrade path that loses chats, users, teams, settings or preferences. The findings that
+are not fixed yet are tracked outside this document.

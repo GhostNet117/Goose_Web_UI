@@ -61,18 +61,29 @@ class ClassifyService:
         self.settings = settings
         self.db = db
         self.guard = guard
-        g = lambda k, d: settings.get("guard", k, d)   # noqa: E731
+        def num(key: str, default: float, lo: float, hi: float) -> float:
+            # a wrong value in config.yaml must never stop the gateway (this runs in its start-up): the default
+            # is used and the mistake is logged
+            v = settings.get("guard", key, default)
+            try:
+                if isinstance(v, bool):
+                    raise ValueError
+                return max(lo, min(hi, float(v if v not in (None, "") else default)))
+            except (TypeError, ValueError):
+                log.warning("classification endpoint: guard.%s is %r, not a number; using %s", key, v, default)
+                return default
         self.port = goosesec.classifier_port(settings) if port is None else int(port)
         self.ephemeral = ephemeral   # tests: bind an OS-assigned port (port 0)
-        self.budget = max(0.2, min(4.9, float(g("classifier_timeout_ms", 4000) or 4000) / 1000.0))
-        self.max_pieces = max(1, min(64, int(g("classifier_max_pieces", 4) or 4)))
-        self.max_body = max(4, min(8192, int(g("classifier_max_body_kb", 256) or 256))) * 1024
-        self.limiter = RateLimiter(max(10, int(g("classifier_rate_per_minute", 600) or 600)), 60.0)
+        self.budget = num("classifier_timeout_ms", 4000, 200, 4900) / 1000.0
+        self.max_pieces = int(num("classifier_max_pieces", 4, 1, 64))
+        self.max_body = int(num("classifier_max_body_kb", 256, 4, 8192)) * 1024
+        self.limiter = RateLimiter(int(num("classifier_rate_per_minute", 600, 10, 100000)), 60.0)
         self.state = "off"           # off | listening | unavailable
         self.reason = ""
         self.bound_port = 0
         self.since = time.time()
-        self.stats = {"requests": 0, "ok": 0, "unauthorized": 0, "limited": 0, "busy": 0, "bad": 0, "tooLarge": 0}
+        self.stats = {"requests": 0, "ok": 0, "unauthorized": 0, "limited": 0, "busy": 0, "bad": 0, "tooLarge": 0,
+                      "tooLong": 0}
         self.last_request = 0.0
         self._server = None
         self._stopping = False
@@ -186,7 +197,14 @@ class ClassifyService:
             return _error(503, "disabled", "The classifier is switched off", {"Retry-After": "60"})
         out = []
         for text in texts:
-            score, status = await self.guard.score_external(text, budget=self.budget, max_pieces=self.max_pieces)
+            # a lone surrogate (valid JSON, not valid text) must not reach the tokenizer
+            text = text.encode("utf-8", "replace").decode("utf-8", "replace")
+            score, status = await self.guard.score_external(text, budget=self.budget, max_pieces=self.max_pieces,
+                                                            key=str(user["id"]))
+            if status == "too_long":
+                # never "safe" for text that was not scored completely: Goose then uses its patterns for this call
+                self.stats["tooLong"] += 1
+                return _error(413, "too_long", "The text is too long to be scored completely")
             if status != "ok" or score is None:
                 self.stats["busy"] += 1
                 return _error(503, status, "The classifier is loading or busy" if status == "busy" else
@@ -242,8 +260,12 @@ class ClassifyService:
             def capture_signals(self):                    # uvicorn >= 0.29
                 yield
 
-        config = uvicorn.Config(self.app, log_config=None, access_log=False, lifespan="off", timeout_keep_alive=20,
-                                limit_concurrency=64, server_header=False, date_header=False)
+        # limit_concurrency counts open connections, idle ones included, and uvicorn has no timeout for a connection
+        # that never sends a request. 64 let any local program, or one sandboxed member through its relay (64
+        # connections), hold them all and turn every request into 503 (security review 2026-11-12, E-2). 1024 is out
+        # of one member's reach; what the classifier works on is bounded separately (GuardService.score_external).
+        config = uvicorn.Config(self.app, log_config=None, access_log=False, lifespan="off", timeout_keep_alive=5,
+                                limit_concurrency=1024, server_header=False, date_header=False)
         self._sock, self._server = sock, _Server(config)
         self.bound_port = sock.getsockname()[1]
         self._task = asyncio.create_task(self._serve(sock))

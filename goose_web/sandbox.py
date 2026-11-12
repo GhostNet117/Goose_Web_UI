@@ -288,7 +288,9 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
         return ContainedProcess(pi.hProcess, pi.dwProcessId, stdin, stdout)
 
     def _icacls(args: list[str]) -> None:
-        r = subprocess.run(["icacls", *args], capture_output=True, text=True, timeout=600,  # nosec B603 B607
+        # by full path (review 2026-11-12, C-5): a bare name is looked up in the current directory before System32
+        icacls = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
+        r = subprocess.run([icacls, *args], capture_output=True, text=True, timeout=600,  # nosec B603
                            stdin=subprocess.DEVNULL, creationflags=0x08000000)
         if r.returncode != 0:
             raise SandboxError(f"icacls {' '.join(args[:2])} failed: {(r.stdout + r.stderr).strip()[:300]}")

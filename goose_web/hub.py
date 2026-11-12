@@ -523,6 +523,9 @@ class Upstream:
             if s.running():
                 self._set_status(s, "error", error=reason)
             s.prompts, s.run_id, s.loaded, s.load_result = 0, None, False, None
+            # B-1 (review 2026-11-12): the bytes leave the gateway-wide total too. They used to stay counted after
+            # every worker stop, until the phantom total made evict_buffers run on every streamed chunk.
+            self.hub.total_buffer = max(0, self.hub.total_buffer - s.buffer_bytes)
             s.buffer.clear()
             s.buffer_bytes = 0
         self.broadcast({"jsonrpc": "2.0", "method": "_gw/upstream", "params": {"state": "down", "error": reason}})
@@ -2116,6 +2119,9 @@ class Hub:
             up.closed = True
             for s in up.sessions.values():
                 s.queue, s.steers = [], []
+                self.total_buffer = max(0, self.total_buffer - s.buffer_bytes)   # B-1
+                s.buffer.clear()
+                s.buffer_bytes = 0
         self.forget_profile(key)
 
     def _activity(self, key: str) -> tuple[int, int]:
@@ -2290,8 +2296,11 @@ class Hub:
         return [a for up in self.upstreams.values() for a in up.herd()]
 
     def evict_buffers(self) -> None:
-        cands = sorted((s.last_touch, up, s) for up in self.upstreams.values() for s in up.sessions.values()
-                       if not s.running() and s.buffer_bytes and not any(s.sid in c.watch for c in up.clients))
+        # key=: two sessions touched at the same instant must not make sorted() compare Upstream objects (TypeError,
+        # which lost the chunk being buffered - B-1)
+        cands = sorted(((s.last_touch, up, s) for up in self.upstreams.values() for s in up.sessions.values()
+                        if not s.running() and s.buffer_bytes and not any(s.sid in c.watch for c in up.clients)),
+                       key=lambda t: t[0])
         for _, up, s in cands:
             if self.total_buffer <= TOTAL_BUFFER_BYTES * 0.7:
                 break

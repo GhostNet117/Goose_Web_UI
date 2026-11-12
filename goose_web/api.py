@@ -313,6 +313,10 @@ async def me(request: Request):
                else None})
 
 
+# Attempts to prove the current password of a signed-in account (change password): 8 per user in 5 minutes.
+_REAUTH_LIMIT = security.RateLimiter(8, 300.0)
+
+
 async def me_password(request: Request):
     c = ctx(request)
     ident = c.require(request, allow_pw_change=True)
@@ -320,9 +324,15 @@ async def me_password(request: Request):
     b = await body_json(request, 16 * 1024)
     if u["auth_source"] != "local":
         raise HTTPError(400, "external_account", "This account's password is managed by your directory")
-    if not security.verify_password(str(b.get("current") or ""), u["password_hash"]):
+    # A-3 (review 2026-11-12): the password check (scrypt) ran on the event loop, so a member repeating this request
+    # could stall the gateway for everyone, and nothing limited guesses of the current password with a stolen session
+    if not _REAUTH_LIMIT.hit(f"pw:{u['id']}"):
+        c.audit(request, "user.password", u, ok=False, detail={"reason": "rate limited"})
+        raise HTTPError(429, "rate_limited", "Too many attempts. Try again in a few minutes.")
+    if not await asyncio.to_thread(security.verify_password, str(b.get("current") or ""), u["password_hash"]):
         c.audit(request, "user.password", u, ok=False)
         raise HTTPError(400, "wrong_password", "Your current password is not correct")
+    _REAUTH_LIMIT.reset(f"pw:{u['id']}")
     new = str(b.get("new") or "")
     problems = security.password_problems(new, _min_pw(c), u["username"])
     if new == b.get("current"):
@@ -988,6 +998,13 @@ async def _reprovision(c: Ctx, users: list[dict]) -> dict:
             # sandbox spec marks the worker for a restart when it is quiet
             c.workers.register(w.key, u["username"], c.profiles.path_root_env(u), False,
                                c.profiles.team_recipe_dirs(u), sandbox=c.sandbox_spec(u))
+    if c.hub is not None:
+        # A-1: a team, policy or membership change takes effect on open sockets now, not at the next 30 s check:
+        # a socket whose role, policy or folders changed is closed and the browser reconnects with the new ones
+        try:
+            c.hub.revalidate_clients()
+        except Exception:
+            log.exception("revalidating sockets after a policy change")
     return out
 
 
