@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.18.3 - 2026-11-12
+
+**Skills load with `load` as well as `load_skill` in members' chats.** No database schema change.
+
+- **Fix: a chat's first attempt to load a skill failed.** Agents usually call the Summon tool `load(source="<skill>")`, but Goose 1.57's Summon only knows recipes and agents, and in Code Mode `load_skill` is reachable only inside `execute_javascript`. So the first `load("<skill name>")` failed and the chat seemed to start without its skills. Goose Web now writes a bridge `config/agents/<name>.md` (same text as the skill, marked as managed) for every skill in an isolated profile, both team-provisioned skills and the member's own. Bridges are refreshed whenever the profile is provisioned, which happens before every worker start, and removed when their skill goes. Agent files the member made are never touched. Nothing is read or written through junctions or links, and hard-linked or oversized SKILL.md files are skipped. A bridge error never stops a chat from starting, and a new bridge needs no restart. Native profiles are untouched; on a native box, bridge `~/.agents/skills` yourself, for example with a nightly script.
+
 ## 1.18.2 - 2026-11-12
 
 **Preferences are merged, never overwritten by an old tab.** No database schema change (the revision lives in the prefs JSON).

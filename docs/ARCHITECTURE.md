@@ -1331,6 +1331,7 @@ The worker runs with `GOOSE_PATH_ROOT=<profiles_root>/<username>`:
     custom_providers/    provider definitions provisioned from teams
     recipes/             the user's own recipes
     skills/              user skills and team skills (marked .goose-web-managed)
+    agents/              skill bridges <skill>.md (1.18.3), so Summon's load(<skill>) works
   data/
     sessions/sessions.db Goose session database (watched by the hub)
     schedule.json        Goose schedules
@@ -1363,6 +1364,19 @@ or memberships change (`_reprovision`).
    - **Skills.** Written as files under `skills/<name>/` with a
      `.goose-web-managed` marker. Skill folders the user owns are never
      overwritten. Entries with `..` or absolute paths are skipped.
+   - **Skill bridges (1.18.3).** After every provisioning (so before every
+     worker start) each `skills/<dir>/SKILL.md` of the profile, team or the
+     user's own, gets `config/agents/<name>.md` with the same text and a
+     `<!-- skill-bridge: managed by Goose Web` marker. Goose 1.57's Summon
+     `load(source=...)` resolves only recipes and agents (it reads
+     `<config_dir>/agents`), and in Code Mode `load_skill` is reachable only
+     inside `execute_javascript`, so without a bridge a chat's first
+     `load("<skill>")` failed. Unmarked agent files are never written or
+     deleted; bridges of removed skills are deleted. Nothing is read or written
+     through a junction or link, and a hard-linked or oversized SKILL.md is
+     skipped. A bridge error is logged and never blocks the worker start, and
+     bridges are not in the change list (no restart: Summon re-reads sources on
+     each call). Native profiles are not touched.
    - **Recipes.** Not copied. They stay in
      `<system_dir>/library/teams/<team_id>/recipes/` and are exposed through
      `GOOSE_RECIPE_PATH`.

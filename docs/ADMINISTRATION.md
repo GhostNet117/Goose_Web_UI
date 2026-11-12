@@ -893,7 +893,7 @@ item. It is copied into the team:
 | Kind | Delivered to members as |
 |---|---|
 | recipe | a file in `<system_dir>/library/teams/<team id>/recipes/`, which is on the members' `GOOSE_RECIPE_PATH`. Members cannot delete it. |
-| skill | a folder in the member's `config/skills/<name>/`, marked as managed. A skill the user created with the same name is never overwritten. Up to 2 MB of text files per skill; binary files are not shared. |
+| skill | a folder in the member's `config/skills/<name>/`, marked as managed. A skill the user created with the same name is never overwritten. Up to 2 MB of text files per skill; binary files are not shared. Since 1.18.3 every skill in the profile (team or the member's own) also gets a bridge `config/agents/<name>.md`, so an agent can load it with `load` as well as `load_skill` (only members whose team has the Summon tool, i.e. allow_shell, have `load`). |
 | extension | an entry in the member's `config.yaml`. Shell and stdio extensions stay disabled for members without `allow_shell`. |
 | provider | a custom provider file in `config/custom_providers/` |
 
@@ -1169,7 +1169,7 @@ Every non-native user gets `<profiles_root>/<username>/`, which is the `GOOSE_PA
 
 ```
 <profiles_root>/<username>/
-  config/        config.yaml, secrets.yaml, .goose-web-hints.md (composed), custom_providers/, recipes/, skills/
+  config/        config.yaml, secrets.yaml, .goose-web-hints.md (composed), custom_providers/, recipes/, skills/, agents/ (skill bridges)
   data/          sessions/sessions.db, logs/        (written by Goose)
   state/                                            (written by Goose)
   workspace/     default folder for new chats

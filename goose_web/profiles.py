@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import re
 import shutil
@@ -59,6 +60,26 @@ HINT_FILE_NAMES = frozenset({".goosehints", "agents.md", GW_HINTS_FILENAME.lower
 BASE_EXTENSIONS = ["todo", "skills", "apps", "chatrecall", "summarize", "extensionmanager", "analyze", "memory",
                    "summon", "tom"]
 MAX_SKILL_BYTES = 2 * 1024 * 1024
+# FIX team-skills-not-loadable-via-load: first line of a skill bridge (config/agents/<skill>.md) Goose Web wrote
+SKILL_BRIDGE_MARK = "<!-- skill-bridge: managed by Goose Web"
+log = logging.getLogger("goose_web")
+
+
+def _split_skill(text: str) -> tuple[dict, str] | None:
+    """(frontmatter dict, body) of a SKILL.md, or None if it has no YAML frontmatter mapping."""
+    lines = text.lstrip("\ufeff").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            try:
+                meta = yaml.safe_load("\n".join(lines[1:i])) or {}
+            except yaml.YAMLError:
+                return None
+            if not isinstance(meta, dict):
+                return None
+            return meta, "\n".join(lines[i + 1:]).strip("\n") + "\n"
+    return None
 
 
 def _read_yaml(p: Path) -> dict:
@@ -611,6 +632,73 @@ class Profiles:
         if self._drop_legacy_hints(user):
             changes.append("old .goosehints removed (Goose Web now uses .goose-web-hints.md)")
         self._write_manifest(user, new_manifest)
+        try:
+            bridged = self.sync_skill_bridges(user)
+            if bridged:
+                log.info("profile %s: skill bridges %s", user.get("username"), "; ".join(bridged)[:300])
+        except Exception:
+            # a convenience file must never block a worker start (provisioning failure fails closed in pre_start)
+            log.exception("profile %s: skill bridge sync failed", user.get("username"))
+        return changes
+
+    def sync_skill_bridges(self, user: dict) -> list[str]:
+        """FIX team-skills-not-loadable-via-load: make every skill of an isolated profile loadable with Summon's
+        load(source=<skill>) too. Goose 1.57 Summon resolves only recipes and agents (it reads agents from
+        Paths::config_dir()/agents = <profile>/config/agents), and in Code Mode load_skill is reachable only inside
+        execute_javascript, so a chat's first load("<skill>") failed. For each config/skills/<dir>/SKILL.md this
+        writes config/agents/<name>.md with the same text and SKILL_BRIDGE_MARK; bridges whose skill is gone are
+        removed. Files without the mark belong to the user and are never written or deleted. Never reads or writes
+        through a junction / link (C-3). Not part of the provisioning change list: Summon re-reads sources on every
+        call, so a new bridge needs no worker restart. Returns what changed."""
+        if self.is_native(user):
+            return []
+        root = self.root_for(user)
+        cfg_dir = self.config_dir(user)
+        skills, agents = cfg_dir / "skills", cfg_dir / "agents"
+        if not _inside_profile(agents, root) or _is_reparse(agents):
+            return []
+        want: dict[str, str] = {}
+        if skills.is_dir() and _inside_profile(skills, root) and not _is_reparse(skills):
+            for d in sorted(skills.iterdir())[:500]:
+                sk = d / "SKILL.md"
+                if _is_reparse(d) or not d.is_dir() or _is_reparse(sk) or not sk.is_file():
+                    continue
+                if not _inside_profile(sk, root):
+                    continue
+                st = os.lstat(sk)
+                if st.st_size > MAX_SKILL_BYTES or getattr(st, "st_nlink", 1) > 1:
+                    continue   # a hard link could point at a file outside the profile
+                parsed = _split_skill(sk.read_text(encoding="utf-8", errors="replace"))
+                if parsed is None:
+                    continue
+                meta, body = parsed
+                sid = _safe_id(str(meta.get("name") or d.name).strip())
+                if sid is None or f"{sid}.md".lower() in (k.lower() for k in want):
+                    continue
+                desc = str(meta.get("description") or f"Skill {sid}")
+                head = yaml.safe_dump({"name": sid, "description": desc}, sort_keys=False, allow_unicode=True,
+                                      width=10_000)
+                want[f"{sid}.md"] = (f"---\n{head}---\n{SKILL_BRIDGE_MARK} from config/skills/{d.name}/SKILL.md; "
+                                     f"same text as load_skill(\"{sid}\"). Edit the skill, not this file. -->\n\n{body}")
+        changes: list[str] = []
+        if agents.is_dir():
+            wanted = {k.lower() for k in want}
+            for f in sorted(agents.glob("*.md"))[:2000]:
+                if f.name.lower() in wanted or _is_reparse(f) or not f.is_file():
+                    continue
+                if SKILL_BRIDGE_MARK in f.read_text(encoding="utf-8", errors="replace")[:4096]:
+                    f.unlink()
+                    changes.append(f"bridge {f.stem} removed")
+        for fname, text in want.items():
+            t = agents / fname
+            if _is_reparse(t) or (t.exists() and not t.is_file()):
+                continue
+            if t.exists():
+                cur = t.read_text(encoding="utf-8", errors="replace")
+                if SKILL_BRIDGE_MARK not in cur[:4096] or cur == text:
+                    continue   # the user's own agent file, or already current
+            _atomic_write(t, text)
+            changes.append(f"bridge {fname[:-3]}")
         return changes
 
     @staticmethod
