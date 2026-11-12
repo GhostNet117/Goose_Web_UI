@@ -373,7 +373,7 @@ class WorkerManager:
             w.path_root, w.native, w.recipe_dirs, w.sandbox = path_root, native, recipe_dirs, sandbox
         return w
 
-    def _sandbox_env(self, w: Worker) -> dict:
+    def _sandbox_env(self, w: Worker, backend: str | None = None) -> dict:
         """Environment of a sandboxed worker (C-2): built from an allow-list, never from the gateway's environment
         as a whole, which holds the gateway account's secrets (API keys in user variables and the like).
 
@@ -399,7 +399,10 @@ class WorkerManager:
         env["CONTEXT_FILE_NAMES"] = json.dumps([ISOLATED_HINTS_FILENAME])
         for k, v in (w.security_env or {}).items():   # spec 026: beats config.yaml, secrets.yaml and extra_env
             env[str(k)] = str(v)
-        if w.backend == "appcontainer":
+        # `backend` = the backend of THIS start. w.backend still holds the previous start's backend until the new
+        # worker is up, so a start that knows its backend passes it (second review 2026-11-12, R-2: an MXC start after
+        # an AppContainer fallback was given the forwarder's address, which no MXC worker can reach).
+        if (backend or w.backend) == "appcontainer":
             # An AppContainer (the configured backend or the fallback, decided at this start: review E-6) reaches
             # the classification endpoint at its relay forwarder's address, not at the gateway's.
             ep_key = "SECURITY_PROMPT_CLASSIFIER_ENDPOINT"
@@ -694,7 +697,7 @@ class WorkerManager:
         cwd = os.path.join(spec["profile_root"], "workspace")
         if not os.path.isdir(cwd):
             cwd = spec["profile_root"]
-        policy = mxc.build_policy(command=args, cwd=cwd, env=self._sandbox_env(w), grants=grants, proxy_url=proxy_url,
+        policy = mxc.build_policy(command=args, cwd=cwd, env=self._sandbox_env(w, "mxc"), grants=grants, proxy_url=proxy_url,
                                   system_drive=os.environ.get("SystemDrive", "C:"))
         pfile = state_dir / "mxc" / f"{spec['name']}.json"
         await asyncio.to_thread(mxc.write_policy, pfile, policy)
@@ -827,8 +830,10 @@ class WorkerManager:
         if p and p.poll() is None:
             try:
                 if IS_WINDOWS:
-                    # goose serve's children (MCP servers) live in the same job/process tree
-                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True,
+                    # goose serve's children (MCP servers) live in the same job/process tree. By full path, like
+                    # icacls and powershell.exe (C-5; R-12): a bare name is looked up in the current directory first.
+                    taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+                    subprocess.run([taskkill, "/PID", str(p.pid), "/T", "/F"], capture_output=True,
                                    creationflags=0x08000000, timeout=15)
                 else:
                     # start_new_session=True made goose the leader of its own process group: stop MCP children too

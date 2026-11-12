@@ -403,8 +403,10 @@ async def ws_endpoint(websocket: WebSocket):
             t = u if target["id"] == user["id"] else c.db.user_by_id(target["id"])
             return t is not None and c.rights_fingerprint(u, t) == rights
         except Exception:
+            # fail closed (second review 2026-11-12, R-6): a socket whose rights cannot be checked is ended; the
+            # browser reconnects and the new socket gets the rights of that moment, or the failure becomes visible
             log.exception("socket re-validation (rights)")
-            return True
+            return False
     try:
         rights = c.rights_fingerprint(user, target)
     except Exception:

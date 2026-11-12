@@ -168,7 +168,7 @@ Classification endpoint (since 1.20.0, ADMINISTRATION 9.11). Goose's own prompt 
 | `guard.classifier_port` | `8711` | Loopback port of the classification endpoint (`http://127.0.0.1:<port>/classify`). `0` = no endpoint: Goose-native detection then uses its patterns only. The address is always `127.0.0.1`. |
 | `guard.native_profile` | `true` | Whether Goose Web applies Goose-native security to the administrator's own (native) Goose profile, the one Goose Desktop, the CLI and scheduled recipes share. `false` = that profile is never changed; members' profiles are still managed. The project's test suite sets it to `false` (`GOOSE_WEB__GUARD__NATIVE_PROFILE=false`), so a gateway started by a test never touches a real Goose profile; do the same for any throwaway gateway whose administrator uses your real Goose folder. |
 | `guard.classifier_timeout_ms` | `4000` | The endpoint answers within this or with `503` (Goose waits 5 s and does not retry; 200 to 4900). A slow answer does not mark the classifier unavailable; the score is cached for Goose's next request. |
-| `guard.classifier_max_pieces` | `4` | A text longer than `guard.max_input_chars` is scored in this many consecutive pieces at most; the rest is not scored. |
+| `guard.classifier_max_pieces` | `4` | A text longer than `guard.max_input_chars` is scored in this many consecutive pieces at most. A text that needs more is refused (`413`) and never reported safe; Goose then uses its patterns for that call. |
 | `guard.classifier_max_body_kb` | `256` | Larger request bodies get `413`. |
 | `guard.classifier_rate_per_minute` | `600` | Requests per profile per minute; beyond it `429`. |
 

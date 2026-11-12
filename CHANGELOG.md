@@ -69,6 +69,17 @@ recipes); Goose Web now configures them where Goose reads them. No database sche
   normal at every start (`server.priority`, default `normal`; `inherit` leaves it) and logs it, which also covers
   tasks registered by earlier versions; `register-service.ps1` registers new tasks with priority 4. Measured after
   the fix, same load: `/healthz` in 2 to 33 ms, a classification in 0.4 to 0.7 s.
+- **A second independent review, of the fixes themselves** (SECURITY-ASSESSMENT 14.5). The changes made after the
+  first review had been read by nobody but their author, so they were reviewed again before release. Two of the
+  fixes had introduced regressions, both corrected: an agent started in an MXC container after an AppContainer
+  fallback was pointed at a classifier address it could not reach; and in the administrator's Goose profile a
+  setting Goose Web had written and something later weakened was silently accepted as the administrator's own. Such
+  a setting is now put back, audited and shown (a stricter one is still kept). Also: a setting that merely equals
+  Goose Web's is no longer treated as Goose Web's; the backup on take-over is written first; a WebSocket whose
+  rights cannot be re-checked is closed; refused change-password requests write one audit row per window; set-aside
+  profile files get unique names and the newest five are kept; every YAML parser error leads to the set-aside;
+  `taskkill` by full path. **Known and open:** one profile can keep the classification endpoint busy so that other
+  profiles' requests end in `503` and Goose uses its patterns only for those calls (14.3, with measurements).
 - **Command line:** `goose-web security status | on | off | rotate-tokens`; `goose-web check` shows the state.
   **API:** `GET/PUT /api/admin/goose-security`, `POST .../check`, `POST .../rotate`.
 - **Fix:** `goose-web check` reported the gateway's port as free when `server.host` is a LAN address (it probed

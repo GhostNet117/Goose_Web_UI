@@ -215,7 +215,8 @@ DEFAULTS: dict[str, Any] = {
         # managed. The test suite sets it to false, so a gateway started by a test never touches a real Goose profile.
         "native_profile": True,
         "classifier_timeout_ms": 4000,    # answer within this or 503 (Goose waits 5 s and does not retry)
-        "classifier_max_pieces": 4,       # a text longer than max_input_chars is scored in this many pieces at most
+        "classifier_max_pieces": 4,       # a text longer than max_input_chars is scored in this many pieces; a text
+                                          # that needs more is refused (413), never reported safe
         "classifier_max_body_kb": 256,    # larger request bodies are refused (413)
         "classifier_rate_per_minute": 600,   # requests per profile per minute (429 beyond)
     },

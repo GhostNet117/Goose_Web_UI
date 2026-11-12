@@ -714,8 +714,8 @@ and the prompt guard of section 11 remain the controls that do not depend on the
 | A sandboxed agent uses the endpoint to reach the gateway | The relay target is the classifier port only; the web application's port is not reachable from the sandbox, as before |
 | Chat text leaks through the endpoint | Nothing is logged or audited; the cache holds a SHA-256 of the text and a score; requests stay on the loopback interface |
 | The gateway points Goose at a port someone else holds | A profile gets the endpoint only while the gateway itself holds the socket (exclusive bind on Windows); otherwise the classifier is switched off in the plan |
-| The feature breaks or overrides the administrator's Goose | The native profile is changed through Goose's own configuration API, key by key, each write read back; a request Goose could not be asked is a failure, never "not there"; a failure is recorded and nothing else is changed (`adversary.md` is touched only after the settings went in). Goose Web remembers what it wrote and replaces or removes only that: a value the administrator set (a stricter threshold, an own classifier with its token) is kept and reported, and "off" removes only Goose Web's own values. Neither those nor an `adversary.md` Goose Web did not write is taken over without an explicit choice and a backup; a file it cannot read is left alone |
-| A long text ties up the classifier | Body cap; at most `classifier_max_pieces` pieces, and a text that cannot be scored completely is answered `413`, never "safe"; a deadline below Goose's timeout; the bounded backlog above |
+| The feature breaks or overrides the administrator's Goose | The native profile is changed through Goose's own configuration API, key by key, each write read back; a request Goose could not be asked is a failure, never "not there"; a failure is recorded and nothing else is changed (`adversary.md` is touched only after the settings went in). Goose Web remembers what it wrote and replaces or removes only that: a value the administrator set (a stricter threshold, an own classifier with its token) is kept and reported, and "off" removes only Goose Web's own values. One exception, on purpose: a value Goose Web wrote that is later changed to something that protects less (detection or the classifier switched off, a higher threshold) is put back at the next start, audited and shown to administrators (14.5 R-3). Neither those nor an `adversary.md` Goose Web did not write is taken over without an explicit choice and a backup; a file it cannot read is left alone |
+| A long text ties up the classifier | Body cap; at most `classifier_max_pieces` pieces, and a text that cannot be scored completely is answered `413`, never "safe"; a deadline below Goose's timeout; the bounded backlog above. Limit: the bound is on pieces, not on time; see 14.3, "One profile can make the endpoint unavailable to the others" |
 | The rules text or a token ends up in a log | The audit holds switches and sizes only (`goosesec.summary`); the state holds a 16-hex-digit fingerprint of the token, not the token |
 
 ### 14.3 Residual risks
@@ -726,10 +726,18 @@ and the prompt guard of section 11 remain the controls that do not depend on the
   the token. Goose's client cannot verify who answers (plain HTTP to a fixed address). A sandboxed member's agent
   cannot do this (no loopback, section 13). Mitigations: run the gateway at boot (service account); do not give other
   people interactive or remote-desktop access to the gateway's computer; or set `guard.classifier_port: 0`.
-- **The classifier is shared hardware, not a shared queue.** The endpoint and the prompt guard of section 11 have a
-  thread each, so the endpoint cannot make the guard wait in a queue; both use the same processor cores, so heavy
-  endpoint use slows the guard down. One profile can hold 3 of the endpoint's 8 slots; three colluding profiles can
-  fill it, and other profiles then get `503` (Goose uses its patterns) until a slot is free.
+- **One profile can make the endpoint unavailable to the others (open, Medium; 14.5 R-1).** The endpoint and the
+  prompt guard of section 11 have a thread each, so the endpoint cannot make the guard wait in a queue; both use the
+  same processor cores, so heavy endpoint use slows the guard down. The endpoint's bound counts pieces, not time,
+  and its one thread serves requests in the order they arrive. Measured on a 4-core computer: one token-dense text of
+  `guard.max_input_chars` (16,000) characters keeps that thread busy for 9 to 11 seconds (ordinary English of the
+  same length: 2 seconds), longer than the 4 seconds a request may take, and a profile may have 3 requests waiting.
+  A member's agent that keeps sending such texts with its own token therefore makes other profiles' requests end in
+  `503`, and Goose uses its patterns only for those tool calls, for as long as it continues. Nothing is disclosed and
+  nothing is blocked wrongly; pattern detection, the sandbox, the policy firewall and the prompt guard of section 11
+  are not affected. The listener counts these answers (`listener.stats.busy` in `GET /api/admin/goose-security`); the
+  admin page does not show the counter yet. Not fixed in 1.20.0: it needs fair scheduling per profile and scoring
+  that stops at the deadline.
 - **Connections.** uvicorn has no timeout for a connection that never sends a request. A program on the computer
   that opens 1,024 connections to the endpoint and sends nothing makes every classification request `503` until it
   stops. A sandboxed member cannot (64 connections through its proxy). Goose then uses its patterns only.
@@ -787,3 +795,29 @@ database (D-1); the audit log is no longer purged with a fixed 365 days at every
 shows the initial password before any later step can fail (D-7). No path was found that starts a member's agent
 without its sandbox, and no upgrade path that loses chats, users, teams, settings or preferences. The findings that
 are not fixed yet are tracked outside this document.
+
+### 14.5 Second independent review 2026-11-12 (the changes made after 14.4)
+
+The fixes of 14.4 and the changes that followed (`guard.native_profile`, the process priority) had been reviewed by
+nobody but their author. Before release a reviewer read exactly that difference (read-only, code only). It found no
+way for a member to read or change another member's data or to leave the sandbox, no private information in the
+published lines, and nothing that fails on Python 3.11. It found two regressions and one overstated claim:
+
+| ID | Severity | Finding | Now |
+|---|---|---|---|
+| R-1 | Medium | The endpoint's bound counts pieces, not thread time: one profile can keep the endpoint's thread busy (14.3 had said three colluding profiles are needed) | **Open.** 14.3 corrected, with measurements |
+| R-2 | Medium | Regression of the E-6 fix: an MXC start after an AppContainer fallback built its environment from the previous start's backend, so the worker was given the relay forwarder's address, which no MXC worker can reach; the classifier was unreachable for that worker's whole life | The start passes its own backend; test for fallback, then MXC |
+| R-3 | Medium | Regression of the E-3 fix: in the native profile a value Goose Web wrote and something later weakened was treated as the administrator's own: no drift, no audit, no notice | A key Goose Web wrote that holds something else is looked at once: a weaker value is put back, another is kept; both are audited and administrators are told |
+| R-4 | Low | A value the administrator had set that happened to equal Goose Web's was recorded as Goose Web's, so a later "off" removed it | Only what Goose Web wrote (or took over on request) is its own |
+| R-5 | Low | On take-over the backup of the replaced values was written last, so a failure in between lost them | Written before the first value is replaced |
+| R-6 | Low | The new re-validation of a WebSocket's rights kept the socket when the check itself failed | The socket is closed; the browser reconnects |
+| R-7 | Low | That re-validation creates the team folder if it is missing (a file-system call on the event loop, every 30 s per socket) | **Open.** Negligible on a local disk |
+| R-8 | Low | Every refused change-password request wrote an audit row at no cost: a member could fill the audit table until its oldest rows were pruned | One row per window |
+| R-9 | Low | Set-aside profile files: never pruned; two in the same second overwrote each other | Unique names; the newest 5 per member and file name are kept |
+| R-10 | Low | Only two kinds of parser error led to the set-aside; others still blocked every start | Every parser error; something that is not a file still fails the start |
+| R-11 | Info | Three places still said the rest of an over-long text "is not scored" | Corrected (`413`) |
+| R-12 | Info | `taskkill` was still started by bare name | Full path |
+| R-13 | Info | A `guard.native_profile` value that is neither true nor false means "not managed", silently | Said in the log at every start |
+
+The fixes of this table were not reviewed a third time. They are covered by tests (`tests/test_goosesec.py`), the
+whole suite on Python 3.11 and 3.13, and a throwaway gateway run with the real Goose binary.

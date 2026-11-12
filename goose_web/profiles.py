@@ -196,6 +196,8 @@ PINNED_DESCRIPTION = "Turned off by Goose Web: your team does not give the permi
 
 
 class Profiles:
+    SET_ASIDE_KEEP = 5   # unreadable config.yaml / secrets.yaml files kept per member and file name (the newest)
+
     def __init__(self, settings: Settings, db: Database):
         self.s = settings
         self.db = db
@@ -434,19 +436,34 @@ class Profiles:
         """config.yaml / secrets.yaml of an isolated profile. A file that is not readable YAML or not a mapping (an
         interrupted write, or something the member's agent did) used to make every start of that member's agent
         fail until an administrator repaired the file by hand (review 2026-11-12, B-9). It is now moved to
-        <system_dir>/backups/profiles/<user>/ (nothing is lost), the event is audited, and provisioning rebuilds
-        the file from the team's policy."""
+        <system_dir>/backups/profiles/<user>/, the event is audited, and provisioning rebuilds the file from the
+        team's policy. Second review 2026-11-12: every way the YAML parser can fail counts (a bad date is a
+        ValueError, deep nesting a RecursionError: R-10); two files set aside in the same second no longer overwrite
+        each other, and only the newest SET_ASIDE_KEEP per file name are kept, because the member decides how often
+        and how large (R-9). Something that is not a file (a folder or a link named config.yaml) is not moved: the
+        start fails, as before."""
         try:
             data = _read_yaml(p)
             if isinstance(data, dict):
                 return data
             problem = "not a mapping"
-        except (yaml.YAMLError, UnicodeDecodeError) as e:
+        except (yaml.YAMLError, ValueError, RecursionError) as e:   # ValueError includes UnicodeDecodeError
             problem = e.__class__.__name__
         dst_dir = self.s.system_dir / "backups" / "profiles" / safe_name(user["username"])
         dst_dir.mkdir(parents=True, exist_ok=True)
-        dst = dst_dir / f"{p.name}.{time.strftime('%Y%m%d-%H%M%S')}.unreadable"
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        dst, n = dst_dir / f"{p.name}.{stamp}.unreadable", 1
+        while dst.exists():
+            n += 1
+            dst = dst_dir / f"{p.name}.{stamp}-{n}.unreadable"
         shutil.move(str(p), str(dst))   # also across volumes (system_dir may be on another disk)
+        try:
+            old = sorted((f for f in dst_dir.glob(f"{p.name}.*.unreadable") if f.is_file()),
+                         key=lambda f: f.stat().st_mtime, reverse=True)[self.SET_ASIDE_KEEP:]
+            for f in old:
+                f.unlink()
+        except OSError:
+            log.exception("profile %s: pruning old set-aside files", user.get("username"))
         log.warning("profile %s: %s was not readable (%s); moved to %s and rebuilt", user.get("username"), p.name,
                     problem, dst)
         self.db.audit("profile.file.set_aside", user=user, target=str(user.get("username") or ""),

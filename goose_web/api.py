@@ -315,6 +315,7 @@ async def me(request: Request):
 
 # Attempts to prove the current password of a signed-in account (change password): 8 per user in 5 minutes.
 _REAUTH_LIMIT = security.RateLimiter(8, 300.0)
+_REAUTH_AUDIT = security.RateLimiter(1, 300.0)   # how often a refusal by the limiter above is written to the audit log
 
 
 async def me_password(request: Request):
@@ -327,12 +328,16 @@ async def me_password(request: Request):
     # A-3 (review 2026-11-12): the password check (scrypt) ran on the event loop, so a member repeating this request
     # could stall the gateway for everyone, and nothing limited guesses of the current password with a stolen session
     if not _REAUTH_LIMIT.hit(f"pw:{u['id']}"):
-        c.audit(request, "user.password", u, ok=False, detail={"reason": "rate limited"})
+        # one audit row per window, not one per refused request (second review 2026-11-12, R-8): a refusal costs
+        # nothing, so a member repeating the request could fill the audit table until its oldest rows are pruned
+        if _REAUTH_AUDIT.hit(f"pw:{u['id']}"):
+            c.audit(request, "user.password", u, ok=False, detail={"reason": "rate limited"})
         raise HTTPError(429, "rate_limited", "Too many attempts. Try again in a few minutes.")
     if not await asyncio.to_thread(security.verify_password, str(b.get("current") or ""), u["password_hash"]):
         c.audit(request, "user.password", u, ok=False)
         raise HTTPError(400, "wrong_password", "Your current password is not correct")
     _REAUTH_LIMIT.reset(f"pw:{u['id']}")
+    _REAUTH_AUDIT.reset(f"pw:{u['id']}")
     new = str(b.get("new") or "")
     problems = security.password_problems(new, _min_pw(c), u["username"])
     if new == b.get("current"):

@@ -529,13 +529,21 @@ def test_change_password_is_rate_limited_and_checks_off_the_event_loop(env):
     s, db, pr, c = env
     alice = user(db, "alice")
     api._REAUTH_LIMIT.reset(f"pw:{alice['id']}")
+    api._REAUTH_AUDIT.reset(f"pw:{alice['id']}")
     with client_for(c) as tc:
         h = sign_in(tc, c, alice)
         codes = [tc.post("/api/me/password", json={"current": "wrong", "new": "x"}, headers=h).status_code
                  for _ in range(10)]
         assert codes[:8] == [400] * 8 and codes[8:] == [429, 429]
         assert tc.post("/api/me/password", json={"current": _tp.PW, "new": "x"}, headers=h).status_code == 429
+        assert [tc.post("/api/me/password", json={"current": "wrong", "new": "x"}, headers=h).status_code
+                for _ in range(20)] == [429] * 20
+    # second review R-8: a refusal costs nothing, so it must not write an audit row each time
+    rows = db.query("SELECT detail FROM audit WHERE action='user.password' AND ok=0")
+    assert sum(1 for r in rows if (r["detail"] or {}).get("reason") == "rate limited") == 1
+    assert sum(1 for r in rows if not (r["detail"] or {}).get("reason")) == 8
     api._REAUTH_LIMIT.reset(f"pw:{alice['id']}")
+    api._REAUTH_AUDIT.reset(f"pw:{alice['id']}")
 
 
 def test_other_security_keys_in_a_member_profile_are_removed(env):
@@ -642,6 +650,189 @@ async def test_native_sync_failure_tells_administrators_and_never_raises(env, tm
     fc.upstream_for = lambda u: (_ for _ in ()).throw(RuntimeError("no worker"))
     assert (await GS.sync_native(fc))["ok"] is False
     assert await GS.sync_native(SimpleNamespace(settings=s, profiles=SimpleNamespace(_native_admin=lambda: None))) is None
+
+
+# ------------------------------------------------------------------ second review 2026-11-12 (R-2 .. R-10)
+THEIRS = "https://classifier.example/classify"
+
+
+def native_plan(db, admin):
+    return GS.profile_plan(GS.load(db), native=True, token=GS.token_for(db, admin["id"]), endpoint=ENDPOINT)
+
+
+def rewrite(cdir, **values):
+    p = cdir / "config.yaml"
+    cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    cfg.update(values)
+    p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+
+
+async def test_native_value_weakened_after_goose_web_wrote_it_is_put_back(env, tmp_path):
+    """R-3: anything that can write the administrator's Goose configuration could switch the protection off, and
+    the ownership rule of E-3 then took the weaker value for the administrator's own choice: no drift, no notice."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    up = FakeUp(cdir)
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and st["reasserted"] == [] and GS.native_drift(cdir, native_plan(db, admin), st) == []
+    rewrite(cdir, **{KEYS[0]: False, KEYS[1]: 0.99, KEYS[2]: False})        # detection off, threshold up, classifier off
+    assert GS.native_drift(cdir, native_plan(db, admin), st) == [f"{k} changed outside Goose Web" for k in KEYS[:3]]
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and [up.cfg()[k] for k in KEYS] == [True, 0.8, True, ENDPOINT]
+    assert st["reasserted"] == list(KEYS[:3]) and st["foreign"] == [] and set(st["written"]) == set(KEYS)
+    assert all(any(ch.startswith(f"{k} put back") for ch in st["changed"]) for k in KEYS[:3])
+    assert json.loads(Path(st["configBackup"]).read_text(encoding="utf-8")) == {KEYS[0]: False, KEYS[1]: 0.99, KEYS[2]: False}
+    assert GS.native_drift(cdir, native_plan(db, admin), st) == []
+    rewrite(cdir, **{KEYS[1]: "not a number"})                               # Goose would fall back to its default
+    st = await apply(s, db, up, admin, cdir)
+    assert up.cfg()[KEYS[1]] == 0.8 and st["reasserted"] == [KEYS[1]]
+
+
+async def test_native_value_made_stricter_or_another_classifier_is_kept_and_looked_at_once(env, tmp_path):
+    """R-3, the other direction: what protects more, or cannot be judged, stays the administrator's choice - but it
+    is drift once, so it is recorded instead of passing unnoticed."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    up = FakeUp(cdir)
+    st = await apply(s, db, up, admin, cdir)
+    rewrite(cdir, **{KEYS[1]: 0.4, KEYS[3]: THEIRS})
+    assert GS.native_drift(cdir, native_plan(db, admin), st) == [f"{KEYS[1]} changed outside Goose Web",
+                                                                 f"{KEYS[3]} changed outside Goose Web"]
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and up.cfg()[KEYS[1]] == 0.4 and up.cfg()[KEYS[3]] == THEIRS
+    assert st["foreign"] == [KEYS[1], KEYS[3]] and st["reasserted"] == [] and "configBackup" not in st
+    assert GS.native_drift(cdir, native_plan(db, admin), st) == []          # theirs now: not asked again
+    assert GS._weaker(KEYS[1], 0.4, 0.8) is False and GS._weaker(KEYS[1], 0.8, 0.8) is False
+    assert GS._weaker(KEYS[1], 0.9, 0.8) and GS._weaker(KEYS[1], True, 0.8) and GS._weaker(KEYS[1], None, 0.8)
+    assert GS._weaker(KEYS[0], False, True) and GS._weaker(KEYS[0], "false", True) and not GS._weaker(KEYS[0], "true", True)
+    assert not GS._weaker(KEYS[0], False, False) and not GS._weaker(KEYS[3], THEIRS, ENDPOINT)
+
+
+async def test_native_sync_audits_and_tells_administrators_about_a_change_made_outside(env, tmp_path):
+    """R-3: the sync is what runs at every gateway start."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    up = FakeUp(cdir)
+    fc, notices, worker = fake_ctx(s, db, pr, up)
+    assert (await GS.sync_native(fc))["ok"] and notices == []
+    rewrite(cdir, **{KEYS[0]: False})
+    st = await GS.sync_native(fc)
+    assert st["ok"] and up.cfg()[KEYS[0]] is True and st["reasserted"] == [KEYS[0]]
+    assert len(notices) == 1 and f"put back: {KEYS[0]}" in notices[0]["params"]["message"]
+    rows = db.query("SELECT ok, detail FROM audit WHERE action='goosesec.native' ORDER BY id")
+    assert len(rows) == 2 and rows[1]["ok"] and rows[1]["detail"]["reasserted"] == [KEYS[0]]
+    rewrite(cdir, **{KEYS[1]: 0.4})                                          # stricter: kept, but said and audited
+    st = await GS.sync_native(fc)
+    assert st["ok"] and st["changed"] == [] and up.cfg()[KEYS[1]] == 0.4 and st["foreign"] == [KEYS[1]]
+    assert len(notices) == 2 and f"kept as changed: {KEYS[1]}" in notices[1]["params"]["message"]
+    assert len(db.query("SELECT id FROM audit WHERE action='goosesec.native'")) == 3
+    up.calls.clear()
+    assert (await GS.sync_native(fc))["ok"] and up.calls == [] and len(notices) == 2     # looked at once
+
+
+async def test_native_value_equal_to_the_plan_that_goose_web_never_wrote_stays_the_administrators(env, tmp_path):
+    """R-4: "off" must not remove a switch the administrator had set themselves."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    rewrite(cdir, **{KEYS[0]: True})                                         # their own, before Goose Web
+    up = FakeUp(cdir)
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and set(st["written"]) == set(KEYS[1:]) and st["foreign"] == []
+    GS.save(db, GS.clean({"enabled": False}))
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and up.cfg()[KEYS[0]] is True and st["foreign"] == [KEYS[0]]
+    assert not any(k in up.cfg() for k in KEYS[1:]) and up.secrets == {}
+
+
+async def test_native_take_over_saves_the_previous_values_before_replacing_anything(env, tmp_path):
+    """R-5: a failure after the first replacement used to lose the administrator's previous values."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    rewrite(cdir, **{KEYS[1]: 0.3, KEYS[3]: THEIRS})
+
+    class FailsAtTheEndpoint(FakeUp):
+        async def request(self, method, params=None, timeout=None):
+            if method.endswith("config/upsert") and (params or {}).get("key") == KEYS[3]:
+                raise TimeoutError("goose did not answer")
+            return await super().request(method, params, timeout)
+
+    up = FailsAtTheEndpoint(cdir)
+    st = await apply(s, db, up, admin, cdir, adopt=True)
+    assert st["ok"] is False and "TimeoutError" in st["error"]
+    assert up.cfg()[KEYS[1]] == 0.8 and up.cfg()[KEYS[3]] == THEIRS         # the first value was already replaced
+    assert json.loads(Path(st["configBackup"]).read_text(encoding="utf-8")) == {KEYS[1]: 0.3, KEYS[3]: THEIRS}
+    assert GS.native_state(db)["configBackup"] == st["configBackup"]
+
+
+def test_env_mxc_start_after_an_appcontainer_fallback_gets_the_real_address(env, tmp_path):
+    """R-2: w.backend is the PREVIOUS start's backend until the new worker is up. An MXC start after a fallback was
+    given the relay forwarder's address, which no MXC worker can reach, for that worker's whole life."""
+    import inspect
+    s, db, pr, c = env
+    wm = wk.WorkerManager(s)
+    root = tmp_path / "sb"
+    root.mkdir()
+    sec = {"SECURITY_PROMPT_ENABLED": "true", KEYS[3]: ENDPOINT, TOKEN_KEY: "tok"}
+    spec = {"name": "x", "profile_root": str(root), "backend": "mxc",
+            "relays": [{"target": "127.0.0.1:8711", "listen": "127.64.0.9:8711"}]}
+    w = wk.Worker(key="bob", username="bob", path_root=str(root), native=False, security_env=sec, sandbox=spec)
+    w.backend = "appcontainer"                                              # left by the fallback start
+    assert wm._sandbox_env(w)[KEYS[3]] == "http://127.64.0.9:8711/classify"
+    assert wm._sandbox_env(w, "mxc")[KEYS[3]] == ENDPOINT                    # the MXC start says what it is
+    assert 'self._sandbox_env(w, "mxc")' in inspect.getsource(wk.WorkerManager._start_mxc)
+    w.backend = "mxc"
+    assert wm._sandbox_env(w, "appcontainer")[KEYS[3]] == "http://127.64.0.9:8711/classify"
+
+
+def test_a_socket_whose_rights_cannot_be_checked_is_closed():
+    """R-6: the re-validation failed open (any exception kept the socket with its old rights)."""
+    import re
+    src = (Path(wk.__file__).parent / "app.py").read_text(encoding="utf-8")
+    m = re.search(r'log\.exception\("socket re-validation \(rights\)"\)\s*\n\s*return (\w+)', src)
+    assert m and m.group(1) == "False"
+
+
+def test_set_aside_files_get_unique_names_and_only_the_newest_are_kept(env):
+    """R-9: the member decides how often this happens; two in the same second overwrote each other."""
+    s, db, pr, c = env
+    alice = member(db)
+    pr.provision(alice)
+    cdir = pr.config_dir(alice)
+    total = pr.SET_ASIDE_KEEP + 3
+    for i in range(total):
+        (cdir / "config.yaml").write_text(f"GOOSE_MODE: [unclosed-{i}-\n", encoding="utf-8")
+        pr.provision(alice)
+    kept = list((s.system_dir / "backups" / "profiles" / "alice").glob("config.yaml.*.unreadable"))
+    texts = sorted(p.read_text(encoding="utf-8") for p in kept)
+    assert len(kept) == pr.SET_ASIDE_KEEP and len(set(texts)) == pr.SET_ASIDE_KEEP
+    assert texts == sorted(f"GOOSE_MODE: [unclosed-{i}-\n" for i in range(total - pr.SET_ASIDE_KEEP, total))
+    assert len(db.query("SELECT id FROM audit WHERE action='profile.file.set_aside'")) == total
+
+
+@pytest.mark.parametrize("text", ["x: 2001-99-99\n", "a: " + "[" * 3000 + "]" * 3000 + "\n", "\x00\x01 not text"])
+def test_every_parser_error_leads_to_the_set_aside(env, text):
+    """R-10: a bad date is a ValueError and deep nesting a RecursionError, not a YAMLError; each still blocked every
+    start of that member's agent."""
+    s, db, pr, c = env
+    alice = member(db)
+    pr.provision(alice)
+    (pr.config_dir(alice) / "config.yaml").write_text(text, encoding="utf-8")
+    pr.provision(alice)
+    cfg, _ = read(pr, alice)
+    assert cfg["SECURITY_PROMPT_ENABLED"] is True
+    assert len(db.query("SELECT id FROM audit WHERE action='profile.file.set_aside'")) == 1
+
+
+def test_something_that_is_not_a_file_in_place_of_config_yaml_still_fails_the_start(env):
+    s, db, pr, c = env
+    alice = member(db)
+    pr.provision(alice)
+    p = pr.config_dir(alice) / "config.yaml"
+    p.unlink()
+    p.mkdir()
+    with pytest.raises(OSError):
+        pr.provision(alice)
+    assert p.is_dir() and not (s.system_dir / "backups" / "profiles" / "alice").exists()
 
 
 # ------------------------------------------------------------------ API

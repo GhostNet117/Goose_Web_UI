@@ -18,9 +18,10 @@ and is served by the Prompt Guard 2 classifier the gateway already runs (guard.p
 What Goose sends (measured, spec 026 spike): on every `shell` call, one request per recent user message (10 at most,
 3 at a time), 5 s timeout, no retry, no cache. The classifier's own cache answers the repeats.
 
-Status codes: 200; 400 not the documented shape; 401 no valid token; 413 body too large; 429 too many requests from
-one profile; 503 the model is missing, loading, or did not answer within guard.classifier_timeout_ms (Goose then
-uses its patterns only for that call).
+Status codes: 200; 400 not the documented shape; 401 no valid token; 413 body too large, or a text that cannot be
+scored completely (more than guard.classifier_max_pieces pieces, or a piece the classifier cannot fit) - it is never
+reported safe; 429 too many requests from one profile; 503 the model is missing, loading, or did not answer within
+guard.classifier_timeout_ms. For every answer but 200 Goose uses its patterns only for that call.
 """
 from __future__ import annotations
 
