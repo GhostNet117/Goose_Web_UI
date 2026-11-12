@@ -3,7 +3,7 @@ import { h, btn, iconBtn, pageHeader, toast, toastError, confirmDialog, promptDi
 import { icon } from '../icons.js';
 import { rpc, G } from '../rpc.js';
 import { GET, POST, PUT, PATCH, DEL } from '../api.js';
-import { store, policy, allowedValue } from '../store.js';
+import { store, bus, policy, allowedValue } from '../store.js';
 import { setBaseTitle, chime } from '../herd.js';
 import { router } from '../router.js';
 import { THEMES, ACCENTS, prefs, pref, setPref, patchPref, activityPrefs } from '../prefs.js';
@@ -340,6 +340,14 @@ function providersTab(body) {
     } catch (e) { list.replaceChildren(banner('error', errMsg(e))); defBox.replaceChildren(); visBox.replaceChildren(); grpBox.replaceChildren(); }
   }
   load(); loadSecrets();
+  // 1.18.2: groups or hidden providers saved in another tab redraw here (not while typing in this section)
+  const offPrefs = bus.on('prefs:changed', (keys) => {
+    if (!entries.length || !keys.some((k) => k === 'providerGroups' || k === 'providerVisibility')) return;
+    const a = document.activeElement;
+    if (a && (grpBox.contains(a) || visBox.contains(a)) && a.tagName === 'INPUT' && a.type !== 'checkbox') return;
+    drawGroups(); drawVis();
+  });
+  return { destroy: offPrefs };
 }
 
 // ===================================================================== Prompts

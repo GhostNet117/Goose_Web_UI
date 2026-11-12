@@ -66,7 +66,7 @@ and the default profiles root `C:\Goose_Web_Profiles`. Replace them with your ow
 
 ## 2. Supported platform: Windows only
 
-Goose Web 1.13 runs on Windows only: Windows 10/11 or Windows Server 2019 and later, with Python 3.11 or later (the
+Goose Web runs on Windows only: Windows 10/11 or Windows Server 2019 and later, with Python 3.11 or later (the
 installer prefers `uv` with Python 3.13 when `uv` is available). `goose-web serve` refuses to start on any other
 system.
 
@@ -903,7 +903,7 @@ For extensions and providers added from a profile library, the secrets named by 
 Items added manually through the API never copy secrets from another profile. Removing an item, or removing a user
 from the team, removes what was provisioned (but never items the user created).
 
-### 9.8 Prompt guard (since 1.14.0)
+### 9.10 Prompt guard (since 1.14.0)
 
 The prompt guard stops forbidden or injected instructions from reaching the tools of a team. It is **off for every
 team** until you turn it on, and existing teams are not changed by the upgrade. It inspects two things and nothing
@@ -1551,7 +1551,7 @@ Recorded actions:
 |---|---|
 | System | `system.init`, `system.start`, `system.stop` |
 | Sign-in | `auth.login` (success and failure), `auth.logout`, `auth.totp` (wrong code), `auth.ldap` (insecure LDAP refused), `auth.oidc` (OIDC failure), `user.oidc.bind`, `auth.password.weak` (existing password below the policy, change forced), `auth.ip.blocked`, `auth.ip.unblocked` (`"via": "cli"` from the console) |
-| Own account | `user.password`, `user.totp.enable`, `user.totp.disable`, `user.token.create`, `user.token.delete`, `hints.personal.save`, `hints.native.save` |
+| Own account | `user.password`, `user.totp.enable`, `user.totp.disable`, `user.token.create`, `user.token.delete`, `hints.personal.save`, `hints.native.save`, `prefs.update` (1.18.2: the changed, deleted and skipped preference NAMES - never values - the tab's client id and the new revision; a refused save is `ok=false` with `error`, for example `prefs_conflict`) |
 | User admin | `user.create`, `user.update` (changed field names, never the password), `user.delete`, `user.reset_password`, `user.totp.reset` (two-factor reset, `"via": "cli"` from the console), `user.unlock`, `user.provision`, `user.team.directory` (directory sign-in matched several teams; the first was used) |
 | Teams and hints | `team.create`, `team.update` (with `moved`: users moved here from another team), `team.delete`, `team.migrate.membership` (1.5.0 upgrade: a second team membership was dropped), `team.item.add`, `team.item.remove`, `hints.create`, `hints.update`, `hints.delete` |
 | Settings | `settings.auth`, `settings.update` |

@@ -2202,6 +2202,16 @@ class Hub:
                     seen.add(id(c))
                     c.send(raw)
 
+    def broadcast_user(self, uid: Any, obj: dict) -> None:
+        """Every open socket signed in as this user (all tabs and browsers, whichever profile they look at)."""
+        raw = json.dumps(obj, separators=(",", ":"))
+        seen: set[int] = set()
+        for up in list(self.upstreams.values()):
+            for c in list(up.clients):
+                if id(c) not in seen and (c.user or {}).get("id") == uid:
+                    seen.add(id(c))
+                    c.send(raw)
+
     def audit_guard(self, up: "Upstream", sid: str, ctx: Any, d: Any, *, tool: str = "", ext: str = "",
                     mode: str = "", actor: Any = None, action: str = "guard.blocked") -> None:
         """guard.blocked (or guard.bypass / guard.not_inspected): who, where, which rule or score - never the prompt

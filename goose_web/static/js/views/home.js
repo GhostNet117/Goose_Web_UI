@@ -3,7 +3,7 @@ import { h, btn, iconBtn, toast, toastError, shortPath, baseName, menu, relTime,
 import { icon, logo } from '../icons.js';
 import { rpc, G } from '../rpc.js';
 import { router } from '../router.js';
-import { store } from '../store.js';
+import { store, bus } from '../store.js';
 import { Composer } from '../composer.js';
 import { pickFolder, fsRoots } from './folderpicker.js';
 import { pref, setPref, addRecentFolder } from '../prefs.js';
@@ -211,6 +211,12 @@ export function renderHome(ctx, query = {}) {
       if (e) { recipe = { id: e.id, title: e.recipe.title || e.id, prompt: e.recipe.prompt || '' }; if (recipe.prompt) composer.value = recipe.prompt; renderChips(); }
     }).catch(() => {});
   }
+  // 1.18.2: a save in another tab (provider groups, hidden providers, a remembered New chat choice) shows here at once
+  const offPrefs = bus.on('prefs:changed', (keys) => {
+    if (keys.includes('newChat')) Object.assign(choice, { provider: '', model: '', effort: '', mode: '', ...(pref('newChat') || {}) });
+    if (keys.some((k) => ['newChat', 'providerGroups', 'providerVisibility'].includes(k))) renderOpts();
+    if (keys.includes('recentFolders')) renderRecents();
+  });
   requestAnimationFrame(() => composer.focus());
-  return { el, focus: () => composer.focus() };
+  return { el, focus: () => composer.focus(), destroy: offPrefs };
 }

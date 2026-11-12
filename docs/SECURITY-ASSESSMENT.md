@@ -532,7 +532,7 @@ administrator starting a chat in a member-writable folder with plugins must conf
 
 ## 11. Addendum: prompt guard (2026-11-10), 1.14.0
 
-Spec 018 adds an optional, per-team **prompt guard** (ADMINISTRATION 9.8, ARCHITECTURE 12.11) that narrows GW-08
+Spec 018 adds an optional, per-team **prompt guard** (ADMINISTRATION 9.10, ARCHITECTURE 12.11) that narrows GW-08
 ("untrusted content can steer the model"):
 
 - **Deterministic rules on tool-call arguments** (for example *Splunk read-only*, *Destructive shell*) enforced by the

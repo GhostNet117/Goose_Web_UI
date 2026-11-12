@@ -52,7 +52,8 @@ def test_prefs_round_trip_per_user(gw):
     # malformed value from a client: stored as an empty list, other prefs untouched
     h = sign_in(client, c, member)
     assert client.put("/api/me/prefs", headers=h, json={"theme": "light", "providerVisibility": "all"}).status_code == 200
-    assert client.get("/api/me/prefs").json() == {"theme": "light", "providerVisibility": {"hidden": []}}
+    got = {k: v for k, v in client.get("/api/me/prefs").json().items() if not k.startswith("_")}   # _rev, _keyRev: 1.18.2
+    assert got == {"theme": "light", "providerVisibility": {"hidden": []}}
 
 
 # ------------------------------------------------------------------ the picker rules, run in node

@@ -5,7 +5,7 @@ import { GET, POST, setCsrf } from './api.js';
 import { rpc, G } from './rpc.js';
 import { store, bus } from './store.js';
 import { router } from './router.js';
-import { loadPrefs, applyTheme, setPref, prefs, resolvedTheme } from './prefs.js';
+import { loadPrefs, applyTheme, setPref, prefs, resolvedTheme, refreshPrefs, prefsChanged, resetPrefsSync } from './prefs.js';
 import { addAsk, resetAsks, resolvedElsewhere, ASK_METHODS, gotoAsk, noteToolCallSource } from './asks.js';
 import { setHerd, upsertAgent, setMyProfile, refreshBadges, browserNotify, chime, setBaseTitle } from './herd.js';
 import { setElsewhere, elsewhereDoneFor } from './elsewhere.js';
@@ -145,6 +145,7 @@ async function clearClientState() {
 
 function teardown() {
   rpc.stop();
+  resetPrefsSync();
   if (view && view.destroy) { try { view.destroy(); } catch { /* */ } }
   view = null;
   if (shell && shell.sidebar && shell.sidebar.destroy) shell.sidebar.destroy();
@@ -289,6 +290,7 @@ rpc.on('hello', (hello) => {
   } else setElsewhere([], false);
   if (hello.draining) toast('Goose Web restarts for an update in a moment. New messages wait until it is back.', { kind: 'warn', timeout: 8000 });
   if (!firstHello) {
+    refreshPrefs();   // 1.18.2: a reconnect re-reads the prefs (saves made while this tab was offline)
     const cur = currentChat();
     for (const c of allChats()) {
       if (c === cur) c.reload().catch(() => {});
@@ -325,6 +327,7 @@ rpc.on('_gw/upstream', (p) => {
   if (p && p.state === 'ready' && prev === 'down') toast('Goose agent is back', { kind: 'success' });
 });
 rpc.on('_gw/guard', (p) => store.set('guardHealth', p || null));
+rpc.on('_gw/prefs', (p) => prefsChanged(p));   // 1.18.2: a prefs save by any tab of this user
 rpc.on('_gw/elsewhere', (p) => {
   setElsewhere((p && p.items) || [], true, (p && p.done) || []);
   // a chat that finished elsewhere while it is open and visible here was seen: it does not wait in Done

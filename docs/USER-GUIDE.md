@@ -1084,7 +1084,7 @@ vs default** shows your changes, and **Default** shows the original. **Save** st
 
 #### Chat
 
-These settings belong to Goose Web and follow you to every device.
+These settings belong to Goose Web and follow you to every device. Since version 1.18.2 a change made in one tab or browser shows in your other open tabs at once, and a tab that was open for a long time can no longer undo newer changes (provider groups, New chat choices, ...) made elsewhere. If two tabs change the same setting at the same moment, the second one is told and shows the first one's version.
 
 | Setting | Values | Default |
 |---|---|---|

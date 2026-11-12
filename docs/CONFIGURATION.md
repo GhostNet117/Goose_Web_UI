@@ -153,7 +153,7 @@ password is changed, set or reset, and when the account is disabled. See [API.md
 | `guard.cache_size` | `2048` | Scores remembered by content hash. |
 | `guard.warm_up` | `true` | Load the model at start-up (and after a settings change) when some guard is on. |
 | `guard.model_dir` | `<system_dir>/models/prompt-guard-2-22m` | Where the model package is installed. |
-| `guard.model_url` / `guard.model_sha256` | empty | Override of the pinned package (the GitHub release asset `prompt-guard-2-22m-onnx-1`, see ADMINISTRATION 9.8), for example an internal https mirror; set both. |
+| `guard.model_url` / `guard.model_sha256` | empty | Override of the pinned package (the GitHub release asset `prompt-guard-2-22m-onnx-1`, see ADMINISTRATION 9.10), for example an internal https mirror; set both. |
 
 ### `elsewhere` keys (Working elsewhere, since 1.16.0)
 
@@ -337,7 +337,7 @@ completed with the 1.4 defaults, empty mode/provider/model lists in teams and us
 user in several teams keeps the team with the lowest id (audit `team.migrate.membership`). See
 [ADMINISTRATION.md](ADMINISTRATION.md#98-upgrading-from-14-the-policy-migration).
 
-Since 1.14.0 a team policy may carry `guard` (prompt guard): `{enabled, check_input, rulesets: [id], trusted_extensions: [name], on_block: "notify"|"silent", auto_approve, threshold}` (`threshold` since 1.18.1: the team's classifier threshold, 0.5-0.99, `null` = `guard.threshold`). Missing = off. While it is on, `allowed_modes` loses `auto` and `smart_approve` (ADMINISTRATION 9.8). Command line: `goose-web guard status | install-model [--file ZIP [--sha256 HEX]] [--if-missing] [--force] | remove-model` (without `--file` it downloads the pinned package; `HTTPS_PROXY` / `NO_PROXY` apply; since 1.18.1 a running gateway notices a removed model at its next check and fails open, no restart needed).
+Since 1.14.0 a team policy may carry `guard` (prompt guard): `{enabled, check_input, rulesets: [id], trusted_extensions: [name], on_block: "notify"|"silent", auto_approve, threshold}` (`threshold` since 1.18.1: the team's classifier threshold, 0.5-0.99, `null` = `guard.threshold`). Missing = off. While it is on, `allowed_modes` loses `auto` and `smart_approve` (ADMINISTRATION 9.10). Command line: `goose-web guard status | install-model [--file ZIP [--sha256 HEX]] [--if-missing] [--force] | remove-model` (without `--file` it downloads the pinned package; `HTTPS_PROXY` / `NO_PROXY` apply; since 1.18.1 a running gateway notices a removed model at its next check and fails open, no restart needed).
 
 ## 6. Profile layout
 

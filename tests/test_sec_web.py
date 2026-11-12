@@ -21,7 +21,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from goose_web import api, security
+from goose_web import api, prefsync, security
 from goose_web import app as gw_app
 from goose_web import auth as auth_mod
 from goose_web.auth import MASK, AuthError, AuthService
@@ -687,7 +687,8 @@ def test_prefs_cannot_write_server_keys(gw):
                                                     "_other": 1})
     assert r.status_code == 200
     prefs = c.db.user_by_id(bob["id"])["prefs"]
-    assert prefs == {"theme": "dark", "_notify": {"webhook": "https://ok.example/h", "events": ["done"]}}
+    assert {k: v for k, v in prefs.items() if k not in prefsync.SERVER_KEYS} == {
+        "theme": "dark", "_notify": {"webhook": "https://ok.example/h", "events": ["done"]}}   # _rev etc.: 1.18.2
 
 
 def test_logout_requires_csrf(gw):

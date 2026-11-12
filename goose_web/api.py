@@ -23,7 +23,7 @@ from starlette.responses import (FileResponse, HTMLResponse, JSONResponse, Plain
 from starlette.routing import Route
 
 from . import guard as guardmod
-from . import guardmodel, hosttasks, logjanitor, security, tls, winsec
+from . import guardmodel, hosttasks, logjanitor, prefsync, security, tls, winsec
 from . import policy as acp_policy
 from .auth import AuthError
 from .context import Ctx, HTTPError, body_json, read_body
@@ -342,19 +342,44 @@ async def me_prefs(request: Request):
     c = ctx(request)
     u = c.require(request, allow_totp_enrol=request.method == "GET").user
     if request.method == "GET":
-        return ok(u.get("prefs") or {})
+        return ok(prefsync.public(c.db.user_by_id(u["id"])["prefs"] or {}))
     b = await body_json(request, MAX_PREFS)
-    # Keys starting with "_" belong to the server (for example _notify, saved through /api/me/notify with its
-    # checks): they are never written from here, and the stored ones are kept (A-14).
-    stored = u.get("prefs") or {}
-    prefs = {k: v for k, v in b.items() if not str(k).startswith("_")}
-    prefs.update({k: v for k, v in stored.items() if str(k).startswith("_")})
-    if "providerVisibility" in prefs:
-        prefs["providerVisibility"] = _clean_provider_visibility(prefs["providerVisibility"])
-    if "providerGroups" in prefs:
-        prefs["providerGroups"] = _clean_provider_groups(prefs["providerGroups"])
-    c.db.update_user(u["id"], prefs=prefs)
-    return ok()
+    # 1.18.2 (bug prefs-stale-tab-overwrite): a save is merged, never a replacement. PATCH = this front end
+    # {baseRev, set, unset, client}: a key changed on the server after baseRev is a conflict (409, nothing applied).
+    # PUT = a front end before 1.18.2 posting its whole object: merge-only, never deletes, stale echoes skipped.
+    # Keys starting with "_" belong to the server (_notify, _rev, ...): never written from here (A-14).
+    if request.method == "PATCH":
+        base = b.get("baseRev")
+        if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+            raise HTTPError(400, "bad_request", "baseRev (the prefs revision this change is based on) is required")
+        sets, unsets, client, mode = b.get("set", {}), b.get("unset", []), prefsync.client_id(b.get("client")), "patch"
+    else:
+        base, sets, unsets, client, mode = None, b, [], "", "legacy-put"
+    res: list = []
+
+    def merge(stored: dict) -> dict | None:
+        r = prefsync.apply(stored, sets, unsets, base_rev=base, clean=PREFS_CLEAN)
+        res.append(r)
+        return r.prefs if (r.changed or r.deleted) else None
+
+    try:
+        c.db.update_prefs(u["id"], merge)
+    except prefsync.PrefsError as e:
+        c.audit(request, "prefs.update", u, detail={"mode": mode, "client": client, "error": e.code,
+                                                     "keys": e.keys[:50]}, ok=False)
+        if e.code == "prefs_conflict":
+            raise HTTPError(409, e.code, str(e), conflicts=e.keys)
+        raise HTTPError(413 if e.code == "prefs_too_large" else 400, e.code, str(e), keys=e.keys[:50])
+    r = res[-1]
+    if r.changed or r.deleted or r.skipped:   # key NAMES only, never values
+        c.audit(request, "prefs.update", u, detail={"mode": mode, "client": client, "rev": r.rev,
+                                                     "keys": r.changed, "deleted": r.deleted, "skipped": r.skipped})
+    pub = prefsync.public(r.prefs)
+    if (r.changed or r.deleted) and c.hub is not None:   # the user's other tabs and browsers update live
+        c.hub.broadcast_user(u["id"], {"jsonrpc": "2.0", "method": "_gw/prefs", "params": {
+            "rev": r.rev, "keys": r.changed + r.deleted, "client": client, "prefs": pub}})
+    return ok({"ok": True, "rev": r.rev, "changed": r.changed, "deleted": r.deleted, "skipped": r.skipped,
+               "prefs": pub})
 
 
 _GROUP_ID = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
@@ -411,6 +436,10 @@ def _clean_provider_visibility(v) -> dict:
         if isinstance(x, str) and x and len(x) <= 200 and x not in hidden:
             hidden.append(x)
     return {"hidden": hidden[:500]}
+
+
+# Prefs values the server cleans on every save (PUT and PATCH).
+PREFS_CLEAN = {"providerVisibility": _clean_provider_visibility, "providerGroups": _clean_provider_groups}
 
 
 def _check_self_totp_allowed(c: Ctx, u: dict) -> None:
@@ -573,8 +602,8 @@ async def me_notify(request: Request):
         except WebhookBlocked as e:
             raise HTTPError(400, "webhook_blocked", f"This webhook address is not allowed: {e}")
     events = [e for e in (b.get("events") or []) if e in ("needs_you", "done", "error")]
-    prefs["_notify"] = {"webhook": hook, "events": events}
-    c.db.update_user(u["id"], prefs=prefs)
+    # re-read inside one transaction: the webhook check above awaited, a prefs save may have landed meanwhile
+    c.db.update_prefs(u["id"], lambda cur: prefsync.set_server_key(cur, "_notify", {"webhook": hook, "events": events}))
     return ok()
 
 
@@ -1929,7 +1958,7 @@ routes = [
     Route("/api/auth/mfa", mfa_step, methods=["GET", "POST"]),
     Route("/api/me", me, methods=["GET", "PATCH"]),
     Route("/api/me/password", me_password, methods=["POST"]),
-    Route("/api/me/prefs", me_prefs, methods=["GET", "PUT"]),
+    Route("/api/me/prefs", me_prefs, methods=["GET", "PUT", "PATCH"]),
     Route("/api/me/totp/setup", totp_setup, methods=["POST"]),
     Route("/api/me/totp/enable", totp_enable, methods=["POST"]),
     Route("/api/me/totp/disable", totp_disable, methods=["POST"]),

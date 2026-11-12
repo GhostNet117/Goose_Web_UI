@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.18.2 - 2026-11-12
+
+**Preferences are merged, never overwritten by an old tab.** No database schema change (the revision lives in the prefs JSON).
+
+- **Fix: a browser tab opened before a preference changed elsewhere could delete or revert it.** Every preference change (theme, sidebar, a new chat's folder, a New chat pick, Settings pages) sent the tab's WHOLE copy and the server replaced the stored prefs with it, so keys added later (for example provider groups) disappeared and newer values went back. Now a tab sends only the keys it changed with the revision its copy is based on (`PATCH /api/me/prefs`); a key that changed on the server since is refused (409) instead of overwritten; only an explicit removal deletes a key. A front end before 1.18.2 that is still open (`PUT`, whole object) is merged: nothing is deleted and values the server has since replaced are ignored.
+- **Live between tabs:** every save is pushed to the user's other tabs and browsers, and a reconnect re-reads the prefs, so no tab keeps an old copy.
+- **Audit:** `prefs.update` records the changed preference names (never values), the tab and the revision.
+- Notification settings and preferences saved at the same moment no longer lose each other.
+- Docs: the prompt guard section of ADMINISTRATION is 9.10 (it was a second 9.8; references updated); the platform message and docs say "Goose Web runs on Windows only" without a version.
+
 ## 1.18.1 - 2026-11-11
 
 **Close-out fixes.** No database schema change.

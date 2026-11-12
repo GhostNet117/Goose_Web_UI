@@ -6,7 +6,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .policy import ANY, CHAT_LISTS, LEGACY_DEFAULT_POLICY
 
@@ -403,6 +403,29 @@ class Database:
         # Column names are checked against the users table's real columns (_check_user_columns);
         # all values are bound parameters.
         self.execute(f"UPDATE users SET {sets} WHERE id=?", [*fields.values(), uid])  # nosec B608
+
+    def update_prefs(self, uid: int, fn: Callable[[dict], dict | None]) -> dict | None:
+        """Read-modify-write one user's prefs in a single transaction (1.18.2): ``fn`` gets the stored prefs (a fresh
+        copy, read inside the transaction) and returns the new prefs, or None to write nothing. Returns what was
+        written (or None). An exception from ``fn`` rolls back."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute("SELECT prefs FROM users WHERE id=?", (uid,)).fetchone()
+                if row is None:
+                    raise KeyError(uid)
+                try:
+                    cur = json.loads(row["prefs"] or "{}")
+                except (TypeError, ValueError):
+                    cur = {}
+                new = fn(cur if isinstance(cur, dict) else {})
+                if new is not None:
+                    self._conn.execute("UPDATE users SET prefs=? WHERE id=?", (json.dumps(new), uid))
+                self._conn.execute("COMMIT")
+                return new
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def _check_user_columns(self, fields: dict) -> None:
         """Allow-list the column names that create_user/update_user interpolate into SQL."""

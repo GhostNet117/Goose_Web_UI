@@ -51,7 +51,7 @@ def _tls_override(settings) -> dict | None:
     return v if isinstance(v, dict) else None
 
 
-WINDOWS_ONLY = ("Goose Web 1.13 runs on Windows only: Linux and macOS have no per-user sandbox yet, so team members' "
+WINDOWS_ONLY = ("Goose Web runs on Windows only: Linux and macOS have no per-user sandbox yet, so team members' "
                 "agents would share this account with full access to every profile. See docs/ADMINISTRATION.md "
                 "section 2. Releases up to 1.12.0 ran on Linux and macOS but are unsupported.")
 
