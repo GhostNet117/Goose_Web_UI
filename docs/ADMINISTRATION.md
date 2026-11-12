@@ -301,9 +301,25 @@ or a Password/S4U logon task). If it is started elevated anyway, it relaunches i
 Medium-integrity token, or refuses to run (exit code 3). `server.allow_elevated: true` disables this guard; leave it
 off.
 
+**Process priority.** Task Scheduler starts a task at task priority 7 unless the task says otherwise: CPU priority
+below normal, low I/O priority, low memory priority. A gateway left like that is starved whenever the computer is
+busy. Measured on a 4-core computer with every core busy: `/healthz` took 3.5 to 4.9 seconds instead of 2
+milliseconds, and the classification endpoint of section 9.11 did not answer within Goose's 5 seconds, so Goose fell
+back to its patterns. Two things prevent this:
+
+- `register-service.ps1` registers the task with priority 4 (normal).
+- At every start the gateway raises what is below normal to normal by itself (`server.priority: normal`, the
+  default) and writes one line to `gateway.log`: `process priority: raised to normal (cpu, io, memory)`. This covers
+  a task that was registered by an earlier version; an upgrade does not register the task again. The agents the
+  gateway starts get the gateway's priority.
+
+Nothing is ever lowered or raised above normal. `server.priority: inherit` leaves the process as it was started. To
+give an existing task the right priority as well (optional, elevated prompt):
+`$t = Get-ScheduledTask -TaskName GooseWeb_Gateway; $t.Settings.Priority = 4; $t | Set-ScheduledTask`.
+
 ### 5.2 What happens at start and stop
 
-At start the gateway opens the database (applying migrations and the audit purge), reads the goose version, and
+At start the gateway opens the database (applying migrations), reads the goose version, and
 registers a worker for every enabled user so that profiles with schedules can run without anyone connected. It
 records `system.start` in the audit log. At stop it stops all workers and records `system.stop`. On Windows the
 workers are in a kill-on-close job object, so they also end if the gateway process dies.

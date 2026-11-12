@@ -76,6 +76,26 @@ if IS_WINDOWS:  # pragma: no branch
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    # process priority (FIX gateway-below-normal-priority)
+    kernel32.GetPriorityClass.argtypes = [wintypes.HANDLE]
+    kernel32.GetPriorityClass.restype = wintypes.DWORD
+    kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.SetPriorityClass.restype = wintypes.BOOL
+    try:
+        kernel32.GetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel32.GetProcessInformation.restype = wintypes.BOOL
+        kernel32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel32.SetProcessInformation.restype = wintypes.BOOL
+        ntdll = ctypes.WinDLL("ntdll")
+        ntdll.NtQueryInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.ULONG,
+                                                    ctypes.POINTER(wintypes.ULONG)]
+        ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+        ntdll.NtSetInformationProcess.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.ULONG]
+        ntdll.NtSetInformationProcess.restype = ctypes.c_long
+        _HAVE_PRIORITY_API = True
+    except (AttributeError, OSError):  # pragma: no cover - a Windows without these calls: only the CPU class is handled
+        ntdll = None
+        _HAVE_PRIORITY_API = False
 
     def _check(ok, what):
         if not ok:
@@ -273,3 +293,97 @@ def ensure_unelevated(allow_elevated: bool = False) -> None:
         sys.stderr.write(f"goose-web: could not de-elevate ({e}); refusing to run elevated.\n")
         raise SystemExit(3)
     raise SystemExit(rc)
+
+
+# ------------------------------------------------------------------------------------------------ process priority
+# FIX gateway-below-normal-priority (2026-11-12). Task Scheduler starts a task at task priority 7 unless the task
+# says otherwise: CPU priority class BELOW_NORMAL, low I/O priority, low memory priority. A gateway started that way
+# is starved by any ordinary process that keeps the cores busy (measured on 4 cores: healthz 2 ms -> 3.5-4.9 s, the
+# classification endpoint gave no answer in 12 s, so Goose fell back to its patterns). The gateway therefore puts
+# itself back to normal at start. A child process gets what its parent has when it is created, so the goose workers
+# follow. Only what is BELOW normal is raised; nothing is ever lowered and nothing goes above normal.
+_CPU_CLASSES = {0x40: "idle", 0x4000: "below_normal", 0x20: "normal", 0x8000: "above_normal", 0x80: "high",
+                0x100: "realtime"}
+_CPU_BELOW_NORMAL = (0x40, 0x4000)
+_IO_LEVELS = {0: "very_low", 1: "low", 2: "normal", 3: "high"}
+_MEMORY_LEVELS = {1: "very_low", 2: "low", 3: "medium", 4: "below_normal", 5: "normal"}
+_CPU_NORMAL, _IO_NORMAL, _MEMORY_NORMAL = 0x20, 2, 5
+_PROCESS_IO_PRIORITY = 33         # NtQueryInformationProcess / NtSetInformationProcess: ProcessIoPriority
+_PROCESS_MEMORY_PRIORITY = 0      # GetProcessInformation / SetProcessInformation: ProcessMemoryPriority
+
+
+def _priority_raw() -> dict:
+    """{'cpu': priority class, 'io': level, 'memory': level}; None = could not be read."""
+    out: dict = {"cpu": None, "io": None, "memory": None}
+    if not IS_WINDOWS:
+        return out
+    h = kernel32.GetCurrentProcess()
+    try:
+        out["cpu"] = int(kernel32.GetPriorityClass(h)) or None
+    except Exception:  # pragma: no cover
+        pass
+    if not _HAVE_PRIORITY_API:  # pragma: no cover
+        return out
+    try:
+        v = wintypes.ULONG(0)
+        if ntdll.NtQueryInformationProcess(h, _PROCESS_IO_PRIORITY, ctypes.byref(v), ctypes.sizeof(v), None) == 0:
+            out["io"] = int(v.value)
+    except Exception:  # pragma: no cover
+        pass
+    try:
+        v = wintypes.ULONG(0)
+        if kernel32.GetProcessInformation(h, _PROCESS_MEMORY_PRIORITY, ctypes.byref(v), ctypes.sizeof(v)):
+            out["memory"] = int(v.value)
+    except Exception:  # pragma: no cover
+        pass
+    return out
+
+
+def _priority_names(raw: dict) -> dict:
+    return {"cpu": _CPU_CLASSES.get(raw.get("cpu"), "unknown"), "io": _IO_LEVELS.get(raw.get("io"), "unknown"),
+            "memory": _MEMORY_LEVELS.get(raw.get("memory"), "unknown")}
+
+
+def process_priority() -> dict:
+    """This process: {'cpu': 'below_normal' | 'normal' | ..., 'io': 'low' | 'normal' | ..., 'memory': 'low' |
+    'normal' | ...}; 'unknown' = could not be read (always on other platforms)."""
+    return _priority_names(_priority_raw())
+
+
+def ensure_normal_priority() -> dict:
+    """Raise what is below normal to normal: the CPU priority class, the I/O priority and the memory priority of
+    this process. Never lowers anything, never goes above normal, never raises an exception.
+    -> {'before': {...}, 'after': {...}, 'changed': ['cpu', 'io', 'memory'], 'errors': ['io: ...']}"""
+    raw = _priority_raw()
+    changed: list[str] = []
+    errors: list[str] = []
+    if IS_WINDOWS:
+        h = kernel32.GetCurrentProcess()
+        if raw["cpu"] in _CPU_BELOW_NORMAL:
+            try:
+                if kernel32.SetPriorityClass(h, _CPU_NORMAL):
+                    changed.append("cpu")
+                else:
+                    errors.append(f"cpu: SetPriorityClass failed (WinError {ctypes.get_last_error()})")
+            except Exception as e:  # pragma: no cover
+                errors.append(f"cpu: {e.__class__.__name__}: {e}")
+        if raw["io"] is not None and raw["io"] < _IO_NORMAL:
+            try:
+                v = wintypes.ULONG(_IO_NORMAL)
+                st = ntdll.NtSetInformationProcess(h, _PROCESS_IO_PRIORITY, ctypes.byref(v), ctypes.sizeof(v))
+                if st == 0:
+                    changed.append("io")
+                else:
+                    errors.append(f"io: NtSetInformationProcess failed (status 0x{st & 0xFFFFFFFF:08X})")
+            except Exception as e:  # pragma: no cover
+                errors.append(f"io: {e.__class__.__name__}: {e}")
+        if raw["memory"] is not None and raw["memory"] < _MEMORY_NORMAL:
+            try:
+                v = wintypes.ULONG(_MEMORY_NORMAL)
+                if kernel32.SetProcessInformation(h, _PROCESS_MEMORY_PRIORITY, ctypes.byref(v), ctypes.sizeof(v)):
+                    changed.append("memory")
+                else:
+                    errors.append(f"memory: SetProcessInformation failed (WinError {ctypes.get_last_error()})")
+            except Exception as e:  # pragma: no cover
+                errors.append(f"memory: {e.__class__.__name__}: {e}")
+    return {"before": _priority_names(raw), "after": process_priority(), "changed": changed, "errors": errors}

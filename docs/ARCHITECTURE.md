@@ -356,6 +356,14 @@ sessions and configuration.
   (`S-1-16-8192`) and the token owner to the user SID, then calls
   `CreateProcessAsUserW`. On failure it raises `OSError` and never falls back
   to an elevated launch.
+- `ensure_normal_priority()` runs in `cmd_serve` right after logging is set up
+  (`_apply_priority`, unless `server.priority: inherit`). A process started by
+  Task Scheduler without a task priority has CPU class BELOW_NORMAL, low I/O
+  priority and low memory priority; the gateway raises each one that is below
+  normal to normal (`SetPriorityClass`, `NtSetInformationProcess`
+  `ProcessIoPriority`, `SetProcessInformation` `ProcessMemoryPriority`) before
+  it starts anything, so its child processes get the same. A failure is a
+  warning in the log, never fatal.
 - `is_elevated()`, `integrity_level()`, `current_user()` and `file_owner()` feed
   `python -m goose_web check` and `GET /api/admin/system`.
   `ownership_report(root)` lists up to 200 files under a profile (scanning at
@@ -378,8 +386,8 @@ sessions and configuration.
 `create_app(settings)` builds the Starlette application. Its lifespan handler:
 
 1. Creates `<system_dir>`.
-2. Opens `Database(<system_dir>/goose-web.db)`. This runs migrations and the
-   audit purge.
+2. Opens `Database(<system_dir>/goose-web.db)`. This runs migrations. (The
+   audit retention is applied by the maintenance loop, section 10.4.)
 3. Creates `WorkerManager`, `Hub(workers)`, `Profiles` and the `Ctx`, and reads
    the Goose version (`goose --version`, 20 s timeout).
 4. Wires hub callbacks: `on_audit` (writes audit rows), `on_event` (webhook

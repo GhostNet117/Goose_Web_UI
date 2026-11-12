@@ -50,6 +50,7 @@ server:
   allowed_hosts: []
   max_upload_mb: 25
   allow_elevated: false
+  priority: normal                          # normal | inherit (process priority, ADMINISTRATION 5.1)
   tls: auto                                 # auto | self-signed | files | off (ADMINISTRATION 6.3)
   tls_cert_file: ""
   tls_key_file: ""
@@ -91,6 +92,7 @@ host_tasks:
 | `server.allowed_hosts` | `[]` | Extra host names or IPs (no ports, no wildcards) accepted in the `Host` header. This guards against DNS rebinding (`app.py: HostGuard`). Always allowed: the `public_url` host, `localhost`, `127.0.0.1`, `::1`, and `server.host` unless it is `0.0.0.0` or `::`. Other Host values get `400 invalid host`, and `GET /healthz` is exempt. Environment: `GOOSE_WEB__SERVER__ALLOWED_HOSTS=goose,192.168.1.10` (comma separated) or a YAML list. |
 | `server.max_upload_mb` | `25` | Size limit per uploaded file (`/api/fs/upload`, at most 20 files per request). |
 | `server.allow_elevated` | `false` | If true, the gateway runs with an elevated token instead of refusing. Leave it false. |
+| `server.priority` | `normal` | `normal`: at start the gateway raises its own CPU priority class, I/O priority and memory priority to normal when they are lower (Task Scheduler starts a task below normal unless the task has a priority), never higher. `inherit`: leave the process as it was started. Any other value means `normal`. |
 | `paths.profiles_root` | `C:\Goose_Web_Profiles` | Parent of all isolated profiles and of `_system`. |
 | `paths.system_dir` | `""` (= `<profiles_root>/_system`) | Database, logs, team library, backups, built-in TLS files (`tls/`). |
 | `server.tls` | `auto` | HTTPS: `self-signed` (built-in local CA + server certificate, renewed automatically), `files` (your PEM certificate and key), `off` (plain HTTP behind a reverse proxy). `auto` = `self-signed` unless `public_url` is set. Admin > System > HTTPS overrides it (stored in the database). Applies at the next start (ADMINISTRATION 6.3). |

@@ -134,6 +134,10 @@ DEFAULTS: dict[str, Any] = {
         "allowed_hosts": [],
         "max_upload_mb": 25,
         "allow_elevated": False,          # Windows: refuse to run with an admin token (ownership guarantee)
+        # normal | inherit. Task Scheduler starts a task below normal (CPU, I/O, memory) unless the task says
+        # otherwise; a gateway left like that is starved whenever the computer is busy. normal = the gateway raises
+        # what is below normal to normal at start (never higher). inherit = leave it as it was started.
+        "priority": "normal",
         # HTTPS (tls.py, spec 015): auto | self-signed | files | off. auto = self-signed unless public_url is set
         # (then a reverse proxy terminates TLS). Admin > System > HTTPS overrides this. Applies at the next start.
         "tls": "auto",

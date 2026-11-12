@@ -61,13 +61,17 @@ if (-not $NoTask) {
         Write-Host "[dry run]   trigger:  $(if ($Mode -eq 'Service') { 'at system startup' } else { "at logon of $User" })"
         Write-Host "[dry run]   runs as:  $User, logon type $logon$(if ($gmsa) { ' (gMSA, no password)' } elseif ($Mode -eq 'Service') { ' (password asked in a secure prompt)' }), run level Limited"
         Write-Host "[dry run]   restart:  every 1 min on failure (999 times), no time limit, one instance"
+        Write-Host "[dry run]   priority: 4 (normal; Task Scheduler's default 7 is below normal)"
     } else {
         $action = New-ScheduledTaskAction -Execute $pyw -Argument $arg -WorkingDirectory $InstallDir
         $trigger = if ($Mode -eq 'Service') { New-ScheduledTaskTrigger -AtStartup } else { New-ScheduledTaskTrigger -AtLogOn -User $User }
         $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType $logon -RunLevel Limited
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
             -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) `
-            -MultipleInstances IgnoreNew
+            -MultipleInstances IgnoreNew -Priority 4
+        # -Priority 4 = normal. Without it Task Scheduler starts the task at priority 7: CPU below normal, low I/O
+        # and memory priority, and the gateway is starved whenever the computer is busy. The gateway also corrects
+        # its own priority at start (server.priority), which covers tasks registered before this line existed.
         $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description $desc
         if ($Mode -eq 'Service' -and -not $gmsa) {
             $cred = Get-Credential -UserName $User -Message "Password of $User (stored by Windows for the Goose Web task only)"

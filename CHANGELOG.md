@@ -62,6 +62,13 @@ recipes); Goose Web now configures them where Goose reads them. No database sche
   - `install.ps1` shows the generated initial password before any later step can fail.
   - `.gitignore`: models, archives, key stores, environment files, journals and backups.
   - Tests and one comment use a neutral example relay port.
+- **The gateway runs at normal priority.** Task Scheduler starts a task below normal (CPU, I/O and memory priority)
+  unless the task has a priority, and the gateway's task had none. Whenever the computer was busy the whole gateway
+  was starved: on 4 busy cores `/healthz` took 3.5 to 4.9 s instead of 2 ms, and the new classification endpoint did
+  not answer within Goose's 5 s, so Goose fell back to its patterns. The gateway now raises what is below normal to
+  normal at every start (`server.priority`, default `normal`; `inherit` leaves it) and logs it, which also covers
+  tasks registered by earlier versions; `register-service.ps1` registers new tasks with priority 4. Measured after
+  the fix, same load: `/healthz` 2 to 12 ms, a classification in about half a second.
 - **Command line:** `goose-web security status | on | off | rotate-tokens`; `goose-web check` shows the state.
   **API:** `GET/PUT /api/admin/goose-security`, `POST .../check`, `POST .../rotate`.
 - **Fix:** `goose-web check` reported the gateway's port as free when `server.host` is a LAN address (it probed

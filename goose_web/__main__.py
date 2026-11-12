@@ -78,6 +78,27 @@ def platform_supported() -> bool:
     return sys.platform == "win32"
 
 
+def _apply_priority(settings) -> dict | None:
+    """FIX gateway-below-normal-priority: a gateway started by Task Scheduler runs below normal (CPU class, I/O and
+    memory priority) unless the task asks for more, and is then starved whenever the computer is busy. Raise what
+    is below normal to normal, before anything is started (children get what the gateway has). server.priority:
+    inherit leaves it alone. Logged; never fatal. -> the result of winsec.ensure_normal_priority, None = left alone."""
+    from . import winsec
+    log = logging.getLogger("goose_web")
+    text = lambda p: f"CPU {p['cpu']}, I/O {p['io']}, memory {p['memory']}"   # noqa: E731
+    if str(settings.get("server", "priority") or "normal").strip().lower() == "inherit":
+        log.info("process priority: left as started (server.priority: inherit): %s", text(winsec.process_priority()))
+        return None
+    r = winsec.ensure_normal_priority()
+    if r["changed"]:
+        log.info("process priority: raised to normal (%s). It was started with %s - Task Scheduler's default for a "
+                 "task without a priority; now %s", ", ".join(r["changed"]), text(r["before"]), text(r["after"]))
+    for e in r["errors"]:
+        log.warning("process priority: could not be raised to normal (%s); the gateway may be slow while the "
+                    "computer is busy. Register the task with priority 4 (scripts\\register-service.ps1).", e)
+    return r
+
+
 def cmd_serve(args, settings) -> int:
     if not platform_supported():
         print("goose-web: " + WINDOWS_ONLY, file=sys.stderr)
@@ -85,6 +106,7 @@ def cmd_serve(args, settings) -> int:
     from . import winsec
     winsec.ensure_unelevated(bool(settings.get("server", "allow_elevated")))
     _setup_logging(settings)
+    _apply_priority(settings)
     import uvicorn
     from .app import create_app
     host = args.host or settings.get("server", "host")
