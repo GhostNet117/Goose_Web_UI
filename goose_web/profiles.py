@@ -469,7 +469,11 @@ class Profiles:
         except OSError:
             pass
         others = []
-        for f in dst_dir.glob(f"{p.name}.*.unreadable"):
+        try:
+            found = list(dst_dir.glob(f"{p.name}.*.unreadable"))
+        except OSError:   # the folder cannot be listed: nothing is pruned this time, the set-aside itself is done
+            found = []
+        for f in found:
             try:
                 if f != dst and f.is_file() and not f.is_symlink():
                     others.append((f.stat().st_mtime, f))

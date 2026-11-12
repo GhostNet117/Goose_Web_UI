@@ -780,15 +780,16 @@ async def test_native_read_back_mismatch_is_a_failure_of_its_own_not_a_change_ma
 
     class StoresAnotherType(FakeUp):
         async def request(self, method, params=None, timeout=None):
-            if method.endswith("config/upsert") and (params or {}).get("key") == KEYS[1]:
+            if method.endswith("config/upsert") and (params or {}).get("key") in KEYS[:2]:
                 params = {**params, "value": str(params["value"])}          # Goose keeps "0.8" where 0.8 was sent
             return await super().request(method, params, timeout)
 
     up = StoresAnotherType(cdir)
-    for _ in range(3):
+    for _ in range(3):   # F-8: TWO keys come back differently; every one is read back before the apply fails once
         st = await apply(s, db, up, admin, cdir)
-        assert st["ok"] is False and "did not read back" in st["error"]
-        assert st["reasserted"] == [] and "configBackup" not in st and st["written"][KEYS[1]] == "0.8"
+        assert st["ok"] is False and "did not read back" in st["error"] and KEYS[0] in st["error"] and KEYS[1] in st["error"]
+        assert st["reasserted"] == [] and "configBackup" not in st
+        assert st["written"][KEYS[0]] == "True" and st["written"][KEYS[1]] == "0.8"
     assert not (s.system_dir / "backups" / "native-security").exists()
 
 
@@ -799,10 +800,13 @@ async def test_native_apply_that_is_interrupted_keeps_what_it_wrote_as_its_own(e
     s, db, pr, c = env
     admin, cdir = native_admin(db, tmp_path)
 
+    during = []
+
     class Interrupted(FakeUp):
         async def request(self, method, params=None, timeout=None):
             r = await super().request(method, params, timeout)              # the write lands in Goose ...
             if method.endswith("config/upsert") and (params or {}).get("key") == KEYS[1]:
+                during.append(GS.native_state(db))                          # what a killed process would leave behind
                 raise asyncio.CancelledError() if how == "the gateway stops" else TimeoutError("no answer")
             return r
 
@@ -813,15 +817,114 @@ async def test_native_apply_that_is_interrupted_keeps_what_it_wrote_as_its_own(e
         assert GS.native_state(db)["error"] == "interrupted"
     else:
         assert (await apply(s, db, up, admin, cdir))["ok"] is False
+    # F-4: the record made before the write says "not finished", with what was written and the write in flight
+    assert during[0]["ok"] is False and during[0]["error"] == "interrupted"
+    assert during[0]["written"] == {KEYS[0]: True} and during[0]["pending"] == {KEYS[1]: 0.8}
     st = GS.native_state(db)
     assert st["ok"] is False and st["written"] == {KEYS[0]: True} and up.cfg()[KEYS[1]] == 0.8
-    assert st["pending"] == {KEYS[1]: 0.8, KEYS[2]: True, KEYS[3]: ENDPOINT}
+    assert st["pending"] == {KEYS[1]: 0.8}                                  # only the write in flight (F-6)
     st = await apply(s, db, FakeUp(cdir), admin, cdir)                      # the next start finishes the job
     assert st["ok"] and set(st["written"]) == set(KEYS) and st["pending"] == {} and st["foreign"] == []
     assert st["reasserted"] == [] and sorted(st["changed"]) == sorted([KEYS[2], KEYS[3], f"{TOKEN_KEY} set"])
     GS.save(db, GS.clean({"enabled": False}))
     assert (await apply(s, db, FakeUp(cdir), admin, cdir))["ok"]
     assert not any(k in FakeUp(cdir).cfg() for k in KEYS)                   # "off" removes all of it
+
+
+async def test_native_value_that_cannot_be_compared_is_put_back_not_a_reason_to_do_nothing(env, tmp_path):
+    """F-1 (High): numbers were compared through float(), which raises on a huge integer in config.yaml. The drift
+    check raised, the sync only logged it, and at every start nothing was applied, recorded, audited or said."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    up = FakeUp(cdir)
+    fc, notices, worker = fake_ctx(s, db, pr, up)
+    assert (await GS.sync_native(fc))["ok"]
+    rewrite(cdir, **{KEYS[0]: False, KEYS[1]: 10 ** 309})
+    assert not GS._same(10 ** 309, 0.8) and not GS._same(0.8, 10 ** 309) and GS._same(10 ** 309, 10 ** 309)
+    assert GS.native_drift(cdir, native_plan(db, admin), GS.native_state(db)) == [
+        f"{KEYS[0]} changed outside Goose Web", f"{KEYS[1]} changed outside Goose Web"]
+    st = await GS.sync_native(fc)
+    assert st["ok"] and up.cfg()[KEYS[0]] is True and up.cfg()[KEYS[1]] == 0.8
+    assert st["reasserted"] == [KEYS[0], KEYS[1]] and len(notices) == 1
+
+
+async def test_native_drift_and_sync_never_fail_silently(env, tmp_path, monkeypatch):
+    """F-1, the other half: whatever goes wrong before apply_native runs must not leave "Applied" on the page."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    fc, notices, worker = fake_ctx(s, db, pr, FakeUp(cdir))
+    assert (await GS.sync_native(fc))["ok"]
+    good = GS.native_state(db)
+    with monkeypatch.context() as m:                                        # a comparison that raises is drift
+        m.setattr(GS, "_same", lambda a, b: (_ for _ in ()).throw(OverflowError("int too large")))
+        assert GS.native_drift(cdir, native_plan(db, admin), good) == ["the settings could not be compared"]
+    with monkeypatch.context() as m:                                        # a failure of the sync itself
+        m.setattr(GS, "native_drift", lambda *a, **k: (_ for _ in ()).throw(OverflowError("int too large")))
+        st = await GS.sync_native(fc)
+    assert st["ok"] is False and "OverflowError" in st["error"]
+    rec = GS.native_state(db)
+    assert rec["ok"] is False and "OverflowError" in rec["error"] and set(rec["written"]) == set(KEYS)
+    assert db.query("SELECT ok FROM audit WHERE action='goosesec.native' ORDER BY id DESC LIMIT 1")[0]["ok"] == 0
+    assert len(notices) == 1 and "could not be checked" in notices[0]["params"]["message"]
+    assert "the last apply failed" in GS.native_drift(cdir, native_plan(db, admin), rec)   # the next start tries again
+
+
+async def test_native_apply_that_fails_before_deciding_keeps_the_write_in_flight_on_record(env, tmp_path):
+    """F-2: a second apply that failed early (Goose still not answering) wiped `pending`; the write that had landed
+    then belonged to nobody again."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+
+    class LandsButNoAnswer(FakeUp):
+        async def request(self, method, params=None, timeout=None):
+            r = await super().request(method, params, timeout)
+            if method.endswith("config/upsert") and (params or {}).get("key") == KEYS[0]:
+                raise TimeoutError("no answer")
+            return r
+
+    assert (await apply(s, db, LandsButNoAnswer(cdir), admin, cdir))["ok"] is False
+    assert GS.native_state(db)["pending"] == {KEYS[0]: True} and FakeUp(cdir).cfg()[KEYS[0]] is True
+    st = await apply(s, db, FakeUp(cdir, fail=TimeoutError("still down")), admin, cdir)   # fails at the first read
+    assert st["ok"] is False and st["pending"] == {KEYS[0]: True} and st["written"] == {}
+    st = await apply(s, db, FakeUp(cdir), admin, cdir)
+    assert st["ok"] and set(st["written"]) == set(KEYS) and st["pending"] == {} and st["reasserted"] == []
+    GS.save(db, GS.clean({"enabled": False}))
+    assert (await apply(s, db, FakeUp(cdir), admin, cdir))["ok"] and not any(k in FakeUp(cdir).cfg() for k in KEYS)
+
+
+async def test_native_switch_goose_web_wrote_is_put_back_also_next_to_an_endpoint_it_never_wrote(env, tmp_path):
+    """F-3: with the classifier unused Goose Web writes the switch (off) and no endpoint. An endpoint added outside
+    made the classifier-group rule let go of that switch, without drift, audit or notice."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    GS.save(db, GS.clean({"classifier": False}))
+    up = FakeUp(cdir)
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and up.cfg()[KEYS[2]] is False and KEYS[3] not in up.cfg() and set(st["written"]) == set(KEYS[:3])
+    rewrite(cdir, **{KEYS[3]: THEIRS, KEYS[2]: True})
+    assert GS.native_drift(cdir, native_plan(db, admin), st) == [f"{KEYS[2]} changed outside Goose Web"]
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and up.cfg()[KEYS[2]] is False and st["reasserted"] == [KEYS[2]]
+    assert up.cfg()[KEYS[3]] == THEIRS and st["foreign"] == [KEYS[3]]       # the endpoint was never Goose Web's: kept
+    assert GS.native_drift(cdir, native_plan(db, admin), st) == []
+
+
+async def test_native_off_removes_a_key_goose_web_wrote_whatever_it_holds_now(env, tmp_path):
+    """F-5: on "off" a key that had been changed outside was let go; after "off" and "on" it counted as the
+    administrator's own and was kept as changed."""
+    s, db, pr, c = env
+    admin, cdir = native_admin(db, tmp_path)
+    up = FakeUp(cdir)
+    assert (await apply(s, db, up, admin, cdir))["ok"]
+    rewrite(cdir, **{KEYS[1]: 1.0})
+    GS.save(db, GS.clean({"enabled": False}))
+    assert f"{KEYS[1]} present" in GS.native_drift(cdir, native_plan(db, admin), GS.native_state(db))
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and not any(k in up.cfg() for k in KEYS) and st["written"] == {} and st["foreign"] == []
+    assert json.loads(Path(st["configBackup"]).read_text(encoding="utf-8")) == {KEYS[1]: 1.0}
+    GS.save(db, GS.clean({"enabled": True}))
+    st = await apply(s, db, up, admin, cdir)
+    assert st["ok"] and up.cfg()[KEYS[1]] == 0.8 and st["foreign"] == [] and set(st["written"]) == set(KEYS)
 
 
 async def test_native_value_equal_to_the_plan_that_goose_web_never_wrote_stays_the_administrators(env, tmp_path):
@@ -938,7 +1041,35 @@ def test_set_aside_pruning_cannot_be_steered_by_the_file_s_date_or_attributes(en
     kept = [f.read_text(encoding="utf-8") for f in folder.glob("config.yaml.*.unreadable")]
     assert len(kept) == pr.SET_ASIDE_KEEP and "GOOSE_MODE: [back-dated-\n" in kept
     last = db.query("SELECT detail FROM audit WHERE action='profile.file.set_aside' ORDER BY id DESC LIMIT 1")[0]
-    assert Path(last["detail"]["movedTo"]).is_file()
+    moved = Path(last["detail"]["movedTo"])
+    assert moved.is_file() and moved.read_text(encoding="utf-8") == "GOOSE_MODE: [back-dated-\n"
+    import time
+    assert moved.stat().st_mtime > time.time() - 300                        # dated when it was set aside, not 2001
+
+
+@pytest.mark.skipif(__import__("os").name != "nt", reason="an open file cannot be deleted on Windows")
+def test_set_aside_pruning_carries_on_after_a_file_it_cannot_delete(env):
+    """Pins the behaviour around T-8: a file that cannot be deleted stays, and the others are still pruned. (This
+    test also passes on the code before the fix, where the order happened to put such a file last; the test that
+    fails without the T-8 fix is the read-only one above.)"""
+    s, db, pr, c = env
+    alice = member(db)
+    pr.provision(alice)
+    p = pr.config_dir(alice) / "config.yaml"
+    folder = s.system_dir / "backups" / "profiles" / "alice"
+    for i in range(pr.SET_ASIDE_KEEP):
+        p.write_text(f"GOOSE_MODE: [first-{i}-\n", encoding="utf-8")
+        pr.provision(alice)
+    oldest = min(folder.glob("config.yaml.*.unreadable"), key=lambda f: f.stat().st_mtime)
+    with open(oldest, "rb"):                                                # held open: Windows refuses the delete
+        for i in range(3):
+            p.write_text(f"GOOSE_MODE: [later-{i}-\n", encoding="utf-8")
+            pr.provision(alice)
+        assert oldest.exists()
+        kept = sorted(f.read_text(encoding="utf-8") for f in folder.glob("config.yaml.*.unreadable") if f != oldest)
+    # the newest KEEP are there and the others were pruned, although one file in the way could not be deleted
+    assert len(kept) == pr.SET_ASIDE_KEEP and all(f"GOOSE_MODE: [later-{i}-\n" in kept for i in range(3))
+    assert "GOOSE_MODE: [first-1-\n" not in kept
 
 
 @pytest.mark.parametrize("text", ["x: 2001-99-99\n", "a: " + "[" * 3000 + "]" * 3000 + "\n"])

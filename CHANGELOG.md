@@ -77,7 +77,9 @@ recipes); Goose Web now configures them where Goose reads them. No database sche
   third review of that fix showed ways round a rule that only put "weaker" values back, so the rule is now simple:
   **a setting Goose Web wrote in the administrator's Goose profile stays Goose Web's.** Changed or removed in the
   file, it is put back at the next start, with the changed value saved, an audit entry, a notice and a line on the
-  page. What was there before Goose Web first wrote a setting is still kept. Also: a setting that merely equals
+  page. What was there before Goose Web first wrote a setting is still kept. A fourth review of that rule found
+  that a value which could not be compared (a huge number) stopped the check for good, in silence; comparisons no
+  longer convert, and a check that fails is recorded and shown. Also: a setting that merely equals
   Goose Web's is no longer treated as Goose Web's; the backup on take-over is written first; an interrupted apply
   no longer leaves values that belong to nobody; a WebSocket whose sign-in or rights cannot be re-checked is closed;
   refused change-password requests write one audit row per window; set-aside profile files get unique names, the

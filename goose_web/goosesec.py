@@ -378,7 +378,7 @@ def _same(a: Any, b: Any) -> bool:
     def num(v: Any) -> bool:
         return isinstance(v, (int, float)) and not isinstance(v, bool)
     if num(a) and num(b):
-        return float(a) == float(b)
+        return a == b   # exact, and never a conversion: float() of a huge integer raises (fourth review, F-1)
     return a == b and type(a) is type(b)
 
 
@@ -413,9 +413,11 @@ async def apply_native(*, db, settings, upstream, config_dir: Path, user: dict, 
         it (R-3, T-1). What is kept is only what was there BEFORE Goose Web first wrote the key;
       - a value that already equals the plan but that Goose Web never wrote stays the administrator's own, so a
         later "off" does not remove it (R-4);
-      - what is about to be written is recorded before the first write (`pending`), and an interrupted apply is
-        recorded too, so a write that landed is never left belonging to nobody (T-3); after a failed read-back the
-        value Goose really holds is what is remembered (T-2).
+      - the write in flight is recorded before every write (`pending`), and an interrupted apply is recorded too,
+        so a write that landed is never left belonging to nobody (T-3, F-2, F-4, F-7); after a failed read-back the
+        value Goose really holds is what is remembered (T-2, F-8);
+      - on "off" a key Goose Web wrote is removed whatever it holds now, and the classifier-group rule (an endpoint
+        that was there before Goose Web) never covers a key Goose Web wrote (F-3, F-5).
     Every write is read back. A request Goose could not be asked (worker down, timeout, unknown method) is a
     failure, never "the key is not there" (E-7)."""
     cfg = load(db)
@@ -429,7 +431,9 @@ async def apply_native(*, db, settings, upstream, config_dir: Path, user: dict, 
     our_adv = pn.get("adversaryHash")
     state: dict[str, Any] = {"ok": True, "at": time.time(), "goose": goose_version, "user": user.get("username"),
                              "detection": bool(cfg["enabled"]), "classifier": bool(plan["secret"]),
-                             "changed": [], "foreign": [], "reasserted": [], "pending": {}, "error": "",
+                             # `pending` stays what it was until this apply has decided on what Goose holds now: an
+                             # apply that fails before that must not forget a write in flight (fourth review, F-2)
+                             "changed": [], "foreign": [], "reasserted": [], "pending": dict(pending), "error": "",
                              "written": dict(ours), "tokenFp": pn.get("tokenFp") or "",
                              "adversary": pn.get("adversary") or "off", "adversaryHash": our_adv}
     if isinstance(pn.get("putBack"), dict):
@@ -470,17 +474,23 @@ async def apply_native(*, db, settings, upstream, config_dir: Path, user: dict, 
         def present(k: str) -> bool:
             return have[k] is not None and have[k] is not unknown
 
+        # A write that was in flight when an earlier apply ended: if Goose holds exactly that value, it landed, and
+        # it is Goose Web's from here on (fourth review, F-7).
+        for k, v in pending.items():
+            if k in have and present(k) and _same(have[k], v):
+                ours[k] = v
+                state["written"][k] = v
+
         def managed(k: str) -> bool:
-            """Goose Web wrote this key (or was writing it when it was interrupted): it is Goose Web's to keep."""
+            """Goose Web wrote this key (or was writing it when an apply was interrupted): Goose Web's to keep."""
             return k in ours or k in pending
 
         def is_ours(k: str) -> bool:
             """The value that is there is the one Goose Web wrote."""
-            return present(k) and ((k in ours and _same(have[k], ours[k]))
-                                   or (k in pending and _same(have[k], pending[k])))
+            return present(k) and k in ours and _same(have[k], ours[k])
 
-        # A classifier endpoint that was there before Goose Web ever wrote one: its switch and its token stay as
-        # they are. (An endpoint Goose Web wrote and something changed afterwards is put back like any managed key.)
+        # A classifier endpoint that was there before Goose Web ever wrote one: a switch and a token Goose Web never
+        # wrote stay as they are next to it. A key Goose Web wrote is never let go this way (fourth review, F-3).
         group_foreign = (present(CLS_ENDPOINT) and not managed(CLS_ENDPOINT) and not adopt
                          and not _same(have[CLS_ENDPOINT], plan["config"].get(CLS_ENDPOINT)))
         # Decide everything first, write afterwards: the values that will be replaced are saved before the first
@@ -495,10 +505,9 @@ async def apply_native(*, db, settings, upstream, config_dir: Path, user: dict, 
                     if managed(key) or adopt:   # R-4: an equal value Goose Web never wrote stays the administrator's
                         state["written"][key] = want
                     continue
-                if (key in (CLS_ENABLED, CLS_ENDPOINT) and group_foreign) or \
-                        (present(key) and not managed(key) and not adopt):
+                if not managed(key) and ((key in (CLS_ENABLED, CLS_ENDPOINT) and group_foreign)
+                                         or (present(key) and not adopt)):
                     state["foreign"].append(key)      # there before Goose Web: the administrator's own, kept
-                    state["written"].pop(key, None)
                     continue
                 # A key Goose Web wrote that is gone or holds something else was changed outside Goose Web. It is
                 # put back whatever the new value is (third review, T-1: judging "weaker or stricter" left ways
@@ -511,13 +520,17 @@ async def apply_native(*, db, settings, upstream, config_dir: Path, user: dict, 
                 what = key if not outside else \
                     f"{key} put back (it had been {'changed' if present(key) else 'removed'} outside Goose Web)"
                 todo.append((key, want, what, outside))
-            else:   # the plan wants the key gone: only Goose Web's own value is removed
-                if is_ours(key) and not (key == CLS_ENABLED and group_foreign):
+            elif managed(key):   # the plan wants the key gone and it is Goose Web's: removed whatever it holds now
+                if present(key):
+                    if not is_ours(key):
+                        replaced[key] = cur   # changed outside meanwhile (F-5): saved, then removed with the rest
                     gone.append(key)
                 else:
-                    if present(key):
-                        state["foreign"].append(key)
                     state["written"].pop(key, None)
+            elif present(key):
+                state["foreign"].append(key)          # there before Goose Web: kept
+        # The decisions stand on what Goose holds now. From here on only the one write in flight is pending.
+        state["pending"] = {}
         if replaced:
             d = Path(settings.system_dir) / "backups" / "native-security"
             d.mkdir(parents=True, exist_ok=True)
@@ -528,18 +541,21 @@ async def apply_native(*, db, settings, upstream, config_dir: Path, user: dict, 
                 bak = d / f"config-keys.{stamp}-{n}.json"
             bak.write_text(json.dumps(replaced, indent=1, default=str), encoding="utf-8")
             state["configBackup"] = str(bak)
-        if todo:
-            # T-3: what is about to be written is recorded BEFORE the first write. A write that lands in Goose while
-            # this apply is interrupted (a lost answer, the gateway stopping) is then still known as Goose Web's.
-            state["pending"] = {key: want for key, want, _, _ in todo}
+
+        def progress() -> None:
+            """Before every write: what was written so far and the write in flight. Even a process that is killed
+            then leaves a record that says "not finished" (F-4) and knows the in-flight key as its own (T-3)."""
             db.set_setting(STATE_SETTING, {**(prev if isinstance(prev, dict) else {}), "native": {
-                "ok": False, "error": "interrupted", "at": state["at"], **pn,
-                "pending": {**pending, **state["pending"]}}})
+                **pn, "ok": False, "error": "interrupted", "at": state["at"],
+                "written": dict(state["written"]), "pending": dict(state["pending"])}})
+
         wrote: list[str] = []
         for key, want, what, outside in todo:
+            state["pending"] = {key: want}
+            progress()
             await upsert(key, want)
             state["written"][key] = want
-            state["pending"].pop(key, None)
+            state["pending"] = {}
             state["changed"].append(what)
             if outside:
                 state["reasserted"].append(key)   # only what was really written (T-4)
@@ -548,7 +564,8 @@ async def apply_native(*, db, settings, upstream, config_dir: Path, user: dict, 
             await remove(key)
             state["written"].pop(key, None)
             state["changed"].append(f"{key} removed")
-        for key in wrote:   # read back
+        bad: list[str] = []
+        for key in wrote:   # read back, every key (F-8), then fail once
             back = await read(key)
             if back is unknown or not _same(back, state["written"][key]):
                 # T-2: what Goose really holds is what gets remembered, so the next apply sees a value of its own
@@ -557,7 +574,9 @@ async def apply_native(*, db, settings, upstream, config_dir: Path, user: dict, 
                     state["written"].pop(key, None)
                 else:
                     state["written"][key] = back
-                raise RuntimeError(f"{key} did not read back as written")
+                bad.append(key)
+        if bad:
+            raise RuntimeError(f"{', '.join(bad)} did not read back as written")
         if plan["secret"] and not group_foreign:
             have_t = await read(CLS_TOKEN, True)
             # Goose masks a secret it returns, so the token is written at every apply (the same value changes nothing)
@@ -649,30 +668,40 @@ def native_drift(config_dir: Path, plan: dict, state: dict | None) -> list[str]:
         cfg = {}
     except Exception:   # unreadable, or not YAML
         return out + ["config.yaml could not be read"]
-    ours = state.get("written") if isinstance(state.get("written"), dict) else {}
+    ours = dict(state["written"]) if isinstance(state.get("written"), dict) else {}
     pending = state.get("pending") if isinstance(state.get("pending"), dict) else {}
+    try:   # the same decisions as apply_native, in the same order
+        for k, v in pending.items():   # a write in flight that landed is Goose Web's
+            if k in cfg and _same(cfg[k], v):
+                ours[k] = v
 
-    def managed(k: str) -> bool:
-        return k in ours or k in pending
+        def managed(k: str) -> bool:
+            return k in ours or k in pending
 
-    def is_ours(k: str) -> bool:
-        return k in cfg and ((k in ours and _same(cfg[k], ours[k])) or (k in pending and _same(cfg[k], pending[k])))
-    group_foreign = (CLS_ENDPOINT in cfg and not managed(CLS_ENDPOINT)
-                     and not _same(cfg[CLS_ENDPOINT], plan["config"].get(CLS_ENDPOINT)))
-    for k in CONFIG_KEYS:   # the same decisions as apply_native, in the same order
-        if k in plan["config"]:
-            if k in cfg and _same(cfg[k], plan["config"][k]):
-                continue
-            if (group_foreign and k in (CLS_ENABLED, CLS_ENDPOINT)) or (k in cfg and not managed(k)):
-                continue   # there before Goose Web wrote the key: kept
-            if managed(k) and not is_ours(k) and (k in ours or k in cfg):
-                out.append(f"{k} {'changed' if k in cfg else 'removed'} outside Goose Web")
-            else:
-                out.append(k)
-        elif is_ours(k):
-            out.append(f"{k} present")
-    if not group_foreign and token_fingerprint(plan["secret"]) != (state.get("tokenFp") or ""):
-        out.append(CLS_TOKEN)
+        def is_ours(k: str) -> bool:
+            return k in cfg and k in ours and _same(cfg[k], ours[k])
+        group_foreign = (CLS_ENDPOINT in cfg and not managed(CLS_ENDPOINT)
+                         and not _same(cfg[CLS_ENDPOINT], plan["config"].get(CLS_ENDPOINT)))
+        for k in CONFIG_KEYS:
+            if k in plan["config"]:
+                if k in cfg and _same(cfg[k], plan["config"][k]):
+                    continue
+                if not managed(k) and ((group_foreign and k in (CLS_ENABLED, CLS_ENDPOINT)) or k in cfg):
+                    continue   # there before Goose Web wrote the key: kept
+                if managed(k) and not is_ours(k) and (k in ours or k in cfg):
+                    out.append(f"{k} {'changed' if k in cfg else 'removed'} outside Goose Web")
+                else:
+                    out.append(k)
+            elif managed(k) and k in cfg:
+                out.append(f"{k} present")
+        if not group_foreign and token_fingerprint(plan["secret"]) != (state.get("tokenFp") or ""):
+            out.append(CLS_TOKEN)
+    except Exception as e:
+        # A value that cannot even be compared is never a reason to do nothing (fourth review, F-1): apply_native
+        # then asks Goose, and whatever happens there is recorded.
+        log.warning("goose security: the native profile's settings could not be compared (%s: %s)",
+                    e.__class__.__name__, str(e)[:120])
+        out.append("the settings could not be compared")
     adv = Path(config_dir) / ADVERSARY_FILE
     cur = file_hash(adv) if adv.is_file() else None
     theirs = state.get("adversaryHash")
@@ -751,4 +780,22 @@ async def sync_native(c, *, adopt: bool = False, force: bool = False) -> dict | 
             return state
         except Exception as e:
             log.exception("goose security: native sync")
-            return {"ok": False, "error": f"{e.__class__.__name__}: {str(e)[:300]}", "changed": [], "at": time.time()}
+            # A failure in here (not inside apply_native, which records its own) used to leave nothing but a log
+            # line, and the page went on saying "Applied" (fourth review, F-1). Recorded, audited and shown.
+            err = f"{e.__class__.__name__}: {str(e)[:300]}"
+            st = {"ok": False, "error": err, "changed": [], "at": time.time()}
+            try:
+                whole = c.db.get_setting(STATE_SETTING)
+                whole = whole if isinstance(whole, dict) else {}
+                was = whole.get("native") if isinstance(whole.get("native"), dict) else {}
+                whole["native"] = {**was, "ok": False, "at": st["at"],
+                                   "error": "the settings could not be checked or applied: " + err}
+                c.db.set_setting(STATE_SETTING, whole)
+                c.db.audit("goosesec.native", detail={"error": err}, ok=False)
+                c.hub.broadcast_admins({"jsonrpc": "2.0", "method": "_gw/notice", "params": {
+                    "level": "warning", "kind": "goosesec",
+                    "message": "Goose security settings could not be checked in the administrator's Goose profile "
+                               f"({err[:200]}). See Admin > Prompt guard."}})
+            except Exception:
+                log.exception("goose security: recording a failed native sync")
+            return st

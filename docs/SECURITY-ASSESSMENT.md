@@ -834,7 +834,25 @@ round it, and several lesser defects in the same logic and in the set-aside:
 | T-7, T-8 | Low | Set-aside pruning went by the file's own date, which the member's agent controls, and stopped at the first file it could not delete | The file is dated when it is set aside and never pruned in the same step; attributes are cleared; one failure does not stop the rest |
 | T-9 | Low | The other half of R-6: the hub kept a socket when the check itself raised | Closed |
 
-These last fixes were not reviewed again. They are covered by tests in `tests/test_goosesec.py` (checked by running
-them against the code as it was before each round of fixes: every test of an R or T finding fails there), the whole
-suite on Python 3.11 and 3.13, and a throwaway gateway run with the real Goose binary. Not tested against a real
-Goose: how Goose returns value types other than the ones Goose Web writes.
+**Fourth review, of the simplified rule.** One High finding, introduced by the commit under review, and two
+Medium ones:
+
+| ID | Severity | Finding | Now |
+|---|---|---|---|
+| F-1 | High | Numbers were compared through `float()`. A huge integer written into the threshold made the comparison raise; the check that decides whether anything must be applied failed, the failure was only logged, and from then on nothing was put back, recorded, audited or said at any start | Numbers are compared exactly, without conversion; a comparison that fails counts as "something to apply"; a failure of the check itself is recorded, audited and shown like a failed apply |
+| F-2 | Medium | An apply that failed before it had decided anything (Goose still not answering) forgot the write that was in flight from the apply before | The record of a write in flight is kept until an apply has seen what Goose holds |
+| F-3 | Medium | The classifier group still let go of a switch Goose Web had written when an endpoint appeared that Goose Web never wrote, now without any trace | The group rule never covers a key Goose Web wrote |
+| F-4 | Low | The record made before the first write kept the previous apply's "ok" and date | It says "not finished", with what was written so far |
+| F-5 | Low | On "off", a key Goose Web wrote that had been changed outside was let go; after "off" and "on" it counted as the administrator's own | Removed like the rest, the changed value saved |
+| F-7 | Low | A write in flight that had landed was not taken over before the next write | Taken over as soon as Goose is seen to hold it |
+| F-8 | Low | The read-back stopped at the first key that came back differently | Every key is read back, then the apply fails once |
+| F-12 | Info | Listing the set-aside folder could fail after the file was moved, skipping the log line and the audit row | Caught |
+| F-6, F-9, F-10 | Low | **Open.** After a failed write, a value the administrator sets for that very key before the next apply is overwritten (saved first); a put-back that landed in an apply that was cancelled or whose answer was lost gets no audit row of its own (the page still shows it when the apply was cancelled); a removal whose answer was lost can later be reported as "removed outside" | Rare sequences of two failures; documented |
+
+After four reviews of this one function the lesson is recorded here on purpose: every version that tried to
+tell a harmless outside change from a harmful one had a way round it, and every repair of a repair added a state.
+The rule that survived is the one with the fewest states. These last fixes were not reviewed again. They are
+covered by tests in `tests/test_goosesec.py`, checked by running them against the code as it was before each round
+of fixes: the tests of every R and T finding and of F-1 to F-5 and F-8 fail there (F-7 and F-12 have no test of
+their own). Also: the whole suite on Python 3.11 and 3.13, and a throwaway gateway run with the real Goose binary.
+Not tested against a real Goose: how Goose returns value types other than the ones Goose Web writes.
