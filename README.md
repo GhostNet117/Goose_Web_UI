@@ -220,8 +220,9 @@ vulnerability, see [SECURITY.md](SECURITY.md).
 - **Goose's home-folder skill, recipe and agent folders belong to the gateway's Windows account.** Goose finds
   `~/.agents/skills`, `~/.agents/recipes`, `~/.agents/agents` (and the `~/.claude`, `~/.goose` and `~/.config/agents`
   equivalents) through the operating system's home folder; `GOOSE_PATH_ROOT` does not move them. With the sandbox
-  (on by default) members' agents cannot read them: an administrator offers chosen skills and recipes to a team as
-  library items, and nothing is shared by default. Without the sandbox every profile's Goose loads them.
+  (on by default; measured with its MXC backend) members' agents cannot read them: an administrator offers chosen
+  skills and recipes to a team as library items, and nothing is shared by default. Without the sandbox every
+  profile's Goose loads them.
 - **One scheduler per profile.** Goose Desktop and the gateway must not both run the scheduler for the native
   profile, or jobs fire twice. `native_scheduler: auto` (the default) runs it in the gateway only while Desktop is
   closed.

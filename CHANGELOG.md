@@ -13,20 +13,31 @@ change.
 - **What the documents said about those folders was too broad.** The README and guides said Goose's home-folder
   skill and recipe folders "are visible to all profiles". Checked in Goose's source (1.57.0, 1.59.0), with the
   Goose binary and in a real container: Goose does find them through the operating system's home folder, which
-  `GOOSE_PATH_ROOT` does not move, and that home is the gateway account's. With the sandbox (the default) a member's
-  agent cannot read them, so its Goose loads none; without it every profile's Goose loads them all. Members get
-  what you offer their team and nothing else. `goose-web check` has a new line that says how many such skills,
-  recipes and agents there are and warns when members are not sandboxed.
+  `GOOSE_PATH_ROOT` does not move, and that home is the gateway account's. With the sandbox (the default; measured
+  with its MXC backend) a member's agent cannot read them, so its Goose loads none; without it every profile's
+  Goose loads them all. Members get what you offer their team and nothing else. `goose-web check` has a new line
+  that says how many such skills, recipes and agents there are (also behind links, which Goose follows) and warns
+  when members are not sandboxed.
 - **Hardening: the library export no longer reads through links.** Offering a skill from a profile read every
   file in the skill's folder with the gateway's rights, also through a junction, a symbolic link or a hard link; if
   a skill folder in a member's profile held such a link to a file outside it, an administrator who offered that
-  skill to a team copied the file's content to the team's members. A member confined by the sandbox cannot create
-  such a link (measured: refused), so this mattered where members are not sandboxed or a link got there another
-  way. Links are now never followed, for skills and recipes, in any profile; a skill needs a regular `SKILL.md` and
-  has at most 500 files (SECURITY-ASSESSMENT 15.3).
+  skill to a team copied the file's content to the team's members. A member confined by the MXC sandbox cannot
+  create such a link (measured: refused), so this mattered where members are not sandboxed or a link got there
+  another way. Now nothing is read through a link in a member's profile: not for skills and recipes, and not for
+  provider files, `config.yaml` or `secrets.yaml` when an extension or provider is offered from it (the secret a
+  linked `secrets.yaml` would have supplied is not copied). In your own home folders skills and recipes are not
+  read through a link either. A skill needs a regular `SKILL.md`; at most 500 files, 2 MB, 12 folder levels
+  (SECURITY-ASSESSMENT 15.3).
+- **From the independent review of this change** (SECURITY-ASSESSMENT 15.5), all in code the picker and the
+  delivery already had: what the picker shows is now bounded and is text (a recipe whose description was a YAML
+  date made the picker fail for that profile; nested YAML aliases could have stalled the gateway); a team skill
+  file that cannot be written into one member's profile no longer stops that member's agent from starting; the
+  "managed" mark of a team skill is never written through a link; a skill whose file is named `skill.md` in
+  another case is shared as `SKILL.md`; of two skills whose names differ only in case, one is offered.
 - **Correction:** inside the sandbox the names of files and folders on the drive can be listed, not only folder
   names as the documents said (contents cannot be read; accepted since 1.19.0).
-- **Tests** never read the developer's own home folder or `GOOSE_RECIPE_PATH`. New: `tests/test_library.py`.
+- **Tests:** the test session replaces the home folder the library reads and removes `GOOSE_RECIPE_PATH`, so
+  results do not depend on who runs them. New: `tests/test_library.py`.
 
 ## 1.20.0 - 2026-11-12
 

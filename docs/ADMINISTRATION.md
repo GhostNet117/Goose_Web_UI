@@ -921,27 +921,33 @@ For extensions and providers added from a profile library, the secrets named by 
 Items added manually through the API never copy secrets from another profile. Removing an item, or removing a user
 from the team, removes what was provisioned (but never items the user created).
 
-**Nothing is shared by default.** Without a library item a member gets none of your skills, recipes, extensions,
-providers or keys: a new profile starts with Goose's bundled platform extensions and nothing else. For skills and
-recipes this rests on the sandbox (11.6), because of where Goose keeps them (11.3): `goose-web check` has a line
+**Nothing is shared by default.** Without a library item a member gets none of your skills, recipes, providers or
+keys, and none of the extensions you added: a new profile starts with Goose's bundled platform extensions (their
+entries are copied from your configuration, 11.2; with `allow_shell` also `developer`). For skills and recipes
+this rests on the sandbox (11.6), because of where Goose keeps them (11.3): `goose-web check` has a line
 "home-folder Goose items" that says how many skills, recipes and agents the gateway's account has in its home
-folder, and warns when members are not sandboxed.
+folder (also behind links, which Goose follows), and warns when members are not sandboxed.
 
 **Where the picker looks.** For a member's profile: that profile's `config/skills` and `config/recipes`. For your
 own native profile it looks where Goose itself looks for that Windows account (since 1.21.0):
 
 | Kind | Folders, in this order |
 |---|---|
-| skill | `~/.agents/skills`, `<native config>/skills`, `~/.claude/skills`, `~/.config/agents/skills`. When two folders hold a skill of the same name, the first one is offered, as Goose would load it. The picker's Source column shows the folder. |
+| skill | `~/.agents/skills`, `<native config>/skills`, `~/.claude/skills`, `~/.config/agents/skills`. When two folders hold a skill of the same name (in any case: `Review` and `review` are one folder for a member), the first one takes the name, as Goose would load it; if that one is a link it is not offered and neither is the later one. The picker's Source column shows the folder. |
 | recipe | `<native config>/recipes`, the folders of your `GOOSE_RECIPE_PATH`, `~/.agents/recipes`, `~/.goose/recipes` |
 
 Home-folder agents (`~/.agents/agents` and the like) are not offered: an agent carries its own instructions and
 tool use.
 
-**Links are never followed** (since 1.21.0). A skill folder, a `SKILL.md` or a recipe file that is a junction, a
-symbolic link or has more than one hard link is not offered, and inside a skill such files and folders are left
-out; so is a `skills` or `recipes` folder that is itself a link. A skill needs a regular `SKILL.md`, and at most 500
-files. Earlier versions read through links with the gateway's rights (SECURITY-ASSESSMENT 15.3): had a skill in a
+**Nothing is read through a link** (since 1.21.0). A skill folder, a `SKILL.md` or a recipe file that is a
+junction, a symbolic link or has more than one hard link is not offered, and inside a skill such files and folders
+are left out; so is a `skills` or `recipes` folder that is a link or lies behind one (for example `~/.agents` as a
+junction to a dotfiles folder: copy the skill to real files to offer it). In a member's profile the same holds for
+the provider files, `config.yaml` and `secrets.yaml` when you offer an extension or a provider from it. Folders you
+name yourself in `GOOSE_RECIPE_PATH` are checked only for being links themselves. Limits: a skill needs a regular
+`SKILL.md` and has at most 500 files, 2 MB, 12 folder levels and 180 characters per file path inside it; a recipe
+or provider file at most 1 MB; the picker looks at the first 2,000 entries of a folder.
+Earlier versions read through links with the gateway's rights (SECURITY-ASSESSMENT 15.3): had a skill in a
 member's profile held a link to a file outside it, offering that skill to a team would have copied the file's
 content to the team. To share a skill that uses links, make it real files first.
 

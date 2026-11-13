@@ -890,8 +890,10 @@ delivered, and nothing is shared without an item. Home-folder agents are not off
 | Threat | Control |
 |---|---|
 | A member lists or adds library items | `GET /api/admin/library` and `POST /api/admin/teams/{id}/items` require an administrator (unchanged) |
-| A member's profile is used to read a file the member cannot read (below, 15.3) | The export follows no link: junctions, symbolic links and hard-linked files are skipped; a `skills` or `recipes` folder that is a link, or has a link between it and the profile root, is not read |
-| A huge or endless skill folder | 2 MB of text and 500 files at most; a linked folder is never entered |
+| A member's profile is used to read a file the member cannot read (below, 15.3) | Nothing is read through a link in a member's profile: junctions, symbolic links and hard-linked files are skipped in skills and recipes; a `skills`, `recipes` or `custom_providers` folder that is a link, or has a link between it and the profile root, is not read; `config.yaml`, `secrets.yaml` and provider files must be regular files (15.5, L-1). In the administrator's home folders skills and recipes are likewise not read through a link; folders named in `GOOSE_RECIPE_PATH` are checked only for being links themselves |
+| A huge, deep or endless folder, or a huge file, in a member's profile | Every limit applies before the work it limits (15.5, L-4): the picker looks at 2,000 entries of a folder and reads 16 KB of a `SKILL.md`; recipe and provider files over 1 MB are skipped; a skill has at most 500 files, 2 MB (binary files count, though they are not shared), 5,000 entries walked, 12 levels, 180 characters per path; a linked folder is never entered |
+| A value in a member's file makes the picker's answer huge or unserialisable | Names and descriptions are text of bounded length or empty (15.5, L-2) |
+| One odd skill stops members' agents from starting | A file that cannot be written into a member's profile is skipped and reported; provisioning goes on (15.5, L-3) |
 | The home-folder items reach members who were not given them | They are copied only as team items. The gateway cannot stop Goose from reading the home folder when the sandbox is off; `goose-web check` says so |
 | The tests read, or depend on, the developer's own home folder | The test session replaces the home folder and removes `GOOSE_RECIPE_PATH` for every test |
 
@@ -913,8 +915,10 @@ that member's profile, and it needed the link:
 - **Not measured:** the AppContainer backend, and links that reach a profile some other way (a restored backup, an
   administrator's own tool).
 
-Severity: Low for an installation that uses the sandbox; the fix is made for every source because the export has
-no reason to follow a link at all.
+Severity: Low for an installation that uses the MXC sandbox. The same held for the other two kinds of item
+(15.5, L-1): a provider file, a `config.yaml` or a `secrets.yaml` in a member's profile that was a link was read,
+and the secret it named was copied to the team. All of it is closed for members' profiles, because the gateway has
+no reason to read a member's file through a link at all.
 
 ### 15.4 Residual risks
 
@@ -928,3 +932,31 @@ no reason to follow a link at all.
 - **Same-named skills** in two folders: the first in Goose's order is offered. Goose itself goes by the name
   inside `SKILL.md`, Goose Web by the folder name; when those differ the picker and Goose can disagree about which
   one "wins".
+- **The AppContainer backend** was not measured for any of this (15.1 and 15.3 are MXC measurements).
+- **The administrator's own profile** (`config.yaml`, `secrets.yaml`, provider files) is read through whatever
+  links it has, as Goose reads it.
+
+### 15.5 Independent review of this change (2026-11-13, before release)
+
+A reviewer read the first version of this change (read-only, code only). No High finding; for members' skills and
+recipes no way through a link beyond the check-then-read race of 15.4. It found three Medium problems in the lines
+around the change, which the change's own documents claimed to cover, one regression and several smaller ones:
+
+| ID | Severity | Finding | Now |
+|---|---|---|---|
+| L-1 | Medium | Extension and provider listing and export, and the secrets copied with them, still read through links (`config.yaml`, `custom_providers` and its files, the source profile's `secrets.yaml`), while the documents said the export follows no link | Regular files only in a member's profile; nothing is copied from a linked `secrets.yaml` |
+| L-2 | Medium | A recipe's description went untyped into the picker's answer: a YAML date failed the picker for that profile, nested aliases expand to gigabytes as JSON on the event loop | Text of at most 500 characters, or empty; the same for extension and provider names and descriptions |
+| L-3 | Medium | Any error writing one file of a team skill failed provisioning, and with it every start of that member's agent, until the item was removed | The file is skipped and reported; provisioning goes on; over-long paths are refused at export |
+| L-4 | Low | Limits applied after the work: whole files read for a description, folders listed and sorted before the cap, the walk unbounded | See 15.2 |
+| L-5 | Low | Regression: a skill whose file is `skill.md` in another case was listed but could not be exported | Shared as `SKILL.md` |
+| L-6, L-7 | Low | In the administrator's home only the last folder was checked for being a link, and `check` said "none" for linked folders although Goose follows them | Every folder between the home folder and the skills folder is checked; `check` counts behind links and says which folders are not offered |
+| L-8 | Low | A linked skill in the first folder did not take its name, so a later folder's skill was offered in its place; `Review` and `review` were both offered and land in one folder | The first folder takes the name, in any case, also when it is a link |
+| L-9 | Low | The "managed" mark of a team skill was written in place, through a link if the member had put one there | A linked mark is not Goose Web's mark: the skill is left alone; the mark is written atomically |
+| L-10 | Low | Sentences the code or the measurements did not support ("in any profile", "the sandbox" where only MXC was measured, "nothing else" for a new profile) | Corrected |
+| L-11 | Low | Tests that did less than their names said, and missing ones | Each finding above has a test that fails on the reviewed commit (checked by running them against it) |
+| L-12 | Info | The home folder was taken from `USERPROFILE`, which Goose does not use | Asked from Windows, as Goose does |
+| L-13 | Info | Small items: the mark compared in exact case, deep trees | Fixed with L-4 |
+
+Not followed up: the reviewer's list of things that reading could not settle (among them `st_nlink` on a volume
+that is not NTFS, a home folder redirected to a cloud drive, the check-then-read race). The fixes of this table
+were not reviewed again by the same depth of reading: a second, narrower review looked only at them (15.6).
