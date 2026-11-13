@@ -315,7 +315,9 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
             raise SandboxError(f"icacls {' '.join(args[:2])} failed: {(r.stdout + r.stderr).strip()[:300]}")
 
     def grant(path: str, sid: str, right: str) -> None:
-        _icacls([path, "/grant", f"*{sid}:{RIGHTS[right]}", "/Q", "/C"])
+        # :r - the container's entry is REPLACED. Without it icacls adds to an entry that is still there (a revoke
+        # that failed), and a folder taken down from modify to read kept modify while the record said read (W-5).
+        _icacls([path, "/grant:r", f"*{sid}:{RIGHTS[right]}", "/Q", "/C"])
 
     def revoke(path: str, sid: str) -> None:
         if os.path.exists(path):
@@ -354,21 +356,21 @@ def write_atomic(path: Path | str, text: str) -> None:
     given (no newline translation). A target name that is a link is replaced by a file of its own, never written
     through. The temporary file has a random name and is created exclusively, so it is new, whatever sits in the
     folder. A target that is open elsewhere without delete sharing (a reader of ours) refuses the move for a
-    moment: tried again for half a second. On failure the temporary file is removed and the target is as it was."""
+    moment: tried again for 150 ms. On failure the temporary file is removed and the target is as it was."""
     path = Path(path)
     tmp = path.with_name(f"{path.name}.{secrets.token_hex(6)}.tmp")
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0))
         with os.fdopen(fd, "wb") as f:
             f.write(text.encode("utf-8"))
-        for attempt in range(10):
+        for attempt in range(6):
             try:
                 os.replace(tmp, path)
                 break
             except PermissionError:
-                if attempt == 9:
+                if attempt == 5:
                     raise
-                time.sleep(0.05)
+                time.sleep(0.03)
     except BaseException:
         try:
             tmp.unlink()
@@ -406,7 +408,7 @@ def prepare(name: str, state_dir: str, grants: dict[str, str]) -> dict:
         except SandboxError as e:
             log.warning("sandbox %s: %s", name, e)
             # The entry is still on the folder: keep it on record, so that the next start tries again (V-10). Not
-            # when the folder is granted anew below - that grant replaces it.
+            # when the folder is granted anew below - that grant replaces the entry (icacls /grant:r).
             if os.path.normcase(p) not in {os.path.normcase(k) for k in present}:
                 missing[p] = have[p]
     for p, right in apply.items():

@@ -1128,3 +1128,18 @@ finding. What was found, and what became of it:
 
 Not verified by the reviewer: anything from inside a container (the review was of code), GitHub's Windows image,
 older Windows builds, and a possible reuse of a handle value between the two relay threads of one connection.
+
+**A second, narrow review** read only the fixes above. Nothing blocking (no High, nothing that breaks an ordinary
+installation). It found one Medium regression of the fix of V-4 and some smaller points:
+
+| Id | Severity | Finding | Status |
+|---|---|---|---|
+| W-1 | Medium, regression | An owed restore whose forward address had since been given to another relay target (targets on one port reordered or replaced) was replayed at every start: two URLs in a member's `config.yaml` swapped, or one was pointed at a closed address | Fixed: such an entry is applied once at the changeover and never kept or replayed |
+| W-2 | Low, regression | A restore owed for a relay that runs again was dropped before the relay had started | Fixed: kept until the relay's record is written |
+| W-3 | Low, regression | `sandbox remove --all` did not visit a container of which only an unfinished restore was left | Fixed |
+| W-4 | Low, regression | Retrying a file that can never be replaced, for many files, on the event loop | Fixed: 150 ms, at most three failing files per start, off the event loop |
+| W-5 | Low | `icacls /grant` adds to an entry whose revoke failed: a folder taken down from modify to read kept modify | Fixed: the entry is replaced (measured in a container) |
+| W-7 | Info | The pipe's security descriptor was not freed when the first instance could not be created | Fixed |
+| W-6, W-8, W-10 | Info | A failed revoke is listed as "folder missing"; the limit of 32 services per port is not in the configuration reference; a temporary file left by a crash is not collected | **Open** |
+
+The fixes of this second review each have a test and were not reviewed by anyone else.

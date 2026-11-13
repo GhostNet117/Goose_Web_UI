@@ -493,7 +493,8 @@ class WorkerManager:
             try:
                 for name in (sb.container_name(str(self.s.profiles_root), w.username),
                              sb.legacy_container_name(str(self.s.profiles_root), w.username)):
-                    if rl.undo_relays(str(self.s.system_dir / "sandbox"), name, w.path_root):
+                    # in a thread (W-4): it reads and replaces files of the profile
+                    if await asyncio.to_thread(rl.undo_relays, str(self.s.system_dir / "sandbox"), name, w.path_root):
                         log.info("worker %s: restored relayed URLs (no longer sandboxed)", w.key)
             except Exception as e:
                 log.warning("worker %s: could not restore relayed URLs: %s", w.key, e)
@@ -814,6 +815,7 @@ class WorkerManager:
         # The record first (AC-5): what the rewrite changes can then be undone, also after a crash in between.
         state_file.parent.mkdir(parents=True, exist_ok=True)
         sb.write_atomic(state_file, json.dumps(new))
+        rl.forget_owed(str(state_file.parent), spec["name"], new)     # covered by the record just written (W-2)
         changed = rl.rewrite_profile_urls(root, new)
         log.info("worker %s: relays %s (rewrote %d file(s))", w.key, new, len(changed))
 

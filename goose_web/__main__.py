@@ -475,6 +475,9 @@ def cmd_sandbox(args, settings) -> int:
                 owners.setdefault(n, usr)
         names = [st.get("name") for st in sb.all_states(state_dir) if st.get("name")]
         names += [f.name[:-len(".relays.json")] for f in sorted(Path(state_dir).glob("GooseWeb.*.relays.json"))]
+        # ... and containers of which only an unfinished restore is left (W-3)
+        names += [f.name[:-len(".relays.undo.json")]
+                  for f in sorted(Path(state_dir).glob("GooseWeb.*.relays.undo.json"))]
         done = 0
         for name in dict.fromkeys(names):
             usr = owners.get(name)

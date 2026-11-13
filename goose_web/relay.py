@@ -190,12 +190,15 @@ def _rewrite(profile_root: str, mapping: dict[str, str]) -> tuple[list[str], lis
     """(changed files, files left as they are although they may need the change: a link, or a write that failed).
     Every file that is left out is logged."""
     from .sandbox import write_atomic
-    changed, left = [], []
+    changed, left, failures = [], [], 0
     files, links = _config_files(profile_root)
     for f in links:
         log.warning("relay: %s is a link or has a second name; its URLs are not rewritten", f)
         left.append(str(f))
     for f in files:
+        if failures >= 3:       # a folder that refuses writes: not 500 more attempts in this start (W-4)
+            left.append(str(f))
+            continue
         try:
             with open(f, "rb") as fh:
                 raw = fh.read(MAX_REWRITE_BYTES + 1)       # bounded: the member can put any file here (V-3)
@@ -215,6 +218,7 @@ def _rewrite(profile_root: str, mapping: dict[str, str]) -> tuple[list[str], lis
             except OSError as e:
                 log.warning("relay: %s was not rewritten: %s", f, e)
                 left.append(str(f))
+                failures += 1
                 continue
             changed.append(str(f))
     return changed, left
@@ -236,33 +240,68 @@ def _pending_file(state_dir: str | Path, name: str) -> Path:
     return Path(state_dir) / f"{name}.relays.undo.json"
 
 
+def _pairs(d) -> dict[str, str]:
+    return {t: lst for t, lst in (d.items() if isinstance(d, dict) else []) if isinstance(t, str) and isinstance(lst, str)}
+
+
+def _read_owed(g: Path) -> dict[str, str]:
+    try:
+        return _pairs(json.loads(g.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_owed(g: Path, before: dict, now: dict) -> None:
+    from .sandbox import write_atomic
+    try:
+        if not now:
+            g.unlink(missing_ok=True)
+        elif now != before:
+            g.parent.mkdir(parents=True, exist_ok=True)
+            write_atomic(g, json.dumps(now))
+    except OSError as e:      # the record of a debt must not be what stops the relays (W-9)
+        log.warning("relay: %s could not be written: %s", g, e)
+
+
 def restore_pending(state_dir: str | Path, name: str, profile_root: str | None, extra: dict | None = None,
                     active: dict | None = None) -> list[str]:
     """Point the profile's URLs back at the real services for `extra` (target -> listen) and for whatever an
     earlier restore could not finish. A restore is not finished while a file could not be written (in use) or is a
     link the gateway does not touch; what is owed is kept in <state_dir>/<name>.relays.undo.json and tried again at
-    the worker's next start (V-4). `active`: relays that run now - never undone. Returns the restored files."""
-    from .sandbox import write_atomic
+    the worker's next start (V-4). Returns the restored files.
+
+    `active` (target -> listen): the relays this start is about to run.
+    - What is owed for one of them is not undone now. It stays on file until that relay's record is written
+      (forget_owed): if the relay does not start after all, the debt is still known (W-2).
+    - A forward address that now belongs to ANOTHER target is never undone from the file: `//<listen>` in the
+      profile means the new service by now, and undoing it at every start made two URLs swap, or pointed one at a
+      closed address for good (W-1). Such an entry is applied once, when it arrives in `extra` at the changeover -
+      before the new rewrite - and is not kept."""
     g = _pending_file(state_dir, name)
-    try:
-        owed = json.loads(g.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        owed = {}
-    m = {**(owed if isinstance(owed, dict) else {}), **(extra or {})}
-    m = {t: lst for t, lst in m.items() if isinstance(t, str) and isinstance(lst, str)
-         and (active or {}).get(t) != lst}
-    if not m or not profile_root:
+    owed, extra, act = _read_owed(g), _pairs(extra or {}), _pairs(active or {})
+    if not profile_root:
         g.unlink(missing_ok=True)
         return []
-    changed, left = _rewrite(profile_root, {lst: t for t, lst in m.items()})
+    busy = set(act.values())
+    keep = {t: lst for t, lst in owed.items() if act.get(t) == lst}
+    todo = {t: lst for t, lst in owed.items() if act.get(t) != lst and lst not in busy}
+    todo.update({t: lst for t, lst in extra.items() if act.get(t) != lst})
+    changed, left = _rewrite(profile_root, {lst: t for t, lst in todo.items()}) if todo else ([], [])
     if left:
-        Path(state_dir).mkdir(parents=True, exist_ok=True)
-        write_atomic(g, json.dumps(m))
+        keep.update({t: lst for t, lst in todo.items() if lst not in busy})
         log.warning("relay %s: %d file(s) still point at a relay forwarder; tried again at the next start: %s",
                     name, len(left), left[:5])
-    else:
-        g.unlink(missing_ok=True)
+    _write_owed(g, owed, keep)
     return changed
+
+
+def forget_owed(state_dir: str | Path, name: str, live: dict) -> None:
+    """The relays in `live` are on record now (<name>.relays.json): a restore owed for one of them is covered by
+    that record and leaves the undo file."""
+    g = _pending_file(state_dir, name)
+    owed = _read_owed(g)
+    if owed:
+        _write_owed(g, owed, {t: lst for t, lst in owed.items() if _pairs(live).get(t) != lst})
 
 
 def undo_relays(state_dir: str, name: str, profile_root: str | None) -> list[str]:
@@ -396,6 +435,7 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows tests
             try:
                 self._pending = self._new_instance(first=True)
             except OSError as e:
+                self._free_sd()
                 raise OSError(f"relay pipe {pipe} exists already or cannot be created ({e}); relay not started") from e
             self._thread = threading.Thread(target=self._serve, name=f"relay {target}", daemon=True)
 

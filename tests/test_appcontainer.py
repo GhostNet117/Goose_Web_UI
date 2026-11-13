@@ -622,7 +622,9 @@ def test_a_restore_that_cannot_finish_is_tried_again(tmp_path, monkeypatch):
         pytest.skip("no hard links here")
     rl.restore_pending(str(state), "N", str(root), m)
     assert b"127.64.0.8" in cfg.read_bytes() and (state / "N.relays.undo.json").exists()
-    assert rl.restore_pending(str(state), "N", str(root), None, active=m) == []             # the relay is back: nothing owed
+    assert rl.restore_pending(str(state), "N", str(root), None, active=m) == []             # the relay is back: not undone
+    assert b"127.64.0.8" in cfg.read_bytes() and (state / "N.relays.undo.json").exists()    # owed until it is on record (W-2)
+    rl.forget_owed(str(state), "N", m)
     assert not (state / "N.relays.undo.json").exists()
     (state / "N.relays.undo.json").write_text(json.dumps(m), encoding="utf-8")
     (root / "config" / "copy.yaml").unlink()
@@ -630,6 +632,98 @@ def test_a_restore_that_cannot_finish_is_tried_again(tmp_path, monkeypatch):
     assert not (state / "N.relays.undo.json").exists()
     (state / "N.relays.undo.json").write_text("[1]", encoding="utf-8")       # damaged, or the user is gone
     assert rl.restore_pending(str(state), "N", None) == [] and not (state / "N.relays.undo.json").exists()
+
+
+def _start(state, root, old, new):
+    """What workers._start_relays does with the URLs at one start, in its order."""
+    gone = {k: v for k, v in old.items() if new.get(k) != v}
+    rl.restore_pending(str(state), "N", str(root), gone, active=new)
+    (state / "N.relays.json").write_text(json.dumps(new), encoding="utf-8")
+    rl.forget_owed(str(state), "N", new)
+    rl.rewrite_profile_urls(str(root), new)
+    return new
+
+
+def test_an_owed_restore_never_undoes_a_running_relay(tmp_path):
+    """W-1: an owed entry whose forward address now belongs to another target was replayed at every start."""
+    root = tmp_path / "profile"
+    (root / "config" / "custom_providers").mkdir(parents=True)
+    cfg = root / "config" / "config.yaml"
+    cfg.write_bytes(b"a: http://10.0.0.5:8080/v1\nb: http://10.0.0.6:8080/v1\n")
+    other = root / "config" / "custom_providers" / "x.json"
+    other.write_bytes(b"{}")
+    try:
+        os.link(other, root / "config" / "custom_providers" / "y.json")     # a restore here never "finishes"
+    except (OSError, NotImplementedError):
+        pytest.skip("no hard links here")
+    state = tmp_path / "state"
+    state.mkdir()
+    first = {s["target"]: s["listen"] for s in rl.relay_specs("N", 7, ["10.0.0.5:8080", "10.0.0.6:8080"])}
+    second = {s["target"]: s["listen"] for s in rl.relay_specs("N", 7, ["10.0.0.6:8080", "10.0.0.5:8080"])}
+    assert first["10.0.0.5:8080"] == second["10.0.0.6:8080"] == "127.64.0.8:8080"      # the addresses changed hands
+    live = _start(state, root, {}, first)
+    assert cfg.read_bytes() == b"a: http://127.64.0.8:8080/v1\nb: http://127.65.0.8:8080/v1\n"
+    live = _start(state, root, live, second)                                           # the administrator reorders
+    want = b"a: http://127.65.0.8:8080/v1\nb: http://127.64.0.8:8080/v1\n"
+    assert cfg.read_bytes() == want
+    for _ in range(3):                                                                 # and it stays so
+        live = _start(state, root, live, second)
+        assert cfg.read_bytes() == want
+    assert not (state / "N.relays.undo.json").exists()
+    # a target replaced on the same port: the old one is undone once, at the changeover, and never again
+    cfg.write_bytes(b"a: http://127.0.0.1:4000/v1\n")
+    live = _start(state, root, {}, {"127.0.0.1:4000": "127.64.0.8:4000"})
+    new = {"10.0.0.5:4000": "127.64.0.8:4000"}
+    live = _start(state, root, live, new)
+    assert cfg.read_bytes() == b"a: http://127.0.0.1:4000/v1\n"       # that URL was the old service's: restored
+    cfg.write_bytes(b"a: http://10.0.0.5:4000/v1\n")                  # the member now uses the new one
+    for _ in range(3):
+        live = _start(state, root, live, new)
+        assert cfg.read_bytes() == b"a: http://127.64.0.8:4000/v1\n"
+
+
+def test_a_debt_for_a_relay_that_runs_again_is_kept_until_its_record_exists(tmp_path):
+    """W-2: dropped before the relays were started, it was lost when a forwarder then failed to start."""
+    root = _profile(tmp_path)
+    state = tmp_path / "state"
+    state.mkdir()
+    m = {"127.0.0.1:4000": "127.64.0.8:4000", "10.0.0.9:9": "127.64.0.8:9"}
+    (state / "N.relays.undo.json").write_text(json.dumps(m), encoding="utf-8")
+    live = {"127.0.0.1:4000": "127.64.0.8:4000"}
+    rl.restore_pending(str(state), "N", str(root), {}, active=live)
+    assert json.loads((state / "N.relays.undo.json").read_text(encoding="utf-8")) == live     # the other one is settled
+    rl.forget_owed(str(state), "N", live)                              # its record is written: covered
+    assert not (state / "N.relays.undo.json").exists()
+    rl.forget_owed(str(state), "N", live)                              # nothing there: nothing happens
+
+
+@windows
+def test_a_grant_replaces_the_containers_entry(monkeypatch):
+    """W-5: icacls /grant adds to an entry that is still there; a folder taken down to read kept modify."""
+    seen = []
+    monkeypatch.setattr(sb, "_icacls", seen.append)
+    sb.grant(r"C:\x", "S-1-15-2-9", "read")
+    assert seen == [[r"C:\x", "/grant:r", "*S-1-15-2-9:(OI)(CI)RX", "/Q", "/C"]]
+
+
+@windows
+def test_a_folder_taken_down_to_read_is_read_only_in_the_container(box):
+    shared = box.tmp / "shared"
+    shared.mkdir()
+    code = f'''
+t("write", lambda: open({str(shared / "w.txt")!r}, "w").write("x"))
+t("list", lambda: len(os.listdir({str(shared)!r})))
+'''
+    sb.prepare(box.name, box.state_dir, member_grants(box.prof, box.pybase, {str(shared): "modify"}))
+    assert inside(box, code)["write"].startswith("OK")
+    real_revoke = sb.revoke
+    try:
+        sb.revoke = lambda p, sid: (_ for _ in ()).throw(sb.SandboxError("icacls failed"))     # the revoke fails
+        sb.prepare(box.name, box.state_dir, member_grants(box.prof, box.pybase, {str(shared): "read"}))
+    finally:
+        sb.revoke = real_revoke
+    r = inside(box, code)
+    assert r["write"] == "ERR PermissionError" and r["list"].startswith("OK")
 
 
 def test_the_forwarder_file_is_never_read_beyond_its_size(tmp_path, monkeypatch):
