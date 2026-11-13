@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.21.0 - 2026-11-13
+
+**Offer your own Goose skills and recipes to a team; nothing is shared by default.** Spec 028. No database schema
+change.
+
+- **The picker sees where Goose keeps skills.** "Add from library" for your own (native) profile now lists the
+  skills in Goose's home-folder locations as well: `~/.agents/skills`, then `config/skills`, `~/.claude/skills` and
+  `~/.config/agents/skills`, in Goose's order (the first folder that has a name wins; the Source column shows the
+  folder). Until now it read only `config/skills`, so skills kept where Goose recommends could not be offered.
+  Recipes: `~/.goose/recipes` is read too. Home-folder agents are not offered.
+- **What the documents said about those folders was too broad.** The README and guides said Goose's home-folder
+  skill and recipe folders "are visible to all profiles". Checked in Goose's source (1.57.0, 1.59.0), with the
+  Goose binary and in a real container: Goose does find them through the operating system's home folder, which
+  `GOOSE_PATH_ROOT` does not move, and that home is the gateway account's. With the sandbox (the default) a member's
+  agent cannot read them, so its Goose loads none; without it every profile's Goose loads them all. Members get
+  what you offer their team and nothing else. `goose-web check` has a new line that says how many such skills,
+  recipes and agents there are and warns when members are not sandboxed.
+- **Hardening: the library export no longer reads through links.** Offering a skill from a profile read every
+  file in the skill's folder with the gateway's rights, also through a junction, a symbolic link or a hard link; if
+  a skill folder in a member's profile held such a link to a file outside it, an administrator who offered that
+  skill to a team copied the file's content to the team's members. A member confined by the sandbox cannot create
+  such a link (measured: refused), so this mattered where members are not sandboxed or a link got there another
+  way. Links are now never followed, for skills and recipes, in any profile; a skill needs a regular `SKILL.md` and
+  has at most 500 files (SECURITY-ASSESSMENT 15.3).
+- **Correction:** inside the sandbox the names of files and folders on the drive can be listed, not only folder
+  names as the documents said (contents cannot be read; accepted since 1.19.0).
+- **Tests** never read the developer's own home folder or `GOOSE_RECIPE_PATH`. New: `tests/test_library.py`.
+
 ## 1.20.0 - 2026-11-12
 
 **Goose-native security: Goose's own prompt injection detection and adversary mode, for every profile.** Spec 026.

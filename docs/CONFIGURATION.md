@@ -398,8 +398,10 @@ Since 1.14.0 a team policy may carry `guard` (prompt guard): `{enabled, check_in
   `goose.extra_env`), so Goose loads only the composed hints file and ignores `AGENTS.md` and `.goosehints` in
   working folders. Composition order: personal hints (only with `hints_edit`), documents assigned to the user, then
   the team's documents last, as the final word. A `config/.goosehints` written by Goose Web 1.4 is removed.
-- Not relocatable by `GOOSE_PATH_ROOT`: home-folder skill and recipe folders such as `~/.agents/skills` and
-  `~/.agents/recipes` are shared by every profile on the machine.
+- Not relocatable by `GOOSE_PATH_ROOT`: Goose's home-folder skill, recipe and agent folders (`~/.agents/skills`,
+  `~/.agents/recipes`, `~/.agents/agents` and the `~/.claude`, `~/.goose`, `~/.config/agents` equivalents). They are
+  the gateway account's. Sandboxed members' agents cannot read them; without the sandbox every profile's Goose
+  loads them (ADMINISTRATION 11.3). Administrators offer skills and recipes from them per team (ADMINISTRATION 9.9).
 - Usernames: letters, digits, `.`, `_`, `-`, starting with a letter or digit, up to 64 characters, no Windows device
   names. Reserved names are refused (case-insensitive): `appdata`, `workspace`, `_system`, `_deleted`, `_teams`,
   `library`, `backups`, `logs` (see [SECURITY-ASSESSMENT.md](SECURITY-ASSESSMENT.md) GW-04).

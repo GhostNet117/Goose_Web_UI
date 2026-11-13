@@ -921,6 +921,33 @@ For extensions and providers added from a profile library, the secrets named by 
 Items added manually through the API never copy secrets from another profile. Removing an item, or removing a user
 from the team, removes what was provisioned (but never items the user created).
 
+**Nothing is shared by default.** Without a library item a member gets none of your skills, recipes, extensions,
+providers or keys: a new profile starts with Goose's bundled platform extensions and nothing else. For skills and
+recipes this rests on the sandbox (11.6), because of where Goose keeps them (11.3): `goose-web check` has a line
+"home-folder Goose items" that says how many skills, recipes and agents the gateway's account has in its home
+folder, and warns when members are not sandboxed.
+
+**Where the picker looks.** For a member's profile: that profile's `config/skills` and `config/recipes`. For your
+own native profile it looks where Goose itself looks for that Windows account (since 1.21.0):
+
+| Kind | Folders, in this order |
+|---|---|
+| skill | `~/.agents/skills`, `<native config>/skills`, `~/.claude/skills`, `~/.config/agents/skills`. When two folders hold a skill of the same name, the first one is offered, as Goose would load it. The picker's Source column shows the folder. |
+| recipe | `<native config>/recipes`, the folders of your `GOOSE_RECIPE_PATH`, `~/.agents/recipes`, `~/.goose/recipes` |
+
+Home-folder agents (`~/.agents/agents` and the like) are not offered: an agent carries its own instructions and
+tool use.
+
+**Links are never followed** (since 1.21.0). A skill folder, a `SKILL.md` or a recipe file that is a junction, a
+symbolic link or has more than one hard link is not offered, and inside a skill such files and folders are left
+out; so is a `skills` or `recipes` folder that is itself a link. A skill needs a regular `SKILL.md`, and at most 500
+files. Earlier versions read through links with the gateway's rights (SECURITY-ASSESSMENT 15.3): had a skill in a
+member's profile held a link to a file outside it, offering that skill to a team would have copied the file's
+content to the team. To share a skill that uses links, make it real files first.
+
+**You are sharing text.** Read a skill before you offer it. Whatever its files say (paths, host names, a key someone
+pasted into an example) is copied into every member's profile, where the member's agent reads it.
+
 ### 9.10 Prompt guard (since 1.14.0)
 
 The prompt guard stops forbidden or injected instructions from reaching the tools of a team. It is **off for every
@@ -1385,9 +1412,22 @@ On Windows the limits below about the shared OS account are closed for non-admin
 
 All workers run as the gateway's OS account. A tool that can read files or run commands can reach other profiles,
 the database and the native profile. That is why the shell extensions and stdio MCP servers are off for non-admins
-unless `allow_shell` is on; grant it only to people you would trust with that OS account. Home-folder skill and
-recipe folders such as `~/.agents/skills` and `~/.agents/recipes` are not moved by `GOOSE_PATH_ROOT` and are visible to
-all profiles. Admins always have the full power of the OS account.
+unless `allow_shell` is on; grant it only to people you would trust with that OS account. Admins always have the
+full power of the OS account.
+
+**Goose's home-folder skills, recipes and agents.** Goose looks for global skills, recipes and agents under the
+home folder of the operating-system account: `~/.agents/skills`, `~/.claude/skills`, `~/.config/agents/skills`;
+`~/.agents/recipes`, `~/.goose/recipes`; `~/.agents/agents`, `~/.goose/agents`, `~/.claude/agents`.
+`GOOSE_PATH_ROOT` does not move them (Goose asks Windows for the home folder; it does not read `USERPROFILE`), and
+that home is the gateway account's, i.e. the administrator's. So:
+
+- **With the sandbox** a member's agent cannot read the contents of those folders (measured in an MXC container:
+  the files are refused), so Goose there loads none of them. Members get the skills and recipes you offer their
+  team (9.9) and nothing else.
+- **Without the sandbox** every profile's Goose loads all of them, and no setting of Goose Web can prevent it.
+  `goose-web check` warns about it.
+
+Members' own skills and recipes are in their profile folders and are not shared with anyone.
 
 **Known risk with teams.** Team policies, team folders and the hints rules are enforced by the gateway (over ACP
 and in the file endpoints), not by Windows permissions: every isolated worker, of every team, runs under the same
@@ -1489,8 +1529,9 @@ from a policy Goose Web builds at every start:
   (`\\?\` prefixes, `/`, case, trailing dots and spaces do not matter) and after resolving junctions, links and 8.3
   names; network (UNC, `\\server\share`, also `\\localhost\C$`) and device paths are never granted. A
   `sandbox.read_dirs` entry naming a refused folder is left out for both backends and listed by `goose-web sandbox
-  status` / `check`. Folder *names* (not contents) on the drives of the granted folders can be listed
-  (`enumeratePaths`; node and cmd need it).
+  status` / `check`. The *names* of files and folders (not their contents) on the drives of the granted folders
+  can be listed (`enumeratePaths`; node and cmd need it): a member's agent that can run commands can see, for
+  example, what the files in the gateway account's Documents folder are called.
 - **Hard links:** MXC grants are path-based. A file in a member's read/write folders that is hard-linked to a file
   outside them would give the agent that outside file, so before an MXC start (once per set of folders, and again
   after the member ran in the AppContainer backend, where agents can make such links) Goose Web looks for them

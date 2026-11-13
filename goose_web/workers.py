@@ -430,8 +430,11 @@ class WorkerManager:
                 if k.startswith(_ISOLATION_STRIP_PREFIXES) and k not in _ISOLATION_KEEP:
                     env.pop(k)
             env["GOOSE_DISABLE_KEYRING"] = "1"   # secrets stay in the profile's own secrets.yaml
+            # Only the team's recipe folders, not the administrator's own GOOSE_RECIPE_PATH. This does NOT keep Goose
+            # away from the home-folder recipe, skill and agent folders (~/.agents/recipes and the like): Goose finds
+            # those through the operating system's home folder whatever this variable says (profiles.HOME_*_DIRS).
+            # Only the sandbox keeps a member's agent out of them; this worker has none (spec 028).
             env["GOOSE_RECIPE_PATH"] = os.pathsep.join(w.recipe_dirs)
-            # machine-wide ~/.agents/recipes would otherwise leak the admin's recipes
         if w.path_root:
             env["GOOSE_PATH_ROOT"] = w.path_root
         else:

@@ -995,6 +995,25 @@ def cmd_check(args, settings) -> int:
         else:
             line("sandbox", "on: isolated non-admin workers run in their own AppContainer (sandbox.backend: "
                  "appcontainer)")
+    # Spec 028: Goose loads its global skill, recipe and agent folders from the home folder of the gateway's account
+    # (GOOSE_PATH_ROOT does not move them). Inside the sandbox a member's agent cannot read them; without it every
+    # member's agent loads them, and nothing in Goose Web can prevent that. Information only: never fails the check.
+    try:
+        from . import profiles as _profiles
+        hl = _profiles.home_library_summary()
+        counts = (len(hl["skills"]), len(hl["recipes"]), len(hl["agents"]))
+        what = f"{counts[0]} skill(s), {counts[1]} recipe(s), {counts[2]} agent(s) in {hl['home']}"
+        links = f"; not read because they are links: {', '.join(hl['linked'])}" if hl["linked"] else ""
+        if not any(counts):
+            print(f"[--] home-folder Goose items: none in {hl['home']}{links}")
+        elif sandbox_on(settings):
+            print(f"[OK] home-folder Goose items: {what}. Members' agents cannot read them (sandbox on); offer "
+                  f"skills and recipes to a team in Admin > Teams > Library items{links}")
+        else:
+            print(f"[!!] home-folder Goose items: {what}. EVERY member's agent loads them while the sandbox is off "
+                  f"(sandbox.enabled); Goose Web cannot prevent that{links}")
+    except Exception as e:
+        print(f"[--] home-folder Goose items: could not be listed ({e.__class__.__name__})")
     from . import logjanitor, tls
     try:
         st = tls.status(settings, _tls_override(settings, readonly=True))

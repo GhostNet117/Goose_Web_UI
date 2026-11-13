@@ -27,6 +27,22 @@ def _no_model_download(monkeypatch):
     monkeypatch.setattr(guardmodel, "_TRANSPORT", httpx.MockTransport(refuse))
 
 
+@pytest.fixture(scope="session")
+def _empty_account_home(tmp_path_factory):
+    return tmp_path_factory.mktemp("account-home-empty")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_home_library(monkeypatch, _empty_account_home):
+    """No test reads the developer's own home folder (spec 028). The native profile's library lists Goose's
+    home-folder skills and recipes and the administrator's GOOSE_RECIPE_PATH; on a developer's machine those are
+    real, so results would depend on who runs the tests. Every test gets an empty folder as that home and no
+    GOOSE_RECIPE_PATH; the tests of the feature put their own folder in place."""
+    from goose_web import profiles
+    monkeypatch.setattr(profiles, "account_home", lambda: _empty_account_home)
+    monkeypatch.delenv("GOOSE_RECIPE_PATH", raising=False)
+
+
 def pytest_runtest_logreport(report):
     if not os.environ.get("GITHUB_ACTIONS") or not report.failed:
         return

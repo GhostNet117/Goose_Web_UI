@@ -611,7 +611,7 @@ native profile stay unsandboxed (GW-01 unchanged: one OS account).
 |---|---|---|
 | Containment | Goose Web's own code: `CreateAppContainerProfile`, capabilities, ACL grants with icacls, grant/revoke state in `<system_dir>/sandbox` | OS policy (process containers, PSEC) driven by Microsoft's `wxc-exec.exe`; no ACL is changed, nothing to revoke; a new container (and SID) per start |
 | Files | Modify/Read&execute ACEs on granted folders | read/write and read-only paths in the policy; Goose Web refuses grants of its own system folder, the profiles root, other profiles, the native profile, its code (write) and drive roots, also through junctions and 8.3 names |
-| Folder names | not listable outside grants | listable (names only, no contents) on the drives of granted folders (`enumeratePaths`; node and cmd need it) - **accepted (Q2)** |
+| File and folder names | not listable outside grants | listable (names only, no contents) on the drives of granted folders (`enumeratePaths`; node and cmd need it) - **accepted (Q2)**. Until 1.21.0 this row said "folder names"; file names are listed too |
 | Network | capabilities: `internetClient` (+ `privateNetworkClientServer`), any protocol; loopback closed; relays through an in-container forwarder and a named pipe; provider URLs rewritten | no own network; one loopback endpoint, the member's **egress proxy** in the gateway, which decides every destination and audits it; **HTTP/HTTPS only** - **accepted (Q1)**; provider URLs unchanged |
 | UI | AppContainer defaults | clipboard, input injection, desktop/system-settings control and IME blocked (Win32k on) |
 | Process | suspended start in the gateway's kill-on-close job | `wxc-exec` suspended, joined to the gateway's and the worker's kill-on-close jobs, then resumed |
@@ -639,7 +639,9 @@ native profile stay unsandboxed (GW-01 unchanged: one OS account).
 - GW-01 (one OS account) is unchanged; MXC is an AppContainer-class boundary inside that account.
 - MXC is young (GA 2026-10-07); the executor is documented by Microsoft for testing or when the SDK cannot be
   embedded. Pinned and re-verified; a new version is a new pin after review.
-- Folder names on the drives of granted folders are visible to members' agents (Q2).
+- The names of files and folders on the drives of granted folders are visible to members' agents (Q2). Measured in
+  an MXC container on 2026-11-13: the names in the gateway account's home folder (for example in Documents, and of
+  its Goose skills) can be listed; reading any of those files is refused.
 - Programs inside the container that send requests without the proxy credential are refused (407); Windows'
   certificate-revocation lookups are among them (HTTPS still works).
 - Learning mode / denial capture is not used (it fails on the tested build).
@@ -856,3 +858,73 @@ covered by tests in `tests/test_goosesec.py`, checked by running them against th
 of fixes: the tests of every R and T finding and of F-1 to F-5 and F-8 fail there (F-7 and F-12 have no test of
 their own). Also: the whole suite on Python 3.11 and 3.13, and a throwaway gateway run with the real Goose binary.
 Not tested against a real Goose: how Goose returns value types other than the ones Goose Web writes.
+
+## 15. Addendum: library items from Goose's home folders (2026-11-13), 1.21.0
+
+Scope: `profiles.py` (`library`, `export_item`, `_skill_dirs`, `_recipe_dirs`, `_read_skill_files`), the
+`goose-web check` line, and what the documents say about Goose's home-folder skills, recipes and agents.
+
+### 15.1 What is true about those folders
+
+Goose looks for global skills, recipes and agents under the operating system's home folder
+(`~/.agents/skills`, `~/.claude/skills`, `~/.config/agents/skills`; `~/.agents/recipes`, `~/.goose/recipes`;
+`~/.agents/agents`, `~/.goose/agents`, `~/.claude/agents`): read in the source of Goose 1.57.0 and 1.59.0, and
+measured with the 1.57.0 binary, which lists the account's home-folder skills for a profile with its own
+`GOOSE_PATH_ROOT` whatever `USERPROFILE`, `HOME`, `HOMEDRIVE` and `HOMEPATH` say. The home is the gateway account's.
+
+| A member's agent | Sandbox on (default) | Sandbox off |
+|---|---|---|
+| reads the contents of those folders | refused (measured in an MXC container) | yes |
+| so its Goose loads those skills, recipes and agents | no | yes, all of them |
+| can list the names in them | yes (Q2, 13.1) | yes |
+
+Earlier versions of this document and the README said these folders "are visible to all profiles". That is the
+right-hand column only.
+
+### 15.2 What 1.21.0 adds
+
+An administrator can offer skills from those folders to a team (the library picker of the native profile now lists
+them, in Goose's order of precedence) and recipes from `~/.goose/recipes` as well. Nothing changes in how items are
+delivered, and nothing is shared without an item. Home-folder agents are not offered.
+
+| Threat | Control |
+|---|---|
+| A member lists or adds library items | `GET /api/admin/library` and `POST /api/admin/teams/{id}/items` require an administrator (unchanged) |
+| A member's profile is used to read a file the member cannot read (below, 15.3) | The export follows no link: junctions, symbolic links and hard-linked files are skipped; a `skills` or `recipes` folder that is a link, or has a link between it and the profile root, is not read |
+| A huge or endless skill folder | 2 MB of text and 500 files at most; a linked folder is never entered |
+| The home-folder items reach members who were not given them | They are copied only as team items. The gateway cannot stop Goose from reading the home folder when the sandbox is off; `goose-web check` says so |
+| The tests read, or depend on, the developer's own home folder | The test session replaces the home folder and removes `GOOSE_RECIPE_PATH` for every test |
+
+### 15.3 A defect in earlier versions, fixed here
+
+Before 1.21.0 `export_item` read every file under a skill folder, also through links. A skill folder in a member's
+profile is the member's to fill: with a junction or a hard link in it to a file outside the profile (another
+profile's `secrets.yaml`, the gateway's database), an administrator who later offered that skill to a team made the
+gateway read the target with its own rights and copy it into the profiles of the team's members. Reproduced
+against 1.20.0 with a junction and with a hard link placed in the folder; neither is read now.
+
+How such a link could get there decides how serious this was. It needed an administrator to choose that skill from
+that member's profile, and it needed the link:
+
+- **A member confined by the MXC sandbox could not create one.** Measured in a container: a hard link, a junction
+  and a symbolic link to a file or folder outside the member's own folder are all refused.
+- **Without the sandbox** a member's agent that can run commands can create them, but it can also read the target
+  directly; the defect then only added that the content was copied to other members.
+- **Not measured:** the AppContainer backend, and links that reach a profile some other way (a restored backup, an
+  administrator's own tool).
+
+Severity: Low for an installation that uses the sandbox; the fix is made for every source because the export has
+no reason to follow a link at all.
+
+### 15.4 Residual risks
+
+- **What the administrator shares is text.** A skill that mentions paths, host names or a pasted key carries them
+  into every member's profile. Goose Web does not inspect skills.
+- **Between the check and the read.** The export checks a file and then reads it. A member's agent running at the
+  very moment an administrator exports from that member's profile could swap a file for a link in between. Exports
+  from the administrator's own profile are not affected.
+- **Without the sandbox** the home-folder skills, recipes and agents are loaded by every profile's Goose (15.1).
+- **Names** of files and folders are listable inside the sandbox (Q2).
+- **Same-named skills** in two folders: the first in Goose's order is offered. Goose itself goes by the name
+  inside `SKILL.md`, Goose Web by the folder name; when those differ the picker and Goose can disagree about which
+  one "wins".

@@ -62,6 +62,16 @@ HINT_FILE_NAMES = frozenset({".goosehints", "agents.md", GW_HINTS_FILENAME.lower
 BASE_EXTENSIONS = ["todo", "skills", "apps", "chatrecall", "summarize", "extensionmanager", "analyze", "memory",
                    "summon", "tom"]
 MAX_SKILL_BYTES = 2 * 1024 * 1024
+MAX_SKILL_FILES = 500
+# Spec 028. Where Goose looks for GLOBAL skills, recipes and agents: under the home folder of the operating-system
+# account, which GOOSE_PATH_ROOT does not move (Goose 1.57.0 and 1.59.0: crates/goose/src/skills/mod.rs
+# all_skill_dirs_with_config, agents/platform_extensions/summon.rs discover_filesystem_sources,
+# recipe/local_recipes.rs local_recipe_dirs). Relative to that home folder. The home is the gateway's account, i.e.
+# the administrator's: inside the sandbox a member's agent cannot read these folders, without it every agent loads
+# them. Administrators offer skills and recipes from them per team (library items); agents are not offered.
+HOME_SKILL_DIRS = ((".agents", "skills"), (".claude", "skills"), (".config", "agents", "skills"))
+HOME_RECIPE_DIRS = ((".agents", "recipes"), (".goose", "recipes"))
+HOME_AGENT_DIRS = ((".agents", "agents"), (".goose", "agents"), (".claude", "agents"))
 # FIX team-skills-not-loadable-via-load: first line of a skill bridge (config/agents/<skill>.md) Goose Web wrote
 SKILL_BRIDGE_MARK = "<!-- skill-bridge: managed by Goose Web"
 log = logging.getLogger("goose_web")
@@ -151,6 +161,50 @@ def _is_reparse(p: Path) -> bool:
 
 def _real_norm(p: str | Path) -> str:
     return os.path.normcase(os.path.normpath(os.path.realpath(str(p))))
+
+
+def _linked(p: Path) -> bool:
+    """True for something a library export must not read through (spec 028, D5): a junction, a symbolic link or a
+    mount point, or a FILE with more than one hard link - its content may be a file somewhere else, which the gateway
+    can read and whoever made the link may not. Something that cannot be examined counts as linked."""
+    if _is_reparse(p):
+        return True
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return not stat.S_ISDIR(st.st_mode) and getattr(st, "st_nlink", 1) > 1
+
+
+def account_home() -> Path:
+    """The home folder of the account the gateway runs as. Goose finds its global skill, recipe and agent folders
+    there (HOME_*_DIRS). One function, so that the tests never read the developer's real home folder."""
+    return Path(os.path.expanduser("~"))
+
+
+def home_library_summary() -> dict:
+    """What Goose finds in the home folder of the gateway's account: the NAMES of global skills, recipes and agents
+    (spec 028; for `goose-web check`). A member's agent loads them whenever it is not confined by the sandbox.
+    `linked` = folders that are links and are therefore not read by Goose Web."""
+    h = account_home()
+    out: dict[str, Any] = {"home": str(h), "skills": set(), "recipes": set(), "agents": set(), "linked": []}
+    for key, rels, want in (("skills", HOME_SKILL_DIRS, lambda x: (x / "SKILL.md").is_file()),
+                            ("recipes", HOME_RECIPE_DIRS, lambda x: x.suffix.lower() in (".yaml", ".yml", ".json")),
+                            ("agents", HOME_AGENT_DIRS, lambda x: x.suffix.lower() == ".md")):
+        for rel in rels:
+            d = h.joinpath(*rel)
+            try:
+                if _is_reparse(d):
+                    out["linked"].append(str(d))
+                elif d.is_dir():
+                    out[key].update(x.name if key == "skills" else x.stem for x in list(d.iterdir())[:2000] if want(x))
+            except OSError:
+                continue
+    for key in ("skills", "recipes", "agents"):
+        out[key] = sorted(out[key])
+    return out
 
 
 def _inside_profile(p: Path, root: Path) -> bool:
@@ -937,14 +991,74 @@ class Profiles:
             if f.exists():
                 f.unlink()
 
+    def _library_dir_ok(self, user: dict, d: Path) -> bool:
+        """A folder the library may read items from: a real folder, not a link; and in a member's profile with no
+        link anywhere between the profile root and the folder (the member's agent could have planted one)."""
+        if _is_reparse(d) or not d.is_dir():
+            return False
+        return self.is_native(user) or _inside_profile(d, self.root_for(user))
+
     def _recipe_dirs(self, user: dict) -> list[Path]:
+        """Where this profile's recipes are. A member's profile: its own config/recipes. The native profile: also
+        the administrator's GOOSE_RECIPE_PATH and Goose's home-folder recipe folders (HOME_RECIPE_DIRS)."""
         dirs = [self.config_dir(user) / "recipes"]
         if self.is_native(user):
             for d in (os.environ.get("GOOSE_RECIPE_PATH") or "").split(os.pathsep):
                 if d.strip():
                     dirs.append(Path(d.strip()))
-            dirs.append(Path(os.path.expanduser("~")) / ".agents" / "recipes")
-        return [d for d in dirs if d.is_dir()]
+            dirs += [account_home().joinpath(*rel) for rel in HOME_RECIPE_DIRS]
+        seen: set[str] = set()
+        out = []
+        for d in dirs:
+            key = os.path.normcase(os.path.normpath(str(d)))
+            if key not in seen and self._library_dir_ok(user, d):
+                seen.add(key)
+                out.append(d)
+        return out
+
+    def _skill_dirs(self, user: dict) -> list[Path]:
+        """The folders this profile's Goose loads global skills from, in Goose's order of precedence. A member's
+        profile: its own config/skills. The native profile: Goose's home-folder skill folders of the gateway's
+        account as well (spec 028) - ~/.agents/skills first, then config/skills, then the others."""
+        cfg = self.config_dir(user) / "skills"
+        if not self.is_native(user):
+            dirs = [cfg]
+        else:
+            h = account_home()
+            first, *rest = HOME_SKILL_DIRS
+            dirs = [h.joinpath(*first), cfg, *[h.joinpath(*r) for r in rest]]
+        return [d for d in dirs if self._library_dir_ok(user, d)]
+
+    @staticmethod
+    def _read_skill_files(d: Path) -> dict[str, str]:
+        """The text files of one skill folder, for a team item. Nothing is read through a link (spec 028, D5): a
+        linked folder is not entered, a linked or hard-linked file is skipped, and a file whose real location is
+        outside the folder is skipped. Binary files are not shared. Raises ValueError when the skill cannot be
+        shared: too large, too many files, or no regular SKILL.md."""
+        if _is_reparse(d) or not d.is_dir():
+            raise ValueError("the skill folder is a link or not a folder; it is not shared")
+        real = _real_norm(d).rstrip("\\/") + os.sep
+        files: dict[str, str] = {}
+        total = count = 0
+        for cur, dirs, names in os.walk(d, followlinks=False):
+            dirs[:] = sorted(x for x in dirs if not _is_reparse(Path(cur) / x))   # never descend into a link
+            for n in sorted(names):
+                f = Path(cur) / n
+                if n == MANAGED_MARK or _linked(f) or not f.is_file() or not _real_norm(f).startswith(real):
+                    continue
+                count += 1
+                if count > MAX_SKILL_FILES:
+                    raise ValueError(f"skill has too many files to share ({MAX_SKILL_FILES} at most)")
+                total += f.stat().st_size
+                if total > MAX_SKILL_BYTES:
+                    raise ValueError("skill too large to share (2 MB limit)")
+                try:
+                    files[f.relative_to(d).as_posix()] = f.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    continue  # binary supporting files are not shared
+        if "SKILL.md" not in files:
+            raise ValueError("SKILL.md is missing, is not text, or is a link; the skill is not shared")
+        return files
 
     def library(self, user: dict, kind: str) -> list[dict]:
         out: list[dict] = []
@@ -952,6 +1066,8 @@ class Profiles:
         if kind == "recipe":
             for d in self._recipe_dirs(user):
                 for f in sorted(list(d.glob("*.yaml")) + list(d.glob("*.yml")) + list(d.glob("*.json")))[:2000]:
+                    if _linked(f) or not f.is_file():
+                        continue   # never read through a link (spec 028, D5)
                     try:
                         data = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
                     except Exception:
@@ -962,17 +1078,25 @@ class Profiles:
                     out.append({"kind": "recipe", "ref": str(f), "name": f.stem,
                                 "description": r.get("description") or r.get("title") or "", "source": str(d)})
         elif kind == "skill":
-            sk = cfg_dir / "skills"
-            if sk.is_dir():
-                for d in sorted(sk.iterdir()):
-                    if (d / "SKILL.md").is_file():
-                        desc = ""
-                        m = re.search(r"^description:\s*(.+)$", (d / "SKILL.md").read_text(encoding="utf-8",
-                                      errors="replace")[:4000], re.M)
-                        if m:
-                            desc = m.group(1).strip().strip("'\"")
-                        out.append({"kind": "skill", "ref": d.name, "name": d.name, "description": desc,
-                                    "source": str(sk)})
+            seen: set[str] = set()
+            for sk in self._skill_dirs(user):
+                try:
+                    children = sorted(sk.iterdir())[:2000]
+                except OSError:
+                    continue
+                for d in children:
+                    md = d / "SKILL.md"
+                    # the first folder that has the name wins, as in Goose; a linked folder or SKILL.md is not offered
+                    if d.name in seen or _is_reparse(d) or not d.is_dir() or _linked(md) or not md.is_file():
+                        continue
+                    try:
+                        head = md.read_text(encoding="utf-8", errors="replace")[:4000]
+                    except OSError:
+                        continue
+                    seen.add(d.name)
+                    m = re.search(r"^description:\s*(.+)$", head, re.M)
+                    out.append({"kind": "skill", "ref": d.name, "name": d.name,
+                                "description": m.group(1).strip().strip("'\"") if m else "", "source": str(sk)})
         elif kind == "extension":
             cfg = _read_yaml(cfg_dir / "config.yaml")
             for key, e in sorted((cfg.get("extensions") or {}).items()):
@@ -1000,21 +1124,14 @@ class Profiles:
         cfg_dir = self.config_dir(user)
         if kind == "recipe":
             p = Path(ref)
+            if _linked(p) or not p.is_file():   # listed a moment ago as a regular file; never read through a link
+                raise ValueError("the recipe file is a link or not a file; it is not shared")
             return re.sub(r"[^A-Za-z0-9._-]", "-", p.stem)[:100], {"yaml": p.read_text(encoding="utf-8"),
                                                                    "origin": str(p)}
         if kind == "skill":
-            d = cfg_dir / "skills" / ref
-            files, total = {}, 0
-            for f in d.rglob("*"):
-                if f.is_file() and f.name != MANAGED_MARK:
-                    total += f.stat().st_size
-                    if total > MAX_SKILL_BYTES:
-                        raise ValueError("skill too large to share (2 MB limit)")
-                    try:
-                        files[f.relative_to(d).as_posix()] = f.read_text(encoding="utf-8")
-                    except UnicodeDecodeError:
-                        continue  # binary supporting files are not shared
-            return ref, {"files": files}
+            # the folder the listing found it in: config/skills, or for the native profile one of Goose's
+            # home-folder skill folders (spec 028)
+            return ref, {"files": self._read_skill_files(Path(listed[ref]["source"]) / ref)}
         if kind == "extension":
             cfg = _read_yaml(cfg_dir / "config.yaml")
             entry = copy.deepcopy((cfg.get("extensions") or {})[ref])
