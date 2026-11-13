@@ -1,5 +1,83 @@
 # Changelog
 
+## 1.22.0 - 2026-11-13
+
+**Two-factor sign-in can be required for everyone or per team; what an administrator changes in his library reaches
+his teams; a team that cannot chat says so; AppContainer folder permissions are checked on the folder.** No database
+schema change. New: the admin setting "Require two-factor for everyone" and the team switch "Require two-factor
+sign-in".
+
+- **Two-factor can be required (spec 029).** Admin > Settings > "Require two-factor for everyone" (administrators
+  and members, whatever way they sign in: password, directory, single sign-on), and per team: Teams > Experience >
+  Other > "Require two-factor sign-in". An account that must use it and has not set it up can do nothing but set it
+  up: its own account page and password change stay open, everything else - other requests, API tokens, the chat
+  socket - answers `403 totp_enrolment_required`, as for administrators since 1.12; and it cannot switch two-factor
+  off again. Two-factor is set up in the browser, signed in as the account, not with an API token. An administrator
+  is not bound by a team's switch (use "for administrators" or "for everyone"). Such an account can always enrol, also when "Users may
+  enable two-factor themselves" is off. Switching the requirement on ends the open sockets of accounts without
+  two-factor at once. "For everyone" can only be switched on by an administrator who uses two-factor himself.
+- **Library items follow the administrator.** A provider, extension, skill or recipe that a team was given from an
+  administrator's profile was a copy made once: changing it in that profile did not reach the team until the item
+  was removed and added again. Now the gateway compares every such item with its source every five minutes (and on
+  `POST /api/admin/library/refresh`), replaces the team's copy when it differs and provisions the members; an agent
+  that runs restarts when it is idle. A copy taken from a member's profile does not follow that member. An item
+  whose source is gone keeps the team's copy: taking it away is the administrator's step. Know what this means:
+  whatever changes in the administrator's profile - also what an agent running as the administrator writes there -
+  reaches those teams within minutes. A recipe whose file lies in a folder members can write is not followed. Removing an item from a
+  team, or a member from the team, removes it from the member's profile - provider file, its key, extension entry,
+  skill folder, recipe - at once; this was so before and now has a test for every kind.
+
+Also in this release - **AppContainer backend: a folder permission that could not be set was recorded as set.**
+Found in use, on folders the gateway's account does not own. Installations that use MXC only are not affected (MXC
+changes no folder permissions).
+
+The AppContainer backend gives each member's container an entry in the access list of every folder it may use, and
+takes it off again. It did so with `icacls /C`, which reports success even when it could not change the folder at
+all. Where the gateway's account may not change a folder's permissions - a Goose or Python folder installed by an
+administrator, a team folder owned by someone else, the usual case when the gateway runs as a service account -
+Goose Web recorded the grant, the member's agent got "access is denied" (or did not start), nothing said why, and
+because the record said "granted" it was never tried again.
+
+- **Every grant and every revoke is checked on the folder itself.** A grant that is not there is not recorded, and
+  one that is wider than wanted (modify where read is wanted) is not recorded as the narrower one. A grant that an
+  earlier version recorded without making is made at the member's next start.
+- **A folder that every container may read already is left alone** (`C:\Program Files` and anything else that
+  gives "ALL APPLICATION PACKAGES" read access): no entry is added, and nothing has to be taken off later.
+- **An entry of the member's container that is already on a wanted folder counts as Goose Web's**, whoever made it
+  (a start that could not save its record, an earlier version, an administrator by hand): it is on record and is
+  taken off when the folder is no longer wanted.
+- **A folder that cannot be given says what to do.** The member's own profile and the goose folder are needed to
+  run at all: the start fails with the folder, the account and the `icacls` command. Any other folder (a team's
+  extra folder, a `sandbox.read_dirs` entry) is left out and the agent starts; the reason is in the gateway log and
+  in `goose-web sandbox status` (under the member's container), the audit log has `sandbox.grant.failed` with the
+  folders; it is tried again at every start.
+- **A folder that is taken away loses the container's entry at once**: when an administrator removes a folder from
+  a team, moves a member or changes a team, the entries that are no longer permitted are taken off in the
+  background, without waiting for that member's agent (audited as `sandbox.revoke`). Before, an entry stayed until
+  the agent next started - for good, if it never did - and a running agent kept the folder until it restarted. An
+  entry that cannot be taken off stays on record and is shown as still on the folder, instead of being reported as
+  removed. New folders are given at the member's next start, as before. Not at once: a team that changes at sign-in
+  from a directory, changes made with the command line, and `sandbox.read_dirs`.
+- **`goose-web check` and `sandbox status` have a "sandbox folders" line** when the AppContainer backend or fallback
+  is configured: whether the account running them may change permissions in the profiles root, and which program
+  folders (goose, `sandbox.read_dirs`, the gateway's Python when something is relayed) neither let containers read
+  them nor can be changed, each with the command that fixes it. Only the profiles root and the goose folder make
+  `check` fail, and only when AppContainer is the configured backend. The gateway logs the same for its own account
+  at every start. `sandbox status` lists per container what was given, what every container may use anyway, what
+  could not be given and why, and what could not be taken off.
+- **A team is told when its members do not have its provider.** Allowing a custom provider for a team, or making
+  it the team's default, does not put the provider or its key into the members' profiles - that takes a library
+  item (Admin > Teams > Library items > Provider). A team set up without it looked complete while its members could
+  not reach a model, and nothing said why (found in use). The team's page now shows an error for a default provider
+  the team does not have as a library item, and a warning for an allowed one. It also shows an error for a default
+  provider without a default model: Goose cannot start a chat without a model, so a new member of such a team could
+  not open one ("Configuration value not found: GOOSE_MODEL"). `goose-web check` has a line per team with members:
+  whether they can chat as the team is set up.
+- `install.ps1` stops when it cannot give the gateway's account full control of the profiles root (it went on with
+  a warning), and accepts a local account written as `.\name` there (before, the permissions were not set at all
+  for that form).
+- Tests: real containers on folders whose permissions the test's own account may not change.
+
 ## 1.21.1 - 2026-11-13
 
 **The AppContainer backend, measured again with real containers; what a sandboxed agent can read in the registry.**

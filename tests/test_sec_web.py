@@ -427,6 +427,86 @@ def test_admin_must_enrol_before_anything_else(gw):
     assert client.post("/api/auth/logout", headers=h).status_code == 200
 
 
+def test_two_factor_can_be_required_for_everyone_and_per_team(gw):
+    """Spec 029. Until 1.21 only administrators could be made to use two-factor."""
+    from tests.test_team_profiles import ANYCHAT, team
+    client, c = gw
+    auth = c.auth
+    boss = mk_user(c.db, "boss", role="admin")
+    ann, bob = mk_user(c.db, "ann"), mk_user(c.db, "bob")
+    strict = team(c.db, "Strict", {**ANYCHAT, "require_totp": True})
+    loose = team(c.db, "Loose", ANYCHAT)
+    c.db.set_user_team(ann["id"], strict)
+    c.db.set_user_team(bob["id"], loose)
+    fresh = lambda u: c.db.user_by_id(u["id"])                                   # noqa: E731
+    assert auth.totp_required(fresh(ann)) and auth.totp_enrolment_required(fresh(ann))       # her team requires it
+    assert not auth.totp_required(fresh(bob)) and not auth.totp_required(fresh(boss))
+    # the member can do nothing but enrol - also when self-service enrolment is switched off
+    c.db.set_setting("allow_self_totp", False)
+    h = sign_in(client, c, fresh(ann))
+    me = client.get("/api/me").json()
+    assert me["totpEnrolmentRequired"] is True and c.must_enrol_or_change(fresh(ann))
+    for method, path in (("POST", "/api/me/tokens"), ("PUT", "/api/me/prefs")):
+        r = client.request(method, path, headers=h, json={})
+        assert (r.status_code, r.json()["error"]) == (403, "totp_enrolment_required"), path
+    secret = client.post("/api/me/totp/setup", headers=h).json()["secret"]
+    assert client.post("/api/me/totp/enable", headers=h, json={"code": security.totp(secret)}).status_code == 200
+    assert client.put("/api/me/prefs", headers=h, json={}).status_code == 200
+    assert not auth.totp_enrolment_required(fresh(ann)) and auth.totp_required(fresh(ann))
+    # ... and cannot switch it off again
+    r = client.post("/api/me/totp/disable", headers=h, json={"password": "x", "code": security.totp(secret)})
+    assert (r.status_code, r.json()["error"]) == (403, "required")
+    # a member of a team that does not require it is refused enrolment while self-service is off, as before
+    client.cookies.clear()
+    hb = sign_in(client, c, fresh(bob))
+    assert client.post("/api/me/totp/setup", headers=hb).json()["error"] == "totp_self_disabled"
+    # for everyone: administrators and members of any team, or of none
+    c.db.set_setting("require_totp_all", True)
+    assert auth.totp_enrolment_required(fresh(bob)) and auth.totp_enrolment_required(fresh(boss))
+    assert client.get("/api/me").json()["totpEnrolmentRequired"] is True
+    assert client.put("/api/me/prefs", headers=hb, json={}).json()["error"] == "totp_enrolment_required"
+    assert "secret" in client.post("/api/me/totp/setup", headers=hb).json()      # required, so enrolment is open
+    c.db.set_setting("require_totp_all", False)
+    # the team's switch survives the policy cleaning and is said on the team's page
+    from goose_web import api as _api, policy as _pol
+    assert _api._clean_policy({**ANYCHAT, "require_totp": True}, c).get("require_totp") is True
+    assert "require_totp" not in _api._clean_policy(dict(ANYCHAT), c)
+    assert any("Two-factor sign-in is required" in w["text"]
+               for w in _pol.team_warnings({**ANYCHAT, "require_totp": True}, hints=1, members=1))
+
+
+def test_two_factor_is_not_set_up_with_an_api_token(gw):
+    """Review Z-3: with two-factor required, a script holding a token of an account without it could enrol an
+    authenticator of its own - full access for the token, and the person locked out."""
+    client, c = gw
+    u = mk_user(c.db, "scripted")
+    token = c.auth.create_api_token(u, "automation", None)[1]
+    c.db.set_setting("require_totp_all", True)
+    from starlette import testclient as _stc
+    http = _stc.httpx.Client(transport=client._transport, base_url="http://testserver")
+    for path in ("/api/me/totp/setup", "/api/me/totp/enable"):
+        r = http.post(path, headers={"authorization": f"Bearer {token}"}, json={"code": "000000"})
+        assert (r.status_code, r.json()["error"]) == (403, "session_required"), path
+    assert not c.db.user_by_id(u["id"])["totp_secret"]
+    h = sign_in(client, c, c.db.user_by_id(u["id"]))                      # in the browser it works
+    assert "secret" in client.post("/api/me/totp/setup", headers=h).json()
+
+
+def test_requiring_two_factor_for_everyone_needs_an_administrator_who_uses_it(gw):
+    client, c = gw
+    boss = mk_user(c.db, "boss", role="admin")
+    h = sign_in(client, c, boss)
+    r = client.put("/api/admin/settings", headers=h, json={"requireTotpForAll": True})
+    assert (r.status_code, r.json()["error"]) == (409, "totp_needed_first") and not c.db.get_setting("require_totp_all")
+    secret = client.post("/api/me/totp/setup", headers=h).json()["secret"]
+    assert client.post("/api/me/totp/enable", headers=h, json={"code": security.totp(secret)}).status_code == 200
+    assert client.put("/api/admin/settings", headers=h, json={"requireTotpForAll": True}).status_code == 200
+    assert c.db.get_setting("require_totp_all") is True
+    assert client.get("/api/admin/settings", headers=h).json()["requireTotpForAll"] is True
+    assert client.put("/api/admin/settings", headers=h, json={"requireTotpForAll": False}).status_code == 200
+    assert not c.db.get_setting("require_totp_all")
+
+
 def test_websocket_refused_until_enrolled(tmp_path, monkeypatch):
     app, c = build(tmp_path)
     c.db.set_setting("require_totp_admins", True)

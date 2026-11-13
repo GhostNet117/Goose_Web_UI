@@ -426,6 +426,11 @@ def _print_sandbox_summary(settings, refresh: bool = True) -> bool:
         print(f"[!!] sandbox.read_dirs entry {p['path']!r} is never granted to members: {p['why']}")
     for p in sm.get("relayProblems") or []:
         print(f"[!!] {p}")
+    for p in sm.get("folderProblems") or []:
+        print(f"[!!] sandbox folders: {p['why']}")
+    if "folderProblems" in sm and not sm["folderProblems"]:
+        print("[OK] sandbox folders: this account may change permissions in the profiles root; the program folders "
+              "are readable by containers or changeable")
     if not sm["membersCanStart"]:
         print(f"[!!] sandboxed members' agents do NOT start (fail closed): {sm['reason']}")
     elif sm["reason"]:
@@ -458,8 +463,13 @@ def cmd_sandbox(args, settings) -> int:
             print(f"  {st.get('name')}  {st.get('sid')}")
             for p, r in sorted((st.get("grants") or {}).items()):
                 print(f"      {r:6}  {p}")
+            for p, r in sorted((st.get("external") or {}).items()):
+                print(f"      {r:6}  {p}  (every application container may use it; nothing added)")
             for p, r in sorted((st.get("pending") or {}).items()):
-                print(f"      {r:6}  {p}  (folder missing now; revoked when it is back)")
+                print(f"      {r:6}  {p}  " + ("(folder missing now; taken off when it is back)" if not os.path.isdir(p)
+                                               else "(STILL ON THE FOLDER: could not be taken off; tried again)"))
+            for p, why in sorted((st.get("failed") or {}).items()):
+                print(f"      [!!] not given: {why}")
         return 0 if can_start else 1
     from .db import Database
     db = Database(settings.system_dir / "goose-web.db")
@@ -922,6 +932,40 @@ def cmd_security(args, settings) -> int:
     return 0
 
 
+def _team_lines(settings) -> list[str]:
+    """`check` lines for teams that have members who cannot chat as the team is set up: no provider, model or mode
+    allowed; a default provider the team was not given (library item); a default provider without a default model.
+    Found in use: such a team looked complete in the administration pages. The database is opened read-only;
+    information only."""
+    import json as _json
+    import sqlite3
+    from . import policy as _pol
+    dbf = Path(settings.system_dir) / "goose-web.db"
+    if not dbf.is_file():
+        return []
+    con = sqlite3.connect(dbf.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    try:
+        con.row_factory = sqlite3.Row
+        out = []
+        for t in con.execute("SELECT id, name, policy FROM teams ORDER BY id"):
+            n = con.execute("SELECT COUNT(*) FROM team_members WHERE team_id=?", (t["id"],)).fetchone()[0]
+            if not n:
+                continue
+            try:
+                pol = _json.loads(t["policy"] or "{}")
+            except ValueError:
+                pol = {}
+            items = {r[0] for r in con.execute("SELECT name FROM team_items WHERE team_id=? AND kind='provider'", (t["id"],))}
+            errs = [w["text"] for w in _pol.team_warnings(pol, hints=1, members=n, provider_items=items) if w["level"] == "err"]
+            for e in errs:
+                out.append(f"[!!] team {t['name']} ({n} member(s)): {e}")
+            if not errs:
+                out.append(f"[OK] team {t['name']} ({n} member(s)): providers, models and modes are set so that members can chat")
+        return out
+    finally:
+        con.close()
+
+
 def _registry_line(settings) -> str:
     """The `check` line about environment variables stored in the registry (AC-1, SECURITY-ASSESSMENT 16). A
     sandboxed agent - MXC and AppContainer alike - can read the registry wherever Windows lets application containers
@@ -1050,6 +1094,15 @@ def cmd_check(args, settings) -> int:
             line("sandbox.read_dirs", f"{p['path']} is never granted to members: {p['why']}", False)
         for p in sm.get("relayProblems") or []:
             line("sandbox.relays", p.split(" ", 1)[1] if p.startswith("sandbox.relays ") else p, False)
+        for p in sm.get("folderProblems") or []:
+            if p.get("fatal"):
+                line("sandbox folders", p["why"], False)
+            else:       # a folder some agents can do without, or the fallback backend: said, not counted
+                print(f"[!!] sandbox folders: {p['why']}")
+        if "folderProblems" in sm and not sm["folderProblems"]:
+            line("sandbox folders", "for the account running this check (AppContainer backend): it may change "
+                 "permissions in the profiles root, and the program folders members' containers need are readable "
+                 "by them or changeable. A team's extra folders are looked at when a member's agent starts")
         if not sm["membersCanStart"]:
             line("sandbox", f"backend {sm['backend']}: isolated non-admin workers will NOT start (fail closed): "
                  f"{sm['reason']}. See goose-web sandbox status; MXC: goose-web sandbox install-mxc", False)
@@ -1070,6 +1123,11 @@ def cmd_check(args, settings) -> int:
         print(_registry_line(settings))
     except Exception as e:
         print(f"[--] registry: could not be checked ({e.__class__.__name__})")
+    try:
+        for ln in _team_lines(settings):
+            print(ln)
+    except Exception as e:
+        print(f"[--] teams: could not be checked ({e.__class__.__name__})")
     from . import logjanitor, tls
     try:
         st = tls.status(settings, _tls_override(settings, readonly=True))

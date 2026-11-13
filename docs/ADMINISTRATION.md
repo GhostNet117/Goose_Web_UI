@@ -635,6 +635,15 @@ C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles
 - Turning it off requires the account password (local accounts).
 - Admin > Settings > "Users may enable two-factor themselves" (`allow_self_totp`, default on). When off, non-admins
   cannot set up or enable two-factor (`403 totp_self_disabled`). Admins can always enrol.
+- **Requiring two-factor** (1.22.0): Admin > Settings > "Require two-factor for everyone" (`require_totp_all`,
+  default off) applies to administrators and members alike, whatever way they sign in (password, directory, single
+  sign-on - the second factor is Goose Web's own). For one team only: Teams > the team > Experience > Other >
+  "Require two-factor sign-in" (`require_totp` in the team's policy). An account that must use two-factor and has
+  not set it up sees the "Set up two-factor sign-in" screen after signing in and can do nothing else; it cannot
+  switch two-factor off again; and it can enrol even when "Users may enable two-factor themselves" is off. Switching
+  a requirement on ends the open chat sockets of accounts without two-factor at once. "For everyone" can only be
+  switched on by an administrator who uses two-factor (`409 totp_needed_first`). If a member loses the
+  authenticator: "Reset two-factor" (below) - the member then sets it up again at the next sign-in.
 - Admin > Settings > "Require two-factor for administrators" (`require_totp_admins`, default off). It can only be
   switched on by an admin who already uses two-factor (`409 totp_needed_first`). While it is on, admins cannot turn
   their two-factor off, and **an admin without two-factor can do nothing but enrol** (since 1.12): after signing in
@@ -798,7 +807,7 @@ A new team starts with every switch off and every list empty.
 | `allowed_models` | Allowed models | nothing | only these model ids; `*` = any. Empty = members cannot chat. |
 | `allowed_roots` | Extra folders | none | use these folders in addition to their workspace and the team folder (chat folders, file browser, uploads, downloads). Every entry must be an absolute path and `*` is not accepted (`400 bad_folder`). Symlinks and junctions are resolved, so a link inside an allowed folder cannot lead outside. |
 | `max_concurrent_runs` | Max concurrent runs | 3 | have at most this many agents running at once. Empty = the default (3), `0` = unlimited. |
-| `default_provider`, `default_model` | Default provider, Default model | not set | the provider and model new members start with (section 9.6). Both should be in the allowed lists; the page warns if they are not. |
+| `default_provider`, `default_model` | Default provider, Default model | not set | the provider and model new members start with (section 9.6). Both should be in the allowed lists; the page warns if they are not. **Allowing a provider or making it the default does not give it to the members:** a custom provider (its address, its models, its key) is defined in one profile, usually yours. Add it to the team under Library items (section 9.9), which copies the definition and the key to every member; until then members cannot reach a model with it. Since 1.22.0 the team's page says so in red. |
 | `share_folder` | Team folder | empty = `<profiles_root>\_teams\<team id>` | the team's shared folder (section 9.7). Must be an absolute path (`400 bad_folder`). |
 
 Chat checks for non-admins:
@@ -903,6 +912,16 @@ Back up the database before the upgrade (section 19). Afterwards, review every t
 final, and check the users whose membership was dropped.
 
 ### 9.9 Team library items
+
+**Items follow the administrator's profile (1.22.0).** An item taken from an administrator's profile is compared
+with that profile every five minutes: when you change the provider, extension, skill or recipe there, the team's
+copy is replaced and the members get the new version (an agent that runs restarts when it is idle). To have it at
+once: `POST /api/admin/library/refresh`, or restart the gateway. A provider's key was never part of the copy - it
+is read from your profile whenever a member is provisioned. A copy taken from a member's profile stays as you took
+it. Deleting the original from your profile does not take the item away from the team: remove the item from the
+team for that. Removing an item, or taking a member out of the team, removes it from the member's profile at once -
+the provider file and its key, the extension entry, the skill folder, the recipe; a chat that is running at that
+moment keeps what it has loaded until its agent restarts, which happens as soon as it is idle.
 
 A team can hand recipes, skills, extensions and providers to its members. In the team's "Library items" section,
 choose "Add from library", pick a profile (any user, including your own native profile) and a kind, then add an
@@ -1686,7 +1705,29 @@ Requirements and limits:
 - Windows file shares (SMB) cannot be limited per container: the file server sees only the shared account. Teams that
   need their own shares need their own account.
 - Granting a folder rewrites its ACL (with inheritance to everything below it), once per change; the account the
-  gateway runs as must be allowed to change permissions on the approved folders.
+  gateway runs as must be allowed to change permissions on it (be its owner, or have full control). That is so for
+  everything the gateway creates itself - members' profiles and team folders under the profiles root, where
+  `install.ps1` gives the gateway's account full control - and it is often NOT so for folders that already existed:
+  - **Program folders** (the goose CLI's folder, `sandbox.read_dirs`, the gateway's Python for relays). Nothing is
+    needed where every container may read anyway, as under `C:\Program Files`. Otherwise let application containers
+    read the folder, once, as an administrator or its owner:
+    `icacls "<folder>" /grant "*S-1-15-2-1:(OI)(CI)RX"`. Do not give the gateway's account the right to change
+    the permissions of the programs it runs.
+  - **A team's extra folders** that someone else owns: make the gateway's account their owner or give it full
+    control (`icacls "<folder>" /grant "<account>:(OI)(CI)F"`).
+  Since 1.22.0 every grant is checked on the folder. A folder that could not be given is left out (the member's
+  agent starts without it) or, for the member's profile and the goose folder, fails the start; either way the
+  message names the folder, the account and the command. Where to look: `goose-web sandbox status` lists, under
+  each member's container, what was given, what could not be given and why, and what could not be taken off;
+  `goose-web check` and `sandbox status` have a "sandbox folders" line for the profiles root and the program
+  folders (run them as the account the gateway runs as - they judge the account that runs them); the gateway logs
+  the same for its own account at every start (`sandbox folders: ...`). Until 1.21.1 a grant that could not be made
+  was recorded as made and nothing said so.
+- A folder that is taken away - removed from a team, the member moved - loses the container's entry at once, in the
+  background, also while that member's agent runs (the agent restarts when it is idle). An entry that cannot be
+  taken off stays listed by `sandbox status` as still on the folder until it can. New folders are given at the
+  member's next start. An entry of the member's container that you put on a wanted folder by hand is treated as
+  Goose Web's own from then on: it is taken off when the folder is no longer wanted.
 
 Check: `goose-web check` (`[OK] sandbox`), `goose-web sandbox status` (every container, its SID and grants),
 Admin > System (the Sandbox column shows **AppContainer** for sandboxed workers). Remove one user's container by hand:

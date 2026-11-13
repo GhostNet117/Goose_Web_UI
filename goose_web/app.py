@@ -324,6 +324,24 @@ async def _maintenance_loop(c: Ctx) -> None:
         await asyncio.sleep(minutes * 60)
 
 
+LIBRARY_REFRESH_SECONDS = 300
+
+
+async def _library_loop(c: Ctx) -> None:
+    """What an administrator changes in his own profile - a provider, an extension, a skill, a recipe - reaches the
+    teams he gave it to within a few minutes (api.refresh_library), without removing and adding the item again."""
+    from . import api as _api
+    await asyncio.sleep(45)
+    while True:
+        try:
+            await _api.refresh_library(c)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("library refresh")
+        await asyncio.sleep(LIBRARY_REFRESH_SECONDS)
+
+
 async def ca_cert(request: Request):
     """The built-in local CA certificate (public), so users can trust the self-signed HTTPS certificate."""
     p = tls.tls_dir(request.app.state.ctx.settings) / "ca.crt"
@@ -397,6 +415,8 @@ async def ws_endpoint(websocket: WebSocket):
             return True
         u = c.db.user_by_id(user["id"])
         if not (row and row["expires_at"] > now and u and not u["disabled"]):
+            return False
+        if c.must_enrol_or_change(u):       # spec 029: two-factor became a requirement for this account
             return False
         # A-1: the rights this socket was opened with (role, policy, folders) must still be the current ones
         try:
@@ -726,6 +746,18 @@ def create_app(settings: Settings) -> Starlette:
             # spec 025 R3: probe MXC at start (logged: "sandbox mxc: available ..." / "UNAVAILABLE: <reason>")
             from . import mxc
             asyncio.get_running_loop().run_in_executor(None, mxc.availability, settings, True)
+        from .config import sandbox_fallback
+        if sandbox_on(settings) and "appcontainer" in (sandbox_backend(settings), sandbox_fallback(settings)):
+            # The folders the AppContainer backend must be able to prepare, judged for the account the gateway really
+            # runs as (`check` and `sandbox status` judge them for whoever runs them): logged at every start.
+            def _sandbox_folders() -> None:
+                try:
+                    from . import mxc as _mxc
+                    for fp in _mxc.summary(settings).get("folderProblems") or []:
+                        log.error("sandbox folders: %s", fp["why"])
+                except Exception:
+                    log.exception("sandbox folders: check failed")
+            asyncio.get_running_loop().run_in_executor(None, _sandbox_folders)
         # FIX deploy-interrupts-running-turns: local scripts ask "is anything running?" and drain before a restart
         from .control import ControlChannel
         control = ControlChannel(hub, settings, __version__)
@@ -741,6 +773,7 @@ def create_app(settings: Settings) -> Starlette:
         db.audit("system.start", detail={"version": __version__, "goose": c.goose_version,
                                           "https": tls.ACTIVE.get("mode") if tls.is_active() else "off"})
         maintenance = asyncio.create_task(_maintenance_loop(c))
+        library = asyncio.create_task(_library_loop(c))
         warm = asyncio.create_task(c.guard.warm_up()) if settings.get("guard", "warm_up") else None
 
         async def native_security() -> None:
@@ -756,6 +789,7 @@ def create_app(settings: Settings) -> Starlette:
         finally:
             control.stop()
             maintenance.cancel()
+            library.cancel()
             native_sec.cancel()
             await c.classify.stop()
             if warm is not None:

@@ -247,6 +247,342 @@ t("through the link", lambda: open({str(link / "a.txt")!r}).read())
     assert inside(box, code)["through the link"] == "OK TOOL"
 
 
+# ------------------------------------------------------------------ folders whose permissions cannot be changed
+def lock(folder: Path, *extra: str) -> None:
+    """Take away this account's right to change the folder's permissions while it stays the owner ("OWNER RIGHTS:
+    Modify"): what a folder that an administrator installed looks like to the gateway's account. Every earlier test
+    used folders the test had made itself, where changing permissions always works - and so none saw that a grant
+    which was never made was recorded as made (found in use, 2026-11-13)."""
+    icacls = os.path.join(os.environ["SystemRoot"], "System32", "icacls.exe")
+    me = os.environ["USERDOMAIN"] + "\\" + os.environ["USERNAME"]
+    subprocess.run([icacls, str(folder), "/inheritance:r", "/grant:r", "*S-1-3-4:(OI)(CI)M", f"{me}:(OI)(CI)M",
+                    *extra, "/Q"], check=True, capture_output=True)
+    still = subprocess.run([icacls, str(folder), "/grant", "*S-1-15-2-2:(RX)", "/Q"], capture_output=True)
+    if sb.can_change_permissions(str(folder)) or still.returncode == 0:
+        pytest.skip("this account can change the permissions of a folder it was denied that on")
+
+
+def _key(grants: dict, folder: Path) -> str:
+    return next(k for k in grants if os.path.normcase(k) == os.path.normcase(os.path.realpath(str(folder))))
+
+
+def _touch(folder: Path) -> str:
+    return f'''
+t("read", lambda: open({str(folder / "f.txt")!r}).read())
+t("write", lambda: open({str(folder / "w.txt")!r}, "w").write("x"))
+'''
+
+
+@windows
+def test_a_grant_that_was_not_made_is_not_recorded_as_made(box):
+    team = box.tmp / "team"
+    team.mkdir()
+    (team / "f.txt").write_text("TEAM", encoding="utf-8")
+    lock(team)
+    grants = member_grants(box.prof, box.pybase, {str(team): "modify"})
+    st = sb.prepare(box.name, box.state_dir, grants, required=[str(box.prof)])
+    key = next(k for k in grants if os.path.normcase(k) == os.path.normcase(os.path.realpath(str(team))))
+    assert key not in st["grants"] and key in st["failed"]                 # 1.21.1 said "granted"
+    assert f'icacls "{key}" /grant' in st["failed"][key] and "(OI)(CI)F" in st["failed"][key]
+    assert sb.load_state(box.state_dir, box.name)["failed"] == st["failed"]
+    r = inside(box, _touch(team))
+    assert r["read"] == "ERR PermissionError" and r["write"] == "ERR PermissionError"      # and the record agrees
+    assert inside(box, "t('own', lambda: open('own.txt', 'w').write('x'))")["own"].startswith("OK")   # the agent runs
+    # the administrator puts the folder right (here: a new folder under that name): the next start grants it
+    import shutil
+    shutil.rmtree(team)
+    team.mkdir()
+    (team / "f.txt").write_text("TEAM", encoding="utf-8")
+    st = sb.prepare(box.name, box.state_dir, grants, required=[str(box.prof)])
+    assert key in st["grants"] and not st["failed"]
+    r = inside(box, _touch(team))
+    assert r["read"] == "OK TEAM" and r["write"].startswith("OK")
+
+
+@windows
+def test_a_folder_the_agent_cannot_run_without_fails_the_start_and_says_what_to_do(box):
+    programs = box.tmp / "programs"
+    programs.mkdir()
+    lock(programs)
+    grants = member_grants(box.prof, box.pybase, {str(programs): "read"})
+    key = next(k for k in grants if os.path.normcase(k) == os.path.normcase(os.path.realpath(str(programs))))
+    with pytest.raises(sb.SandboxError) as e:
+        sb.prepare(box.name, box.state_dir, grants, required=[str(box.prof), key])
+    assert f'icacls "{key}" /grant "*S-1-15-2-1:(OI)(CI)RX"' in str(e.value) and "may not change its permissions" in str(e.value)
+
+
+@windows
+def test_a_folder_every_container_may_read_is_left_alone(box):
+    """C:\\Program Files gives "ALL APPLICATION PACKAGES" read access and belongs to the system: the gateway's
+    account cannot change it and does not have to. The start used to try, fail unnoticed, and record a grant."""
+    programs = box.tmp / "programs"
+    programs.mkdir()
+    (programs / "f.txt").write_text("TOOL", encoding="utf-8")
+    lock(programs, "*S-1-15-2-1:(OI)(CI)RX")
+    grants = member_grants(box.prof, box.pybase, {str(programs): "read"})
+    key = next(k for k in grants if os.path.normcase(k) == os.path.normcase(os.path.realpath(str(programs))))
+    st = sb.prepare(box.name, box.state_dir, grants, required=[str(box.prof), key])
+    assert st["external"] == {key: "read"} and key not in st["grants"] and not st["failed"]
+    assert inside(box, _touch(programs))["read"] == "OK TOOL"
+    st = sb.prepare(box.name, box.state_dir, member_grants(box.prof, box.pybase))       # no longer wanted
+    assert not st.get("external") and not st["pending"] and not st["failed"]             # nothing of ours to take off
+
+
+@windows
+def test_a_grant_on_record_that_is_not_on_the_folder_is_made_again(box):
+    """An installation that ran 1.21.1 or earlier has such records; they must not stay wrong for good."""
+    shared = box.tmp / "shared"
+    shared.mkdir()
+    (shared / "f.txt").write_text("SHARED", encoding="utf-8")
+    grants = member_grants(box.prof, box.pybase, {str(shared): "modify"})
+    key = next(k for k in grants if os.path.normcase(k) == os.path.normcase(os.path.realpath(str(shared))))
+    st = sb.load_state(box.state_dir, box.name)
+    sb._save_state(box.state_dir, box.name, {**st, "grants": {**st["grants"], key: "modify"}})     # the old record
+    assert inside(box, _touch(shared))["read"] == "ERR PermissionError"
+    st = sb.prepare(box.name, box.state_dir, grants)
+    assert key in st["grants"] and inside(box, _touch(shared))["read"] == "OK SHARED"
+
+
+@windows
+def test_an_entry_that_could_not_be_taken_off_stays_on_record(box):
+    shared = box.tmp / "shared"
+    shared.mkdir()
+    (shared / "f.txt").write_text("SHARED", encoding="utf-8")
+    grants = member_grants(box.prof, box.pybase, {str(shared): "modify"})
+    key = next(k for k in grants if os.path.normcase(k) == os.path.normcase(os.path.realpath(str(shared))))
+    assert key in sb.prepare(box.name, box.state_dir, grants)["grants"]
+    lock(shared)                                        # from now on its permissions cannot be changed
+    st = sb.prepare(box.name, box.state_dir, member_grants(box.prof, box.pybase))       # the folder is taken away
+    assert key not in st["grants"] and st["pending"] == {key: "modify"}                 # 1.21.1: "revoked"
+    assert inside(box, _touch(shared))["read"] == "OK SHARED"                           # true: it is still there
+    left = sb.remove(box.state_dir, box.name)
+    assert left and sb.load_state(box.state_dir, box.name).get("pending") == {key: "modify"}
+
+
+@windows
+def test_folders_this_account_cannot_prepare_are_named(tmp_path):
+    plain, ac, ours, root = tmp_path / "plain", tmp_path / "ac", tmp_path / "ours", tmp_path / "profiles"
+    for d in (plain, ac, ours, root):
+        d.mkdir()
+    assert sb.can_change_permissions(str(ours)) and not sb.allowed(str(ours), [sb.ALL_APP_PACKAGES], "read")
+    lock(plain)
+    lock(ac, "*S-1-15-2-1:(OI)(CI)RX")
+    assert sb.allowed(str(ac), [sb.ALL_APP_PACKAGES], "read") and not sb.allowed(str(ac), [sb.ALL_APP_PACKAGES], "modify")
+    probs = sb.folder_problems([str(plain), str(ac), str(ours), str(tmp_path / "missing")], str(root))
+    assert [p["path"] for p in probs] == [str(plain)] and "*S-1-15-2-1:(OI)(CI)RX" in probs[0]["why"]
+    lock(root)
+    probs = sb.folder_problems([str(ours)], str(root))
+    assert [p["path"] for p in probs] == [str(root)] and ":(OI)(CI)F" in probs[0]["why"]
+
+
+def test_check_and_status_report_the_folders_only_where_the_appcontainer_backend_may_be_used(tmp_path, monkeypatch, capsys):
+    from goose_web import mxc
+    root = str(tmp_path / "profiles")
+    seen = []
+    monkeypatch.setattr(sb, "folder_problems", lambda folders, r: seen.append(list(folders)) or [
+        {"path": r, "why": "ROOT: do this"}, {"path": "X:\\tools", "why": "TOOLS: do that"}])
+    base = {"paths": {"profiles_root": root}}
+    for sandbox, expected, fatal in (({"enabled": True, "backend": "appcontainer"}, True, [True, False]),
+                                     ({"enabled": True, "backend": "mxc", "fallback": "appcontainer"}, True, [False, False]),
+                                     ({"enabled": True, "backend": "mxc", "fallback": "none"}, False, None),
+                                     ({"enabled": False, "backend": "appcontainer"}, False, None)):
+        sm = mxc.summary(Settings(_deep_merge(DEFAULTS, {**base, "sandbox": sandbox}), None))
+        assert ("folderProblems" in sm) is expected, sandbox
+        if expected:        # only what no agent can run without stops `check`, and only for the configured backend (X-3)
+            assert [p["fatal"] for p in sm["folderProblems"]] == fatal
+    # the gateway's Python is looked at only when something is relayed (X-3)
+    seen.clear()
+    quiet = {"enabled": True, "backend": "appcontainer", "relays": []}
+    mxc.summary(Settings(_deep_merge(DEFAULTS, {**base, "sandbox": quiet, "guard": {"classifier_port": 0}}), None))
+    mxc.summary(Settings(_deep_merge(DEFAULTS, {**base, "sandbox": {**quiet, "relays": ["127.0.0.1:4000"]},
+                                                "guard": {"classifier_port": 0}}), None))
+    py = os.path.normcase(mxc.resolved(sys.base_prefix))
+    assert py not in {os.path.normcase(f) for f in seen[0]} and py in {os.path.normcase(f) for f in seen[1]}
+
+
+@windows
+def test_a_folder_taken_from_a_team_loses_its_entry_at_once(tmp_path, monkeypatch):
+    """Nothing is mocked: the entry is put on a real folder by a real start's prepare, the administrator removes the
+    folder from the team, and the entry is gone from the folder - without the member's agent starting again.
+    Before, it stayed until that agent next started, for good when it never did."""
+    import asyncio
+    from goose_web import api
+    from goose_web.auth import AuthService
+    from goose_web.context import Ctx
+    from goose_web.config import load_settings
+    from goose_web.db import Database
+    from goose_web.profiles import Profiles
+    from tests.test_team_profiles import ANYCHAT, team, user
+    monkeypatch.setenv("GOOSE_WEB__PATHS__PROFILES_ROOT", str(tmp_path / "profiles"))
+    (tmp_path / "none.yaml").write_text("", encoding="utf-8")
+    monkeypatch.setenv("GOOSE_WEB_CONFIG", str(tmp_path / "none.yaml"))
+    s = load_settings()
+    db = Database(tmp_path / "gw.db")
+    c = Ctx(settings=s, db=db, auth=AuthService(db, s), profiles=Profiles(s, db), workers=None, hub=None, version="t")
+    extra = tmp_path / "approved"
+    extra.mkdir()
+    tid = team(db, "A", {**ANYCHAT, "allowed_roots": [str(extra)]})
+    bob, carol = user(db, "bob"), user(db, "carol")
+    db.set_user_team(bob["id"], tid)
+    db.set_user_team(carol["id"], tid)
+    s.data.setdefault("sandbox", {})["enabled"] = True
+    spec = c.sandbox_spec(db.user_by_id(bob["id"]))
+    Path(spec["profile_root"]).mkdir(parents=True, exist_ok=True)
+    grants, _, required = workers.appcontainer_grants(spec, s)
+    state_dir = str(s.system_dir / "sandbox")
+    st = sb.prepare(spec["name"], state_dir, grants, required=required)       # what the start of bob's agent does
+    try:
+        key, prof = _key(grants, extra), _key(grants, Path(spec["profile_root"]))
+        assert sb.allowed(key, [st["sid"]], "modify") and key in st["grants"]
+        assert asyncio.run(api._sync_grants(c, db.user_by_id(bob["id"]))) == []           # nothing was taken away yet
+        db.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps(ANYCHAT), tid))    # the administrator removes it
+        gone = asyncio.run(api._sync_grants(c, db.user_by_id(bob["id"])))
+        assert [os.path.normcase(g) for g in gone] == [os.path.normcase(key)]
+        assert sb.own_mask(key, st["sid"]) == 0 and not sb.allowed(key, [st["sid"]], "read")      # off the folder
+        now = sb.load_state(state_dir, spec["name"])
+        assert key not in now["grants"] and prof in now["grants"] and sb.allowed(prof, [st["sid"]], "modify")
+        # nothing is granted and no container is made by an administrator's change: that is the next start's business
+        db.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps({**ANYCHAT, "allowed_roots": [str(extra)]}), tid))
+        assert asyncio.run(api._sync_grants(c, db.user_by_id(bob["id"]))) == [] and sb.own_mask(key, st["sid"]) == 0
+        cname = sb.container_name(str(s.profiles_root), "carol")
+        assert asyncio.run(api._sync_grants(c, db.user_by_id(carol["id"]))) == [] and not sb.load_state(state_dir, cname)
+    finally:
+        sb.remove(state_dir, spec["name"])
+        db.close()
+
+
+@windows
+def test_what_a_failed_start_put_on_folders_is_on_record_and_comes_off_later(box):
+    """Review X-1: a start that gave two folders and then failed on a third saved nothing; at the next start those
+    entries were taken for someone else's and never taken off again - a member kept a folder that was taken away."""
+    team, programs = box.tmp / "team", box.tmp / "programs"
+    team.mkdir()
+    programs.mkdir()
+    (team / "f.txt").write_text("TEAM", encoding="utf-8")
+    lock(programs)
+    grants = member_grants(box.prof, box.pybase, {str(team): "modify", str(programs): "read"})
+    tkey, pkey = _key(grants, team), _key(grants, programs)
+    with pytest.raises(sb.SandboxError, match="may not change its permissions"):
+        sb.prepare(box.name, box.state_dir, grants, required=[str(box.prof), pkey])
+    st = sb.load_state(box.state_dir, box.name)
+    assert tkey in st["grants"] and pkey in st["failed"] and sb.allowed(tkey, [box.sid], "modify")    # saved first
+    # worse: the record is lost altogether. What is on the folders is found and goes on record as Goose Web's.
+    (Path(box.state_dir) / f"{box.name}.json").unlink()
+    with_team = member_grants(box.prof, box.pybase, {str(team): "modify"})
+    st = sb.prepare(box.name, box.state_dir, with_team, required=[str(box.prof)])
+    assert tkey in st["grants"] and not st["external"] and not st["failed"]
+    st = sb.prepare(box.name, box.state_dir, member_grants(box.prof, box.pybase), required=[str(box.prof)])
+    assert sb.own_mask(tkey, box.sid) == 0 and tkey not in st["grants"] and not st["pending"]         # taken away: gone
+    assert inside(box, _touch(team))["read"] == "ERR PermissionError"
+
+
+@windows
+def test_a_folder_taken_down_to_read_that_cannot_be_changed_is_not_recorded_as_read(box):
+    """Review X-2: revoke and grant both failed, "read" was satisfied by the modify entry still there, and the
+    record said read."""
+    shared = box.tmp / "shared"
+    shared.mkdir()
+    (shared / "f.txt").write_text("SHARED", encoding="utf-8")
+    grants = member_grants(box.prof, box.pybase, {str(shared): "modify"})
+    key = _key(grants, shared)
+    assert key in sb.prepare(box.name, box.state_dir, grants)["grants"]
+    lock(shared)
+    st = sb.prepare(box.name, box.state_dir, member_grants(box.prof, box.pybase, {str(shared): "read"}))
+    assert key not in st["grants"] and key in st["failed"] and st["pending"] == {key: "modify"}
+    assert sb.exceeds(key, box.sid, "read") and inside(box, _touch(shared))["write"].startswith("OK")   # and that is true
+    # a record that says less than the folder carries (as 1.21.1 could leave it) is put right, not repeated (Z-2)
+    sb._save_state(box.state_dir, box.name, {**st, "grants": {**st["grants"], key: "read"}, "pending": {}, "failed": {}})
+    st = sb.prepare(box.name, box.state_dir, member_grants(box.prof, box.pybase, {str(shared): "read"}))
+    assert st["pending"] == {key: "modify"} and "could not be narrowed" in st["failed"][key] and key not in st["grants"]
+    # the same where every container may read the folder: nothing of the container's own is needed, what is there stays on record
+    both = box.tmp / "both"
+    both.mkdir()
+    grants = member_grants(box.prof, box.pybase, {str(both): "modify"})
+    bkey = _key(grants, both)
+    sb.prepare(box.name, box.state_dir, grants)
+    lock(both, "*S-1-15-2-1:(OI)(CI)RX")
+    st = sb.prepare(box.name, box.state_dir, member_grants(box.prof, box.pybase, {str(both): "read"}))
+    assert st["external"] == {bkey: "read"} and st["pending"].get(bkey) == "modify" and bkey not in st["grants"]
+
+
+@windows
+def test_taking_a_folder_away_takes_the_entry_off_what_is_below_it_too(box):
+    """Review Z-1 (true of every earlier version): a subfolder whose inheritance was switched off keeps a copy of
+    the container's entry as its own. The revoke looked at the folder only and reported success."""
+    icacls = os.path.join(os.environ["SystemRoot"], "System32", "icacls.exe")
+    shared, stuck = box.tmp / "shared", box.tmp / "stuck"
+    for top in (shared, stuck):
+        (top / "sub").mkdir(parents=True)
+        (top / "sub" / "f.txt").write_text("SUB", encoding="utf-8")
+    grants = member_grants(box.prof, box.pybase, {str(shared): "modify", str(stuck): "modify"})
+    skey, tkey = _key(grants, shared), _key(grants, stuck)
+    sb.prepare(box.name, box.state_dir, grants)
+    for top in (shared, stuck):       # "disable inheritance, convert to explicit" in Explorer
+        subprocess.run([icacls, str(top / "sub"), "/inheritance:d", "/Q"], check=True, capture_output=True)
+        assert sb.own_mask(str(top / "sub"), box.sid)
+    lock(stuck / "sub")                # and this one cannot be changed any more
+    st = sb.prepare(box.name, box.state_dir, member_grants(box.prof, box.pybase))       # both folders are taken away
+    assert sb.own_mask(str(shared / "sub"), box.sid) == 0 and skey not in st["pending"]   # cleaned below as well
+    assert inside(box, _touch(shared / "sub"))["read"] == "ERR PermissionError"
+    assert st["pending"].get(tkey) == "modify" and sb.own_mask(str(stuck / "sub"), box.sid)   # true: still there, on record
+    assert inside(box, _touch(stuck / "sub"))["read"] == "OK SUB"
+    # a folder that is still wanted inside one that is taken away keeps its entry
+    outer, inner = box.tmp / "outer", box.tmp / "outer" / "inner"
+    inner.mkdir(parents=True)
+    both = member_grants(box.prof, box.pybase, {str(outer): "modify", str(inner): "modify"})
+    sb.prepare(box.name, box.state_dir, both)
+    st = sb.prepare(box.name, box.state_dir, member_grants(box.prof, box.pybase, {str(inner): "modify"}))
+    ikey = _key(both, inner)
+    assert ikey in st["grants"] and sb.allowed(ikey, [box.sid], "modify") and sb.own_mask(_key(both, outer), box.sid) == 0
+
+
+def test_a_damaged_record_stops_the_change_instead_of_being_forgotten(tmp_path, monkeypatch):
+    """Review Z-5: it was read as "no record" and overwritten; the entries it listed stayed on their folders."""
+    monkeypatch.setattr(sb, "ensure_container", lambda name: "S-1-15-2-9")
+    state = tmp_path / "state"
+    state.mkdir()
+    a = tmp_path / "a"
+    a.mkdir()
+    for bad in ("{not json", json.dumps({"sid": "S-1-15-2-9", "grants": ["a"]}), json.dumps([1, 2])):
+        f = state / "N.json"
+        f.write_text(bad, encoding="utf-8")
+        for call in (lambda: sb.prepare("N", str(state), {str(a): "modify"}), lambda: sb.shrink("N", str(state), {}),
+                     lambda: sb.remove(str(state), "N")):
+            with pytest.raises(sb.SandboxError, match="nothing was changed"):
+                call()
+        assert f.read_text(encoding="utf-8") == bad
+    (state / "N.json").unlink()
+    assert sb.shrink("N", str(state), {}) == {} and sb.remove(str(state), "N") == {}       # no record: nothing to do
+
+
+@windows
+def test_what_the_access_list_says(tmp_path):
+    icacls = os.path.join(os.environ["SystemRoot"], "System32", "icacls.exe")
+    d = tmp_path / "d"
+    d.mkdir()
+    ac, sid = sb.ALL_APP_PACKAGES, "S-1-15-2-99-1-2-3-4-5-6"
+
+    def set_(*entries):
+        subprocess.run([icacls, str(d), "/remove:g", f"*{ac}", f"*{sid}", "/Q"], capture_output=True)
+        subprocess.run([icacls, str(d), "/grant", *entries, "/Q"], check=True, capture_output=True)
+    set_(f"*{ac}:(OI)(CI)RX")
+    assert sb.allowed(str(d), [ac], "read") and not sb.allowed(str(d), [ac], "modify") and sb.own_mask(str(d), sid) == 0
+    set_(f"*{ac}:(RX)", f"*{ac}:(OI)(CI)(IO)(GR,GE)")                   # how C:\Program Files is written
+    assert sb.allowed(str(d), [ac], "read")
+    set_(f"*{ac}:(RX)")                                                  # the folder only: its files are not covered
+    assert not sb.allowed(str(d), [ac], "read")
+    set_(f"*{ac}:(OI)(CI)(NP)RX")                                        # one level only (review X-8)
+    assert not sb.allowed(str(d), [ac], "read")
+    set_(f"*{sid}:(OI)(CI)M")
+    assert sb.allowed(str(d), [sid], "modify") and sb.exceeds(str(d), sid, "read") and not sb.exceeds(str(d), sid, "modify")
+    subprocess.run([icacls, str(d), "/deny", f"*{sid}:(OI)(CI)R", "/Q"], check=True, capture_output=True)
+    assert not sb.allowed(str(d), [sid], "read")                         # a deny entry: nothing is assumed
+    assert sb.access_of(str(tmp_path / "missing"), [ac]) is None and not sb.allowed(str(tmp_path / "missing"), [ac], "read")
+    who, ident = sb._account()
+    assert ident.startswith("*S-1-") and f'/grant "{ident}:(OI)(CI)F"' in sb.grant_help(str(d), "modify")     # X-7
+
+
+# ------------------------------------------------------------------ AC-3: the relay serves a bounded number
 # ------------------------------------------------------------------ AC-3: the relay serves a bounded number
 @windows
 def test_a_relay_serves_no_more_connections_than_its_limit(tmp_path):
@@ -363,9 +699,11 @@ async def test_the_appcontainer_start_leaves_protected_folders_out(tmp_path, mon
             "protected_any": [str(native)]}
     seen = {}
 
-    def prepare(name, state_dir, g):
+    def prepare(name, state_dir, g, required=()):
         seen.update(g)
+        seen_required.extend(required)
         raise sb.SandboxError("stop here")
+    seen_required = []
     monkeypatch.setattr(sb, "prepare", prepare)
     wm = workers.WorkerManager(s)
     wm.register("alice", "alice", str(prof), False, [], sandbox=spec)
@@ -378,6 +716,8 @@ async def test_the_appcontainer_start_leaves_protected_folders_out(tmp_path, mon
     assert kept == {os.path.normcase(os.path.realpath(str(prof))): "modify",
                     os.path.normcase(os.path.realpath(str(team))): "modify",
                     os.path.normcase(os.path.realpath(str(tools))): "read"}
+    # the folders without which the agent cannot run at all: a grant that fails there fails the start
+    assert os.path.normcase(os.path.realpath(str(prof))) in {os.path.normcase(p) for p in seen_required}
 
 
 # ------------------------------------------------------------------ AC-5: the URL rewrite
@@ -702,8 +1042,19 @@ def test_a_grant_replaces_the_containers_entry(monkeypatch):
     """W-5: icacls /grant adds to an entry that is still there; a folder taken down to read kept modify."""
     seen = []
     monkeypatch.setattr(sb, "_icacls", seen.append)
+    monkeypatch.setattr(sb, "allowed", lambda path, sids, right: True)
+    monkeypatch.setattr(sb, "exceeds", lambda path, sid, right: False)
     sb.grant(r"C:\x", "S-1-15-2-9", "read")
     assert seen == [[r"C:\x", "/grant:r", "*S-1-15-2-9:(OI)(CI)RX", "/Q", "/C"]]
+    # icacls /C exits 0 also when it changed nothing: without the entry on the folder the grant has failed
+    monkeypatch.setattr(sb, "allowed", lambda path, sids, right: False)
+    with pytest.raises(sb.SandboxError, match="could not be changed"):
+        sb.grant(r"C:\x", "S-1-15-2-9", "read")
+    # ... and an older, wider entry that was not replaced is not "read" either (review X-2)
+    monkeypatch.setattr(sb, "allowed", lambda path, sids, right: True)
+    monkeypatch.setattr(sb, "exceeds", lambda path, sid, right: True)
+    with pytest.raises(sb.SandboxError, match="wider than read"):
+        sb.grant(r"C:\x", "S-1-15-2-9", "read")
 
 
 @windows
@@ -848,3 +1199,30 @@ def test_the_sandbox_environment_keeps_what_an_appcontainer_start_needs():
     # CreateProcess fails with error 203 for an AppContainer whose environment has no LOCALAPPDATA: Windows replaces
     # it, TEMP and TMP with the container's own folder (AC-9), and needs the variable to be there
     assert "LOCALAPPDATA" in workers.SANDBOX_ENV_ALLOW
+
+
+@windows
+def test_install_makes_sure_the_gateway_account_has_full_control_of_the_profiles_root(tmp_path):
+    """Members' profiles and team folders are made there, and the AppContainer backend changes their permissions:
+    when install.ps1 cannot set the folder's permissions it must not go on with a warning."""
+    import re
+    text = (Path(__file__).resolve().parents[1] / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    fn = re.search(r"function Test-FullControl.*?\n}\n", text, re.S)
+    assert fn, "install.ps1 has no Test-FullControl"
+    after = text[text.index("& icacls $ProfilesRoot /inheritance:r /grant:r @grants"):][:1500]
+    assert "Test-FullControl $ProfilesRoot $gwAccount" in after and "throw " in after
+    full, modify = tmp_path / "full", tmp_path / "modify"
+    full.mkdir()
+    modify.mkdir()
+    icacls = os.path.join(os.environ["SystemRoot"], "System32", "icacls.exe")
+    me = os.environ["USERDOMAIN"] + "\\" + os.environ["USERNAME"]
+    subprocess.run([icacls, str(full), "/inheritance:r", "/grant:r", f"{me}:(OI)(CI)F", "/Q"], check=True, capture_output=True)
+    subprocess.run([icacls, str(modify), "/inheritance:r", "/grant:r", f"{me}:(OI)(CI)M", "/Q"], check=True, capture_output=True)
+    script = tmp_path / "t.ps1"
+    script.write_text(fn.group(0) + f"\n\"$(Test-FullControl '{full}' '{me}') $(Test-FullControl '{modify}' '{me}') "
+                      f"$(Test-FullControl '{tmp_path / 'missing'}' '{me}') $(Test-FullControl '{full}' 'NO-SUCH\\nobody')\"\n",
+                      encoding="utf-8")
+    ps = os.path.join(os.environ["SystemRoot"], "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    r = subprocess.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)], capture_output=True,
+                       text=True, timeout=120)
+    assert r.stdout.strip() == "True False False False", r.stdout + r.stderr

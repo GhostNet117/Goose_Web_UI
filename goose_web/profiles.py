@@ -575,6 +575,77 @@ class Profiles:
             "SELECT i.* FROM team_items i JOIN team_members m ON m.team_id=i.team_id WHERE m.user_id=? "
             "ORDER BY i.team_id, i.kind, i.name", (user["id"],))
 
+    def refresh_team_items(self, team_id: int | None = None) -> dict[int, list[str]]:
+        """Team library items that were taken from an ADMINISTRATOR's profile follow that profile: the item is
+        exported again and, when it differs from the copy the team holds, the copy is replaced (provider: address,
+        models; extension entry; skill files; recipe). Returns {team id: ["kind name", ...]} for what changed; the
+        caller provisions those teams' members. Before, an item was a copy made once: an administrator who changed
+        a provider or a skill had to remove it from the team and add it again, and nothing said so.
+
+        Only administrators' items follow by themselves. A copy taken from a member's profile stays as the
+        administrator took it - otherwise a member could change what the rest of the team runs. An item whose
+        source is gone or cannot be exported now (a file half written, a link) keeps the copy the team has; taking
+        an item away from a team is the administrator's explicit step. A provider's key is not part of the copy: it
+        is read from the source profile at every provisioning, so a changed key has always reached the members."""
+        from . import security
+        out: dict[int, list[str]] = {}
+        rows = self.db.query("SELECT * FROM team_items" + (" WHERE team_id=?" if team_id is not None else ""),
+                             (team_id,) if team_id is not None else ())
+        writable = None
+        for it in rows:
+            try:
+                src = str(it.get("source") or "")
+                who, _, ref = src.partition(":")
+                if not who or not ref or src == "manual":
+                    continue
+                u = self.db.user_by_name(who)
+                if not u or u.get("role") != "admin" or u.get("disabled"):
+                    continue
+                try:
+                    name, payload = self.export_item(u, it["kind"], ref)
+                    name = security.safe_name(name.replace(" ", "-"), 128)      # as the item was named when added
+                except (ValueError, OSError, KeyError) as e:   # not there (any more), not shareable now: the copy stays
+                    log.debug("library: %s %s of team %s not refreshed from %s: %s", it["kind"], it["name"],
+                              it["team_id"], who, e)
+                    continue
+                held = it["payload"] if isinstance(it["payload"], dict) else json.loads(it["payload"] or "{}")
+                if name != it["name"] or held == json.loads(json.dumps(payload)):
+                    continue
+                origin = str(payload.get("origin") or "") if isinstance(payload, dict) else ""
+                if origin:
+                    # A recipe can come from a folder outside the administrator's profile (GOOSE_RECIPE_PATH). One
+                    # that members can write into - a team folder, a team's extra folder, a member's profile - must
+                    # not feed the team by itself: a member would change what the others run (review Z-4).
+                    if writable is None:
+                        writable = self._member_writable_folders()
+                    o = os.path.normcase(os.path.realpath(origin))
+                    if any(o == w or o.startswith(w + os.sep) for w in writable):
+                        log.info("library: %s %s of team %s is not followed: its source %s is in a folder members can "
+                                 "write", it["kind"], name, it["team_id"], origin)
+                        continue
+                self.db.execute("UPDATE team_items SET payload=? WHERE id=?", (json.dumps(payload), it["id"]))
+                self.store_team_item_files(it["team_id"], it["kind"], name, payload)
+                out.setdefault(it["team_id"], []).append(f"{it['kind']} {name}")
+                log.info("library: %s %s of team %s brought in line with %s's profile", it["kind"], name,
+                         it["team_id"], who)
+            except Exception:       # one item must not stop the others
+                log.exception("library: refreshing %s %s (team %s)", it.get("kind"), it.get("name"), it.get("team_id"))
+        return out
+
+    def _member_writable_folders(self) -> list[str]:
+        """Folders some member's agent may write: every team folder, every team's extra folders, every member's
+        profile (resolved, case-folded)."""
+        out = [os.path.join(str(self.root), "_teams")]
+        for t in self.db.query("SELECT policy FROM teams"):
+            pol_ = t.get("policy") if isinstance(t.get("policy"), dict) else json.loads(t.get("policy") or "{}")
+            out += [str(r) for r in (pol_.get("allowed_roots") or []) if r]
+            if pol_.get("share_folder"):
+                out.append(str(pol_["share_folder"]))
+        for u in self.db.users():
+            if u.get("role") != "admin" and not self.is_native(u):
+                out.append(str(self.root_for(u)))
+        return [os.path.normcase(os.path.realpath(p)) for p in out if p]
+
     def relay_mapping(self, user: dict) -> dict[str, str]:
         """Spec 014 relays the user's sandboxed worker runs now (target -> forwarder address), from the record
         workers._start_relays keeps; {} for a user without relays."""

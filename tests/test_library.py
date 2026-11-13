@@ -767,3 +767,135 @@ def test_a_native_profile_reached_through_a_link_still_offers_its_own_skills(tmp
     other = db.user_by_id(db.create_user(username="admin2", role="admin", profile_mode="native", profile_path=str(link)))
     assert refs(pr, other) == ["hello"] and [i["name"] for i in pr.library(other, "recipe")] == ["own"]
     assert refs(pr, other, "provider") == ["p1"]
+
+
+# ------------------------------------------------------------------ items follow the administrator; removal removes
+def _everything(root: Path) -> str:
+    """All text under a profile folder that could carry an item (config, skills, recipes, secrets)."""
+    out = []
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and p.suffix.lower() in (".yaml", ".yml", ".json", ".md", ".txt"):
+            out.append(f"## {p.relative_to(root)}\n" + p.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(out)
+
+
+def test_what_the_administrator_changes_reaches_the_team_and_what_he_removes_is_gone(tmp_path, monkeypatch):
+    """Asked for in use: "when I update providers, extensions, skills, recipes, these are propagated to users I
+    assigned them to, and when I remove them from their profiles they actually lose access." An item was a copy made
+    once; a change in the administrator's profile never reached the team."""
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    tid = with_team(db, alice)
+    db.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps({**ANYCHAT, "allow_shell": True}), tid))   # a command extension
+    nroot, aroot = Path(native), Path(pr.root_for(alice))
+    (nroot / "config" / "recipes").mkdir(parents=True, exist_ok=True)
+    (nroot / "config" / "recipes" / "plan.yaml").write_text(
+        yaml.safe_dump({"title": "Plan", "description": "the plan", "prompt": "RECIPE-V1"}), encoding="utf-8")
+    skill(nroot / "config" / "skills", "howto", body="SKILL-V1")
+    ncfg = nroot / "config" / "config.yaml"
+    cfg = yaml.safe_load(ncfg.read_text(encoding="utf-8"))
+    cfg["extensions"]["mytool"] = {"enabled": True, "type": "stdio", "name": "mytool", "cmd": "python", "args": ["-V"],
+                                   "description": "EXTENSION-V1", "env_keys": [], "timeout": 30}
+    ncfg.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    ids = {}
+    for kind, want in (("provider", "p1"), ("skill", "howto"), ("recipe", None), ("extension", "mytool")):
+        have = refs(pr, admin, kind)
+        ref = want if want in have else next(r for r in have if kind != "recipe" or "plan" in r.lower())
+        name, payload = pr.export_item(admin, kind, ref)
+        ids[kind] = (db.execute("INSERT INTO team_items(team_id, kind, name, payload, source, created_at) "
+                                "VALUES(?,?,?,?,?,0)", (tid, kind, name, json.dumps(payload), f"{admin['username']}:{ref}")),
+                     name, ref)
+        pr.store_team_item_files(tid, kind, name, payload)
+    pr.provision(alice)
+    team_recipes = Path(pr.team_recipe_dir(tid))
+
+    def member_sees() -> str:
+        return _everything(aroot) + _everything(team_recipes)
+    before = member_sees()
+    assert "SKILL-V1" in before and "RECIPE-V1" in before and "p1" in before and "EXTENSION-V1" in before
+    assert pr.refresh_team_items() == {}                                   # nothing changed: nothing is rewritten
+
+    # the administrator changes all four in his own profile
+    pfile = next((nroot / "config" / "custom_providers").glob("p1*.json"))
+    pj = json.loads(pfile.read_text(encoding="utf-8"))
+    pj["description"] = "PROVIDER-V2"
+    pfile.write_text(json.dumps(pj), encoding="utf-8")
+    skill(nroot / "config" / "skills", "howto", body="SKILL-V2")
+    (nroot / "config" / "recipes" / "plan.yaml").write_text(
+        yaml.safe_dump({"title": "Plan", "description": "the plan", "prompt": "RECIPE-V2"}), encoding="utf-8")
+    ncfg = nroot / "config" / "config.yaml"
+    cfg = yaml.safe_load(ncfg.read_text(encoding="utf-8"))
+    cfg["extensions"][ids["extension"][2]]["description"] = "EXTENSION-V2"
+    ncfg.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    changed = pr.refresh_team_items()
+    assert sorted(changed[tid]) == sorted(f"{k} {ids[k][1]}" for k in ids)
+    pr.provision(alice)
+    after = member_sees()
+    for new, old in (("PROVIDER-V2", None), ("SKILL-V2", "SKILL-V1"), ("RECIPE-V2", "RECIPE-V1"),
+                     ("EXTENSION-V2", "EXTENSION-V1")):
+        assert new in after, new
+        assert old is None or old not in after, old
+    assert pr.refresh_team_items() == {}
+
+    # a copy taken from a MEMBER's profile does not follow that member: the rest of the team must not get what a
+    # member changes without the administrator looking at it
+    skill(aroot / "config" / "skills", "mine", body="MEMBER-V1")
+    name, payload = pr.export_item(alice, "skill", "mine")
+    db.execute("INSERT INTO team_items(team_id, kind, name, payload, source, created_at) VALUES(?,?,?,?,?,0)",
+               (tid, "skill", name, json.dumps(payload), f"{alice['username']}:mine"))
+    skill(aroot / "config" / "skills", "mine", body="MEMBER-V2")
+    assert pr.refresh_team_items() == {}
+    assert "MEMBER-V1" in json.dumps(db.one("SELECT payload FROM team_items WHERE name='mine'")["payload"])
+    db.execute("DELETE FROM team_items WHERE name='mine'")
+
+    # the administrator removes the items from the team: the member's profile loses each of them, key included
+    secrets_before = set(yaml.safe_load((aroot / "config" / "secrets.yaml").read_text(encoding="utf-8")) or {})
+    for kind, (iid, name, ref) in ids.items():
+        db.execute("DELETE FROM team_items WHERE id=?", (iid,))
+        pr.remove_team_item_files(tid, kind, name)
+    pr.provision(alice)
+    gone = member_sees()
+    for marker in ("PROVIDER-V2", "SKILL-V2", "RECIPE-V2", "EXTENSION-V2"):
+        assert marker not in gone, marker
+    assert not list((aroot / "config" / "custom_providers").glob("p1*.json")) if (aroot / "config" / "custom_providers").is_dir() else True
+    secrets_after = set(yaml.safe_load((aroot / "config" / "secrets.yaml").read_text(encoding="utf-8")) or {})
+    assert secrets_after < secrets_before                                   # the provider's key went with it
+
+
+def test_a_member_taken_out_of_a_team_loses_what_the_team_gave(tmp_path, monkeypatch):
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    tid = with_team(db, alice)
+    nroot, aroot = Path(native), Path(pr.root_for(alice))
+    skill(nroot / "config" / "skills", "howto", body="SKILL-TEAM")
+    for kind, ref in (("provider", "p1"), ("skill", "howto")):
+        offer(db, pr, admin, tid, kind, ref)
+    pr.provision(alice)
+    assert "SKILL-TEAM" in _everything(aroot) and list((aroot / "config" / "custom_providers").glob("p1*.json"))
+    db.execute("DELETE FROM team_members WHERE user_id=?", (alice["id"],))
+    pr.provision(alice)
+    assert "SKILL-TEAM" not in _everything(aroot) and not list((aroot / "config" / "custom_providers").glob("p1*.json"))
+
+
+def test_a_recipe_in_a_folder_members_can_write_does_not_feed_the_team_by_itself(tmp_path, monkeypatch):
+    """Review Z-4: an administrator's recipes can come from folders outside his profile (GOOSE_RECIPE_PATH). If
+    members can write there, following the source would let a member change what the rest of the team runs."""
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    extra = tmp_path / "team-extra"
+    extra.mkdir()
+    tid = with_team(db, alice)
+    db.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps({**ANYCHAT, "allowed_roots": [str(extra)]}), tid))
+    own = Path(native) / "config" / "recipes"
+    own.mkdir(parents=True, exist_ok=True)
+    for folder, name in ((extra, "shared"), (own, "mine")):
+        (folder / f"{name}.yaml").write_text(yaml.safe_dump({"title": name, "description": name, "prompt": "V1"}), encoding="utf-8")
+    monkeypatch.setenv("GOOSE_RECIPE_PATH", str(extra))
+    for name in ("shared", "mine"):
+        ref = next(r for r in refs(pr, admin, "recipe") if name in r.lower())
+        n, payload = pr.export_item(admin, "recipe", ref)
+        db.execute("INSERT INTO team_items(team_id, kind, name, payload, source, created_at) VALUES(?,?,?,?,?,0)",
+                   (tid, "recipe", n, json.dumps(payload), f"{admin['username']}:{ref}"))
+    for folder, name in ((extra, "shared"), (own, "mine")):
+        (folder / f"{name}.yaml").write_text(yaml.safe_dump({"title": name, "description": name, "prompt": "V2"}), encoding="utf-8")
+    changed = pr.refresh_team_items()
+    assert [x for x in changed.get(tid, []) if "mine" in x] and not [x for x in changed.get(tid, []) if "shared" in x]
+    held = {r["name"]: json.dumps(r["payload"]) for r in db.query("SELECT name, payload FROM team_items")}
+    assert "V2" in next(v for k, v in held.items() if "mine" in k) and "V1" in next(v for k, v in held.items() if "shared" in k)

@@ -35,6 +35,8 @@ CAP_INTERNET = "S-1-15-3-1"          # internetClient
 CAP_PRIVATE_NETWORK = "S-1-15-3-3"   # privateNetworkClientServer
 NETWORK_CAPS = {"none": [], "internet": [CAP_INTERNET], "internet+lan": [CAP_INTERNET, CAP_PRIVATE_NETWORK]}
 RIGHTS = {"modify": "(OI)(CI)M", "read": "(OI)(CI)RX"}
+NEED = {"modify": 0x1301BF, "read": 0x1200A9}      # the access masks icacls writes for M and RX
+ALL_APP_PACKAGES = "S-1-15-2-1"                     # "ALL APPLICATION PACKAGES": every application container
 
 
 class SandboxError(RuntimeError):
@@ -309,19 +311,180 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
     def _icacls(args: list[str]) -> None:
         # by full path (review 2026-11-12, C-5): a bare name is looked up in the current directory before System32
         icacls = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
-        r = subprocess.run([icacls, *args], capture_output=True, text=True, timeout=600,  # nosec B603
-                           stdin=subprocess.DEVNULL, creationflags=0x08000000)
+        try:
+            r = subprocess.run([icacls, *args], capture_output=True, text=True, timeout=600,  # nosec B603
+                               stdin=subprocess.DEVNULL, creationflags=0x08000000)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise SandboxError(f"icacls {' '.join(args[:2])} did not finish: {e.__class__.__name__}") from e
         if r.returncode != 0:
             raise SandboxError(f"icacls {' '.join(args[:2])} failed: {(r.stdout + r.stderr).strip()[:300]}")
+
+    _adv.GetNamedSecurityInfoW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
+                                           ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+                                           ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
+                                           ctypes.POINTER(ctypes.c_void_p)]
+    _adv.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    _adv.GetAclInformation.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_int]
+    _adv.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    _k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                 wintypes.DWORD, ctypes.c_void_p]
+    _k32.CreateFileW.restype = ctypes.c_void_p
+
+    def _aces(path: str) -> list[tuple[int, int, int, str]] | None:
+        """(type, flags, mask, sid) of the allow (0) and deny (1) entries of a folder's access list, in order; None
+        when the list cannot be read. Read from the folder itself, not from what a program reported about it."""
+        pdacl, psd = ctypes.c_void_p(), ctypes.c_void_p()
+        if _adv.GetNamedSecurityInfoW(path, 1, 4, None, None, ctypes.byref(pdacl), None, ctypes.byref(psd)) != 0:
+            return None
+        try:
+            if not pdacl:
+                return []
+            info = (wintypes.DWORD * 3)()
+            if not _adv.GetAclInformation(pdacl, info, ctypes.sizeof(info), 2):      # AclSizeInformation
+                return None
+            out = []
+            for i in range(info[0]):
+                pace = ctypes.c_void_p()
+                if not _adv.GetAce(pdacl, i, ctypes.byref(pace)) or not pace.value:
+                    continue
+                kind = ctypes.c_ubyte.from_address(pace.value).value
+                if kind not in (0, 1):        # other entry types (object, audit, ...) have another layout
+                    continue
+                try:
+                    sid = _sid_to_str(ctypes.c_void_p(pace.value + 8))
+                except SandboxError:
+                    continue
+                out.append((kind, ctypes.c_ubyte.from_address(pace.value + 1).value,
+                            ctypes.c_uint32.from_address(pace.value + 4).value, sid))
+            return out
+        finally:
+            _k32.LocalFree(psd)
+
+    def _specific(mask: int) -> int:
+        for generic, rights in ((0x10000000, 0x1F01FF), (0x80000000, 0x120089), (0x40000000, 0x120116),
+                                (0x20000000, 0x1200A0)):
+            if mask & generic:
+                mask |= rights
+        return mask & 0x1FFFFF
+
+    def access_of(path: str, sids: list[str]) -> tuple[int, int] | None:
+        """(rights on the folder itself, rights its files and subfolders inherit) that the access list gives to any
+        of `sids`. None when the list cannot be read or a deny entry names one of them (then nothing is assumed)."""
+        aces = _aces(path)
+        if aces is None:
+            return None
+        here = below = 0
+        for kind, flags, mask, sid in aces:
+            if sid not in sids:
+                continue
+            if kind == 1:
+                return None
+            if not flags & 0x8:                    # not inherit-only: applies to the folder
+                here |= _specific(mask)
+            if flags & 0x1 and flags & 0x2 and not flags & 0x4:    # object + container inherit, not "this level only"
+                below |= _specific(mask)
+        return here, below
+
+    def own_mask(path: str, sid: str) -> int | None:
+        """The rights of the allow entries `sid` has ON this folder itself (not inherited from a folder above); 0
+        when it has none, None when the access list cannot be read."""
+        aces = _aces(path)
+        if aces is None:
+            return None
+        m = 0
+        for kind, flags, mask, s in aces:
+            if s == sid and kind == 0 and not flags & 0x10:
+                m |= _specific(mask)
+        return m
+
+    def exceeds(path: str, sid: str, right: str) -> bool:
+        """True when the container's own entry on the folder carries more than `right` (modify where read is
+        wanted, full control where modify is). A list that cannot be read counts as "more"."""
+        m = own_mask(path, sid)
+        return m is None or bool(m & ~NEED[right] & 0x1FFFFF)
+
+    def allowed(path: str, sids: list[str], right: str) -> bool:
+        """True when the folder's access list gives one of `sids` the rights of `right`, on it and below it."""
+        a = access_of(path, sids)
+        return a is not None and a[0] & NEED[right] == NEED[right] and a[1] & NEED[right] == NEED[right]
+
+    def can_change_permissions(path: str) -> bool:
+        """May this process change the access list of `path`? Asked of Windows by opening it for exactly that."""
+        h = _k32.CreateFileW(path, 0x00040000, 7, None, 3, 0x02000000, None)     # WRITE_DAC, backup semantics
+        if h in (None, 0, ctypes.c_void_p(-1).value):
+            return False
+        _k32.CloseHandle(h)
+        return True
 
     def grant(path: str, sid: str, right: str) -> None:
         # :r - the container's entry is REPLACED. Without it icacls adds to an entry that is still there (a revoke
         # that failed), and a folder taken down from modify to read kept modify while the record said read (W-5).
         _icacls([path, "/grant:r", f"*{sid}:{RIGHTS[right]}", "/Q", "/C"])
+        # /C ("continue") lets one locked file below not fail the folder - but with it icacls exits 0 even when it
+        # could not change the folder at all, and Goose Web recorded a grant that was never made (found in use,
+        # 2026-11-13). The entry must be on the folder.
+        if not allowed(path, [sid], right):
+            raise SandboxError(f"the permissions of {path} could not be changed: the container's entry is not there")
+        if exceeds(path, sid, right):       # an older, wider entry that /grant:r could not replace (X-2)
+            raise SandboxError(f"the permissions of {path} could not be changed: the container's entry there is "
+                               f"wider than {right}")
+
+    def sweep(path: str, sid: str, keep=(), seconds: float = 20.0, max_entries: int = 200000) -> tuple[list[str], bool]:
+        """After the container's entry was taken off `path`: is it off everything below as well? A subfolder whose
+        inheritance was switched off keeps a copy of the entry as its own, and one that cannot be changed keeps the
+        inherited one - both stayed, with nothing on record (review Z-1). An entry of its own found below is taken
+        off; what cannot be cleaned is returned. Folders in `keep` (still wanted) and what is below them are not
+        touched. Bounded walk; links are not followed. Returns (what still names the container - at most 20,
+        whether everything was looked at)."""
+        norm = os.path.normcase
+        keepers = [norm(os.path.normpath(k)) for k in keep]
+        top = _aces(path)
+        # the folder itself still gets the entry from a granted folder above: below it, inherited entries are right
+        inherits = top is not None and any(k == 0 and s == sid and f & 0x10 for k, f, m, s in top)
+        left: list[str] = []
+        seen, end, stack = 0, time.monotonic() + seconds, [path]
+        while stack:
+            d = stack.pop()
+            try:
+                it = os.scandir(d)
+            except OSError:
+                continue
+            with it:
+                for e in it:
+                    seen += 1
+                    if seen > max_entries or time.monotonic() > end:
+                        return left, False
+                    try:
+                        if e.is_symlink() or getattr(e.stat(follow_symlinks=False), "st_file_attributes", 0) & 0x400:
+                            continue
+                        n = norm(e.path)
+                        if any(n == k or n.startswith(k + os.sep) for k in keepers):
+                            continue
+                        aces = _aces(e.path)
+                        if aces is not None:
+                            own = any(k == 0 and s == sid and not f & 0x10 for k, f, m, s in aces)
+                            stale = not inherits and any(k == 0 and s == sid and f & 0x10 for k, f, m, s in aces)
+                            if own:
+                                try:
+                                    _icacls([e.path, "/remove:g", f"*{sid}", "/Q", "/C"])
+                                except SandboxError:
+                                    pass
+                                again = _aces(e.path)
+                                own = again is None or any(k == 0 and s == sid and not f & 0x10 for k, f, m, s in again)
+                            if (own or stale) and len(left) < 20:
+                                left.append(e.path)
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                    except OSError:
+                        continue
+        return left, True
 
     def revoke(path: str, sid: str) -> None:
         if os.path.exists(path):
             _icacls([path, "/remove:g", f"*{sid}", "/Q", "/C"])
+            aces = _aces(path)      # an entry of its own must be gone; one inherited from a folder above is that folder's
+            if aces is None or any(k == 0 and s == sid and not f & 0x10 for k, f, m, s in aces):
+                raise SandboxError(f"the container's entry on {path} could not be removed")
 else:
     def ensure_container(name: str) -> str:
         raise SandboxError("the sandbox needs Windows (AppContainer)")
@@ -337,6 +500,24 @@ else:
 
     def revoke(path: str, sid: str) -> None:
         raise SandboxError("the sandbox needs Windows (AppContainer)")
+
+    def access_of(path: str, sids: list[str]) -> tuple[int, int] | None:
+        return None
+
+    def allowed(path: str, sids: list[str], right: str) -> bool:
+        return False
+
+    def own_mask(path: str, sid: str) -> int | None:
+        return None
+
+    def exceeds(path: str, sid: str, right: str) -> bool:
+        return True
+
+    def sweep(path: str, sid: str, keep=(), seconds: float = 20.0, max_entries: int = 200000) -> tuple[list[str], bool]:
+        return [], True
+
+    def can_change_permissions(path: str) -> bool:
+        return False
 
 
 def _state_path(state_dir: str, name: str) -> Path:
@@ -385,17 +566,134 @@ def _save_state(state_dir: str, name: str, state: dict) -> None:
     write_atomic(sp, json.dumps(state, indent=1))
 
 
-def prepare(name: str, state_dir: str, grants: dict[str, str]) -> dict:
+def _account() -> tuple[str, str]:
+    """(name, "*<sid>" or the name) of the account this process runs as. icacls takes the SID form in cmd and in
+    PowerShell alike; a name ending in $ (a managed service account) breaks a PowerShell command line (X-7)."""
+    name = os.environ.get("USERNAME", "the gateway's account")
+    try:
+        from . import winsec
+        name = str(winsec.current_user() or name)
+        sid = str(winsec.current_user_sid() or "")
+        return name, (f"*{sid}" if sid.startswith("S-1-") else name)
+    except Exception:
+        return name, name
+
+
+def grant_help(path: str, right: str) -> str:
+    """What to do about a folder a member's container needs and the gateway cannot give it."""
+    who, ident = _account()
+    if right == "read":
+        return (f"{path}: members' containers cannot read it and the gateway's account ({who}) may not change its "
+                "permissions. Let application containers read it, as an administrator or the folder's owner: "
+                f'icacls "{path}" /grant "*{ALL_APP_PACKAGES}:(OI)(CI)RX"')
+    return (f"{path}: the gateway's account ({who}) may not change its permissions, so a member's container cannot "
+            "be given access. Make that account the folder's owner or give it full control, as an administrator or "
+            f'its owner: icacls "{path}" /grant "{ident}:(OI)(CI)F"')
+
+
+def folder_problems(read_folders: list[str], profiles_root: str) -> list[dict]:
+    """For `check`, `sandbox status` and the start of the gateway, when the AppContainer backend may be used: program
+    folders every member's container must read (goose, sandbox.read_dirs, the gateway's base Python for relays) that
+    give application containers no access while this account may not change their permissions, and the profiles
+    root when this account may not change permissions in its own data folder. [{path, why}]; judged for THIS
+    account. A team's extra folders are judged when a member's agent starts."""
+    out = []
+    for d in dict.fromkeys(os.path.normpath(x) for x in read_folders if x):
+        if os.path.isdir(d) and not allowed(d, [ALL_APP_PACKAGES], "read") and not can_change_permissions(d):
+            out.append({"path": d, "why": grant_help(d, "read")})
+    if profiles_root and os.path.isdir(profiles_root) and not can_change_permissions(profiles_root):
+        out.append({"path": profiles_root, "why": grant_help(profiles_root, "modify")})
+    return out
+
+
+_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock(name: str) -> threading.Lock:
+    """One at a time per container: a worker start, an administrator's change and a removal all rewrite the same
+    folders and the same record (X-1 d)."""
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(str(name).lower(), threading.Lock())
+
+
+def _drop(d: dict, path: str) -> None:
+    for k in [k for k in d if os.path.normcase(k) == os.path.normcase(path)]:
+        del d[k]
+
+
+def prepare(name: str, state_dir: str, grants: dict[str, str], required: list[str] | tuple = ()) -> dict:
     """Ensure the container exists and the folder grants match `grants` (only changes are applied; folders that
     do not exist yet are skipped and retried at the next start). Returns the saved state
-    {name, sid, grants, pending, updatedAt} (<system_dir>/sandbox/<name>.json).
+    {name, sid, grants, external, failed, pending, updatedAt} (<system_dir>/sandbox/<name>.json).
 
-    `pending` keeps grants that were applied earlier on a folder that is missing right now (renamed away, a
-    disconnected drive): its ACE cannot be checked or revoked, so the record is kept until the folder is back and
-    the grant is either confirmed (still wanted) or revoked (no longer wanted). Dropping it would leave an ACE
+    `grants`: the folders on which the container has its entry, and from which Goose Web takes it off again when
+    they are no longer wanted. Each is looked at on the folder itself, never taken from the record or from what
+    icacls reported: an entry that is missing is made, one that is wider than wanted is replaced. An entry of the
+    container that is already there counts as a grant whoever made it - a start that could not save its record, an
+    earlier version, an administrator by hand: what is on record is taken off later, what is not would stay for
+    good (review X-1).
+    `external`: folders every application container may use anyway ("ALL APPLICATION PACKAGES", as under
+    C:\\Program Files). Nothing is added there; an entry of the container's own that is still there is taken off.
+    `failed` {folder: what to do}: folders that could not be given, because this account may not change their
+    permissions. They are left out and tried again at every start. When one of them is in `required` (the member's
+    profile, the goose folder) the call fails with that text - after the record is saved.
+    `pending`: entries on a folder that is missing right now (renamed away, a disconnected drive) or that could not
+    be taken off. Kept until the entry is confirmed (wanted again) or gone; dropping it would leave an entry
     nobody tracks."""
+    with _lock(name):
+        return _prepare(name, state_dir, grants, required)
+
+
+def _record(state_dir: str, name: str) -> dict:
+    """The container's record, for changing it: {} only when there is none. A record that cannot be read or is not
+    a record stops the change: the entries it listed would otherwise be forgotten while they stay on the folders
+    (review Z-5)."""
+    p = _state_path(state_dir, name)
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        raise SandboxError(f"the sandbox record {p} cannot be read ({e.__class__.__name__}); nothing was changed") from e
+    try:
+        st = json.loads(raw)
+    except ValueError as e:
+        raise SandboxError(f"the sandbox record {p} is damaged; nothing was changed. It lists the folders that carry "
+                           "this container's entries: repair it, or look at those folders and delete the file") from e
+    if not isinstance(st, dict) or any(not isinstance(st.get(k, {}), dict) for k in ("grants", "pending", "external", "failed")):
+        raise SandboxError(f"the sandbox record {p} is not a record of this version; nothing was changed")
+    return st
+
+
+def _still_there(path: str, sid: str, fallback: str) -> str | None:
+    """What the container's own entry on the folder is now: "modify", "read", None when it has none - read from the
+    folder, so that the record never says less than is there (review Z-2). `fallback` when the list cannot be read
+    (it may be there)."""
+    m = own_mask(path, sid)
+    if m is None:
+        return fallback
+    if not m:
+        return None
+    return "modify" if m & ~NEED["read"] & 0x1FFFFF else "read"
+
+
+def _take_off(path: str, sid: str, keep=()) -> None:
+    """The container's entry is off the folder and off everything below it, or SandboxError."""
+    revoke(path, sid)
+    left, complete = sweep(path, sid, keep)
+    if left:
+        raise SandboxError(f"the container's entry is still on {left[0]}"
+                           + (f" and {len(left) - 1} more place(s)" if len(left) > 1 else "") + f" below {path}")
+    if not complete:
+        log.warning("sandbox: %s is too large to look through completely; single files or subfolders below it whose "
+                    "permissions were set by hand may still name the container", path)
+
+
+def _prepare(name: str, state_dir: str, grants: dict[str, str], required) -> dict:
+    norm = os.path.normcase
+    old = _record(state_dir, name)
     sid = ensure_container(name)
-    old = load_state(state_dir, name)
     same = old.get("sid") == sid
     recorded = {**(old.get("pending", {}) if same else {}), **(old.get("grants", {}) if same else {})}
     have = {p: r for p, r in recorded.items() if os.path.isdir(p)}
@@ -404,30 +702,104 @@ def prepare(name: str, state_dir: str, grants: dict[str, str]) -> dict:
     apply, revoke_list = diff_grants(have, present)
     for p in revoke_list:
         try:
-            revoke(p, sid)
+            _take_off(p, sid, keep=present)
         except SandboxError as e:
             log.warning("sandbox %s: %s", name, e)
-            # The entry is still on the folder: keep it on record, so that the next start tries again (V-10). Not
-            # when the folder is granted anew below - that grant replaces the entry (icacls /grant:r).
-            if os.path.normcase(p) not in {os.path.normcase(k) for k in present}:
-                missing[p] = have[p]
+            # still on the folder (or below it): on record, with what is really there, until it is gone or replaced
+            missing[p] = _still_there(p, sid, have[p]) or have[p]
+    for p, r in present.items():        # after the revokes (Z-7): on record and wanted - on the folder, and no more?
+        if p not in apply and (not allowed(p, [sid, ALL_APP_PACKAGES], r) or exceeds(p, sid, r)):
+            apply[p] = r
+    must = {norm(os.path.normpath(p)) for p in required}
+    granted, external, failed, fatal = dict(present), {}, {}, ""
     for p, right in apply.items():
-        grant(p, sid, right)
-    state = {"name": name, "sid": sid, "grants": present, "pending": missing, "updatedAt": time.time()}
-    _save_state(state_dir, name, state)
+        if allowed(p, [ALL_APP_PACKAGES], right):
+            own = _still_there(p, sid, recorded.get(p, right))
+            if own:                     # no entry of the container's own is needed here: take it off
+                try:
+                    revoke(p, sid)
+                    _drop(missing, p)
+                except SandboxError as e:
+                    log.warning("sandbox %s: %s", name, e)
+                    _drop(missing, p)
+                    missing[p] = own
+            external[p] = granted.pop(p)
+            continue
+        if allowed(p, [sid], right) and not exceeds(p, sid, right):
+            _drop(missing, p)           # the entry is there and is exactly what is wanted: a grant, on record
+            continue
+        try:
+            grant(p, sid, right)
+            _drop(missing, p)           # replaced: whatever was there before is gone
+        except SandboxError as e:
+            why = grant_help(p, right) if not can_change_permissions(p) else f"{p}: {e}"
+            own = _still_there(p, sid, recorded.get(p, right))
+            if own:                     # something of the container's is on it all the same: on record as it is
+                _drop(missing, p)
+                missing[p] = own
+                if own == "modify" and right == "read":
+                    why += " The container's modify entry could not be narrowed and is still on the folder."
+            failed[p] = why
+            granted.pop(p)
+            log.error("sandbox %s: folder left out: %s", name, why)
+            if norm(os.path.normpath(p)) in must and not fatal:
+                fatal = why
+    state = {"name": name, "sid": sid, "grants": granted, "external": external, "failed": failed,
+             "pending": missing, "updatedAt": time.time()}
+    _save_state(state_dir, name, state)     # before anything is raised: what was done is on record
     if apply or revoke_list:
-        log.info("sandbox %s: granted %s, revoked %s", name, sorted(apply), sorted(revoke_list))
+        log.info("sandbox %s: granted %s, revoked %s", name, sorted(p for p in apply if p in granted),
+                 sorted(p for p in revoke_list if p not in missing))
     if missing:
-        log.info("sandbox %s: %d earlier grant(s) on missing folders kept for a later revoke: %s", name,
+        log.info("sandbox %s: %d entr(y/ies) kept on record until they can be taken off: %s", name,
                  len(missing), sorted(missing))
+    if fatal:
+        raise SandboxError(fatal)
     return state
+
+
+def shrink(name: str, state_dir: str, grants: dict[str, str]) -> dict:
+    """Take the container's entry off every folder on record that is not in `grants` any more - now, without
+    starting anything, granting anything or creating the container. For the moment an administrator takes a folder
+    away (api._sync_grants): before, the entry stayed until that member's agent next started, for good when it
+    never did, and a running agent kept the folder until it was restarted. What cannot be taken off stays on record
+    (`pending`). Returns {revoked: [...], pending: {...}}; {} when the container has no record."""
+    norm = os.path.normcase
+    with _lock(name):
+        st = _record(state_dir, name)
+        sid = st.get("sid")
+        if not sid:
+            return {}
+        wanted = {norm(p) for p in grants}
+        keep, pending, gone = {}, {}, []
+        for source, target in ((st.get("grants") or {}, keep), (st.get("pending") or {}, pending)):
+            for p, r in source.items():
+                if norm(p) in wanted or not os.path.isdir(p):
+                    target[p] = r       # still wanted (a changed right is the next start's business), or not there now
+                    continue
+                try:
+                    _take_off(p, sid, keep=grants)
+                    gone.append(p)
+                except SandboxError as e:
+                    log.warning("sandbox %s: %s", name, e)
+                    pending[p] = _still_there(p, sid, r) or r
+        if gone or keep != (st.get("grants") or {}) or pending != (st.get("pending") or {}):
+            _save_state(state_dir, name, {**st, "grants": keep, "pending": pending, "updatedAt": time.time()})
+        if gone:
+            log.info("sandbox %s: entries taken off at once (no longer permitted): %s", name, sorted(gone))
+        return {"revoked": gone, "pending": pending}
 
 
 def remove(state_dir: str, name: str) -> dict:
     """Revoke every recorded grant and delete the container profile (user deleted, made admin, or sandbox off).
     Grants on folders that are missing now stay recorded (a record with only `pending` grants), so a later
     remove (`goose-web sandbox remove --all`) or a new container of the same name revokes them when they are back."""
-    st = load_state(state_dir, name)
+    with _lock(name):
+        return _remove(state_dir, name)
+
+
+def _remove(state_dir: str, name: str) -> dict:
+    st = _record(state_dir, name)
     if not st.get("sid"):
         return {}
     left: dict[str, str] = {}
@@ -436,10 +808,10 @@ def remove(state_dir: str, name: str) -> dict:
             left[p] = r
             continue
         try:
-            revoke(p, st["sid"])
+            _take_off(p, st["sid"])
         except SandboxError as e:
             log.warning("sandbox remove: %s", e)
-            left[p] = r
+            left[p] = _still_there(p, st["sid"], r) or r
     delete_container(name)
     if left:
         _save_state(state_dir, name, {"name": name, "sid": st["sid"], "grants": {}, "pending": left,

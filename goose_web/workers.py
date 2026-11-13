@@ -115,6 +115,24 @@ class _Job:
             self._k32.CloseHandle(h)
 
 
+def appcontainer_grants(spec: dict, settings) -> tuple[dict[str, str], list[tuple[str, str]], list[str]]:
+    """(grants, refused, required) for sandbox.prepare, from a member's sandbox spec: the rules MXC applies at every
+    start (mxc.filter_grants: links resolved, protected folders left out) and the folders without which the agent
+    cannot run at all - its profile and the goose folder. One place, for the worker start and for the moment an
+    administrator changes what a member may reach (api._sync_grants)."""
+    from . import mxc
+    grants, refused = mxc.filter_grants(
+        spec.get("grants") or {}, profile_root=spec["profile_root"],
+        profiles_root=spec.get("profiles_root") or str(settings.profiles_root),
+        system_dir=spec.get("system_dir") or str(settings.system_dir),
+        protected_write=spec.get("protected_write") or [], protected_any=spec.get("protected_any") or [])
+    required = [mxc.resolved(spec["profile_root"])]
+    goose = str(getattr(settings, "goose_binary", "") or "")
+    if goose and os.path.isabs(goose):
+        required.append(mxc.resolved(os.path.dirname(goose)))
+    return grants, refused, required
+
+
 def _first_line(proc, seconds: float) -> str:
     """The first line a started process prints, or '' when it prints none within `seconds` (the caller then ends
     the process, which ends the reader)."""
@@ -614,15 +632,12 @@ class WorkerManager:
             # that is the gateway's system folder, the profiles root, another member's profile, the native Goose
             # profile or - for writing - the code, the Pythons, the goose folder or the MXC folder is left out, in
             # any spelling and through any link.
-            from . import mxc
-            grants, refused = mxc.filter_grants(
-                spec.get("grants") or {}, profile_root=spec["profile_root"],
-                profiles_root=spec.get("profiles_root") or str(self.s.profiles_root),
-                system_dir=spec.get("system_dir") or str(self.s.system_dir),
-                protected_write=spec.get("protected_write") or [], protected_any=spec.get("protected_any") or [])
+            grants, refused, required = appcontainer_grants(spec, self.s)
             for p, why in refused:
                 log.warning("sandbox appcontainer: %s: grant %s refused: %s", w.username, p, why)
-            state = await asyncio.to_thread(sb.prepare, spec["name"], state_dir, grants)
+            state = await asyncio.to_thread(sb.prepare, spec["name"], state_dir, grants, required=required)
+            if state.get("failed"):     # the agent starts without these folders; the administrator is told how to fix it
+                self._sandbox_event("sandbox.grant.failed", w, {"folders": sorted(state["failed"])[:10]})
         except Exception as e:
             w.state, w.last_error = "crashed", f"sandbox: {e}"
             raise RuntimeError(w.last_error) from e

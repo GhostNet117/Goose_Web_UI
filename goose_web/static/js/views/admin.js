@@ -172,6 +172,7 @@ export const POLICY_FLAGS = [
   ['recipes_edit', 'Edit recipes'], ['skills_edit', 'Edit skills'], ['extensions_edit', 'Edit extensions'], ['providers_edit', 'Edit providers & models'],
   ['schedules', 'Manage schedules'], ['apps', 'Manage apps'], ['prompts_edit', 'Edit system prompts'], ['hints_edit', 'Members may add personal hints'],
   ['tools_permissions', 'Set tool permissions'], ['config_edit', 'Edit raw config'], ['allow_shell', 'Allow shell / stdio extensions'], ['notify_webhook', 'Notification webhooks'],
+  ['require_totp', 'Require two-factor sign-in (a member without it can only set it up)'],
 ];
 const FLAG_LABEL = Object.fromEntries(POLICY_FLAGS);
 const EXPERIENCE = [
@@ -181,7 +182,7 @@ const EXPERIENCE = [
   { id: 'folders', title: 'Folders', flags: [] },
   { id: 'ext', title: 'Extensions & tools', flags: ['allow_shell', 'extensions_edit', 'tools_permissions', 'apps'], kinds: ['extension'] },
   { id: 'recipes', title: 'Recipes, skills & schedules', flags: ['recipes_edit', 'skills_edit', 'schedules'], kinds: ['recipe', 'skill'] },
-  { id: 'other', title: 'Other', flags: ['prompts_edit', 'config_edit', 'notify_webhook'] },
+  { id: 'other', title: 'Other', flags: ['prompts_edit', 'config_edit', 'notify_webhook', 'require_totp'] },
   { id: 'guard', title: 'Prompt guard', flags: [] },
 ];
 const GUARD_DEFAULT = { enabled: false, check_input: true, rulesets: [], trusted_extensions: [], on_block: 'notify', auto_approve: false, threshold: null };
@@ -719,7 +720,7 @@ function settingsTab(body) {
     const bn = input({ value: brand.name }); const bt = input({ value: brand.tagline || '', placeholder: 'Your AI agent, anywhere' });
     const dt = select([{ value: '', label: '— none —' }, ...teams.map((t) => ({ value: t.id, label: t.name }))], s.defaultTeamId || '');
     const hrs = input({ type: 'number', min: '1', max: '720', value: s.sessionHours ?? 12, class: 'inp inp-sm' });
-    let allowSelfTotp = s.allowSelfTotp !== false, reqTotp = !!s.requireTotpForAdmins;
+    let allowSelfTotp = s.allowSelfTotp !== false, reqTotp = !!s.requireTotpForAdmins, reqTotpAll = !!s.requireTotpForAll;
     const peers = (s.peers || []).map((p) => ({ ...p }));
     const peersBox = h('div', { class: 'stack-sm' });
     const drawPeers = () => peersBox.replaceChildren(...peers.map((p, i) => {
@@ -733,11 +734,12 @@ function settingsTab(body) {
       section('Branding', null, h('div', { class: 'card grid2' }, field('Name', bn), field('Tagline', bt))),
       section('Accounts', null, h('div', { class: 'card stack' }, h('div', { class: 'grid2' }, field('Default team for new users', dt), field('Sign-in lifetime (hours)', hrs)),
         h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Users may enable two-factor themselves'), toggle(allowSelfTotp, (v) => { allowSelfTotp = v; })),
-        h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Require two-factor for administrators'), toggle(reqTotp, (v) => { reqTotp = v; })))),
+        h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Require two-factor for administrators'), toggle(reqTotp, (v) => { reqTotp = v; })),
+        h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Require two-factor for everyone (a team can require it for its members: Teams > Experience > Other)'), toggle(reqTotpAll, (v) => { reqTotpAll = v; })))),
       section('Herd peers', null, h('p', { class: 'muted small' }, 'Other Goose Web gateways shown in everyone’s Herd (“every machine in one sidebar”). The token must belong to a user on that machine.'), peersBox),
       h('div', { class: 'row sticky-foot' }, actionBtn('Save settings', async () => {
         const pp = peers.filter((p) => p.url).map((p) => { const x = { name: p.name || p.url, url: p.url }; if (p._tok) x.token = p._tok; else if (p.token) x.token = p.token; return x; });
-        await PUT('/api/admin/settings', { brand: { name: bn.value.trim() || 'Goose Web', tagline: bt.value.trim() }, defaultTeamId: dt.value || null, sessionHours: Number(hrs.value) || 12, allowSelfTotp, requireTotpForAdmins: reqTotp, peers: pp });
+        await PUT('/api/admin/settings', { brand: { name: bn.value.trim() || 'Goose Web', tagline: bt.value.trim() }, defaultTeamId: dt.value || null, sessionHours: Number(hrs.value) || 12, allowSelfTotp, requireTotpForAdmins: reqTotp, requireTotpForAll: reqTotpAll, peers: pp });
         const ac = store.get('authConfig'); if (ac) store.set('authConfig', { ...ac, brand: { name: bn.value.trim(), tagline: bt.value.trim() } });
       }, { variant: 'primary', success: 'Settings saved' })));
   })();

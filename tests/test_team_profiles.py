@@ -122,6 +122,29 @@ def test_prompt_refused_when_current_model_not_allowed():
         pol.check_session_choice(e, {"configOptions": [{"id": "model", "currentValue": "m9"}]})
 
 
+def test_a_team_is_told_when_its_members_do_not_have_its_provider():
+    """Found in use: a team was given a default provider that is defined in the administrator's profile only. Its
+    members had neither the provider nor its key, could not reach a model, and nothing said why."""
+    def said(policy, items):
+        return [(w["level"], w["text"]) for w in pol.team_warnings(policy, hints=1, members=1, provider_items=items)
+                if "do not have the provider" in w["text"]]
+    team_policy = {**ANYCHAT, "allowed_providers": ["custom_proxy"], "default_provider": "custom_proxy"}
+    got = said(team_policy, set())
+    assert len(got) == 1 and got[0][0] == "err"
+    assert "'custom_proxy' (the team's default)" in got[0][1] and "Library items" in got[0][1]
+    assert said(team_policy, {"custom_proxy"}) == []                      # offered to the team: nothing to say
+    # allowed but not the default: a warning; a built-in provider (members bring their own key) is not judged
+    assert [lvl for lvl, _ in said({**ANYCHAT, "allowed_providers": ["custom_a", "openai"]}, set())] == ["warn"]
+    assert said(ANYCHAT, set()) == []                                     # any provider, no default
+    assert not any("do not have the provider" in w["text"]               # the items were not looked at
+                   for w in pol.team_warnings(team_policy, hints=1, members=1))
+    # the second trap of the same set-up: a default provider and no default model - a new member cannot start a chat
+    no_model = [w for w in pol.team_warnings(team_policy, hints=1, members=1) if "without a default model" in w["text"]]
+    assert [w["level"] for w in no_model] == ["err"]
+    with_model = pol.team_warnings({**team_policy, "default_model": "m1"}, hints=1, members=1)
+    assert not any("without a default model" in w["text"] for w in with_model)
+
+
 def test_team_warnings():
     texts = [w["text"] for w in pol.team_warnings({}, hints=0, members=0)]
     assert "No models allowed: members can't chat." in texts
@@ -314,3 +337,24 @@ def test_api_managed_native_hints(env, tmp_path):
         # a library edit rewrites the native file for its users
         assert tc.put(f"/api/admin/hints/{hid}", json={"content": "- rule B"}, headers=h).json()["updatedUsers"] == ["root"]
         assert "- rule B" in (native / "config" / ".goosehints").read_text(encoding="utf-8")
+
+
+def test_check_names_teams_whose_members_cannot_chat(env, tmp_path):
+    from goose_web.__main__ import _team_lines
+    s, db, pr, c = env
+    good = team(db, "Good", {**ANYCHAT, "allowed_providers": ["custom_p"], "default_provider": "custom_p", "default_model": "m"})
+    bad = team(db, "Bad", {**ANYCHAT, "allowed_providers": ["custom_p"], "default_provider": "custom_p"})
+    team(db, "Empty", {})                                     # nobody in it: not reported
+    db.execute("INSERT INTO team_items(team_id, kind, name, payload, created_at) VALUES(?,?,?,?,0)", (good, "provider", "custom_p", "{}"))
+    db.set_user_team(user(db, "u1")["id"], good)
+    db.set_user_team(user(db, "u2")["id"], bad)
+    import shutil
+    from pathlib import Path
+    target = Path(s.system_dir) / "goose-web.db"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    db.close()
+    shutil.copyfile(tmp_path / "gw.db", target)
+    lines = _team_lines(s)
+    assert [ln[:4] for ln in lines] == ["[OK]", "[!!]", "[!!]"] and not any("Empty" in ln for ln in lines)
+    assert "team Good (1 member(s))" in lines[0]
+    assert any("do not have the provider 'custom_p'" in ln for ln in lines[1:]) and any("without a default model" in ln for ln in lines[1:])

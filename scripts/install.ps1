@@ -97,6 +97,27 @@ function Find-Goose {
     }
     return ''
 }
+function Test-FullControl([string]$Dir, [string]$Account) {
+    # True when $Dir's own access list gives $Account full control of the folder and of everything below it - which
+    # includes changing permissions there. The account's own entry is looked for (by SID; by name when the account
+    # cannot be resolved right now, e.g. no domain controller in reach), not what it may hold through a group.
+    try {
+        $want = ''
+        if ($Account -match '^S-1-[0-9-]+$') { $want = $Account } else {
+            $want = $(try { (New-Object Security.Principal.NTAccount($Account)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { '' }) }
+        $full = [Security.AccessControl.FileSystemRights]::FullControl
+        $both = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        foreach ($ace in (Get-Acl -LiteralPath $Dir).Access) {
+            if ("$($ace.AccessControlType)" -ne 'Allow' -or ($ace.FileSystemRights -band $full) -ne $full) { continue }
+            if (($ace.InheritanceFlags -band $both) -ne $both -or "$($ace.PropagationFlags)" -ne 'None') { continue }
+            $sid = $(try { $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { '' })
+            if ($want -and $sid -eq $want) { return $true }
+            if (-not $want -and "$($ace.IdentityReference.Value)" -ieq $Account) { return $true }
+        }
+    } catch { }
+    return $false
+}
+
 function Protect-InstallDir([string]$Dir, [string]$RunAs = '', [switch]$WhatIf) {
     # The gateway runs the code, the .venv and (on upgrade) the git hooks in this folder as its own account. Only the
     # installing account, SYSTEM and Administrators may change them; the account that runs the gateway, if another
@@ -242,6 +263,8 @@ if (-not $NonInteractive -and -not $RunAs) {
         $RunAs = Ask '     Account (DOMAIN\name, .\name for a local account, DOMAIN\name$ for a gMSA)' ''
     }
 }
+# .\name is a local account: icacls and the permission checks below need it as COMPUTER\name
+if ($RunAs.StartsWith('.\')) { $RunAs = "$env:COMPUTERNAME\" + $RunAs.Substring(2) }
 $service = [bool]$RunAs -and ($RunAs -ine $id.Name) -and ($RunAs -ine $env:USERNAME)
 if (-not $service) { $RunAs = $id.Name }
 
@@ -314,7 +337,15 @@ New-Item -ItemType Directory -Force -Path $sys | Out-Null
 $grants = @("$($id.Name):(OI)(CI)F", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
 if ($service) { $grants += "$($RunAs):(OI)(CI)F" }
 & icacls $ProfilesRoot /inheritance:r /grant:r @grants /Q | Out-Null
-if ($LASTEXITCODE) { Warn "Could not restrict permissions on $ProfilesRoot (icacls exit $LASTEXITCODE)" }
+if ($LASTEXITCODE) {
+    # Members' profiles and team folders are made in this folder, and the AppContainer sandbox backend gives each
+    # member's container its folders by changing their permissions: the gateway's account needs full control here.
+    $gwAccount = $(if ($service) { $RunAs } else { $id.Name })
+    if (-not (Test-FullControl $ProfilesRoot $gwAccount)) {
+        throw "Could not set the permissions of $ProfilesRoot (icacls exit $LASTEXITCODE), and $gwAccount does not have full control of it. Goose Web keeps members' profiles and team folders there and must be able to change their permissions. Make yourself the owner of $ProfilesRoot, or choose another folder with -ProfilesRoot, and run again."
+    }
+    Warn "Could not set the permissions of everything below $ProfilesRoot (icacls exit $LASTEXITCODE); the folder itself is set."
+}
 if ($service) {
     # The service account must read the install folder, the venv's Python and Goose, and use the Goose appdata.
     $base = (& $venvPy -c "import sys; print(sys.base_prefix)").Trim()

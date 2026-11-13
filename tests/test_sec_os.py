@@ -245,8 +245,10 @@ def test_legacy_container_is_removed_before_the_new_one_is_used(tmp_path, monkey
 def test_grants_on_missing_folders_stay_recorded_until_revoked(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(sb, "ensure_container", lambda name: "S-1-15-2-77")
-    monkeypatch.setattr(sb, "grant", lambda p, sid, r: calls.append(("grant", p, r)))
-    monkeypatch.setattr(sb, "revoke", lambda p, sid: calls.append(("revoke", p)))
+    on = {}     # what is on the folders: since 1.21.2 prepare looks at the folder, not only at its own record
+    monkeypatch.setattr(sb, "grant", lambda p, sid, r: calls.append(("grant", p, r)) or on.__setitem__(p, r))
+    monkeypatch.setattr(sb, "revoke", lambda p, sid: calls.append(("revoke", p)) or on.pop(p, None))
+    monkeypatch.setattr(sb, "allowed", lambda p, sids, r: "S-1-15-2-77" in sids and on.get(p) in (r, "modify"))
     monkeypatch.setattr(sb, "delete_container", lambda name: calls.append(("delete", name)) or True)
     state = str(tmp_path / "state")
     a, b = tmp_path / "a", tmp_path / "team"

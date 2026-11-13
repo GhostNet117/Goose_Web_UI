@@ -605,10 +605,26 @@ class AuthService:
         else:
             self.db.execute("DELETE FROM auth_sessions WHERE user_id=?", (uid,))
 
+    def totp_required(self, user: dict) -> bool:
+        """Must this account sign in with two-factor (spec 029)? Yes when two-factor is required for everyone
+        (`require_totp_all`), for administrators and this is one (`require_totp_admins`), or by the policy of a
+        team this member belongs to (`require_totp`). It holds for every way of signing in - a local password, the
+        directory, single sign-on: the second factor is Goose Web's own. A team that cannot be looked up counts as
+        requiring it (the account can still enrol; nothing else is open)."""
+        if self.db.get_setting("require_totp_all"):
+            return True
+        if user.get("role") == "admin":
+            return bool(self.db.get_setting("require_totp_admins"))
+        try:
+            return any(bool((t.get("policy") or {}).get("require_totp")) for t in self.db.user_teams(user["id"]))
+        except Exception:
+            log.exception("two-factor requirement of %s", user.get("username"))
+            return True
+
     def totp_enrolment_required(self, user: dict) -> bool:
-        """True for an administrator without two-factor while 'require two-factor for admins' is on."""
-        return bool(user.get("role") == "admin" and not user.get("totp_enabled")
-                    and self.db.get_setting("require_totp_admins"))
+        """True for an account that must use two-factor (totp_required) and has not set it up: it can do nothing
+        but enrol."""
+        return bool(not user.get("totp_enabled") and self.totp_required(user))
 
     def revoke_user_tokens(self, uid: int) -> int:
         """Delete every API token of a user (password reset/change, account disabled - GW-21)."""

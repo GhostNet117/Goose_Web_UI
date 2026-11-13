@@ -86,7 +86,7 @@ function showChangePassword(me) {
   });
 }
 
-// Two-factor is required for this account (Admin > Auth: require it for administrators) and not set up yet: the
+// Two-factor is required for this account (for everyone, for administrators, or by the member's team) and not set up yet: the
 // server allows only enrolment until it is (security assessment 2026-11-09 A-8). Same steps as Settings > Two-factor.
 async function showTotpEnrol(me) {
   teardown();

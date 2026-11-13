@@ -1143,3 +1143,74 @@ installation). It found one Medium regression of the fix of V-4 and some smaller
 | W-6, W-8, W-10 | Info | A failed revoke is listed as "folder missing"; the limit of 32 services per port is not in the configuration reference; a temporary file left by a crash is not collected | **Open** |
 
 The fixes of this second review each have a test and were not reviewed by anyone else.
+
+## 17. Addendum: folder permissions of the AppContainer backend (2026-11-13), 1.22.0
+
+Found in use by the owner of the project, not by the reviews or the tests of section 16: on a folder whose
+permissions the gateway's account may not change, the AppContainer backend recorded a grant it had not made.
+
+**Cause.** `sandbox.grant` and `sandbox.revoke` ran `icacls ... /C` and trusted its exit code. `/C` ("continue on
+errors") is there so that one locked file below a folder does not fail the folder; with it `icacls` exits 0 even
+when it could not open the folder's access list at all. Every test of section 16 used folders made by the account
+that ran the test, where changing permissions always works.
+
+**Effect.** In the direction of less access for grants: the member's container did not get the folder (the agent
+could not use a team folder, or could not start when the goose folder was concerned), the record and `sandbox
+status` said it had, and the start never tried again. For revokes the direction is the other one: an entry that
+could not be removed was recorded as removed. That needs a folder whose permissions the account could change when
+the entry was made and not when it was to be taken off; then a member kept a folder that had been taken away, and
+nothing showed it.
+
+**Change (1.22.0).** The access list of the folder is read after every grant and revoke (`sandbox._aces`,
+`allowed`, `exceeds`): a grant is recorded only when the container's entry is there and no wider than wanted, a
+revoke only when the entry is gone; what could not be taken off stays on record (`pending`) and is shown as still
+on the folder. A grant that an earlier version recorded without making is made at the next start. A folder that "ALL
+APPLICATION PACKAGES" may read gets no entry. A folder that cannot be given is either left out with the agent
+starting (logged, audited as `sandbox.grant.failed`, listed with its reason under the member's container by
+`sandbox status`) or - the member's profile, the goose folder - fails the start, in both cases naming the folder,
+the account and the command; the record is saved before the start fails. When an administrator takes a folder away
+(team, folder or membership change) the entries no longer permitted are taken off at once in the background
+(`api._sync_grants`, `sandbox.shrink`; audited as `sandbox.revoke`), not at the member's next start. One container's
+folders and record are changed by one caller at a time.
+
+**Independent review of this change (before release).** One High finding, in the first version of the fix itself:
+an entry of the member's container that was on a folder but not on record was taken for an administrator's and
+left alone for good. A record can be missing for ordinary reasons - a start that gave two folders and failed on a
+third before saving - so a member would have kept a folder that was taken away (X-1). Now such an entry goes on
+record as Goose Web's and is taken off when the folder is no longer wanted; the record is saved before a failure
+is raised; `icacls` timing out is a failed change, not a crash. Also from that review: a change from modify to
+read on a folder that could no longer be changed was recorded as read while modify stayed (X-2, fixed: "wider
+than wanted" is a failure, the old entry stays on record); `check` failed, and with it an upgrade, over a Python
+folder no agent needed or over the fallback backend (X-3, fixed: only the profiles root and the goose folder count,
+for the configured backend); `install.ps1` stopped for a local account written as `.\name` (X-4, fixed; that form
+had left the profiles root unrestricted before); `sandbox status` did not show what could not be given (X-5,
+fixed); an administrator's change could create a container and give folders (X-6, fixed: it only takes entries
+off). The fixes of that review each have a test; they were not reviewed again.
+
+**Residual.**
+- The fix for a program folder is an entry for "ALL APPLICATION PACKAGES": every application container of an
+  account that can itself read the folder may then read it, as with `C:\Program Files`. The alternative - letting
+  the gateway's account change the permissions of the programs it runs - is worse and is not recommended.
+- `check` and `sandbox status` judge the folders for the account that runs them. Run by an administrator they say
+  nothing about a service account; the gateway's own log does.
+- The check reads the entry on the folder, not on every file below it; a file with protected permissions inside a
+  granted folder stays closed to the container, as before.
+- A member who is disabled keeps the entries until deleted or enabled and started; a container that is not running
+  cannot use them.
+- A member's agent that is starting at the very moment an administrator takes a folder away can be given the folder
+  by that start, with the folder set of before the change; it then keeps it until it restarts (it is marked for a
+  restart when idle). Taking away at once holds for agents that are running or stopped.
+- An entry that 1.21.1 or earlier reported as removed without removing it is on no record. It is found only if the
+  folder is given to that member again.
+- Taken off at once: changes made through the administration pages. A team set at sign-in from a directory, changes
+  made with the command line and changes to `sandbox.read_dirs` take effect at the member's next start.
+- `check` cannot judge a team's extra folders or a service account it is not run as.
+- Taking an entry off looks below the folder too (a subfolder whose inheritance was switched off kept a copy of the
+  entry; found by the last review, true of every earlier version): up to 200,000 files and folders or 20 seconds.
+  Beyond that it is logged that the folder was not looked through completely.
+- The record is written when a start has finished with the folders. A gateway that is stopped in the middle leaves
+  entries that are found again only when the folder is still wanted at the next start.
+- A damaged record stops the member's start with the file named, instead of being replaced by an empty one.
+- Seen while testing this, and true of section 16.2 as well: a container cannot list a folder it has no access to,
+  but it can tell whether a path it guesses exists there - a missing file answers "not found", an existing one
+  "access denied". Windows answers every process without access that way.

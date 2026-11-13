@@ -460,14 +460,26 @@ PREFS_CLEAN = {"providerVisibility": _clean_provider_visibility, "providerGroups
 def _check_self_totp_allowed(c: Ctx, u: dict) -> None:
     """Admin setting 'Users may enable two-factor themselves' (allow_self_totp, default on).
     Administrators can always enrol, so 'require two-factor for admins' stays satisfiable."""
-    if u["role"] != "admin" and not c.db.get_setting("allow_self_totp", True):
+    if u["role"] != "admin" and not c.db.get_setting("allow_self_totp", True) and not c.auth.totp_required(u):
+        # (an account that MUST use two-factor can always enrol, whatever this switch says - spec 029)
         raise HTTPError(403, "totp_self_disabled",
                         "Your administrator has turned off self-service two-factor enrolment")
 
 
+def _enrol_in_person(ident) -> None:
+    """Two-factor is set up from the account's own sign-in in the browser. With an API token it would be the token's
+    holder - a script, another gateway - who enrols an authenticator, and the person is locked out (review Z-3; it
+    matters once two-factor is required for accounts that have tokens)."""
+    if ident.via != "cookie":
+        raise HTTPError(403, "session_required", "Two-factor is set up in the browser, signed in as the account - "
+                                                 "not with an API token")
+
+
 async def totp_setup(request: Request):
     c = ctx(request)
-    u = c.require(request, allow_totp_enrol=True).user
+    ident = c.require(request, allow_totp_enrol=True)
+    _enrol_in_person(ident)
+    u = ident.user
     if u["totp_enabled"]:
         raise HTTPError(409, "already_enabled", "Two-factor is already on")
     _check_self_totp_allowed(c, u)
@@ -480,7 +492,9 @@ async def totp_setup(request: Request):
 
 async def totp_enable(request: Request):
     c = ctx(request)
-    u = c.require(request, allow_totp_enrol=True).user
+    ident = c.require(request, allow_totp_enrol=True)
+    _enrol_in_person(ident)
+    u = ident.user
     if u["totp_enabled"]:
         raise HTTPError(409, "already_enabled", "Two-factor is already on")
     _check_self_totp_allowed(c, u)
@@ -497,8 +511,9 @@ async def totp_disable(request: Request):
     c = ctx(request)
     u = c.require(request).user
     b = await body_json(request, 16 * 1024)
-    if u["role"] == "admin" and c.db.get_setting("require_totp_admins"):
-        raise HTTPError(403, "required", "Two-factor is required for administrators")
+    if c.auth.totp_required(u):
+        raise HTTPError(403, "required", "Two-factor is required for administrators" if u["role"] == "admin"
+                        and not c.db.get_setting("require_totp_all") else "Two-factor is required for your account")
     # A-8: every account type re-authenticates - local and directory accounts with the current password,
     # accounts without a password here (OIDC) with a current authenticator code.
     if not await asyncio.to_thread(c.auth.reauthenticate, u, str(b.get("password") or ""), str(b.get("code") or "")):
@@ -995,6 +1010,7 @@ async def _reprovision(c: Ctx, users: list[dict]) -> dict:
             out[u["username"]] = [f"error: {e}"]
             continue
         out[u["username"]] = changes
+        _background(_sync_grants(c, u))     # icacls over a large folder takes time: not inside this request
         w = c.workers.get(u["username"].lower())
         if w and changes and w.state == "ready":
             w.restart_pending = True
@@ -1011,6 +1027,47 @@ async def _reprovision(c: Ctx, users: list[dict]) -> dict:
         except Exception:
             log.exception("revalidating sockets after a policy change")
     return out
+
+
+_BACKGROUND: set = set()
+
+
+def _background(coro) -> None:
+    t = asyncio.ensure_future(coro)
+    _BACKGROUND.add(t)
+    t.add_done_callback(_BACKGROUND.discard)
+
+
+async def _sync_grants(c: Ctx, u: dict) -> list[str]:
+    """A folder that is taken away from a member - removed from the team, the member moved, the team changed - loses
+    the entry of the member's AppContainer NOW. Before, the entry stayed until that member's agent next started -
+    for good, when it never did - and a running agent kept using the folder until it was restarted (found in use,
+    2026-11-13). Only entries are taken off (sandbox.shrink): nothing is granted and no container is created here;
+    new folders are given at the member's next start, as before. Returns the folders that lost their entry."""
+    from . import sandbox as sb
+    from .workers import appcontainer_grants
+    try:
+        spec = c.sandbox_spec(u)
+        if not spec:        # not sandboxed (any more): _drop_sandbox removes everything
+            return []
+        state_dir = str(c.settings.system_dir / "sandbox")
+
+        def work() -> dict:
+            if not sb.load_state(state_dir, spec["name"]).get("sid"):
+                return {}       # never ran in an AppContainer: no entry anywhere
+            grants, _, _ = appcontainer_grants(spec, c.settings)
+            return sb.shrink(spec["name"], state_dir, grants)
+        res = await asyncio.to_thread(work)
+        gone = sorted(res.get("revoked") or [])
+        if gone:
+            c.db.audit("sandbox.revoke", target=u["username"], detail={"folders": gone[:10]})
+        if res.get("pending"):
+            log.warning("sandbox: %s: entries that could not be taken off stay on record: %s", u.get("username"),
+                        sorted(res["pending"])[:10])
+        return gone
+    except Exception as e:
+        log.warning("sandbox: folder permissions of %s not brought in line: %s", u.get("username"), e)
+        return []
 
 
 async def _drop_sandbox(c: Ctx, u: dict) -> None:
@@ -1343,6 +1400,8 @@ def _clean_policy_fields(p: dict) -> dict:
         out["share_folder"] = sf
     if isinstance(p.get("guard"), dict):
         out["guard"] = guardmod.clean_team_guard(p["guard"])   # spec 018
+    if p.get("require_totp") is True:
+        out["require_totp"] = True      # spec 029: this team's members must sign in with two-factor
     return out
 
 
@@ -1354,7 +1413,10 @@ def _team_view(c: Ctx, t: dict) -> dict:
     return {"id": t["id"], "name": t["name"], "description": t["description"],
             "policy": pol, "members": members, "hints": hints,
             "itemCount": n, "createdAt": t["created_at"], "teamFolder": str(c.profiles.team_folder(t)),
-            "warnings": acp_policy.team_warnings(pol, hints=len(hints), members=len(members))}
+            "warnings": acp_policy.team_warnings(
+                pol, hints=len(hints), members=len(members),
+                provider_items={r["name"] for r in c.db.query(
+                    "SELECT name FROM team_items WHERE team_id=? AND kind='provider'", (t["id"],))})}
 
 
 def _team_members(c: Ctx, team_id: int) -> list[dict]:
@@ -1481,6 +1543,23 @@ async def admin_team_item_delete(request: Request):
     await _reprovision(c, _team_members(c, tid))
     c.audit(request, "team.item.remove", admin, target=f"{tid}:{it['kind']}:{it['name']}")
     return ok()
+
+
+async def refresh_library(c: Ctx) -> dict:
+    """Library items taken from an administrator's profile are brought in line with it (profiles.refresh_team_items)
+    and the members of the teams concerned are provisioned: their profiles get the new version, and an agent that
+    runs is restarted when it is idle. Run every few minutes by the gateway and on demand."""
+    changed = await asyncio.to_thread(c.profiles.refresh_team_items)
+    for tid, names in changed.items():
+        await _reprovision(c, _team_members(c, tid))
+        c.db.audit("team.item.refresh", target=str(tid), detail={"items": names[:20]})
+    return {str(tid): names for tid, names in changed.items()}
+
+
+async def admin_library_refresh(request: Request):
+    c = ctx(request)
+    c.require(request, admin=True)
+    return ok({"changed": await refresh_library(c)})
 
 
 async def admin_library(request: Request):
@@ -1805,13 +1884,17 @@ async def admin_settings(request: Request):
                    "defaultTeamId": c.db.get_setting("default_team_id"),
                    "sessionHours": c.db.get_setting("session_hours") or c.settings.get("auth", "session_hours"),
                    "allowSelfTotp": c.db.get_setting("allow_self_totp", True),
-                   "requireTotpForAdmins": bool(c.db.get_setting("require_totp_admins")), "peers": peers})
+                   "requireTotpForAdmins": bool(c.db.get_setting("require_totp_admins")),
+                   "requireTotpForAll": bool(c.db.get_setting("require_totp_all")), "peers": peers})
     b = await body_json(request)
     # Validate before writing anything (the UI saves every field in one request).
     if b.get("requireTotpForAdmins") and not c.db.get_setting("require_totp_admins") and not admin["totp_enabled"]:
         # Only an admin who already uses two-factor may switch the requirement on.
         raise HTTPError(409, "totp_needed_first",
                         "Turn on two-factor for your own account before requiring it for administrators")
+    if b.get("requireTotpForAll") and not c.db.get_setting("require_totp_all") and not admin["totp_enabled"]:
+        raise HTTPError(409, "totp_needed_first",
+                        "Turn on two-factor for your own account before requiring it for everyone")
     if "brand" in b and isinstance(b["brand"], dict):
         c.db.set_setting("brand", {k: str(v)[:120] for k, v in b["brand"].items() if k in ("name", "tagline", "machine")})
     if "defaultTeamId" in b:
@@ -1822,6 +1905,13 @@ async def admin_settings(request: Request):
         c.db.set_setting("allow_self_totp", bool(b["allowSelfTotp"]))
     if "requireTotpForAdmins" in b:
         c.db.set_setting("require_totp_admins", bool(b["requireTotpForAdmins"]))
+    if "requireTotpForAll" in b:
+        c.db.set_setting("require_totp_all", bool(b["requireTotpForAll"]))
+    if ("requireTotpForAll" in b or "requireTotpForAdmins" in b) and c.hub is not None:
+        try:        # a requirement that was just switched on ends the open sockets of accounts without two-factor now
+            c.hub.revalidate_clients()
+        except Exception:
+            log.exception("revalidating sockets after a two-factor setting")
     if "peers" in b and isinstance(b["peers"], list):
         old = {p.get("url"): p for p in (c.db.get_setting("peers") or [])}
         peers = []
@@ -2086,6 +2176,7 @@ routes = [
     Route("/api/admin/teams/{tid:int}/items", admin_team_items, methods=["GET", "POST"]),
     Route("/api/admin/teams/{tid:int}/items/{iid:int}", admin_team_item_delete, methods=["DELETE"]),
     Route("/api/admin/library", admin_library),
+    Route("/api/admin/library/refresh", admin_library_refresh, methods=["POST"]),
     Route("/api/admin/hints", admin_hints, methods=["GET", "POST"]),
     Route("/api/admin/hints/{hid:int}", admin_hint, methods=["GET", "PUT", "DELETE"]),
     Route("/api/admin/goose-security", admin_goose_security, methods=["GET", "PUT"]),

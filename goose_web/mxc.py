@@ -644,6 +644,29 @@ def summary(settings, refresh: bool = False) -> dict:
         out["mxc"] = {k: st.get(k) for k in ("available", "reason", "exe", "version", "contract", "build", "probe",
                                              "signature", "checkedAt")}
         out["mxc"]["installed"] = installed_info(settings)
+    if on and (backend == "appcontainer" or out["fallback"] == "appcontainer"):
+        # the AppContainer backend puts an entry for each member's container on the folders it may use; that works
+        # only where this account may change permissions, or where every container may read anyway
+        from . import sandbox as sb
+        goose = os.path.dirname(str(settings.goose_binary or "")) if os.path.isabs(str(settings.goose_binary or "")) else ""
+        refused = {d for d, _ in read_dir_problems(settings)}
+        folders = [goose] + [str(d) for d in (settings.get("sandbox", "read_dirs") or []) if d and str(d) not in refused]
+        try:
+            relayed = bool(out["relays"]) or int(settings.get("guard", "classifier_port") or 0) > 0
+        except (TypeError, ValueError):
+            relayed = bool(out["relays"])
+        if relayed:
+            folders.append(sys.base_prefix)      # a relay's forwarder runs on the gateway's base Python
+        try:
+            found = sb.folder_problems([resolved(d) for d in folders if d], str(settings.profiles_root))
+            # Only what no member's agent can run without stops `check` (and with it an upgrade), and only where the
+            # AppContainer backend is the configured one, not merely the fallback (review X-3).
+            vital = {os.path.normcase(resolved(d)) for d in (goose, str(settings.profiles_root)) if d}
+            for p in found:
+                p["fatal"] = backend == "appcontainer" and os.path.normcase(p["path"]) in vital
+            out["folderProblems"] = found
+        except Exception as e:
+            out["folderProblems"] = [{"path": "", "why": f"the folders could not be checked: {e}", "fatal": False}]
     if out["problems"]:
         out["membersCanStart"], out["reason"] = False, "; ".join(out["problems"])
     elif on and backend == "mxc" and not out["mxc"]["available"]:

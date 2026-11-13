@@ -19,7 +19,7 @@ CHAT_LISTS = ["allowed_modes", "allowed_providers", "allowed_models"]
 ANY = "*"
 # Extra keys a team policy may carry besides BOOL_KEYS / LIST_KEYS / max_concurrent_runs.
 # guard: the team's prompt guard (spec 018, guard.clean_team_guard); missing = off.
-TEAM_EXTRA_KEYS = ["default_provider", "default_model", "share_folder", "guard"]
+TEAM_EXTRA_KEYS = ["default_provider", "default_model", "share_folder", "guard", "require_totp"]
 # Approval modes in which Goose does not ask before every tool call: Auto never asks, Smart approve skips tools
 # annotated (or judged) read-only. A guarded team cannot use them (spec 018): the guard sees tool calls only through
 # Goose's permission requests.
@@ -244,10 +244,24 @@ def check_session_choice(policy: dict, load_result: dict | None) -> None:
                      "allow. Pick an allowed mode for this chat first.")
 
 
-def team_warnings(policy: dict, *, hints: int, members: int) -> list[dict]:
-    """What the admin should know about a team's experience (Experience page). level: err | warn | info."""
+def team_warnings(policy: dict, *, hints: int, members: int, provider_items: set | None = None) -> list[dict]:
+    """What the admin should know about a team's experience (Experience page). level: err | warn | info.
+    `provider_items`: the ids of the providers this team has as library items (None = not looked at)."""
     p = {**DEFAULT_POLICY, **(policy or {})}
     out: list[dict] = []
+    # Allowing a provider, or making it the team's default, does not put it into the members' profiles. A custom
+    # provider is defined in ONE profile - its address, its models, its key. Found in use, 2026-11-13: a team with
+    # a default provider whose members could not reach a model, and nothing said why.
+    if provider_items is not None:
+        default = p.get("default_provider")
+        named = [x for x in (p.get("allowed_providers") or []) if x != ANY]
+        for prov in dict.fromkeys(([default] if default else []) + named):
+            if str(prov).startswith("custom_") and prov not in provider_items:
+                out.append({"level": "err" if prov == default else "warn", "text": (
+                    f"Members do not have the provider '{prov}'" + (" (the team's default)" if prov == default else "")
+                    + ": it is defined in one profile only. Add it to this team under Library items (Provider) - "
+                    "that copies its definition and its key to every member. Until then members cannot reach a "
+                    "model with it.")})
     for k in ("allowed_providers", "allowed_models", "allowed_modes"):
         if not p.get(k):
             out.append({"level": "err", "text": f"No {_LIST_LABELS[k]} allowed: members can't chat."})
@@ -256,6 +270,11 @@ def team_warnings(policy: dict, *, hints: int, members: int) -> list[dict]:
         out.append({"level": "warn", "text": f"The default provider '{dp}' is not in the allowed providers."})
     if dm and p.get("allowed_models") and not allows(p, "allowed_models", dm):
         out.append({"level": "warn", "text": f"The default model '{dm}' is not in the allowed models."})
+    if dp and not dm:
+        # found in use, 2026-11-13: Goose answers a new chat with "Configuration value not found: GOOSE_MODEL"
+        out.append({"level": "err", "text": "A default provider without a default model: a new member's profile has "
+                                            "no model, and Goose cannot start a chat without one. Choose a default "
+                                            "model."})
     if not dp and p.get("allowed_providers"):
         out.append({"level": "info", "text": "No default model: members keep their profile's model if it is "
                                              "allowed, otherwise the first allowed provider."})
@@ -270,6 +289,9 @@ def team_warnings(policy: dict, *, hints: int, members: int) -> list[dict]:
         out.append({"level": "info", "text": "No team hints assigned: members get no team instructions."})
     if p.get("hints_edit"):
         out.append({"level": "info", "text": "Members may add personal hints (team hints take precedence)."})
+    if p.get("require_totp"):
+        out.append({"level": "info", "text": "Two-factor sign-in is required: a member who has not set it up can do "
+                                             "nothing but set it up."})
     if not members:
         out.append({"level": "info", "text": "No members yet."})
     from .guard import clean_team_guard
