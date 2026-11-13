@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.22.1 - 2026-11-13
+
+**The installer lets sandboxes read the program folders; a check of 1.22.0 that failed under PowerShell 7.** No
+database schema change, no new setting.
+
+- **`install.ps1` gives application containers read access to the goose CLI's folder and to the Python the gateway
+  runs on** (when the sandbox is on): once, for all containers, as `C:\Program Files` has it. Where members' agents
+  run in an AppContainer and the gateway does not own those folders - a service account - no member's agent
+  started (0xC0000142, "access is denied"), and the gateway could not put that right itself. A fresh installation
+  no longer gets there. For an existing one `goose-web check` prints the command (1.22.0).
+- `install.ps1`: the check that the gateway's account has full control of the profiles root read the folder with
+  `Get-Acl`, which Windows PowerShell cannot load when it is started from PowerShell 7; it then answered "no" for
+  every folder. It reads the access list through .NET now. (It is asked only after `icacls` failed, so no
+  installation was stopped by it; the project's CI was.)
+- AppContainer backend: when `icacls` reports files it could not change below a folder that was granted, the gateway
+  log says how many (the folder itself is checked on its access list, as in 1.22.0). The message for a folder that
+  cannot be given names the missing right (`WRITE_DAC`).
+
 ## 1.22.0 - 2026-11-13
 
 **Two-factor sign-in can be required for everyone or per team; what an administrator changes in his library reaches

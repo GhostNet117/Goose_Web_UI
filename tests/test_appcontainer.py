@@ -1223,6 +1223,40 @@ def test_install_makes_sure_the_gateway_account_has_full_control_of_the_profiles
                       f"$(Test-FullControl '{tmp_path / 'missing'}' '{me}') $(Test-FullControl '{full}' 'NO-SUCH\\nobody')\"\n",
                       encoding="utf-8")
     ps = os.path.join(os.environ["SystemRoot"], "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-    r = subprocess.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)], capture_output=True,
-                       text=True, timeout=120)
-    assert r.stdout.strip() == "True False False False", r.stdout + r.stderr
+    # Also where Windows PowerShell cannot load its own modules: started from PowerShell 7 (as on the project's CI),
+    # PSModulePath names the newer ones and Get-Acl does not load. The first version used Get-Acl and answered
+    # "False" four times there. Tried with the variable as it is, without it, and pointing nowhere.
+    for label, env in (("as it is", dict(os.environ)),
+                       ("without PSModulePath", {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}),
+                       ("PSModulePath pointing nowhere", {**os.environ, "PSModulePath": str(tmp_path / "no-modules")})):
+        r = subprocess.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)], capture_output=True,
+                           text=True, timeout=120, env=env)
+        assert r.stdout.strip() == "True False False False", (label, r.stdout + r.stderr)
+    code = "\n".join(ln for ln in fn.group(0).splitlines() if not ln.lstrip().startswith("#"))
+    assert "Get-Acl" not in code and "New-Object" not in code            # no cmdlet: nothing to load
+    # the program folders are opened to sandboxes by the installer itself, so that a fresh installation whose gateway
+    # does not own them (a service account) is not one where no member's agent starts
+    grant = text[text.index("if ($Sandbox -ne 'off') {"):][:1800]
+    assert "'*S-1-15-2-1:(OI)(CI)RX'" in grant and "'*S-1-15-2-2:(OI)(CI)RX'" in grant and "Split-Path $gooseExe" in grant
+
+
+@windows
+def test_what_icacls_could_not_change_below_a_granted_folder_is_said(monkeypatch, caplog):
+    """icacls /C exits 0 whatever happened; its own sentence is the only trace of files it skipped."""
+    class Done:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, out):
+            self.stdout = out
+    outs = iter(["Successfully processed 3 files; Failed processing 2 files\n", "Successfully processed 5 files; Failed processing 0 files\n",
+                 "Erfolgreich verarbeitet: 5 Dateien\n"])
+    monkeypatch.setattr(sb.subprocess, "run", lambda *a, **k: Done(next(outs)))
+    assert [sb._icacls(["x", "/grant"]) for _ in range(3)] == [2, 0, 0]
+    monkeypatch.setattr(sb, "_icacls", lambda args: 4)
+    monkeypatch.setattr(sb, "allowed", lambda path, sids, right: True)
+    monkeypatch.setattr(sb, "exceeds", lambda path, sid, right: False)
+    with caplog.at_level("WARNING"):
+        sb.grant(r"C:\x", "S-1-15-2-9", "read")
+    assert any("could not change 4 file(s)" in r.getMessage() for r in caplog.records)
+    assert "WRITE_DAC" in sb.grant_help(r"C:\x", "read") and "WRITE_DAC" in sb.grant_help(r"C:\x", "modify")

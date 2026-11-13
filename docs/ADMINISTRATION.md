@@ -1711,8 +1711,9 @@ Requirements and limits:
   - **Program folders** (the goose CLI's folder, `sandbox.read_dirs`, the gateway's Python for relays). Nothing is
     needed where every container may read anyway, as under `C:\Program Files`. Otherwise let application containers
     read the folder, once, as an administrator or its owner:
-    `icacls "<folder>" /grant "*S-1-15-2-1:(OI)(CI)RX"`. Do not give the gateway's account the right to change
-    the permissions of the programs it runs.
+    `icacls "<folder>" /grant "*S-1-15-2-1:(OI)(CI)RX"`. Since 1.22.1 `install.ps1` does this itself for the goose
+    CLI's folder and the gateway's Python when the sandbox is on. Do not give the gateway's account the right to
+    change the permissions of the programs it runs.
   - **A team's extra folders** that someone else owns: make the gateway's account their owner or give it full
     control (`icacls "<folder>" /grant "<account>:(OI)(CI)F"`).
   Since 1.22.0 every grant is checked on the folder. A folder that could not be given is left out (the member's

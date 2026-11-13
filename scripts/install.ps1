@@ -101,17 +101,23 @@ function Test-FullControl([string]$Dir, [string]$Account) {
     # True when $Dir's own access list gives $Account full control of the folder and of everything below it - which
     # includes changing permissions there. The account's own entry is looked for (by SID; by name when the account
     # cannot be resolved right now, e.g. no domain controller in reach), not what it may hold through a group.
+    # Read through .NET and without any cmdlet (not Get-Acl, not New-Object): cmdlets live in modules that Windows
+    # PowerShell cannot load when it is started from PowerShell 7 (PSModulePath then names the newer modules), and
+    # this function answered "no" for every folder there.
     try {
         $want = ''
         if ($Account -match '^S-1-[0-9-]+$') { $want = $Account } else {
-            $want = $(try { (New-Object Security.Principal.NTAccount($Account)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { '' }) }
+            $want = $(try { ([Security.Principal.NTAccount]::new($Account)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { '' }) }
+        $di = [IO.DirectoryInfo]::new($Dir)
+        if (-not $di.Exists) { return $false }
+        $acl = if ($di.PSObject.Methods['GetAccessControl']) { $di.GetAccessControl() } else { [System.IO.FileSystemAclExtensions]::GetAccessControl($di) }
         $full = [Security.AccessControl.FileSystemRights]::FullControl
         $both = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-        foreach ($ace in (Get-Acl -LiteralPath $Dir).Access) {
+        $kind = $(if ($want) { [Security.Principal.SecurityIdentifier] } else { [Security.Principal.NTAccount] })
+        foreach ($ace in $acl.GetAccessRules($true, $true, $kind)) {
             if ("$($ace.AccessControlType)" -ne 'Allow' -or ($ace.FileSystemRights -band $full) -ne $full) { continue }
             if (($ace.InheritanceFlags -band $both) -ne $both -or "$($ace.PropagationFlags)" -ne 'None') { continue }
-            $sid = $(try { $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { '' })
-            if ($want -and $sid -eq $want) { return $true }
+            if ($want -and "$($ace.IdentityReference.Value)" -eq $want) { return $true }
             if (-not $want -and "$($ace.IdentityReference.Value)" -ieq $Account) { return $true }
         }
     } catch { }
@@ -345,6 +351,20 @@ if ($LASTEXITCODE) {
         throw "Could not set the permissions of $ProfilesRoot (icacls exit $LASTEXITCODE), and $gwAccount does not have full control of it. Goose Web keeps members' profiles and team folders there and must be able to change their permissions. Make yourself the owner of $ProfilesRoot, or choose another folder with -ProfilesRoot, and run again."
     }
     Warn "Could not set the permissions of everything below $ProfilesRoot (icacls exit $LASTEXITCODE); the folder itself is set."
+}
+if ($Sandbox -ne 'off') {
+    # The program folders every member's sandbox must read: the goose CLI's folder and the Python the gateway runs on
+    # (a relay's forwarder runs on it). Where Windows cannot run MXC, a member's agent runs in an AppContainer, which
+    # reads only what its access list lets application containers read - as C:\Program Files does for every program
+    # in it. Without this the gateway has to add an entry per member, which it cannot when it does not own the folder
+    # (a service account): the agent then does not start (0xC0000142, access denied). Given once, here, to all
+    # application containers (ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES): read and execute.
+    $pyBase = (& $venvPy -c "import sys; print(sys.base_prefix)").Trim()
+    foreach ($d in (@((Split-Path $gooseExe), $pyBase) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)) {
+        & icacls $d /grant '*S-1-15-2-1:(OI)(CI)RX' '*S-1-15-2-2:(OI)(CI)RX' /Q | Out-Null
+        if ($LASTEXITCODE) { Warn "Could not let sandboxes read $d (you must own it or be an administrator). With the AppContainer sandbox backend members' agents will not start until someone runs: icacls `"$d`" /grant `"*S-1-15-2-1:(OI)(CI)RX`" `"*S-1-15-2-2:(OI)(CI)RX`"" }
+        else { Say "Sandboxes may read and run $d" }
+    }
 }
 if ($service) {
     # The service account must read the install folder, the venv's Python and Goose, and use the Goose appdata.

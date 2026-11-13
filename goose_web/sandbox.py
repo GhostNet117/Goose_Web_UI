@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -308,7 +309,14 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
         stdout = os.fdopen(msvcrt.open_osfhandle(out_r, os.O_RDONLY | os.O_BINARY), "rb", buffering=0)
         return ContainedProcess(pi.hProcess, pi.dwProcessId, stdin, stdout)
 
-    def _icacls(args: list[str]) -> None:
+    _FAILED = re.compile(r"Failed processing (\d+) file")
+
+    def _icacls(args: list[str]) -> int:
+        """Run icacls; SandboxError when it exits with an error. Returns the number of files icacls says it could
+        not process (0 when it says nothing we can read: the sentence is English, other Windows languages word it
+        differently). With /C that number is the only sign of a failure - the exit code stays 0 - so it is never
+        what a grant or revoke is judged by (the folder's access list is read for that); it is what tells an
+        administrator that files BELOW a granted folder were left out."""
         # by full path (review 2026-11-12, C-5): a bare name is looked up in the current directory before System32
         icacls = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icacls.exe")
         try:
@@ -318,6 +326,8 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
             raise SandboxError(f"icacls {' '.join(args[:2])} did not finish: {e.__class__.__name__}") from e
         if r.returncode != 0:
             raise SandboxError(f"icacls {' '.join(args[:2])} failed: {(r.stdout + r.stderr).strip()[:300]}")
+        m = _FAILED.search(r.stdout or "")
+        return int(m.group(1)) if m else 0
 
     _adv.GetNamedSecurityInfoW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
                                            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p),
@@ -419,7 +429,7 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
     def grant(path: str, sid: str, right: str) -> None:
         # :r - the container's entry is REPLACED. Without it icacls adds to an entry that is still there (a revoke
         # that failed), and a folder taken down from modify to read kept modify while the record said read (W-5).
-        _icacls([path, "/grant:r", f"*{sid}:{RIGHTS[right]}", "/Q", "/C"])
+        skipped = _icacls([path, "/grant:r", f"*{sid}:{RIGHTS[right]}", "/Q", "/C"])
         # /C ("continue") lets one locked file below not fail the folder - but with it icacls exits 0 even when it
         # could not change the folder at all, and Goose Web recorded a grant that was never made (found in use,
         # 2026-11-13). The entry must be on the folder.
@@ -428,6 +438,9 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
         if exceeds(path, sid, right):       # an older, wider entry that /grant:r could not replace (X-2)
             raise SandboxError(f"the permissions of {path} could not be changed: the container's entry there is "
                                f"wider than {right}")
+        if skipped:
+            log.warning("sandbox: %s is granted, but icacls could not change %d file(s) or folder(s) below it; the "
+                        "member's agent cannot use those", path, skipped)
 
     def sweep(path: str, sid: str, keep=(), seconds: float = 20.0, max_entries: int = 200000) -> tuple[list[str], bool]:
         """After the container's entry was taken off `path`: is it off everything below as well? A subfolder whose
@@ -584,10 +597,12 @@ def grant_help(path: str, right: str) -> str:
     who, ident = _account()
     if right == "read":
         return (f"{path}: members' containers cannot read it and the gateway's account ({who}) may not change its "
-                "permissions. Let application containers read it, as an administrator or the folder's owner: "
+                "permissions (it has no WRITE_DAC there). Let application containers read it, as an administrator or "
+                "the folder's owner: "
                 f'icacls "{path}" /grant "*{ALL_APP_PACKAGES}:(OI)(CI)RX"')
-    return (f"{path}: the gateway's account ({who}) may not change its permissions, so a member's container cannot "
-            "be given access. Make that account the folder's owner or give it full control, as an administrator or "
+    return (f"{path}: the gateway's account ({who}) may not change its permissions (it has no WRITE_DAC there), so a "
+            "member's container cannot be given access. Make that account the folder's owner or give it full control "
+            "(or at least the right to change permissions), as an administrator or "
             f'its owner: icacls "{path}" /grant "{ident}:(OI)(CI)F"')
 
 
