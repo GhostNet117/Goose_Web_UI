@@ -1416,7 +1416,27 @@ Implications:
 
 ### 11.3 Isolation limits
 
-On Windows the limits below about the shared OS account are closed for non-admin users by the sandbox (11.6).
+On Windows the limits below about the shared OS account are closed for non-admin users by the sandbox (11.6), with
+one exception: the registry.
+
+**The registry of the gateway's account is readable from the sandbox.** A member's sandboxed agent - in an MXC
+container and in an AppContainer alike - runs as the gateway's Windows account inside an application container.
+Windows lets every application container read most of that account's registry (`HKEY_CURRENT_USER`), and that
+includes `HKEY_CURRENT_USER\Environment`, where the account's **user environment variables** are stored. Goose Web
+gives a sandboxed agent an environment of its own (an allow-list: none of the gateway's variables), but an agent that
+can run a command can read the variables from the registry (`reg query HKCU\Environment`). Measured with both
+backends and with the real agent; a "less privileged" container is not a way out (Python does not start in one
+without registry access). Goose Web cannot prevent it. What you can do:
+
+- **Keep secrets out of the user environment variables of the gateway's account** (API keys, tokens). Provider keys
+  belong in Goose's own secret store of each profile.
+- Or **run the gateway under a Windows account that is used for nothing else**, so that its registry holds nothing
+  of value. This is the recommended set-up when members are not fully trusted.
+- `goose-web check` prints an "account registry" line naming the user variables whose names look like secrets
+  (`KEY`, `TOKEN`, `SECRET`, `PASSWORD` ...). Other programs' settings under `HKEY_CURRENT_USER` are readable the
+  same way; Goose Web does not inspect them.
+
+The files of the account are not affected: the sandbox refuses them (11.6).
 
 All workers run as the gateway's OS account. A tool that can read files or run commands can reach other profiles,
 the database and the native profile. That is why the shell extensions and stdio MCP servers are off for non-admins
@@ -1429,9 +1449,9 @@ home folder of the operating-system account: `~/.agents/skills`, `~/.claude/skil
 `GOOSE_PATH_ROOT` does not move them (Goose asks Windows for the home folder; it does not read `USERPROFILE`), and
 that home is the gateway account's, i.e. the administrator's. So:
 
-- **With the sandbox** a member's agent cannot read the contents of those folders (measured in an MXC container:
-  the files are refused), so Goose there loads none of them. Members get the skills and recipes you offer their
-  team (9.9) and nothing else.
+- **With the sandbox** a member's agent cannot read the contents of those folders (measured in both kinds of
+  container: the files are refused; an AppContainer does not even list their names), so Goose there loads none of
+  them. Members get the skills and recipes you offer their team (9.9) and nothing else.
 - **Without the sandbox** every profile's Goose loads all of them, and no setting of Goose Web can prevent it.
   `goose-web check` warns about it.
 
@@ -1515,7 +1535,7 @@ sandbox:
   read_dirs: []              # extra program folders agents may run, e.g. C:\Program Files\nodejs, a Python install
   relays: []                 # local services sandboxed agents may use, e.g. ["127.0.0.1:4000"] (a local model proxy)
   mxc_dir: ""                # default: <install folder>\vendor\mxc
-  proxy_max_connections: 64  # MXC egress proxy, per member
+  proxy_max_connections: 64  # MXC egress proxy, per member; also each AppContainer relay
   proxy_idle_seconds: 900
 ```
 
@@ -1542,10 +1562,12 @@ from a policy Goose Web builds at every start:
   example, what the files in the gateway account's Documents folder are called.
 - **Hard links:** MXC grants are path-based. A file in a member's read/write folders that is hard-linked to a file
   outside them would give the agent that outside file, so before an MXC start (once per set of folders, and again
-  after the member ran in the AppContainer backend, where agents can make such links) Goose Web looks for them
+  after the member ran in the AppContainer backend) Goose Web looks for them
   (at most 5 s / 200,000 entries) and **does not start** the worker when it finds one: the reason names the files
   (`fsutil hardlink list <file>` shows every name; delete the link). Links between two of the member's own folders are
-  fine. Processes inside an MXC container cannot create hard links or junctions.
+  fine. Processes inside an MXC container cannot create hard links or junctions, and a process in an AppContainer
+  cannot create a link to a file or folder outside its own folders either (measured for both; until 1.21.0 this
+  guide said an AppContainer could). Such links come from the host.
 - **Desktop:** clipboard, input injection, desktop and system-settings control and IME are blocked (Win32k stays on:
   goose.exe and node.exe need it).
 - **Network:** the container has none of its own. When `network` is not `none` or `relays` are set, the gateway runs
@@ -1629,7 +1651,11 @@ What it does, for every **isolated, non-admin** user:
   are the team's *approved folders*), and **Read & execute** on the goose CLI's folder and `sandbox.read_dirs`.
   Everything else is denied - including the gateway's `_system` folder, other users' profiles, the native Goose
   profile (for example `C:\AI\Goose_appdata`) and every other folder on the disk that does not grant access to "ALL
-  APPLICATION PACKAGES" (system folders such as `C:\Windows` stay readable, as for any Windows app).
+  APPLICATION PACKAGES" (system folders such as `C:\Windows` stay readable, as for any Windows app). Not even the
+  names of files outside the granted folders are listed. Since 1.21.1 the folders MXC refuses are refused here as
+  well, whatever a team's settings name: the gateway's system folder, the profiles root, other users' profiles, the
+  native Goose profile, drive roots and - for writing - Goose Web's code, its Python, the goose CLI's folder and the
+  MXC folder (logged as `sandbox appcontainer: <user>: grant <path> refused: <why>`).
 - The gateway talks to the worker over the worker's own stdin/stdout pipes - no network port, no shared secret, no
   loopback exemption, no administrator rights. **Loopback (127.0.0.1) stays closed** for the container, so local
   services (a browser's remote-debugging port, a local model proxy, other workers) cannot be reached from it.
@@ -1646,8 +1672,11 @@ Requirements and limits:
   `internet+lan`), or be listed in `sandbox.relays` (below). A container cannot reach this machine's own LAN
   address either, so a service on this machine is reachable only through a relay.
 - Programs the agents run must be readable by the container: tools under `C:\Program Files` usually are; per-user
-  installs (Python, node, uv in the user profile) must be added to `sandbox.read_dirs`. The workers' temp, uv, pip and
-  npm caches live in the user's profile (`tmp\`, `cache\`).
+  installs (Python, node, uv in the user profile) must be added to `sandbox.read_dirs`. The workers' uv, pip and
+  npm caches live in the user's profile (`cache\`). Temporary files do not: Windows gives every AppContainer its own
+  `TEMP`, `TMP` and `LOCALAPPDATA` (`%LOCALAPPDATA%\Packages\<container>\AC` of the gateway's account) whatever
+  the gateway sets; only that container can use it, and it is deleted with the container.
+- The registry of the gateway's account is readable from the container (11.3).
 - The Windows Credential Manager is not reachable from a container; isolated profiles already keep their secrets in
   their own `secrets.yaml`.
 - Windows file shares (SMB) cannot be limited per container: the file server sees only the shared account. Teams that
@@ -1675,11 +1704,13 @@ For each sandboxed user and listed service, the gateway starts a small forwarder
 container**. It listens on a loopback address of that user's own (`127.64.x.y`, from the user id) and the same
 port, and passes each connection over a named pipe to the gateway, which connects to the real service. The pipe's
 ACL admits only that user's container, so another user's agent cannot use it. Only the listed services become
-reachable; the rest of 127.0.0.1 stays closed (no loopback exemption).
+reachable; the rest of 127.0.0.1 stays closed (no loopback exemption). One user's relay to one service carries at
+most `sandbox.proxy_max_connections` connections at once (default 64); more are closed at once and logged.
 
 The user's Goose configuration (`config/config.yaml` and `config/custom_providers/*.json` in their profile) is
 rewritten so URLs to the service (`//127.0.0.1:4000`, `//localhost:4000`) point at the forwarder
-(`//127.64.x.y:4000`). The rewrite is undone when the service is removed from `sandbox.relays`, when the user stops
+(`//127.64.x.y:4000`). Only regular files of the profile itself are rewritten (none that is a link, at most 500
+provider files of at most 1 MB). The rewrite is undone when the service is removed from `sandbox.relays`, when the user stops
 being sandboxed (administrator, sandbox off) and by `goose-web sandbox remove`. The forwarder runs on the gateway's
 own Python (its base installation is granted Read & execute). Relays take effect at the worker's next start.
 `goose-web sandbox status` lists them.

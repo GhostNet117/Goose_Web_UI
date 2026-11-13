@@ -20,6 +20,8 @@
   security-relevant changes of goose-web 1.5.0 (team profiles with least privilege) and the known risk that
   remains. Sections 1 to 6 describe v1.0.0. [Section 13](#13-addendum-mxc-sandbox-backend-2026-11-12-1190) covers
   the MXC sandbox backend of 1.19.0 (threat model, change from the AppContainer backend, accepted trade-offs).
+  [Section 16](#16-addendum-the-appcontainer-backend-measured-again-2026-11-13-1211) measures the AppContainer
+  backend again and records a limit of both backends: the registry of the gateway's account is readable.
 
 ## 1. Summary
 
@@ -932,7 +934,8 @@ no reason to read a member's file through a link at all.
 - **Same-named skills** in two folders: the first in Goose's order is offered. Goose itself goes by the name
   inside `SKILL.md`, Goose Web by the folder name; when those differ the picker and Goose can disagree about which
   one "wins".
-- **The AppContainer backend** was not measured for any of this (15.1 and 15.3 are MXC measurements).
+- **The AppContainer backend** was not measured for any of this (15.1 and 15.3 are MXC measurements). It has been
+  since: section 16 (contents and names refused, no link to the outside can be made).
 - **A source profile whose `secrets.yaml` becomes a link** after an item was offered from it: the secret is no
   longer copied, and a copy made earlier is withdrawn from the team's members at their next start (their provider
   then has no key). A source that merely cannot be read at that moment changes nothing.
@@ -1009,3 +1012,88 @@ These last changes are small and local, and each has a test; they were not revie
 up from this reviewer's list: two team items whose names differ only in case share one folder in a member's
 profile; a number that is not finite (`NaN`) in a provider file passes; a source `secrets.yaml` that is empty for a
 moment reads as "no keys" and withdraws them until the next start.
+
+## 16. Addendum: the AppContainer backend, measured again (2026-11-13), 1.21.1
+
+The AppContainer backend of 1.8.0 is what a member's agent runs in where Windows cannot run MXC process containers
+(`sandbox.backend: appcontainer`, or `sandbox.fallback: appcontainer`). Since MXC became the default (1.19.0) it was
+covered by unit tests and one container test, and sections 14 and 15 say that their claims were measured with MXC
+only. For 1.21.1 it was run again with real containers on Windows build 26100: a Python, and the real goose 1.57.0
+binary, both started by the product's own code (`sandbox.prepare`, `sandbox.spawn`, `relay.PipeRelayServer`,
+`WorkerManager`). One finding of this work is not about the AppContainer backend alone (16.3).
+
+### 16.1 Still supported
+
+Started by `WorkerManager` on `sandbox.backend: appcontainer`, goose 1.57.0 was ready in 2 s, answered `initialize`
+and `session/new`, and finished a prompt whose model was a service on this machine's loopback, reached through
+forwarder -> named pipe -> gateway. Its shell call ran inside the container. Goose's prompt injection detection
+(section 14) asked the classification endpoint through a relay of its own, with the profile's token. Stopping the
+worker ended goose and both forwarders; removing the container removed its grants.
+
+### 16.2 What a member's container reaches (measured)
+
+| Subject | Result |
+|---|---|
+| Files outside the grants | Refused for reading and for listing: another member's profile, the system folder, the profiles root, the gateway account's home folder and Goose's home-folder skills and agents in it (section 15), the native Goose profile and its `secrets.yaml`, the install folder, the drive root. Unlike MXC (Q2), names are not listable either. A child process is refused the same way. |
+| Network | Loopback, and this machine's own LAN address, are closed with every capability. Without a capability there is no network at all; with `internetClient` name lookup, TCP and TLS with certificate check work. |
+| Relay | Works. Another member's container is refused by the pipe (access denied). |
+| Links | A hard link to a file outside, a hard link to a file in a read-only grant, a junction to a folder outside or to another member's folder, and symbolic links are all refused. Links inside the container's own folders are allowed. Earlier text (13.3, the administration guide) assumed an AppContainer agent could create hard links to outside files; on this Windows it cannot. The scan of MX-3 stays: links can still come from the host. |
+| Processes | The gateway process cannot be opened (query, read memory, terminate). |
+| Temporary files | Windows replaces `TEMP`, `TMP` and `LOCALAPPDATA` of an AppContainer process with a folder of that container under the gateway account's `%LOCALAPPDATA%\Packages`; the values Goose Web sets for them are not what the agent sees. Only that container can use the folder. Without `LOCALAPPDATA` in the environment the process cannot be created at all (error 203), which is why it is on the allow-list. |
+| Registry | **Readable**, see 16.3. |
+
+### 16.3 The registry of the gateway's account is readable - both backends (AC-1, open)
+
+**Severity: High where the gateway's account keeps secrets in its user environment variables or elsewhere in its
+registry hive; otherwise information.** A sandboxed agent runs as the gateway's Windows account inside an
+application container. The default access rights of `HKEY_CURRENT_USER` let "ALL APPLICATION PACKAGES" read it, and
+keys below inherit that - among them `HKEY_CURRENT_USER\Environment`, where the account's user environment
+variables are stored.
+
+- Measured from an AppContainer and from an **MXC** container (whose token is an application-container token too):
+  the key was opened, its value names were listed and a value was read. On the test machine it held 15 values, 9 of
+  them named like API keys. The real agent's shell ran `reg query HKCU\Environment` with the same result.
+- This goes round a control this assessment relied on: C-2 of section 9 ("Sandboxed workers inherited the gateway
+  account's environment (API keys)" - fixed by an allow-listed environment) and the statement of 13.2 that the worker
+  environment holds no gateway secrets. Both remain true of the *environment*; the same values can be read from the
+  registry.
+- **Not closable by Goose Web.** A "less privileged" AppContainer (which ignores the ALL APPLICATION PACKAGES
+  entries) was tried: without the `registryRead` capability Python does not start in it, and with that capability
+  the key is readable again. Changing the access rights of the account's registry keys is not something a web
+  application should do on its own.
+- **What an administrator does** (ADMINISTRATION 11.3): keep secrets out of the user environment variables of the
+  gateway's account, or run the gateway under an account that is used for nothing else. `goose-web check` prints an
+  "account registry" line that names the user variables whose names look like secrets.
+- Not examined: which other keys of other programs under `HKEY_CURRENT_USER` hold secrets on a given machine, and
+  the machine-wide keys an application container may read (`HKEY_LOCAL_MACHINE\SOFTWARE` was readable).
+
+Files are not affected: 16.2 holds for the account's files, the native Goose profile and its secret store.
+
+### 16.4 Fixed in 1.21.1
+
+| Id | Severity | Finding | Change |
+|---|---|---|---|
+| AC-2 | Medium | The AppContainer backend and fallback granted every folder of a member's settings with icacls. MXC filters them at each start; here a team folder set to the code or to a folder above the system folder was granted as written. | `workers._start_appcontainer` applies `mxc.filter_grants`: the same rules, in canonical form and through links; a refused folder is logged |
+| AC-3 | Medium | A relay accepted any number of connections; each costs the gateway two threads and a socket, and the gateway serves everyone. | At most `sandbox.proxy_max_connections` at once per member and service; more are closed at once and counted |
+| AC-4 | Low | `sandbox.spawn` resumed a process that could not be put in its kill-on-close job (a warning only). | The process is ended while still suspended and the start fails, as MX-9 for MXC; a job that does not exist counts as a failure |
+| AC-5 | Low | The relay URL rewrite matched a port as a prefix (`:80` in `:8080`); wrote the record that undoes it after the rewrite; wrote files in place, converting line endings, and through links in folders the member can write. | The port must end; record first; whole-file replacement with bytes kept; regular files of the profile only, a bounded number and size; the forwarder file is replaced, never written through a link |
+| AC-6 | Low | An entry of `sandbox.relays` that is not `host:port` raised where the member's connection is set up. | It is a configuration problem (fail closed, named in `check` and in the worker's error); IPv6 is refused |
+| AC-7 | Low | Container state files were written in place. | Replaced as a whole |
+| AC-8 | Info | The forwarder logged the normal end of every answer as an error; a forwarder that printed nothing held the worker's start for ever. | Not logged; the start waits 30 s |
+
+Considered and left: the container holds the right to create further instances of its own relay pipe (GENERIC_WRITE
+includes it). Only its own forwarder connects to that name, and it refuses a pipe that is not served by the gateway
+process, so nothing is gained by it.
+
+### 16.5 Residual risks
+
+- The registry (16.3).
+- The relay's limit is per member and service; a member with several relayed services can hold that many
+  connections on each. A connection that sends nothing holds its place until the service or the agent closes it.
+- Between the gateway's check of a profile file and its replacement a member's agent could swap the file; it could
+  only make the gateway replace a name inside the member's own folders (the replacement never follows a link).
+- Granting a folder still rewrites its access rights for the container, with inheritance; a folder that passes the
+  rules but holds hard links to files elsewhere carries those files' rights with it (the host's doing, not the
+  agent's).
+- Measured on one Windows build (26100). Older builds that cannot run MXC are the ones this backend is for; the
+  container tests of `tests/test_appcontainer.py` run on every Windows the project's CI runs on.

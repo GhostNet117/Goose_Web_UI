@@ -917,6 +917,29 @@ def cmd_security(args, settings) -> int:
     return 0
 
 
+def _registry_line(settings) -> str:
+    """The `check` line about the gateway account's user environment variables (AC-1, SECURITY-ASSESSMENT 16). A
+    sandboxed agent - MXC and AppContainer alike - can read the registry of the account the gateway runs as wherever
+    Windows lets application containers read it, and HKEY_CURRENT_USER\\Environment is such a place. Goose Web gives
+    a sandboxed agent an environment of its own, but cannot keep it from that key. Information only."""
+    from . import winsec
+    from .config import sandbox_on
+    names = winsec.user_environment_names()
+    if names is None:
+        return "[--] account registry: the user environment variables of this account could not be listed"
+    hot = sorted(n for n in names if winsec.secret_looking(n))
+    if not hot:
+        return (f"[OK] account registry: none of this account's {len(names)} user environment variable(s) is named "
+                "like a secret. Keep it so: members' sandboxed agents can read this account's registry")
+    shown = ", ".join(hot[:5]) + (f" and {len(hot) - 5} more" if len(hot) > 5 else "")
+    who = ("Members' sandboxed agents (MXC and AppContainer alike)" if sandbox_on(settings)
+           else "Members' agents (the sandbox is off)")
+    return (f"[!!] account registry: {len(hot)} user environment variable(s) of this account are named like secrets "
+            f"({shown}). {who} can read them from the registry (HKEY_CURRENT_USER\\Environment), whatever "
+            "environment Goose Web gives them. Keep secrets out of this account's user variables or run the gateway "
+            "under an account used for nothing else (ADMINISTRATION 11.3)")
+
+
 def _home_library_line(settings) -> str:
     """The `check` line about Goose's home-folder skills, recipes and agents (spec 028). Goose loads them from the
     home folder of the gateway's account; GOOSE_PATH_ROOT does not move them. Inside the sandbox a member's agent is
@@ -936,7 +959,7 @@ def _home_library_line(settings) -> str:
         # The same sentence whichever backend a member's agent ends up in (the configured one or the fallback):
         # which one that is, is the sandbox line's business (second review, M-11)
         return (f"[OK] home-folder Goose items: {what}. Members' agents are sandboxed and are given no access to "
-                f"that folder (measured for MXC; an AppContainer has no grant for it, not measured); offer skills "
+                f"that folder (measured for both sandbox backends); offer skills "
                 f"and recipes to a team in Admin > Teams > Library items{links}")
     return (f"[!!] home-folder Goose items: {what}. EVERY member's agent loads them while the sandbox is off "
             f"(sandbox.enabled); Goose Web cannot prevent that{links}")
@@ -1024,6 +1047,10 @@ def cmd_check(args, settings) -> int:
         print(_home_library_line(settings))
     except Exception as e:
         print(f"[--] home-folder Goose items: could not be listed ({e.__class__.__name__})")
+    try:
+        print(_registry_line(settings))
+    except Exception as e:
+        print(f"[--] account registry: could not be checked ({e.__class__.__name__})")
     from . import logjanitor, tls
     try:
         st = tls.status(settings, _tls_override(settings, readonly=True))

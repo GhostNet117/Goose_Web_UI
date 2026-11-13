@@ -729,7 +729,7 @@ def test_the_check_line_reports_the_home_folder_items_and_warns_without_the_sand
     assert on.startswith(f"[OK] home-folder Goose items: {counts}. Members' agents are sandboxed")
     assert "Library items" in on and "review" not in on                        # counts, never names
     # M-11: one sentence that is true whichever backend a member's agent ends up in (configured, or the fallback)
-    assert "measured for MXC; an AppContainer has no grant for it, not measured" in on
+    assert "measured for both sandbox backends" in on
     assert cli_mod._home_library_line(_settings(enabled=True, backend="appcontainer")) == on
     off = cli_mod._home_library_line(_settings(enabled=False))
     assert off.startswith(f"[!!] home-folder Goose items: {counts}. EVERY member's agent loads them")

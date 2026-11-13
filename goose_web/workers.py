@@ -21,6 +21,7 @@ from typing import Any
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -111,6 +112,16 @@ class _Job:
         h, self.handle = self.handle, None
         if h and IS_WINDOWS:
             self._k32.CloseHandle(h)
+
+
+def _first_line(proc, seconds: float) -> str:
+    """The first line a started process prints, or '' when it prints none within `seconds` (the caller then ends
+    the process, which ends the reader)."""
+    got: list[bytes] = []
+    t = threading.Thread(target=lambda: got.append(proc.stdout.readline()), daemon=True)
+    t.start()
+    t.join(seconds)
+    return got[0].decode("utf-8", "replace").strip() if got else ""
 
 
 def desktop_running(cli_binary: str = "") -> bool:
@@ -595,7 +606,19 @@ class WorkerManager:
             state_dir = str(self.s.system_dir / "sandbox")
             # 1.11 named containers so that two users could share one (C-5): drop this user's old one first
             await asyncio.to_thread(sb.migrate_legacy, state_dir, str(self.s.profiles_root), w.username)
-            state = await asyncio.to_thread(sb.prepare, spec["name"], state_dir, spec["grants"])
+            # AC-2: the rules MXC applies at every start (mxc.filter_grants) hold here too. A team or extra folder
+            # that is the gateway's system folder, the profiles root, another member's profile, the native Goose
+            # profile or - for writing - the code, the Pythons, the goose folder or the MXC folder is left out, in
+            # any spelling and through any link.
+            from . import mxc
+            grants, refused = mxc.filter_grants(
+                spec.get("grants") or {}, profile_root=spec["profile_root"],
+                profiles_root=spec.get("profiles_root") or str(self.s.profiles_root),
+                system_dir=spec.get("system_dir") or str(self.s.system_dir),
+                protected_write=spec.get("protected_write") or [], protected_any=spec.get("protected_any") or [])
+            for p, why in refused:
+                log.warning("sandbox appcontainer: %s: grant %s refused: %s", w.username, p, why)
+            state = await asyncio.to_thread(sb.prepare, spec["name"], state_dir, grants)
         except Exception as e:
             w.state, w.last_error = "crashed", f"sandbox: {e}"
             raise RuntimeError(w.last_error) from e
@@ -759,6 +782,8 @@ class WorkerManager:
             old = json.loads(state_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             old = {}
+        if not isinstance(old, dict):
+            old = {}
         new = {r["target"]: r["listen"] for r in spec.get("relays") or []}
         gone = {t: lst for t, lst in old.items() if new.get(t) != lst}
         if gone:
@@ -774,19 +799,29 @@ class WorkerManager:
                 # C-1: a new random name per start; the server owns it (first instance) or the relay fails closed,
                 # and the forwarder accepts only a pipe served by this process (the gateway's pid is passed on).
                 pipe = rl.new_pipe_name()
-                w.relay_servers.append(rl.PipeRelayServer(pipe, sid, r["target"]).start())
+                w.relay_servers.append(rl.PipeRelayServer(pipe, sid, r["target"], self._relay_limit()).start())
                 p = sb.spawn([py, "-I", fwd, r["listen"], pipe, str(os.getpid())], self._env(w), root, sid, [], logf,
                              job=[self.job, w.job])
                 w.relay_procs.append(p)
-                line = p.stdout.readline().decode("utf-8", "replace").strip()
+                line = _first_line(p, 30)     # bounded: a forwarder that says nothing must not hold the start
                 if line != "listening":
                     raise RuntimeError(f"forwarder for {r['target']} did not start (see worker-{w.key}.log)")
         finally:
             logf.close()
-        changed = rl.rewrite_profile_urls(root, new)
+        # The record first (AC-5): what the rewrite changes can then be undone, also after a crash in between.
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps(new), encoding="utf-8")
+        sb.write_atomic(state_file, json.dumps(new))
+        changed = rl.rewrite_profile_urls(root, new)
         log.info("worker %s: relays %s (rewrote %d file(s))", w.key, new, len(changed))
+
+    def _relay_limit(self) -> int:
+        """Connections one member's relay serves at once (AC-3): sandbox.proxy_max_connections, as for the MXC
+        egress proxy."""
+        try:
+            n = int(self.s.get("sandbox", "proxy_max_connections"))
+        except (TypeError, ValueError):
+            n = 64
+        return n if 1 <= n <= 4096 else 64
 
     def _stop_relays(self, w: Worker) -> None:
         for p in w.relay_procs:

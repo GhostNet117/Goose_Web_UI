@@ -425,3 +425,32 @@ def ensure_normal_priority() -> dict:
             except Exception as e:  # pragma: no cover
                 errors.append(f"memory: {e.__class__.__name__}: {e}")
     return {"before": _priority_names(raw), "after": process_priority(), "changed": changed, "errors": errors}
+
+
+# ------------------------------------------------------------------ the account's user environment (AC-1)
+_SECRET_WORDS = frozenset({"KEY", "APIKEY", "TOKEN", "SECRET", "SECRETS", "PASSWORD", "PASSWD", "PWD", "PASS",
+                           "CREDENTIAL", "CREDENTIALS"})
+
+
+def secret_looking(name: str) -> bool:
+    """True for a variable name with a word that says secret: CUSTOM_X_API_KEY, GH_TOKEN, DB_PASSWORD. Whole words
+    only (split at anything but letters and digits): GOOSE_DISABLE_KEYRING and MONKEY are not secrets."""
+    import re
+    return any(w in _SECRET_WORDS for w in re.split(r"[^A-Za-z0-9]+", str(name).upper()) if w)
+
+
+def user_environment_names() -> list[str] | None:
+    """The names of this account's user environment variables (HKEY_CURRENT_USER\\Environment); None when they
+    cannot be listed (not Windows, or the key cannot be opened). Only the names are kept.
+
+    Why Goose Web asks: an application container - MXC and AppContainer alike - may read this key, as it may read
+    most of HKEY_CURRENT_USER, so a member's sandboxed agent can read these variables from the registry whatever
+    environment the gateway gives it (measured 2026-11-13, SECURITY-ASSESSMENT 16)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
+            return [winreg.EnumValue(k, i)[0] for i in range(winreg.QueryInfoKey(k)[1])]
+    except OSError:
+        return None

@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import sys
@@ -43,6 +44,25 @@ def parse_target(t: str) -> tuple[str, int]:
     if not host or not port.isdigit():
         raise ValueError(f"relay target must be host:port, got {t!r}")
     return host.strip("[]"), int(port)
+
+
+_HOST = re.compile(r"[A-Za-z0-9._-]+\Z")
+
+
+def target_problem(t) -> str:
+    """'' when `t` is a relay target Goose Web can serve ("127.0.0.1:4000", "localhost:4000", "name:port"), else
+    why not (AC-6). An IPv6 address is refused: the URL rewrite and the per-user forward address are IPv4."""
+    if not isinstance(t, str):
+        return "not a text"
+    try:
+        host, port = parse_target(t)
+    except ValueError:
+        return "not host:port"
+    if not 1 <= port <= 65535:
+        return "the port is not between 1 and 65535"
+    if not _HOST.match(host):
+        return "the host must be an IPv4 address or a name (IPv6 is not supported)"
+    return ""
 
 
 def forward_ip(user_id: int) -> str:
@@ -82,10 +102,16 @@ def _url_variants(hostport: str) -> list[str]:
 
 
 def rewrite_text(text: str, mapping: dict[str, str]) -> str:
-    """'//<target host>:<port>' -> '//<forward ip>:<port>' in one text (mapping target -> listen)."""
+    """'//<target host>:<port>' -> '//<forward ip>:<port>' in one text (mapping target -> listen). The port must
+    end there (AC-5): a target on port 80 does not rewrite a URL on port 8080. An entry that is not host:port is
+    skipped."""
     for target, listen in (mapping or {}).items():
-        for v in _url_variants(target):
-            text = text.replace(f"//{v}", f"//{listen}")
+        try:
+            variants = _url_variants(str(target))
+        except ValueError:
+            continue
+        for v in variants:
+            text = re.sub("//" + re.escape(v) + r"(?![0-9])", lambda m, to=str(listen): "//" + to, text)
     return text
 
 
@@ -108,20 +134,49 @@ def state_mapping(state_dir: str | Path, name: str) -> dict[str, str]:
     return out
 
 
+MAX_REWRITE_FILES = 500           # custom provider files looked at per profile
+MAX_REWRITE_BYTES = 1024 * 1024   # a larger file is not a Goose configuration file; it is left alone
+
+
+def _own_config_files(profile_root: str) -> list[Path]:
+    """config.yaml and the custom provider files of a profile that the gateway may rewrite (AC-5). The member can
+    write in these folders and the gateway writes with its own rights, so: regular files only, none that is a link
+    or has a second name, nothing below a folder that is a link, a bounded number."""
+    from itertools import islice
+    from .profiles import _is_reparse, _linked
+    cfg = Path(profile_root) / "config"
+    if _is_reparse(cfg) or not cfg.is_dir():
+        return []
+    files = [cfg / "config.yaml"]
+    cp = cfg / "custom_providers"
+    if cp.is_dir() and not _is_reparse(cp):
+        try:
+            with os.scandir(cp) as it:
+                files += sorted(Path(e.path) for e in islice(it, MAX_REWRITE_FILES) if e.name.lower().endswith(".json"))
+        except OSError:
+            pass
+    return [f for f in files if f.is_file() and not _linked(f)]
+
+
 def rewrite_profile_urls(profile_root: str, mapping: dict[str, str]) -> list[str]:
     """Replace '<target host>:<port>' by '<forward ip>:<port>' in the profile's config.yaml and custom provider
     JSON files (mapping target -> listen). Returns the changed files. Idempotent."""
-    cfg = Path(profile_root) / "config"
-    files = [cfg / "config.yaml", *sorted((cfg / "custom_providers").glob("*.json"))]
+    from .sandbox import write_atomic
     changed = []
-    for f in files:
+    for f in _own_config_files(profile_root):
         try:
-            text = f.read_text(encoding="utf-8")
-        except OSError:
+            if f.stat().st_size > MAX_REWRITE_BYTES:
+                continue
+            text = f.read_bytes().decode("utf-8")
+        except (OSError, ValueError):
             continue
         new = rewrite_text(text, mapping)
         if new != text:
-            f.write_text(new, encoding="utf-8")
+            try:
+                write_atomic(f, new)
+            except OSError as e:
+                log.warning("relay: %s was not rewritten: %s", f, e)
+                continue
             changed.append(str(f))
     return changed
 
@@ -171,7 +226,8 @@ def pump_pipe_to_sock(h, s):
                 break
             s.sendall(data)
     except OSError as e:
-        sys.stderr.write('relay pipe to socket: %r\n' % (e,)); sys.stderr.flush()
+        if getattr(e, 'winerror', 0) not in (109, 232, 233):   # the gateway closed the pipe: the answer is complete
+            sys.stderr.write('relay pipe to socket: %r\n' % (e,)); sys.stderr.flush()
     finally:
         try: s.shutdown(socket.SHUT_WR)
         except OSError: pass
@@ -240,9 +296,13 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows tests
         until stop() (the next one is created before a connected one is handed on), so the name never becomes
         free for another process to take."""
 
-        def __init__(self, pipe: str, sid: str, target: str):
+        def __init__(self, pipe: str, sid: str, target: str, max_connections: int = 64):
             self.pipe, self.sid, self.target = pipe, sid, parse_target(target)
             self._stop = False
+            # AC-3: every connection costs the gateway two threads and a socket, and the gateway serves everyone
+            self.max_connections = max(1, int(max_connections))
+            self._slots = threading.BoundedSemaphore(self.max_connections)
+            self.refused = 0
             sddl = f"D:P(A;;GA;;;SY)(A;;GA;;;OW)(A;;GRGW;;;{sid})S:(ML;;NW;;;LW)"
             self._sd = ctypes.c_void_p()
             if not _adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(self._sd), None):
@@ -282,8 +342,18 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows tests
                 except OSError as e:
                     log.warning("relay %s: cannot create pipe: %s", self.pipe, e)
                     break
-                if connected:
-                    threading.Thread(target=self._handle, args=(h,), daemon=True).start()
+                if connected and self._slots.acquire(blocking=False):
+                    try:
+                        threading.Thread(target=self._handle, args=(h,), daemon=True).start()
+                    except RuntimeError:          # no thread to be had: give the slot and the instance back
+                        self._slots.release()
+                        _winapi.CloseHandle(h)
+                elif connected:                   # over the limit: closed at once, the client sees an empty answer
+                    self.refused += 1
+                    if self.refused in (1, 100) or self.refused % 1000 == 0:
+                        log.warning("relay %s -> %s:%s: more than %d connections at once; %d refused so far",
+                                    self.pipe, *self.target, self.max_connections, self.refused)
+                    _winapi.CloseHandle(h)
                 else:
                     _winapi.CloseHandle(h)
                 h = self._pending = nxt
@@ -294,6 +364,12 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows tests
                 pass
 
         def _handle(self, h: int) -> None:
+            try:
+                self._relay(h)
+            finally:
+                self._slots.release()
+
+        def _relay(self, h: int) -> None:
             try:
                 s = socket.create_connection(self.target, timeout=30)
                 s.settimeout(None)
@@ -360,10 +436,22 @@ else:
 
 
 def write_forwarder(profile_root: str) -> str:
-    p = Path(profile_root) / ".goose-web" / "relay_forwarder.py"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if not p.exists() or p.read_text(encoding="utf-8") != FORWARDER_SRC:
-        p.write_text(FORWARDER_SRC, encoding="utf-8")
+    """The forwarder script in the member's profile (it runs inside the member's container, which reads nothing
+    else of the gateway's). The member can write there: the folder must not be a link, and the file is replaced as
+    a whole, never written through a link (AC-5)."""
+    from .profiles import _is_reparse
+    from .sandbox import write_atomic
+    d = Path(profile_root) / ".goose-web"
+    if _is_reparse(d):
+        raise OSError(f"{d} is a link; the relay forwarder is not written through it")
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "relay_forwarder.py"
+    try:
+        same = not _is_reparse(p) and p.read_bytes().decode("utf-8") == FORWARDER_SRC
+    except (OSError, ValueError):
+        same = False
+    if not same:
+        write_atomic(p, FORWARDER_SRC)
     return str(p)
 
 

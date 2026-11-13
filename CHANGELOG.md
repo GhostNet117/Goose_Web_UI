@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.21.1 - 2026-11-13
+
+**The AppContainer backend, measured again with real containers; what a sandboxed agent can read in the registry.**
+No database schema change, no new setting.
+
+The AppContainer backend (`sandbox.backend: appcontainer`, or `sandbox.fallback: appcontainer` where Windows cannot
+run MXC) had been covered by unit tests only since MXC became the default. It was run again with real containers and
+the real goose binary (SECURITY-ASSESSMENT 16): a member's agent starts, answers, reaches a loopback model and the
+prompt injection classifier of 1.20.0 through its relays, and is confined to its folders - not even the names of
+files outside them are listed, loopback is closed, and no link to anything outside can be made.
+
+- **Known limit, both backends (AC-1): a sandboxed agent can read the registry of the account the gateway runs
+  as** wherever Windows lets application containers read it, and `HKEY_CURRENT_USER\Environment` - the account's
+  user environment variables - is such a place. The environment Goose Web gives a sandboxed agent is an allow-list,
+  but the variables can be read from the registry all the same. Goose Web cannot prevent this. **Keep secrets out
+  of the user environment variables of the gateway's account, or run the gateway under an account used for nothing
+  else.** `goose-web check` has a new line, "account registry", that names the user variables that look like secrets.
+- **The folder rules of MXC now hold for the AppContainer backend too (AC-2).** A team folder or extra folder that is
+  the gateway's system folder, the profiles root, another member's profile, the native Goose profile or - for
+  writing - Goose Web's code, its Python, the goose folder or the MXC folder is left out and logged
+  (`sandbox appcontainer: <user>: grant <path> refused: <why>`). Before, such a folder was granted as configured.
+- **A relay serves a bounded number of connections (AC-3):** `sandbox.proxy_max_connections` per member and service
+  (default 64). Before, one member's agent could open connections until the gateway ran out of threads.
+- **A sandboxed process that cannot join its kill-on-close job is ended before it runs (AC-4)**, as with MXC.
+- **Relay URL rewrite (AC-5):** a service on port 80 no longer rewrites a URL on port 8080; the record that undoes the
+  rewrite is written first; files are replaced as a whole with their bytes kept (line endings were converted
+  before) and never written through a link; at most 500 provider files of at most 1 MB are looked at.
+- **`sandbox.relays` is checked (AC-6):** an entry that is not `host:port` (IPv4 address or name, port 1 to 65535)
+  is a configuration problem that `check` and the worker's error name. Before, it failed the member's connection
+  with a traceback. IPv6 addresses are refused: they never worked with the URL rewrite.
+- A relay forwarder that does not answer within 30 seconds no longer holds the worker's start; the normal end of an
+  answer is no longer written to the worker log as an error (AC-8); state files are replaced as a whole (AC-7).
+- Documents corrected: an AppContainer cannot create links to files outside its folders (the administration guide
+  said it could); Windows gives an AppContainer its own TEMP and LOCALAPPDATA folder whatever the gateway sets.
+- Tests: `tests/test_appcontainer.py` (real containers on Windows: files, names, links, loopback, relay, pipe
+  access, connection limit, job).
+
 ## 1.21.0 - 2026-11-13
 
 **Offer your own Goose skills and recipes to a team; nothing is shared by default.** Spec 028. No database schema

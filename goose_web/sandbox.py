@@ -277,10 +277,19 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
             _k32.CloseHandle(in_r)
             _k32.CloseHandle(out_w)
             os.set_handle_inheritable(err_h, False)
+        # Every job the caller names must hold the process before it runs one instruction (AC-4; MX-9 for MXC): a
+        # process outside the kill-on-close jobs would outlive the gateway and be missed when its worker is stopped.
         for j in (job if isinstance(job, (list, tuple)) else [job]):
-            if j is not None and getattr(j, "handle", None):
-                if not _k32.AssignProcessToJobObject(j.handle, pi.hProcess):
-                    log.warning("could not put the sandboxed worker in the job object (%s)", ctypes.get_last_error())
+            if j is None:
+                continue
+            h = getattr(j, "handle", None)
+            if not h or not _k32.AssignProcessToJobObject(h, pi.hProcess):
+                err = ctypes.get_last_error() if h else 0
+                _k32.TerminateProcess(pi.hProcess, 1)
+                for x in (pi.hThread, pi.hProcess, in_w, out_r):
+                    _k32.CloseHandle(x)
+                raise SandboxError("the sandboxed process could not be put in its kill-on-close job "
+                                   f"({err or 'the job does not exist'}); it was ended before it ran")
         _k32.ResumeThread(pi.hThread)
         _k32.CloseHandle(pi.hThread)
         stdin = os.fdopen(msvcrt.open_osfhandle(in_w, os.O_WRONLY | os.O_BINARY), "wb", buffering=0)
@@ -330,10 +339,34 @@ def load_state(state_dir: str, name: str) -> dict:
         return {}
 
 
+def write_atomic(path: Path | str, text: str) -> None:
+    """The whole file or nothing (AC-5, AC-7): written to a new file beside the target and moved over it, bytes as
+    given (no newline translation). A target name that is a link is replaced by a file of its own, never written
+    through; the temporary name is created exclusively, so nothing planted under that name is written through
+    either. On any failure the temporary file is removed and the target is as it was."""
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    try:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0))
+        with os.fdopen(fd, "wb") as f:
+            f.write(text.encode("utf-8"))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _save_state(state_dir: str, name: str, state: dict) -> None:
     sp = _state_path(state_dir, name)
     sp.parent.mkdir(parents=True, exist_ok=True)
-    sp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+    write_atomic(sp, json.dumps(state, indent=1))
 
 
 def prepare(name: str, state_dir: str, grants: dict[str, str]) -> dict:
