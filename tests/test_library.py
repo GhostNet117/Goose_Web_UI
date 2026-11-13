@@ -595,7 +595,7 @@ def test_an_extension_entry_with_nested_aliases_is_not_exported(tmp_path, monkey
     name, payload = pr.export_item(alice, "extension", "plain")
     assert payload["entry"] == {"enabled": True, "type": "stdio", "name": "plain", "cmd": "x", "args": ["a", "b"]}
     assert profiles._small_tree({"a": [1, "x", None, True, 2.5, {"b": []}]}) and not profiles._small_tree({"when": object()})
-    assert not profiles._small_tree([0] * 30000) and not profiles._small_tree("x" * 70000)
+    assert not profiles._small_tree([0] * 30000) and not profiles._small_tree("x" * (1024 * 1024 + 1))
 
 
 def test_the_skill_md_of_a_case_sensitive_folder_and_a_mark_in_another_case(tmp_path, monkeypatch, home):
@@ -610,9 +610,102 @@ def test_the_skill_md_of_a_case_sensitive_folder_and_a_mark_in_another_case(tmp_
         return lambda folder, limit=None: [folder / n for n in names] if folder == d else real(folder, limit)
     monkeypatch.setattr(profiles, "_scan", two_names(["SKILL.md", "skill.md"]))   # both "exist": the exact one counts
     assert "The real one" in pr._read_skill_files(d)["SKILL.md"]
+    monkeypatch.setattr(profiles, "_scan", two_names(["SKILL.MD", "SKILL.md"]))   # N-4: a variant that sorts first
+    assert "The real one" in pr._read_skill_files(d)["SKILL.md"]
     monkeypatch.setattr(profiles, "_scan", two_names(["Skill.md", "skill.md"]))   # two variants, no exact one
     with pytest.raises(ValueError, match="both Skill.md and skill.md"):
         pr._read_skill_files(d)
+
+
+def test_a_shared_item_is_bounded_as_a_whole_and_its_key_names_are_names(tmp_path, monkeypatch, home):
+    """N-1: the budget counted values and each text, not the text as a whole - one long text used thousands of
+    times passed. N-2: an `env_keys` or `api_key_env` that is not a list of names made provisioning raise for every
+    member of the team the item was added to."""
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    bob = db.user_by_id(db.create_user(username="bob", role="user"))
+    pr.provision(alice)
+    cfg = pr.config_dir(alice)
+    cp = cfg / "config.yaml"
+    ext = ("  wide:\n    enabled: true\n    type: stdio\n    name: wide\n    cmd: x\n    args: ["
+           + ", ".join(["*long"] * 30) + "]\n"
+           "  badkeys:\n    enabled: true\n    type: stdio\n    name: badkeys\n    cmd: x\n    env_keys: 5\n"
+           "  fine:\n    enabled: true\n    type: stdio\n    name: fine\n    cmd: x\n    env_keys: [A_KEY]\n")
+    cp.write_text('long: &long "' + "x" * 60000 + '"\n'
+                  + cp.read_text(encoding="utf-8").replace("extensions:\n", "extensions:\n" + ext, 1), encoding="utf-8")
+    assert {"wide", "badkeys", "fine"} <= set(refs(pr, alice, "extension"))
+    with pytest.raises(ValueError, match="too large"):
+        pr.export_item(alice, "extension", "wide")                             # 30 x 60,000 characters as JSON
+    with pytest.raises(ValueError, match="env_keys is not a list of names"):
+        pr.export_item(alice, "extension", "badkeys")
+    assert pr.export_item(alice, "extension", "fine")[1]["entry"]["env_keys"] == ["A_KEY"]
+    assert profiles._small_tree({"a": ["y" * 60000] * 10}) and not profiles._small_tree({"a": ["y" * 60000] * 30})
+    (cfg / "custom_providers").mkdir(exist_ok=True)
+    (cfg / "custom_providers" / "bad.json").write_text(json.dumps(
+        {"name": "bad", "engine": "openai", "api_key_env": ["X"], "base_url": "http://bad.example"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="api_key_env is not a name"):
+        pr.export_item(alice, "provider", "bad")
+    # items that did not come through export_item (the API also takes a payload by hand): they must not be able
+    # to stop a member's agent from starting
+    (cfg / "secrets.yaml").write_text(yaml.safe_dump({"OK_KEY": "v"}), encoding="utf-8")
+    tid = with_team(db, bob)
+    for kind, name, payload in (
+            ("extension", "manual", {"key": "manual", "secretsFrom": "alice", "entry": {
+                "enabled": True, "type": "sse", "name": "manual", "uri": "http://x.example/sse", "env_keys": 5}}),
+            ("provider", "mp", {"providerId": "mp", "secretsFrom": "alice", "secretKeys": [["Y"], 7, "OK_KEY"],
+                                "json": {"name": "mp", "engine": "openai", "api_key_env": ["X"], "base_url": "http://x.example"}})):
+        db.execute("INSERT INTO team_items(team_id, kind, name, payload, created_at) VALUES(?,?,?,?,0)",
+                   (tid, kind, name, json.dumps(payload)))
+    pr.provision(bob)                                                          # TypeError before
+    assert yaml.safe_load((pr.config_dir(bob) / "secrets.yaml").read_text(encoding="utf-8"))["OK_KEY"] == "v"
+    assert profiles._names(["A", "", 5, ["B"], None, "C"]) == ["A", "C"] and profiles._names(5) == [] and profiles._names(None) == []
+
+
+def test_a_write_that_fails_leaves_no_temporary_file_and_no_unmarked_folder(tmp_path, monkeypatch, home):
+    """N-3: the temporary file of a failed write stayed. In a new skill folder it kept the folder from being removed
+    again, and a folder without the mark is the member's own for ever: never delivered, never withdrawn."""
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    ta = with_team(db, alice)
+    skill(home / ".agents" / "skills", "review", "R")
+    offer(db, pr, admin, ta, "skill", "review")
+    real = os.replace
+
+    def not_the_mark(a, b):
+        if str(b).endswith(profiles.MANAGED_MARK) or str(b).endswith("plain.txt"):
+            raise PermissionError("in use")
+        return real(a, b)
+    monkeypatch.setattr(os, "replace", not_the_mark)
+    with pytest.raises(PermissionError):
+        profiles._atomic_write(tmp_path / "plain.txt", "x")
+    assert not list(tmp_path.glob("plain.txt*"))                               # nothing left behind
+    pr.provision(alice)
+    d = pr.config_dir(alice) / "skills" / "review"
+    assert not d.exists()                                                      # not an unmarked folder
+    monkeypatch.setattr(os, "replace", real)
+    pr.provision(alice)
+    assert (d / "SKILL.md").is_file() and (d / profiles.MANAGED_MARK).is_file()
+
+
+@windows_only
+def test_a_withdrawal_that_cannot_be_completed_is_finished_at_a_later_start(tmp_path, monkeypatch, home, caplog):
+    """N-5 / N-6: a file of a withdrawn skill that is in use left a folder without its mark, reported as removed
+    and never removed; a withdrawn provider file that is in use made provisioning raise."""
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    ta = with_team(db, alice)
+    skill(home / ".agents" / "skills", "review", "R", {"big/notes.md": "notes"})
+    offer(db, pr, admin, ta, "skill", "review")
+    offer(db, pr, admin, ta, "provider", "p1")
+    pr.provision(alice)
+    d, pf = pr.config_dir(alice) / "skills" / "review", pr.config_dir(alice) / "custom_providers" / "p1.json"
+    assert (d / "big" / "notes.md").is_file() and pf.is_file()
+    db.execute("DELETE FROM team_items")
+    with open(d / "big" / "notes.md", "rb"), open(pf, "rb"), caplog.at_level(logging.WARNING, logger="goose_web"):
+        changes = pr.provision(alice)                                          # raised before (the provider file)
+        assert d.is_dir() and (d / profiles.MANAGED_MARK).is_file() and pf.is_file()
+        assert "skill review removed" not in changes and "provider p1 removed" not in changes
+    assert "could not be removed completely" in caplog.text and "provider p1 could not be removed" in caplog.text
+    changes = pr.provision(alice)                                              # nothing holds them any more
+    assert not d.exists() and not pf.exists()
+    assert "skill review removed" in changes and "provider p1 removed" in changes
 
 
 # ------------------------------------------------------------------ SC5: goose-web check says where things stand

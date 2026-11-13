@@ -988,4 +988,24 @@ closed:
 Not followed up from this reviewer's list of things reading could not settle: whether Goose's own saving ever
 leaves a second hard link on `config.yaml` (a member's extension could then not be offered until the file is
 rewritten), files on a volume with deduplication or cloud placeholders counting as links, and whether a sandboxed
-agent can make a folder case-sensitive. The fixes of this table were not reviewed by anyone else.
+agent can make a folder case-sensitive. The fixes of this table were read once more, narrowly (15.7).
+
+### 15.7 Third review, of the delivery and export functions only (2026-11-13, before release)
+
+The second round of fixes had rewritten the branch that delivers a team skill, the place of the regression M-2, so
+a third reviewer read only those functions in the commit with the fixes of 15.6. No High finding; no path on which
+a skill that is still assigned is deleted, or a member's own skill is overwritten or deleted. It found:
+
+| ID | Severity | Finding | Now |
+|---|---|---|---|
+| N-1 | Medium, residual of M-1 | The budget counted values and each text, not the text as a whole: one long text used thousands of times still passed, about a gigabyte as JSON | A budget of 1 MB for all text and keys of an item |
+| N-2 | Medium, as before | An extension's `env_keys` or a provider's `api_key_env` that is not a list of names (a number, a nested list) made provisioning raise for every member of the team | Refused at export; provisioning takes only names from a stored item, whoever built it |
+| N-3 | Low | The temporary file of a failed write stayed; in a new skill folder it kept the folder from being removed again, and a folder without the mark is the member's own for good | A failed write leaves nothing behind |
+| N-4 | Low, new | "The exact `SKILL.md` wins" did not hold for `SKILL.MD`, which sorts before it (refused instead; nothing wrong was shared) | The exact name wins wherever it sorts |
+| N-5, N-6 | Low / Info, as before | A withdrawn skill with a file in use left a folder that was reported as removed and never removed; a withdrawn provider file in use made provisioning raise | What is left stays on record and is removed at a later start; never a failed start |
+| N-7 | Info | Sizes are checked with `stat` and the file is then read whole; the mark and the delivered files in a member's profile are read without a limit | **Open** |
+
+These last changes are small and local, and each has a test; they were not reviewed by anyone else. Not followed
+up from this reviewer's list: two team items whose names differ only in case share one folder in a member's
+profile; a number that is not finite (`NaN`) in a provider file passes; a source `secrets.yaml` that is empty for a
+moment reads as "no keys" and withdraws them until the next start.

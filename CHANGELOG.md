@@ -37,7 +37,10 @@ change.
   review, of those fixes (15.6), found that one of them could delete a team skill that was still assigned when its
   mark could not be rewritten; fixed, with the other things it found: an extension entry is shared only as plain
   data of bounded size (nested YAML aliases again), a source profile that cannot be read for a moment no longer
-  takes a provider's key away from the team, and a name that cannot be encoded no longer fails the picker.
+  takes a provider's key away from the team, and a name that cannot be encoded no longer fails the picker. A third,
+  narrow review of the delivery code (15.7) found no way to lose a skill; from it: an item's text is bounded as a
+  whole, key names in an item must be names, a failed write leaves no temporary file, and a withdrawal that cannot
+  be completed because a file is in use is finished at a later start instead of failing or being reported as done.
 - **Correction:** inside the sandbox the names of files and folders on the drive can be listed, not only folder
   names as the documents said (contents cannot be read; accepted since 1.19.0).
 - **Tests:** the test session replaces the home folder the library reads and removes `GOOSE_RECIPE_PATH`, so

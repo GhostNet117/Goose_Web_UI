@@ -114,9 +114,18 @@ def _read_yaml(p: Path) -> dict:
 def _atomic_write(p: Path, text: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + f".tmp{os.getpid()}")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
-    os.replace(tmp, p)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        os.replace(tmp, p)
+    except BaseException:
+        # a write that failed leaves nothing behind (third review of 1.21.0, N-3: a left-over temporary file kept
+        # a new skill folder from being removed again, and the folder was then taken for the member's own)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _write_yaml(p: Path, data: dict) -> None:
@@ -214,32 +223,42 @@ def _sendable(name: str) -> bool:
     return 0 < len(name) <= 200
 
 
-def _small_tree(obj: Any, nodes: int = 20000, depth: int = 24) -> bool:
-    """True when `obj`, written out as JSON, stays small and is plain data: at most `nodes` values counting every
-    repetition, at most `depth` levels, no text over 64 KB, only JSON types. YAML aliases share one object; JSON
-    writes it out every time it is used, so a few hundred bytes of nested aliases become gigabytes (second review,
-    M-1). The count stops at the budget: it never walks more than it allows."""
+def _small_tree(obj: Any, nodes: int = 20000, depth: int = 24, chars: int = 1024 * 1024) -> bool:
+    """True when `obj`, written out as JSON, stays small and is plain data: at most `nodes` values and `chars`
+    characters of text and keys, both counting every repetition; at most `depth` levels; only JSON types. YAML
+    aliases share one object; JSON writes it out every time it is used, so a few hundred bytes of nested aliases
+    become gigabytes (second review, M-1), and so does one long text used twenty thousand times (third review,
+    N-1). The count stops at the budget: it never walks more than it allows."""
     todo = [(obj, 0)]
-    seen = 0
+    seen = text = 0
     while todo:
         o, d = todo.pop()
         seen += 1
         if seen > nodes or d > depth:
             return False
         if isinstance(o, dict):
-            if len(o) > nodes or not all(isinstance(k, str) and len(k) <= 1000 for k in o):
+            if len(o) > nodes or not all(isinstance(k, str) for k in o):
                 return False
+            text += sum(len(k) for k in o)
             todo.extend((v, d + 1) for v in o.values())
         elif isinstance(o, list):
             if len(o) > nodes:
                 return False
             todo.extend((v, d + 1) for v in o)
         elif isinstance(o, str):
-            if len(o) > 65536:
-                return False
+            text += len(o)
         elif not (o is None or isinstance(o, (bool, int, float))):
             return False
+        if text > chars:
+            return False
     return True
+
+
+def _names(v: Any) -> list[str]:
+    """The names in a list a file or a stored item supplies (an extension's env_keys, a provider's secret keys):
+    only non-empty text. Anything else - not a list, a number, a nested list - is no name; it must not be able to
+    fail the provisioning of a whole team (third review, N-2)."""
+    return [k for k in v if isinstance(k, str) and k] if isinstance(v, list) else []
 
 
 def _read_head(p: Path, size: int = 16384) -> str:
@@ -790,7 +809,7 @@ class Profiles:
                     changes.append(f"extension {key}")
                 exts[key] = e
                 new_manifest["extensions"].append(key)
-                secrets_from(payload.get("secretsFrom"), list(entry.get("env_keys") or []))
+                secrets_from(payload.get("secretsFrom"), _names(entry.get("env_keys")))
             elif kind == "provider":
                 pj = payload.get("json")
                 pid = payload.get("providerId") or name
@@ -803,9 +822,9 @@ class Profiles:
                         _atomic_write(target, text)
                         changes.append(f"provider {pid}")
                     new_manifest["providers"].append(pid)
-                keys = list(payload.get("secretKeys") or [])
-                if isinstance(pj, dict) and pj.get("api_key_env"):
-                    keys.append(pj["api_key_env"])
+                keys = _names(payload.get("secretKeys"))
+                if isinstance(pj, dict):
+                    keys += _names([pj.get("api_key_env")])
                 secrets_from(payload.get("secretsFrom"), keys)
             elif kind == "skill":
                 files = payload.get("files") or {}
@@ -868,8 +887,13 @@ class Profiles:
         for pid in set(old.get("providers") or []) - set(new_manifest["providers"]):
             f = _delete_target(cfg_dir / "custom_providers", pid, ".json", root)
             if f is not None and f.is_file():
-                f.unlink()
-                changes.append(f"provider {pid} removed")
+                try:
+                    f.unlink()
+                    changes.append(f"provider {pid} removed")
+                except OSError as e:   # in use: tried again at the next start, never a failed start (N-6)
+                    log.warning("profile %s: provider %s could not be removed (%s); tried again at the next start",
+                                user.get("username"), pid, e.__class__.__name__)
+                    new_manifest["providers"].append(pid)
         for k in set(old.get("secrets") or []) - set(new_manifest["secrets"]):
             if k in secrets:
                 secrets.pop(k)
@@ -879,7 +903,20 @@ class Profiles:
             if sdir is not None and sdir.is_dir() and (sdir / MANAGED_MARK).is_file() \
                     and not _linked(sdir / MANAGED_MARK):
                 shutil.rmtree(sdir, ignore_errors=True)
-                changes.append(f"skill {sk} removed")
+                if not sdir.exists():
+                    changes.append(f"skill {sk} removed")
+                    continue
+                # A file in it is in use: what is left stays Goose Web's (the mark is put back if it went with the
+                # rest) and on record, so the withdrawal is finished at a later start instead of leaving a folder
+                # that nothing ever removes (third review, N-5).
+                try:
+                    if not (sdir / MANAGED_MARK).is_file():
+                        _atomic_write(sdir / MANAGED_MARK, "team item withdrawn\n")
+                except OSError:
+                    pass
+                log.warning("profile %s: skill %s could not be removed completely; tried again at the next start",
+                            user.get("username"), sk)
+                new_manifest["skills"].append(sk)
 
         self._apply_extension_permissions(pol, exts, admin_cfg, old, new_manifest, changes)
 
@@ -1198,6 +1235,7 @@ class Profiles:
         while todo:
             cur, depth = todo.pop(0)
             names = [p.name for p in _scan(cur, MAX_SKILL_ENTRIES - entries + 1)]
+            exact = depth == 0 and "SKILL.md" in names
             entries += len(names)
             if entries > MAX_SKILL_ENTRIES:
                 raise ValueError(f"skill has too many files and folders to share ({MAX_SKILL_ENTRIES} at most)")
@@ -1215,8 +1253,9 @@ class Profiles:
                 rel = f.relative_to(d).as_posix()
                 if depth == 0 and n.lower() == "skill.md":
                     # Windows finds it under any case; members get the canonical name. In a case-sensitive folder
-                    # the exact SKILL.md is the one, and two other variants are ambiguous (second review, M-7).
-                    if skill_md == "SKILL.md":
+                    # the exact SKILL.md is the one whatever sorts before it, and two other variants are ambiguous
+                    # (reviews M-7, N-4).
+                    if exact and n != "SKILL.md":
                         continue
                     if skill_md:
                         raise ValueError(f"the skill has both {skill_md} and {n}; it is not shared")
@@ -1354,6 +1393,8 @@ class Profiles:
             if not isinstance(entry, dict) or not _small_tree(entry):
                 raise ValueError("the extension entry is too large, too deeply nested or not plain data; it is not "
                                  "shared")
+            if entry.get("env_keys") is not None and _names(entry["env_keys"]) != entry["env_keys"]:
+                raise ValueError("the extension's env_keys is not a list of names; it is not shared")
             entry = json.loads(json.dumps(entry))   # a plain copy: no shared parts, nothing but JSON types
             entry["enabled"] = True
             return ref, {"key": ref, "entry": entry, "secretsFrom": user["username"]}
@@ -1367,6 +1408,7 @@ class Profiles:
             if not isinstance(j, dict) or not _small_tree(j):
                 raise ValueError("the provider file is too deeply nested or not plain data; it is not shared")
             key = j.get("api_key_env")
-            return ref, {"providerId": ref, "json": j, "secretsFrom": user["username"],
-                         "secretKeys": [key] if isinstance(key, str) and key else []}
+            if key is not None and not isinstance(key, str):
+                raise ValueError("the provider's api_key_env is not a name; it is not shared")
+            return ref, {"providerId": ref, "json": j, "secretsFrom": user["username"], "secretKeys": _names([key])}
         raise ValueError("unknown kind")
