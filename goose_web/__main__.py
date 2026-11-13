@@ -923,7 +923,7 @@ def _home_library_line(settings) -> str:
     given no access to that folder; without it every member's agent loads them, and nothing in Goose Web can prevent
     that. Information only: it never fails the check."""
     from . import profiles as _profiles
-    from .config import sandbox_backend, sandbox_on
+    from .config import sandbox_on
     hl = _profiles.home_library_summary()
     counts = (len(hl["skills"]), len(hl["recipes"]), len(hl["agents"]))
     what = f"{counts[0]} skill(s), {counts[1]} recipe(s), {counts[2]} agent(s) in {hl['home']}"
@@ -933,10 +933,11 @@ def _home_library_line(settings) -> str:
     if not any(counts):
         return f"[--] home-folder Goose items: none in {hl['home']}"
     if sandbox_on(settings):
-        how = ("measured for the MXC backend" if sandbox_backend(settings) == "mxc" else
-               "by its folder grants; not measured for the AppContainer backend")
+        # The same sentence whichever backend a member's agent ends up in (the configured one or the fallback):
+        # which one that is, is the sandbox line's business (second review, M-11)
         return (f"[OK] home-folder Goose items: {what}. Members' agents are sandboxed and are given no access to "
-                f"that folder ({how}); offer skills and recipes to a team in Admin > Teams > Library items{links}")
+                f"that folder (measured for MXC; an AppContainer has no grant for it, not measured); offer skills "
+                f"and recipes to a team in Admin > Teams > Library items{links}")
     return (f"[!!] home-folder Goose items: {what}. EVERY member's agent loads them while the sandbox is off "
             f"(sandbox.enabled); Goose Web cannot prevent that{links}")
 

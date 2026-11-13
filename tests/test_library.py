@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -101,15 +102,20 @@ def test_the_library_tests_never_read_the_developers_home_folder():
 
 
 @windows_only
-def test_the_home_folder_is_asked_from_windows_not_taken_from_the_environment(monkeypatch, tmp_path):
+def test_the_home_folder_is_asked_from_windows_not_taken_from_the_environment(monkeypatch, tmp_path, real_account_home):
     """L-12: Goose asks Windows for the home folder (measured: USERPROFILE does not move it); Python's expanduser
-    goes by USERPROFILE. The picker and `check` must look where Goose looks."""
+    goes by USERPROFILE. The picker and `check` must look where Goose looks. (`real_account_home`: the product's
+    function; every test otherwise gets an empty folder in its place.)"""
     real = winsec.profile_folder()
     assert real and Path(real).is_dir()
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(winsec, "_PROFILE_FOLDER", None)                       # ask again
+    monkeypatch.setattr(winsec, "_PROFILE_ASKED", False)
     assert os.path.expanduser("~") == str(tmp_path) and winsec.profile_folder() == real
+    assert real_account_home() == Path(real)                                   # what the picker and `check` use
+    monkeypatch.setattr(winsec, "profile_folder", lambda: None)                # Windows cannot be asked: the fallback
+    assert real_account_home() == tmp_path
 
 
 # ------------------------------------------------------------------ SC1: what the picker offers
@@ -231,7 +237,7 @@ def test_api_the_picker_is_for_administrators_and_delivers_to_the_team(env, tmp_
     assert row["detail"]["source"] == "root:review"
 
 
-def test_one_skill_file_that_cannot_be_written_does_not_stop_the_members_start(tmp_path, monkeypatch, home):
+def test_one_skill_file_that_cannot_be_written_does_not_stop_the_members_start(tmp_path, monkeypatch, home, caplog):
     """L-3: any OSError while writing one file of a team skill (a path too long under this member's profile) made
     provisioning raise, and every start of that member's agent failed until someone removed the item."""
     s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
@@ -245,13 +251,72 @@ def test_one_skill_file_that_cannot_be_written_does_not_stop_the_members_start(t
             raise FileNotFoundError("the path is too long here")
         return real(p, text)
     monkeypatch.setattr(profiles, "_atomic_write", flaky)
-    changes = pr.provision(alice)                                              # raised before
+    with caplog.at_level(logging.WARNING, logger="goose_web"):
+        changes = pr.provision(alice)                                          # raised before
     d = pr.config_dir(alice) / "skills" / "review"
     assert (d / "SKILL.md").is_file() and (d / "a.md").read_text(encoding="utf-8") == "A" and not (d / "sub" / "b.md").exists()
-    assert any("sub/b.md NOT written (FileNotFoundError)" in ch for ch in changes)
+    assert "team skill review: 1 part(s) could not be written" in caplog.text and "sub/b.md (FileNotFoundError)" in caplog.text
+    # M-3: a failure is not a "change" (a change marks the member's agent for a restart, at every admin action)
+    assert not any("b.md" in ch for ch in changes) and pr.provision(alice) == []
     monkeypatch.setattr(profiles, "_atomic_write", real)
-    pr.provision(alice)                                                        # and it heals at the next start
+    assert pr.provision(alice) == ["skill review/sub/b.md"]                    # and it heals at the next start
     assert (d / "sub" / "b.md").read_text(encoding="utf-8") == "B"
+
+
+def test_a_team_skill_whose_mark_cannot_be_written_is_neither_deleted_nor_orphaned(tmp_path, monkeypatch, home, caplog):
+    """M-2 (a regression of the first fix for L-3): when the mark could not be rewritten the skill was dropped from
+    the record, and the cleanup then DELETED the folder of a skill that was still assigned. And a new folder whose
+    mark failed stayed behind without a mark: never updated, never withdrawn."""
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    ta = with_team(db, alice)
+    skill(home / ".agents" / "skills", "review", "R")
+    iid = offer(db, pr, admin, ta, "skill", "review")
+    real = profiles._atomic_write
+
+    def no_mark(p, text):
+        if p.name == profiles.MANAGED_MARK:
+            raise PermissionError("the mark is in use")
+        return real(p, text)
+    d = pr.config_dir(alice) / "skills" / "review"
+    monkeypatch.setattr(profiles, "_atomic_write", no_mark)                    # a NEW folder whose mark fails
+    with caplog.at_level(logging.WARNING, logger="goose_web"):
+        pr.provision(alice)
+    assert not d.exists() and "the folder or its mark (PermissionError)" in caplog.text   # nothing left behind
+    monkeypatch.setattr(profiles, "_atomic_write", real)
+    pr.provision(alice)
+    assert (d / "SKILL.md").is_file() and (d / profiles.MANAGED_MARK).is_file()            # delivered at the next start
+    (d / profiles.MANAGED_MARK).write_text("something else\n", encoding="utf-8")          # the mark has to be rewritten
+    monkeypatch.setattr(profiles, "_atomic_write", no_mark)
+    pr.provision(alice)
+    assert (d / "SKILL.md").is_file()                                          # still assigned: NOT deleted
+    monkeypatch.setattr(profiles, "_atomic_write", real)
+    pr.provision(alice)
+    assert (d / profiles.MANAGED_MARK).read_text(encoding="utf-8") == f"team item {iid}\n"
+    db.execute("DELETE FROM team_items")
+    pr.provision(alice)
+    assert not d.exists()                                                      # and still withdrawn with the item
+
+
+def test_a_source_that_cannot_be_read_does_not_take_the_members_keys_away(tmp_path, monkeypatch, home, caplog):
+    """M-4: when the source profile's secrets.yaml could not be read for a moment, the first fix returned in
+    silence and the cleanup removed the key from every recipient: their agents ran without it."""
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    bob = db.user_by_id(db.create_user(username="bob", role="user"))
+    pr.provision(alice)
+    cfg = pr.config_dir(alice)
+    (cfg / "custom_providers").mkdir(exist_ok=True)
+    (cfg / "custom_providers" / "own.json").write_text(json.dumps(
+        {"name": "own", "engine": "openai", "api_key_env": "OWN_KEY", "base_url": "http://own.example"}), encoding="utf-8")
+    (cfg / "secrets.yaml").write_text(yaml.safe_dump({"OWN_KEY": "k-123"}), encoding="utf-8")
+    offer(db, pr, alice, with_team(db, bob), "provider", "own")
+    pr.provision(bob)
+    bsec = pr.config_dir(bob) / "secrets.yaml"
+    assert yaml.safe_load(bsec.read_text(encoding="utf-8"))["OWN_KEY"] == "k-123"
+    (cfg / "secrets.yaml").write_text("OWN_KEY: [not closed\n", encoding="utf-8")         # unreadable right now
+    with caplog.at_level(logging.WARNING, logger="goose_web"):
+        pr.provision(bob)
+    assert yaml.safe_load(bsec.read_text(encoding="utf-8"))["OWN_KEY"] == "k-123"          # kept
+    assert "could not be read; keys copied earlier are kept" in caplog.text
 
 
 # ------------------------------------------------------------------ SC3: nothing is read through a link
@@ -473,16 +538,35 @@ def test_what_the_picker_shows_is_bounded_and_is_text(tmp_path, monkeypatch, hom
     # a description that is not text is dropped (the title stands in when IT is text), a long one is cut
     assert {i["name"]: i["description"] for i in items} == {"dated": "", "bomb": "bomb", "long": "d" * 500}
     assert len(json.dumps(items)) < 4000                                       # serialisable, and small
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not found"):                         # not listed, so not exportable
         pr.export_item(alice, "recipe", str(rdir / "huge.yaml"))
+    listed = [{"kind": "recipe", "ref": str(rdir / "huge.yaml"), "name": "huge", "description": "", "source": str(rdir)}]
+    with monkeypatch.context() as m:                                           # and the export checks for itself
+        m.setattr(profiles.Profiles, "library", lambda self, u, k: listed)
+        with pytest.raises(ValueError, match="too large"):
+            pr.export_item(alice, "recipe", str(rdir / "huge.yaml"))
+    (rdir / "surrogate.yaml").write_text('title: s\ndescription: "lone \\ud800 surrogate"\n', encoding="utf-8")
+    items = pr.library(alice, "recipe")                                        # M-8: could not be sent at all
+    assert json.dumps(items, ensure_ascii=False).encode("utf-8") and "surrogate" in {i["name"] for i in items}
     # a SKILL.md of any size: only its head is read for the description
     d = skill(pr.config_dir(alice) / "skills", "heavy", "Short description")
     with open(d / "SKILL.md", "ab") as fh:
         fh.write(b"\n" + b"y" * (3 * 1024 * 1024))
-    read = []
-    real = profiles._read_head
-    monkeypatch.setattr(profiles, "_read_head", lambda p, size=16384: read.append(size) or real(p, size))
-    assert [i["description"] for i in pr.library(alice, "skill")] == ["Short description of heavy"] and read == [16384]
+    assert len(profiles._read_head(d / "SKILL.md")) <= 16384
+    assert [i["description"] for i in pr.library(alice, "skill")] == ["Short description of heavy"]
+    # the picker looks at a bounded number of entries of a folder (the bound applies before the listing is sorted)
+    for i in range(8):
+        skill(pr.config_dir(alice) / "skills", f"s{i}")
+    monkeypatch.setattr(profiles, "LIBRARY_SCAN", 5)
+    assert len(pr.library(alice, "skill")) <= 5
+    monkeypatch.setattr(profiles, "LIBRARY_SCAN", 2000)
+    # provider files: typed, bounded, and a deeply nested one cannot fail the picker (M-9)
+    cp = pr.config_dir(alice) / "custom_providers"
+    cp.mkdir(exist_ok=True)
+    (cp / "odd.json").write_text(json.dumps({"display_name": ["x"], "base_url": {"a": 1}, "engine": "openai"}), encoding="utf-8")
+    (cp / "deep.json").write_text("[" * 100000, encoding="utf-8")
+    (cp / "big.json").write_text(json.dumps({"engine": "x" * (profiles.MAX_RECIPE_BYTES + 1)}), encoding="utf-8")
+    assert [(i["ref"], i["name"], i["description"]) for i in pr.library(alice, "provider")] == [("odd", "odd", "openai")]
     # an extension entry whose description is not text
     cfg = yaml.safe_load((pr.config_dir(alice) / "config.yaml").read_text(encoding="utf-8"))
     cfg.setdefault("extensions", {})["odd"] = {"enabled": True, "type": "stdio", "name": "odd", "description": ["a", "b"],
@@ -490,6 +574,45 @@ def test_what_the_picker_shows_is_bounded_and_is_text(tmp_path, monkeypatch, hom
     (pr.config_dir(alice) / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
     odd = [i for i in pr.library(alice, "extension") if i["ref"] == "odd"][0]
     assert odd["name"] == "odd" and odd["description"] == "stdio"
+
+
+def test_an_extension_entry_with_nested_aliases_is_not_exported(tmp_path, monkeypatch, home):
+    """M-1: the listing was typed, but the EXPORT of an extension copied the whole entry. A few hundred bytes of
+    nested YAML aliases in a member's config.yaml are gigabytes once written out as JSON - which the gateway does on
+    its event loop when the administrator adds the item."""
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    pr.provision(alice)
+    cp = pr.config_dir(alice) / "config.yaml"
+    text = cp.read_text(encoding="utf-8")
+    bomb = "a: &a [x,x,x,x,x,x,x,x,x,x]\n" + "".join(
+        f"{n}: &{n} [{','.join('*' + p for _ in range(10))}]\n" for p, n in zip("abcdefgh", "bcdefghi"))
+    cp.write_text(bomb + text.replace("extensions:\n", "extensions:\n  helper:\n    enabled: true\n    type: stdio\n"
+                                      "    name: helper\n    cmd: x\n    extra: *i\n  plain:\n    enabled: true\n"
+                                      "    type: stdio\n    name: plain\n    cmd: x\n    args: [a, b]\n", 1), encoding="utf-8")
+    assert {"helper", "plain"} <= set(refs(pr, alice, "extension"))            # listed: the listing is typed
+    with pytest.raises(ValueError, match="too large, too deeply nested or not plain data"):
+        pr.export_item(alice, "extension", "helper")
+    name, payload = pr.export_item(alice, "extension", "plain")
+    assert payload["entry"] == {"enabled": True, "type": "stdio", "name": "plain", "cmd": "x", "args": ["a", "b"]}
+    assert profiles._small_tree({"a": [1, "x", None, True, 2.5, {"b": []}]}) and not profiles._small_tree({"when": object()})
+    assert not profiles._small_tree([0] * 30000) and not profiles._small_tree("x" * 70000)
+
+
+def test_the_skill_md_of_a_case_sensitive_folder_and_a_mark_in_another_case(tmp_path, monkeypatch, home):
+    """M-7 / L-13: in a case-sensitive folder SKILL.md and skill.md are two files; the exact one is the skill, two
+    other variants are ambiguous. A file named like the mark in another case is not exported either."""
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    d = skill(home / ".agents" / "skills", "cs", "The real one", {".GOOSE-WEB-MANAGED": "not for members"})
+    assert sorted(pr._read_skill_files(d)) == ["SKILL.md"]                      # the mark, in any case, stays out
+    real = profiles._scan
+
+    def two_names(names):
+        return lambda folder, limit=None: [folder / n for n in names] if folder == d else real(folder, limit)
+    monkeypatch.setattr(profiles, "_scan", two_names(["SKILL.md", "skill.md"]))   # both "exist": the exact one counts
+    assert "The real one" in pr._read_skill_files(d)["SKILL.md"]
+    monkeypatch.setattr(profiles, "_scan", two_names(["Skill.md", "skill.md"]))   # two variants, no exact one
+    with pytest.raises(ValueError, match="both Skill.md and skill.md"):
+        pr._read_skill_files(d)
 
 
 # ------------------------------------------------------------------ SC5: goose-web check says where things stand
@@ -511,8 +634,10 @@ def test_the_check_line_reports_the_home_folder_items_and_warns_without_the_sand
     counts = f"1 skill(s), 1 recipe(s), 1 agent(s) in {home}"
     on = cli_mod._home_library_line(_settings(enabled=True, backend="mxc"))
     assert on.startswith(f"[OK] home-folder Goose items: {counts}. Members' agents are sandboxed")
-    assert "measured for the MXC backend" in on and "Library items" in on and "review" not in on   # counts, no names
-    assert "not measured for the AppContainer backend" in cli_mod._home_library_line(_settings(enabled=True, backend="appcontainer"))
+    assert "Library items" in on and "review" not in on                        # counts, never names
+    # M-11: one sentence that is true whichever backend a member's agent ends up in (configured, or the fallback)
+    assert "measured for MXC; an AppContainer has no grant for it, not measured" in on
+    assert cli_mod._home_library_line(_settings(enabled=True, backend="appcontainer")) == on
     off = cli_mod._home_library_line(_settings(enabled=False))
     assert off.startswith(f"[!!] home-folder Goose items: {counts}. EVERY member's agent loads them")
 
@@ -527,9 +652,25 @@ def test_a_linked_home_folder_is_counted_but_not_offered(tmp_path, monkeypatch, 
     (dot / "agents").mkdir()
     (dot / "agents" / "helper.md").write_text("x", encoding="utf-8")
     junction(home / ".agents", dot)
-    assert refs(pr, admin) == ["hello"]                                        # only the one in config/skills
+    skill(native / "config" / "skills", "from-dotfiles", "another skill of the same name, in config")
+    # M-5: Goose loads the one behind the link, so that name is taken; the one in config must not stand in for it
+    assert refs(pr, admin) == ["hello"]
     summ = profiles.home_library_summary()
     assert summ["skills"] == ["from-dotfiles"] and summ["agents"] == ["helper"]
     assert summ["linked"] == [str(home / ".agents" / "skills"), str(home / ".agents" / "agents")]
     assert "Reached through a link, so not offered by the picker" in cli_mod._home_library_line(_settings(enabled=True))
     assert cli_mod._home_library_line(_settings(enabled=False)).startswith("[!!] home-folder Goose items: 1 skill(s)")
+
+
+@windows_only
+def test_a_native_profile_reached_through_a_link_still_offers_its_own_skills(tmp_path, monkeypatch, home):
+    """M-6: the native profile's config folders are the administrator's own arrangement. With the profile root as
+    the starting point of the link check, a root behind a junction emptied the picker without a word."""
+    s, db, pr, admin, alice, native = make(tmp_path, monkeypatch)
+    (native / "config" / "recipes").mkdir()
+    (native / "config" / "recipes" / "own.yaml").write_text(yaml.safe_dump({"title": "own"}), encoding="utf-8")
+    link = tmp_path / "native-behind-a-link"
+    junction(link, native)
+    other = db.user_by_id(db.create_user(username="admin2", role="admin", profile_mode="native", profile_path=str(link)))
+    assert refs(pr, other) == ["hello"] and [i["name"] for i in pr.library(other, "recipe")] == ["own"]
+    assert refs(pr, other, "provider") == ["p1"]

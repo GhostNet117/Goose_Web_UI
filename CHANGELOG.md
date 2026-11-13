@@ -33,7 +33,11 @@ change.
   date made the picker fail for that profile; nested YAML aliases could have stalled the gateway); a team skill
   file that cannot be written into one member's profile no longer stops that member's agent from starting; the
   "managed" mark of a team skill is never written through a link; a skill whose file is named `skill.md` in
-  another case is shared as `SKILL.md`; of two skills whose names differ only in case, one is offered.
+  another case is shared as `SKILL.md`; of two skills whose names differ only in case, one is offered. A second
+  review, of those fixes (15.6), found that one of them could delete a team skill that was still assigned when its
+  mark could not be rewritten; fixed, with the other things it found: an extension entry is shared only as plain
+  data of bounded size (nested YAML aliases again), a source profile that cannot be read for a moment no longer
+  takes a provider's key away from the team, and a name that cannot be encoded no longer fails the picker.
 - **Correction:** inside the sandbox the names of files and folders on the drive can be listed, not only folder
   names as the documents said (contents cannot be read; accepted since 1.19.0).
 - **Tests:** the test session replaces the home folder the library reads and removes `GOOSE_RECIPE_PATH`, so

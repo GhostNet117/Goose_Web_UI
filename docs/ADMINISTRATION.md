@@ -946,7 +946,9 @@ junction to a dotfiles folder: copy the skill to real files to offer it). In a m
 the provider files, `config.yaml` and `secrets.yaml` when you offer an extension or a provider from it. Folders you
 name yourself in `GOOSE_RECIPE_PATH` are checked only for being links themselves. Limits: a skill needs a regular
 `SKILL.md` and has at most 500 files, 2 MB, 12 folder levels and 180 characters per file path inside it; a recipe
-or provider file at most 1 MB; the picker looks at the first 2,000 entries of a folder.
+or provider file at most 1 MB; the picker looks at the first 2,000 entries of a folder; an extension entry or
+provider file must be plain data of ordinary size. A file of a team skill that cannot be written into one member's
+profile (a path too long there) is left out for that member and logged in `gateway.log`; the rest is delivered.
 Earlier versions read through links with the gateway's rights (SECURITY-ASSESSMENT 15.3): had a skill in a
 member's profile held a link to a file outside it, offering that skill to a team would have copied the file's
 content to the team. To share a skill that uses links, make it real files first.

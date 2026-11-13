@@ -71,6 +71,7 @@ MAX_SKILL_DEPTH = 12          # levels of folders inside a skill
 MAX_SKILL_REL_PATH = 180      # characters of a file's path inside a skill (it must also fit in the members' profiles)
 MAX_RECIPE_BYTES = 1024 * 1024   # a recipe or provider file larger than this is neither listed nor shared
 LIBRARY_SCAN = 2000           # entries of one folder the picker looks at
+LIBRARY_BYTES = 16 * 1024 * 1024   # recipe files one listing parses in total
 # Spec 028. Where Goose looks for GLOBAL skills, recipes and agents: under the home folder of the operating-system
 # account, which GOOSE_PATH_ROOT does not move (Goose 1.57.0 and 1.59.0: crates/goose/src/skills/mod.rs
 # all_skill_dirs_with_config, agents/platform_extensions/summon.rs discover_filesystem_sources,
@@ -186,14 +187,59 @@ def _linked(p: Path) -> bool:
     return not stat.S_ISDIR(st.st_mode) and getattr(st, "st_nlink", 1) > 1
 
 
-def _scan(d: Path, limit: int = LIBRARY_SCAN) -> list[Path]:
-    """At most `limit` entries of a folder, sorted by name. Bounded BEFORE the sorting (review of 1.21.0, L-4)."""
+def _scan(d: Path, limit: int | None = None) -> list[Path]:
+    """At most `limit` (default LIBRARY_SCAN) entries of a folder, sorted by name. Bounded BEFORE the listing is
+    complete and before the sorting (reviews of 1.21.0, L-4 and M-10)."""
     try:
         with os.scandir(d) as it:
-            names = [e.name for e in itertools.islice(it, limit)]
+            names = [e.name for e in itertools.islice(it, LIBRARY_SCAN if limit is None else max(0, limit))]
     except OSError:
         return []
     return [d / n for n in sorted(names)]
+
+
+def _text(v: Any, limit: int = 500) -> str:
+    """A value from a file someone else wrote, as text that can be sent: a str, cut to `limit`, with anything that
+    cannot be encoded replaced (a lone surrogate makes the whole answer unserialisable: second review, M-8).
+    Anything that is not a str is ''."""
+    return v[:limit].encode("utf-8", "replace").decode("utf-8") if isinstance(v, str) else ""
+
+
+def _sendable(name: str) -> bool:
+    """A file, folder or key name that can be part of the picker's answer and of a reference sent back."""
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return 0 < len(name) <= 200
+
+
+def _small_tree(obj: Any, nodes: int = 20000, depth: int = 24) -> bool:
+    """True when `obj`, written out as JSON, stays small and is plain data: at most `nodes` values counting every
+    repetition, at most `depth` levels, no text over 64 KB, only JSON types. YAML aliases share one object; JSON
+    writes it out every time it is used, so a few hundred bytes of nested aliases become gigabytes (second review,
+    M-1). The count stops at the budget: it never walks more than it allows."""
+    todo = [(obj, 0)]
+    seen = 0
+    while todo:
+        o, d = todo.pop()
+        seen += 1
+        if seen > nodes or d > depth:
+            return False
+        if isinstance(o, dict):
+            if len(o) > nodes or not all(isinstance(k, str) and len(k) <= 1000 for k in o):
+                return False
+            todo.extend((v, d + 1) for v in o.values())
+        elif isinstance(o, list):
+            if len(o) > nodes:
+                return False
+            todo.extend((v, d + 1) for v in o)
+        elif isinstance(o, str):
+            if len(o) > 65536:
+                return False
+        elif not (o is None or isinstance(o, (bool, int, float))):
+            return False
+    return True
 
 
 def _read_head(p: Path, size: int = 16384) -> str:
@@ -702,8 +748,16 @@ class Profiles:
             try:
                 src_secrets = _read_yaml(sp)
             except Exception:
-                return
+                src_secrets = None
             if not isinstance(src_secrets, dict):
+                # The source cannot be read right now (in use, not valid YAML). That is no reason to take away the
+                # keys this profile already has: the cleanup below removes every key that is not confirmed here
+                # (second review of 1.21.0, M-4).
+                log.warning("profile %s: secrets.yaml of the source profile %s could not be read; keys copied "
+                            "earlier are kept", user.get("username"), su.get("username"))
+                for k in keys:
+                    if k in (old.get("secrets") or []) and k in secrets:
+                        new_manifest["secrets"].append(k)
                 return
             for k in keys:
                 if k in src_secrets:
@@ -763,8 +817,29 @@ class Profiles:
                     # the user owns a skill with that name; never overwrite it. A mark that is a link is not Goose
                     # Web's mark either: it used to be written through (review of 1.21.0, L-9).
                     continue
+                # A part that cannot be written here (a path too long under this profile, a file in use) must not
+                # fail the provisioning: that would stop this member's agent from starting until someone removed
+                # the item (review of 1.21.0, L-3). It is logged, not reported as a change: a change marks the
+                # member's agent for a restart, which cannot help (second review, M-3). And a skill that was
+                # delivered before stays on record, or the cleanup below would delete it while it is still
+                # assigned (M-2).
+                was_ours, existed, began = name in (old.get("skills") or []), sdir.exists(), False
+                failed: list[str] = []
                 try:
                     sdir.mkdir(parents=True, exist_ok=True)
+                    want = f"team item {it['id']}\n"
+                    # the mark first: a folder Goose Web begins to fill is its own from the first moment
+                    if not mark.is_file() or mark.read_text(encoding="utf-8", errors="replace") != want:
+                        _atomic_write(mark, want)
+                    began = True
+                except OSError as e:
+                    failed.append(f"the folder or its mark ({e.__class__.__name__})")
+                    if not existed:
+                        try:
+                            sdir.rmdir()   # empty: nothing was written; tried again at the next start
+                        except OSError:
+                            pass
+                if began:
                     for rel, content in files.items():
                         rp = Path(rel)
                         if rp.is_absolute() or ".." in rp.parts or not isinstance(content, str):
@@ -777,21 +852,12 @@ class Profiles:
                                 _atomic_write(target, content)
                                 changes.append(f"skill {name}/{rel}")
                         except OSError as e:
-                            # One file that cannot be written here (a path that is too long under this profile, a
-                            # file in use) must not fail the provisioning: that would stop this member's agent from
-                            # starting until someone removed the item (review of 1.21.0, L-3).
-                            log.warning("profile %s: skill %s: %s could not be written (%s)", user.get("username"),
-                                        name, rel, e.__class__.__name__)
-                            changes.append(f"skill {name}/{rel} NOT written ({e.__class__.__name__})")
-                    want = f"team item {it['id']}\n"
-                    if not mark.is_file() or mark.read_text(encoding="utf-8", errors="replace") != want:
-                        _atomic_write(mark, want)
-                except OSError as e:
-                    log.warning("profile %s: skill %s could not be written (%s)", user.get("username"), name,
-                                e.__class__.__name__)
-                    changes.append(f"skill {name} NOT written ({e.__class__.__name__})")
-                    continue
-                new_manifest["skills"].append(name)
+                            failed.append(f"{rel} ({e.__class__.__name__})")
+                if failed:
+                    log.warning("profile %s: team skill %s: %d part(s) could not be written; tried again at the next "
+                                "start: %s", user.get("username"), name, len(failed), "; ".join(failed[:5]))
+                if began or was_ours:
+                    new_manifest["skills"].append(name)
 
         # remove items that were provisioned before but are no longer assigned. Every name comes from the manifest:
         # only safe ids, and only files / folders whose resolved parent is the expected folder of THIS profile (C-3).
@@ -1057,8 +1123,8 @@ class Profiles:
     @staticmethod
     def _library_dir_ok(d: Path, root: Path | None) -> bool:
         """A folder the library may read items from: a real folder that is not a link, with no link between `root`
-        and it (`root` included). `root` None = a folder the administrator named in GOOSE_RECIPE_PATH: only the
-        folder itself is examined."""
+        and it (`root` included). `root` None = a folder that is the administrator's own arrangement (the native
+        profile's config folders, GOOSE_RECIPE_PATH): only the folder itself is examined."""
         if _is_reparse(d) or not d.is_dir():
             return False
         return root is None or _inside_profile(d, root)
@@ -1075,8 +1141,9 @@ class Profiles:
     def _recipe_dirs(self, user: dict) -> list[Path]:
         """Where this profile's recipes are. A member's profile: its own config/recipes. The native profile: also
         the administrator's GOOSE_RECIPE_PATH and Goose's home-folder recipe folders (HOME_RECIPE_DIRS)."""
-        cands: list[tuple[Path, Path | None]] = [(self.config_dir(user) / "recipes", self.root_for(user))]
-        if self.is_native(user):
+        native = self.is_native(user)
+        cands: list[tuple[Path, Path | None]] = [(self.config_dir(user) / "recipes", None if native else self.root_for(user))]
+        if native:
             for d in (os.environ.get("GOOSE_RECIPE_PATH") or "").split(os.pathsep):
                 if d.strip():
                     cands.append((Path(d.strip()), None))
@@ -1091,18 +1158,27 @@ class Profiles:
                 out.append(d)
         return out
 
-    def _skill_dirs(self, user: dict) -> list[Path]:
-        """The folders this profile's Goose loads global skills from, in Goose's order of precedence. A member's
-        profile: its own config/skills. The native profile: Goose's home-folder skill folders of the gateway's
-        account as well (spec 028) - ~/.agents/skills first, then config/skills, then the others."""
-        cfg = (self.config_dir(user) / "skills", self.root_for(user))
+    def _skill_dirs(self, user: dict) -> list[tuple[Path, bool]]:
+        """(folder, offered) for the folders this profile's Goose loads global skills from, in Goose's order of
+        precedence. A member's profile: its own config/skills. The native profile: Goose's home-folder skill folders
+        of the gateway's account as well (spec 028) - ~/.agents/skills first, then config/skills, then the others.
+        `offered` False = Goose loads from it but the library does not read it (it is a link or lies behind one):
+        its skills still take their names, so that a later folder's skill of the same name is not offered in their
+        place (second review, M-5)."""
         if not self.is_native(user):
-            cands = [cfg]
+            cands: list[tuple[Path, Path | None]] = [(self.config_dir(user) / "skills", self.root_for(user))]
         else:
             h = account_home()
             first, *rest = HOME_SKILL_DIRS
-            cands = [(h.joinpath(*first), h), cfg, *[(h.joinpath(*r), h) for r in rest]]
-        return [d for d, root in cands if self._library_dir_ok(d, root)]
+            # the native config folder is the administrator's own arrangement: only the folder itself is examined
+            # (M-6: with the profile root as the starting point a linked root emptied the picker without a word)
+            cands = [(h.joinpath(*first), h), (self.config_dir(user) / "skills", None), *[(h.joinpath(*r), h) for r in rest]]
+        out = []
+        for d, root in cands:
+            ok = self._library_dir_ok(d, root)
+            if ok or (self.is_native(user) and d.is_dir()):
+                out.append((d, ok))
+        return out
 
     @staticmethod
     def _read_skill_files(d: Path) -> dict[str, str]:
@@ -1110,25 +1186,41 @@ class Profiles:
         linked folder is not entered, a linked or hard-linked file is skipped, and a file whose real location is
         outside the folder is skipped. Binary files are not shared. Raises ValueError when the skill cannot be
         shared: too large, too many files or folders, nested too deeply, a path too long, or no regular SKILL.md.
-        The walk itself is bounded: whoever fills the folder decides how big it is."""
+        Every limit applies before the work it limits: whoever fills the folder decides how big it is, so a folder
+        is never listed further than the entries that are still allowed (second review, M-10)."""
         if _is_reparse(d) or not d.is_dir():
             raise ValueError("the skill folder is a link or not a folder; it is not shared")
         real = _real_norm(d).rstrip("\\/") + os.sep
         files: dict[str, str] = {}
         total = count = entries = 0
-        for cur, dirs, names in os.walk(d, followlinks=False):
-            depth = len(Path(cur).relative_to(d).parts)
-            entries += len(dirs) + len(names)
+        skill_md = ""                       # the on-disk name of the top-level file that became SKILL.md
+        todo: list[tuple[Path, int]] = [(d, 0)]
+        while todo:
+            cur, depth = todo.pop(0)
+            names = [p.name for p in _scan(cur, MAX_SKILL_ENTRIES - entries + 1)]
+            entries += len(names)
             if entries > MAX_SKILL_ENTRIES:
                 raise ValueError(f"skill has too many files and folders to share ({MAX_SKILL_ENTRIES} at most)")
-            dirs[:] = sorted(x for x in dirs if not _is_reparse(Path(cur) / x))   # never descend into a link
-            if dirs and depth >= MAX_SKILL_DEPTH:
-                raise ValueError(f"skill folders are nested too deeply to share ({MAX_SKILL_DEPTH} levels at most)")
-            for n in sorted(names):
-                f = Path(cur) / n
+            for n in names:   # sorted by _scan: upper case first, so an exact SKILL.md comes before another case
+                f = cur / n
+                if _is_reparse(f):
+                    continue                # never through a link, file or folder
+                if f.is_dir():
+                    if depth >= MAX_SKILL_DEPTH:
+                        raise ValueError(f"skill folders are nested too deeply to share ({MAX_SKILL_DEPTH} levels at most)")
+                    todo.append((f, depth + 1))
+                    continue
                 if n.lower() == MANAGED_MARK or _linked(f) or not f.is_file() or not _real_norm(f).startswith(real):
                     continue
                 rel = f.relative_to(d).as_posix()
+                if depth == 0 and n.lower() == "skill.md":
+                    # Windows finds it under any case; members get the canonical name. In a case-sensitive folder
+                    # the exact SKILL.md is the one, and two other variants are ambiguous (second review, M-7).
+                    if skill_md == "SKILL.md":
+                        continue
+                    if skill_md:
+                        raise ValueError(f"the skill has both {skill_md} and {n}; it is not shared")
+                    skill_md, rel = n, "SKILL.md"
                 if len(rel) > MAX_SKILL_REL_PATH:
                     raise ValueError(f"a file path inside the skill is too long to share ({MAX_SKILL_REL_PATH} "
                                      f"characters at most): {rel[:60]}...")
@@ -1138,8 +1230,6 @@ class Profiles:
                 total += f.stat().st_size
                 if total > MAX_SKILL_BYTES:
                     raise ValueError("skill too large to share (2 MB limit)")
-                if depth == 0 and n.lower() == "skill.md":
-                    rel = "SKILL.md"   # Windows finds it under any case; members get the canonical name
                 try:
                     files[rel] = f.read_text(encoding="utf-8")
                 except UnicodeDecodeError:
@@ -1150,21 +1240,24 @@ class Profiles:
 
     def library(self, user: dict, kind: str) -> list[dict]:
         """What the "Add from library" picker offers from `user`'s profile. Everything a member's profile holds is
-        the member's to write, so every value is bounded and typed before it leaves here (review of 1.21.0, L-2 and
-        L-4): at most 2000 entries of a folder are looked at, large files are skipped, a description is text."""
+        the member's to write, so every value is bounded and is sendable text before it leaves here (reviews of
+        1.21.0: L-2, L-4, M-8, M-10): at most LIBRARY_SCAN entries of a folder are looked at, large files are
+        skipped, one listing parses at most LIBRARY_BYTES, a name or description is text of bounded length."""
         out: list[dict] = []
         cfg_dir = self.config_dir(user)
-
-        def text(v: Any, limit: int = 500) -> str:
-            return v[:limit] if isinstance(v, str) else ""
+        member = not self.is_native(user)
         if kind == "recipe":
+            budget = LIBRARY_BYTES
             for d in self._recipe_dirs(user):
                 for f in _scan(d):
-                    if f.suffix.lower() not in (".yaml", ".yml", ".json") or _linked(f) or not f.is_file():
+                    if f.suffix.lower() not in (".yaml", ".yml", ".json") or not _sendable(f.name) \
+                            or _linked(f) or not f.is_file():
                         continue   # never read through a link (spec 028, D5)
                     try:
-                        if f.stat().st_size > MAX_RECIPE_BYTES:
+                        size = f.stat().st_size
+                        if size > MAX_RECIPE_BYTES or size > budget:
                             continue
+                        budget -= size
                         data = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
                     except Exception:
                         continue
@@ -1172,19 +1265,21 @@ class Profiles:
                         continue
                     r = data.get("recipe", data) if isinstance(data.get("recipe"), dict) else data
                     out.append({"kind": "recipe", "ref": str(f), "name": f.stem,
-                                "description": text(r.get("description")) or text(r.get("title")), "source": str(d)})
+                                "description": _text(r.get("description")) or _text(r.get("title")), "source": str(d)})
         elif kind == "skill":
             seen: set[str] = set()
-            for sk in self._skill_dirs(user):
+            for sk, offered in self._skill_dirs(user):
                 for d in _scan(sk):
                     md = d / "SKILL.md"
                     key = d.name.casefold()   # one folder on Windows whatever the case
                     if key in seen or not os.path.lexists(md):
                         continue
                     # The first folder that has a skill of this name is the one Goose loads: the name is taken from
-                    # here on, also when this one is a link and therefore not offered (review L-8).
+                    # here on, also when this one is a link, or in a linked folder, and therefore not offered
+                    # (reviews L-8, M-5).
                     seen.add(key)
-                    if _is_reparse(d) or not d.is_dir() or _linked(md) or not md.is_file():
+                    if not offered or not _sendable(d.name) or _is_reparse(d) or not d.is_dir() \
+                            or _linked(md) or not md.is_file():
                         continue
                     try:
                         head = _read_head(md)
@@ -1192,40 +1287,49 @@ class Profiles:
                         continue
                     m = re.search(r"^description:\s*(.+)$", head, re.M)
                     out.append({"kind": "skill", "ref": d.name, "name": d.name,
-                                "description": m.group(1).strip().strip("'\"")[:500] if m else "", "source": str(sk)})
+                                "description": _text(m.group(1).strip().strip("'\"")) if m else "", "source": str(sk)})
         elif kind == "extension":
             cp = cfg_dir / "config.yaml"
             try:
-                cfg = _read_yaml(cp) if self._profile_file_ok(user, cp) else {}
+                readable = self._profile_file_ok(user, cp) and not (member and cp.stat().st_size > MAX_RECIPE_BYTES)
+                cfg = _read_yaml(cp) if readable else {}
             except Exception:
                 cfg = {}
             exts = cfg.get("extensions") if isinstance(cfg, dict) else None
-            for key, e in sorted((exts if isinstance(exts, dict) else {}).items(), key=lambda kv: str(kv[0])):
-                if isinstance(e, dict) and isinstance(key, str):
-                    out.append({"kind": "extension", "ref": key, "name": text(e.get("display_name"), 200) or key,
-                                "description": text(e.get("description")) or text(e.get("type")),
+            keys = sorted(k for k in itertools.islice(exts if isinstance(exts, dict) else {}, LIBRARY_SCAN)
+                          if isinstance(k, str) and _sendable(k))
+            for key in keys:
+                e = exts[key]
+                if isinstance(e, dict):
+                    out.append({"kind": "extension", "ref": key, "name": _text(e.get("display_name"), 200) or key,
+                                "description": _text(e.get("description")) or _text(e.get("type")),
                                 "source": "config.yaml", "enabled": bool(e.get("enabled"))})
         elif kind == "provider":
             cp = cfg_dir / "custom_providers"
-            if cp.is_dir() if self.is_native(user) else self._library_dir_ok(cp, self.root_for(user)):
+            if self._library_dir_ok(cp, self.root_for(user)) if member else cp.is_dir():
+                budget = LIBRARY_BYTES
                 for f in _scan(cp):
-                    if f.suffix.lower() != ".json" or not self._profile_file_ok(user, f):
+                    if f.suffix.lower() != ".json" or not _sendable(f.name) or not self._profile_file_ok(user, f):
                         continue
                     try:
-                        if f.stat().st_size > MAX_RECIPE_BYTES:
+                        size = f.stat().st_size
+                        if size > MAX_RECIPE_BYTES or size > budget:
                             continue
+                        budget -= size
                         j = json.loads(f.read_text(encoding="utf-8"))
-                    except (ValueError, OSError):
+                    except (ValueError, OSError, RecursionError):
                         continue
                     if not isinstance(j, dict):
                         continue
-                    out.append({"kind": "provider", "ref": f.stem, "name": text(j.get("display_name"), 200) or f.stem,
-                                "description": text(j.get("base_url")) or text(j.get("engine")), "source": str(cp)})
+                    out.append({"kind": "provider", "ref": f.stem, "name": _text(j.get("display_name"), 200) or f.stem,
+                                "description": _text(j.get("base_url")) or _text(j.get("engine")), "source": str(cp)})
         return out
 
     def export_item(self, user: dict, kind: str, ref: str) -> tuple[str, dict]:
         """Build a team-item payload from a profile library item. Secrets are referenced, never copied. Only what
-        the listing offers can be exported, and nothing is read through a link in a member's profile."""
+        the listing offers can be exported, and nothing is read through a link in a member's profile. The payload
+        is plain data of bounded size: it is written out as JSON on the gateway's event loop and copied to every
+        member of the team (second review, M-1)."""
         listed = {i["ref"]: i for i in self.library(user, kind)}
         if ref not in listed:
             raise ValueError(f"{kind} not found in {user['username']}'s profile: {ref}")
@@ -1246,15 +1350,23 @@ class Profiles:
             cp = cfg_dir / "config.yaml"
             if not self._profile_file_ok(user, cp):
                 raise ValueError("config.yaml of that profile is a link or not a file; nothing is shared from it")
-            cfg = _read_yaml(cp)
-            entry = copy.deepcopy((cfg.get("extensions") or {})[ref])
+            entry = (_read_yaml(cp).get("extensions") or {})[ref]
+            if not isinstance(entry, dict) or not _small_tree(entry):
+                raise ValueError("the extension entry is too large, too deeply nested or not plain data; it is not "
+                                 "shared")
+            entry = json.loads(json.dumps(entry))   # a plain copy: no shared parts, nothing but JSON types
             entry["enabled"] = True
             return ref, {"key": ref, "entry": entry, "secretsFrom": user["username"]}
         if kind == "provider":
             f = cfg_dir / "custom_providers" / f"{ref}.json"
             if not self._profile_file_ok(user, f):
                 raise ValueError("the provider file is a link or not a file; it is not shared")
+            if f.stat().st_size > MAX_RECIPE_BYTES:
+                raise ValueError("provider file too large to share (1 MB limit)")
             j = json.loads(f.read_text(encoding="utf-8"))
+            if not isinstance(j, dict) or not _small_tree(j):
+                raise ValueError("the provider file is too deeply nested or not plain data; it is not shared")
+            key = j.get("api_key_env")
             return ref, {"providerId": ref, "json": j, "secretsFrom": user["username"],
-                         "secretKeys": [j["api_key_env"]] if j.get("api_key_env") else []}
+                         "secretKeys": [key] if isinstance(key, str) and key else []}
         raise ValueError("unknown kind")

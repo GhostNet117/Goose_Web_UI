@@ -27,6 +27,18 @@ def _no_model_download(monkeypatch):
     monkeypatch.setattr(guardmodel, "_TRANSPORT", httpx.MockTransport(refuse))
 
 
+from goose_web import profiles as _profiles  # noqa: E402
+
+_REAL_ACCOUNT_HOME = _profiles.account_home   # before any test replaces it
+
+
+@pytest.fixture
+def real_account_home():
+    """The product's own account_home. Every test otherwise gets an empty folder in its place (below), so the
+    function itself would never run in the suite."""
+    return _REAL_ACCOUNT_HOME
+
+
 @pytest.fixture(scope="session")
 def _empty_account_home(tmp_path_factory):
     return tmp_path_factory.mktemp("account-home-empty")

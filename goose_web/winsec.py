@@ -297,32 +297,37 @@ def ensure_unelevated(allow_elevated: bool = False) -> None:
 
 # ------------------------------------------------------------------------------------------------ the profile folder
 _PROFILE_FOLDER: str | None = None
+_PROFILE_ASKED = False
+
+if IS_WINDOWS:  # pragma: no branch
+    class _GUID(ctypes.Structure):
+        _fields_ = [("a", wintypes.DWORD), ("b", wintypes.WORD), ("c", wintypes.WORD), ("d", ctypes.c_ubyte * 8)]
 
 
 def profile_folder() -> str | None:
     """The home folder of this process's account as Windows knows it (FOLDERID_Profile), or None when it cannot be
     asked (other platforms, an error). Goose finds its global skill, recipe and agent folders under it and does not
-    go by the USERPROFILE variable (spec 028: measured with the Goose binary), so Goose Web asks the same way."""
-    global _PROFILE_FOLDER
-    if _PROFILE_FOLDER is not None or not IS_WINDOWS:
+    go by the USERPROFILE variable (spec 028: measured with the Goose binary), so Goose Web asks the same way.
+    Asked once per process, whatever the answer."""
+    global _PROFILE_FOLDER, _PROFILE_ASKED
+    if _PROFILE_ASKED or not IS_WINDOWS:
         return _PROFILE_FOLDER
+    _PROFILE_ASKED = True
     try:
-        class GUID(ctypes.Structure):
-            _fields_ = [("a", wintypes.DWORD), ("b", wintypes.WORD), ("c", wintypes.WORD), ("d", ctypes.c_ubyte * 8)]
-
         shell32, ole32 = ctypes.WinDLL("shell32"), ctypes.WinDLL("ole32")
-        shell32.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+        shell32.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(_GUID), wintypes.DWORD, wintypes.HANDLE,
                                                  ctypes.POINTER(ctypes.c_void_p)]
         shell32.SHGetKnownFolderPath.restype = ctypes.c_long
         ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
         ole32.CoTaskMemFree.restype = None
-        fid = GUID(0x5E6C858F, 0x0E22, 0x4760, (ctypes.c_ubyte * 8)(0x9A, 0xFE, 0xEA, 0x33, 0x17, 0xB6, 0x71, 0x73))
+        fid = _GUID(0x5E6C858F, 0x0E22, 0x4760, (ctypes.c_ubyte * 8)(0x9A, 0xFE, 0xEA, 0x33, 0x17, 0xB6, 0x71, 0x73))
         ptr = ctypes.c_void_p()
-        if shell32.SHGetKnownFolderPath(ctypes.byref(fid), 0, None, ctypes.byref(ptr)) == 0 and ptr.value:
-            try:
+        try:
+            if shell32.SHGetKnownFolderPath(ctypes.byref(fid), 0, None, ctypes.byref(ptr)) == 0 and ptr.value:
                 _PROFILE_FOLDER = ctypes.wstring_at(ptr.value) or None
-            finally:
-                ole32.CoTaskMemFree(ptr)
+        finally:
+            if ptr.value:
+                ole32.CoTaskMemFree(ptr)   # freed whatever the result, as the API asks
     except Exception:  # pragma: no cover - the caller falls back to the environment
         _PROFILE_FOLDER = None
     return _PROFILE_FOLDER
