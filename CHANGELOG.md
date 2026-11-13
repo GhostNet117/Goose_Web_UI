@@ -9,33 +9,51 @@ The AppContainer backend (`sandbox.backend: appcontainer`, or `sandbox.fallback:
 run MXC) had been covered by unit tests only since MXC became the default. It was run again with real containers and
 the real goose binary (SECURITY-ASSESSMENT 16): a member's agent starts, answers, reaches a loopback model and the
 prompt injection classifier of 1.20.0 through its relays, and is confined to its folders - not even the names of
-files outside them are listed, loopback is closed, and no link to anything outside can be made.
+files outside them are listed, loopback is closed, and it cannot create a link to a file or folder it may not write.
 
-- **Known limit, both backends (AC-1): a sandboxed agent can read the registry of the account the gateway runs
-  as** wherever Windows lets application containers read it, and `HKEY_CURRENT_USER\Environment` - the account's
-  user environment variables - is such a place. The environment Goose Web gives a sandboxed agent is an allow-list,
-  but the variables can be read from the registry all the same. Goose Web cannot prevent this. **Keep secrets out
-  of the user environment variables of the gateway's account, or run the gateway under an account used for nothing
-  else.** `goose-web check` has a new line, "account registry", that names the user variables that look like secrets.
+- **Known limit, both backends (AC-1): a sandboxed agent can read the registry** wherever Windows lets application
+  containers read it. That includes the user environment variables of the account the gateway runs as
+  (`HKEY_CURRENT_USER\Environment`) and the machine's environment variables. The environment Goose Web gives a
+  sandboxed agent is an allow-list, but the variables can be read from the registry all the same. Goose Web does not
+  prevent this: it would mean changing the access rights of registry keys of the account. **Keep secrets out of
+  environment variables on the gateway's machine - the user variables of the gateway's account and the machine's
+  variables - or, for the user variables, run the gateway under an account used for nothing else.** `goose-web
+  check` has a new line, "registry", that names the variables whose names look like secrets.
 - **The folder rules of MXC now hold for the AppContainer backend too (AC-2).** A team folder or extra folder that is
-  the gateway's system folder, the profiles root, another member's profile, the native Goose profile or - for
-  writing - Goose Web's code, its Python, the goose folder or the MXC folder is left out and logged
-  (`sandbox appcontainer: <user>: grant <path> refused: <why>`). Before, such a folder was granted as configured.
+  the gateway's system folder, the profiles root, another member's profile, the native Goose profile, a drive root,
+  a network path or - for writing - Goose Web's code, its Python, the goose folder or the MXC folder is left out and
+  logged (`sandbox appcontainer: <user>: grant <path> refused: <why>`). Before, such a folder was granted as
+  configured. A grant made by an earlier version that is refused now is taken back at the member's next start.
+- **A program folder reached through a directory link is granted where it really is (AC-11).** Changing the
+  permissions of a junction changes the link, not the folder behind it, so a program started through the link could
+  not load its DLLs. uv keeps its Pythons behind such a link: on a gateway running on one, the relay forwarders did
+  not start with the AppContainer backend. The start now resolves links before it grants. Found by the test run on
+  Python 3.11.
 - **A relay serves a bounded number of connections (AC-3):** `sandbox.proxy_max_connections` per member and service
   (default 64). Before, one member's agent could open connections until the gateway ran out of threads.
 - **A sandboxed process that cannot join its kill-on-close job is ended before it runs (AC-4)**, as with MXC.
 - **Relay URL rewrite (AC-5):** a service on port 80 no longer rewrites a URL on port 8080; the record that undoes the
   rewrite is written first; files are replaced as a whole with their bytes kept (line endings were converted
-  before) and never written through a link; at most 500 provider files of at most 1 MB are looked at.
-- **`sandbox.relays` is checked (AC-6):** an entry that is not `host:port` (IPv4 address or name, port 1 to 65535)
-  is a configuration problem that `check` and the worker's error name. Before, it failed the member's connection
-  with a traceback. IPv6 addresses are refused: they never worked with the URL rewrite.
-- A relay forwarder that does not answer within 30 seconds no longer holds the worker's start; the normal end of an
-  answer is no longer written to the worker log as an error (AC-8); state files are replaced as a whole (AC-7).
-- Documents corrected: an AppContainer cannot create links to files outside its folders (the administration guide
-  said it could); Windows gives an AppContainer its own TEMP and LOCALAPPDATA folder whatever the gateway sets.
+  before) and never written through a link; the first 500 entries of the providers folder are looked at, files of
+  at most 1 MB. A restore that cannot finish - a file in use, a file that has become a link - is tried again at
+  every start of that member's agent.
+- **`sandbox.relays` is checked (AC-6):** an entry that is not `host:port` (an IPv4 address or a name, port 1 to
+  65535) is left out and named by `check`, `sandbox status` and the gateway log; the other relays work and members'
+  agents start. Before, with the AppContainer backend it failed the member's connection with a traceback. IPv6
+  addresses are left out too: they never worked with the URL rewrite. A value that is not a list relays nothing.
+- **Two relayed services on the same port** (or one on the port of the classification endpoint) each get a forward
+  address of their own (`127.64.x.y`, `127.65.x.y`, ...). Before, the second forwarder could not start and that
+  stopped all relays of every member.
+- **A member's container can no longer create instances of its own relay pipe.** With one it could keep the
+  gateway's serving thread alive after the worker stopped.
+- A relay forwarder that does not answer within 30 seconds no longer holds the worker's start, and the forwarder file
+  in a member's profile is never read beyond its expected size; the normal end of an answer is no longer written to
+  the worker log as an error (AC-8); state files are replaced as a whole (AC-7); a folder permission that could not
+  be taken back stays on record and is tried again.
+- Documents corrected: an AppContainer cannot create links to files it may not write (the administration guide said
+  it could); Windows gives an AppContainer its own TEMP and LOCALAPPDATA folder whatever the gateway sets.
 - Tests: `tests/test_appcontainer.py` (real containers on Windows: files, names, links, loopback, relay, pipe
-  access, connection limit, job).
+  access, connection limit, job). The change was reviewed independently before release (SECURITY-ASSESSMENT 16.6).
 
 ## 1.21.0 - 2026-11-13
 

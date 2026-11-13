@@ -1037,35 +1037,38 @@ worker ended goose and both forwarders; removing the container removed its grant
 | Files outside the grants | Refused for reading and for listing: another member's profile, the system folder, the profiles root, the gateway account's home folder and Goose's home-folder skills and agents in it (section 15), the native Goose profile and its `secrets.yaml`, the install folder, the drive root. Unlike MXC (Q2), names are not listable either. A child process is refused the same way. |
 | Network | Loopback, and this machine's own LAN address, are closed with every capability. Without a capability there is no network at all; with `internetClient` name lookup, TCP and TLS with certificate check work. |
 | Relay | Works. Another member's container is refused by the pipe (access denied). |
-| Links | A hard link to a file outside, a hard link to a file in a read-only grant, a junction to a folder outside or to another member's folder, and symbolic links are all refused. Links inside the container's own folders are allowed. Earlier text (13.3, the administration guide) assumed an AppContainer agent could create hard links to outside files; on this Windows it cannot. The scan of MX-3 stays: links can still come from the host. |
+| Links | A hard link to a file outside, a hard link to a file in a read-only grant, and a junction to a folder outside or to another member's folder are refused: the container cannot link to what it may not write. Symbolic links were refused for lack of the privilege (a machine without Developer Mode). Links inside and between the container's own folders are allowed, the team folder included - so a link can outlive a grant that is withdrawn later. Earlier text (13.3, the administration guide) assumed an AppContainer agent could create hard links to any outside file; it cannot. The scan of MX-3 stays for the links that remain possible and for those the host makes. |
 | Processes | The gateway process cannot be opened (query, read memory, terminate). |
 | Temporary files | Windows replaces `TEMP`, `TMP` and `LOCALAPPDATA` of an AppContainer process with a folder of that container under the gateway account's `%LOCALAPPDATA%\Packages`; the values Goose Web sets for them are not what the agent sees. Only that container can use the folder. Without `LOCALAPPDATA` in the environment the process cannot be created at all (error 203), which is why it is on the allow-list. |
 | Registry | **Readable**, see 16.3. |
 
-### 16.3 The registry of the gateway's account is readable - both backends (AC-1, open)
+### 16.3 The registry is readable from the sandbox - both backends (AC-1, open)
 
-**Severity: High where the gateway's account keeps secrets in its user environment variables or elsewhere in its
-registry hive; otherwise information.** A sandboxed agent runs as the gateway's Windows account inside an
-application container. The default access rights of `HKEY_CURRENT_USER` let "ALL APPLICATION PACKAGES" read it, and
-keys below inherit that - among them `HKEY_CURRENT_USER\Environment`, where the account's user environment
-variables are stored.
+**Severity: High where secrets are kept in environment variables stored in the registry (the user variables of the
+gateway's account, the machine's variables) or elsewhere in the account's registry hive; otherwise information.** A
+sandboxed agent runs as the gateway's Windows account inside an application container. The access rights of
+`HKEY_CURRENT_USER` let "ALL APPLICATION PACKAGES" read it, and so do those of `HKEY_CURRENT_USER\Environment`,
+where the account's user environment variables are stored (by an entry of its own or by inheritance, depending on
+the installation), and of the key that holds the machine's environment variables.
 
 - Measured from an AppContainer and from an **MXC** container (whose token is an application-container token too):
-  the key was opened, its value names were listed and a value was read. On the test machine it held 15 values, 9 of
-  them named like API keys. The real agent's shell ran `reg query HKCU\Environment` with the same result.
+  both keys were opened and their value names listed, and a value of the user key was read. On the test machine the
+  user key held 15 values, 9 of them named like API keys. The real agent's shell ran `reg query HKCU\Environment`
+  with the same result.
 - This goes round a control this assessment relied on: C-2 of section 9 ("Sandboxed workers inherited the gateway
   account's environment (API keys)" - fixed by an allow-listed environment) and the statement of 13.2 that the worker
   environment holds no gateway secrets. Both remain true of the *environment*; the same values can be read from the
   registry.
-- **Not closable by Goose Web.** A "less privileged" AppContainer (which ignores the ALL APPLICATION PACKAGES
+- **Not closed by Goose Web.** A "less privileged" AppContainer (which ignores the ALL APPLICATION PACKAGES
   entries) was tried: without the `registryRead` capability Python does not start in it, and with that capability
-  the key is readable again. Changing the access rights of the account's registry keys is not something a web
-  application should do on its own.
-- **What an administrator does** (ADMINISTRATION 11.3): keep secrets out of the user environment variables of the
-  gateway's account, or run the gateway under an account that is used for nothing else. `goose-web check` prints an
-  "account registry" line that names the user variables whose names look like secrets.
+  the key is readable again. A deny entry on the key would close this one key; changing the access rights of an
+  account's registry is the administrator's decision, not something this web application does on its own.
+- **What an administrator does** (ADMINISTRATION 11.3): keep secrets out of environment variables on the gateway's
+  machine; for the user variables, running the gateway under an account that is used for nothing else has the same
+  effect. `goose-web check` prints a "registry" line that names the user and machine variables whose names look
+  like secrets. It judges names only: a secret under a plain name is not found.
 - Not examined: which other keys of other programs under `HKEY_CURRENT_USER` hold secrets on a given machine, and
-  the machine-wide keys an application container may read (`HKEY_LOCAL_MACHINE\SOFTWARE` was readable).
+  the other machine-wide keys an application container may read (`HKEY_LOCAL_MACHINE\SOFTWARE` was readable).
 
 Files are not affected: 16.2 holds for the account's files, the native Goose profile and its secret store.
 
@@ -1073,17 +1076,17 @@ Files are not affected: 16.2 holds for the account's files, the native Goose pro
 
 | Id | Severity | Finding | Change |
 |---|---|---|---|
-| AC-2 | Medium | The AppContainer backend and fallback granted every folder of a member's settings with icacls. MXC filters them at each start; here a team folder set to the code or to a folder above the system folder was granted as written. | `workers._start_appcontainer` applies `mxc.filter_grants`: the same rules, in canonical form and through links; a refused folder is logged |
+| AC-2 | Medium | The AppContainer backend and fallback granted every folder of a member's settings with icacls. MXC filters them at each start; here a team folder set to the code or to a folder above the system folder was granted as written. | `workers._start_appcontainer` applies `mxc.filter_grants`: the same rules, in canonical form and through links; a refused folder is logged, and a grant an earlier version made is taken back |
+| AC-11 | Medium (function) | A granted folder that is reached through a directory link (junction) was granted on the link; the folder behind it stayed closed, and a program started through the link could not load its DLLs (exit 0xC0000135). uv keeps its Pythons behind such a link, so on a gateway running on one the relay forwarders did not start. Found by the test run on Python 3.11, not by review. | The grant filter of AC-2 resolves links, so the grant lands on the real folder (measured: the program then runs through the link) |
 | AC-3 | Medium | A relay accepted any number of connections; each costs the gateway two threads and a socket, and the gateway serves everyone. | At most `sandbox.proxy_max_connections` at once per member and service; more are closed at once and counted |
 | AC-4 | Low | `sandbox.spawn` resumed a process that could not be put in its kill-on-close job (a warning only). | The process is ended while still suspended and the start fails, as MX-9 for MXC; a job that does not exist counts as a failure |
-| AC-5 | Low | The relay URL rewrite matched a port as a prefix (`:80` in `:8080`); wrote the record that undoes it after the rewrite; wrote files in place, converting line endings, and through links in folders the member can write. | The port must end; record first; whole-file replacement with bytes kept; regular files of the profile only, a bounded number and size; the forwarder file is replaced, never written through a link |
-| AC-6 | Low | An entry of `sandbox.relays` that is not `host:port` raised where the member's connection is set up. | It is a configuration problem (fail closed, named in `check` and in the worker's error); IPv6 is refused |
-| AC-7 | Low | Container state files were written in place. | Replaced as a whole |
+| AC-5 | Low | The relay URL rewrite matched a port as a prefix (`:80` in `:8080`); wrote the record that undoes it after the rewrite; wrote files in place, converting line endings, and through links in folders the member can write. | The port must end; record first; whole-file replacement with bytes kept; regular files of the profile only, a bounded number and size, never read beyond the bound; the forwarder file is compared by size first and replaced, never written through a link; a restore that cannot finish is kept as owed and tried again |
+| AC-6 | Low | An entry of `sandbox.relays` that is not `host:port` raised where the member's connection is set up. | Left out and named by `check`, `sandbox status` and the log; nothing else is affected; IPv6 is left out; a value of any type is handled |
+| AC-7 | Low | Container state files were written in place. A folder permission that could not be taken back was dropped from the record. | Replaced as a whole; a failed revoke stays on record and is tried again |
 | AC-8 | Info | The forwarder logged the normal end of every answer as an error; a forwarder that printed nothing held the worker's start for ever. | Not logged; the start waits 30 s |
-
-Considered and left: the container holds the right to create further instances of its own relay pipe (GENERIC_WRITE
-includes it). Only its own forwarder connects to that name, and it refuses a pipe that is not served by the gateway
-process, so nothing is gained by it.
+| V-9 | Low | The container held the right to create further instances of its own relay pipe (GENERIC_WRITE includes it). Its forwarder refuses a pipe not served by the gateway, but with an instance of its own in front of the gateway's the agent could keep the serving thread alive after the worker stopped. | The pipe grants the container read and write-data only; the forwarder opens it that way (measured: creating an instance is refused, the relay works) |
+| V-12 | Low | Two relayed services on one port shared one forward address: the second forwarder could not bind, and that stopped all relays of every member. | Each gets an address of its own (`127.64.x.y`, `127.65.x.y`, ...) |
+| V-8 | Low | A relay target whose name cannot be encoded raised something other than `OSError` in the gateway; the pipe instance stayed open. | Such names are refused as targets, and any failure to connect closes the instance |
 
 ### 16.5 Residual risks
 
@@ -1092,8 +1095,36 @@ process, so nothing is gained by it.
   connections on each. A connection that sends nothing holds its place until the service or the agent closes it.
 - Between the gateway's check of a profile file and its replacement a member's agent could swap the file; it could
   only make the gateway replace a name inside the member's own folders (the replacement never follows a link).
+- A member whose `config.yaml` has a second name (a hard link the agent made inside its own folders) is not
+  rewritten: with the AppContainer backend that member's relayed provider does not work until the second name is
+  gone, and after a move to MXC the restore stays owed. Logged at every start.
 - Granting a folder still rewrites its access rights for the container, with inheritance; a folder that passes the
-  rules but holds hard links to files elsewhere carries those files' rights with it (the host's doing, not the
-  agent's).
-- Measured on one Windows build (26100). Older builds that cannot run MXC are the ones this backend is for; the
-  container tests of `tests/test_appcontainer.py` run on every Windows the project's CI runs on.
+  rules but holds hard links to files elsewhere carries those files' rights with it.
+- Not closed, Low (16.6): handles that leak when the creation of a sandboxed process fails before the process
+  exists; the forwarder's own log line for a connection over the limit.
+- Measured on one Windows build (26100). Older builds that cannot run MXC are the ones this backend is for. The
+  container tests of `tests/test_appcontainer.py` run on the Windows image of the project's CI.
+
+### 16.6 Independent review of this change (2026-11-13, before release)
+
+A reviewer who had not written the change read the diff and the code around it and ran the container tests. No High
+finding. What was found, and what became of it:
+
+| Id | Severity | Finding | Status |
+|---|---|---|---|
+| V-1 | Medium | The new connection-limit test raced the relay's threads and failed at random | Fixed (the test waits for the free place) |
+| V-2 | Medium | The check and the documents covered the user variables only; the machine's variables are readable the same way and another account does not help there | Fixed: both are listed and described |
+| V-3 | Medium | The forwarder file in the member's profile was read whole whatever its size, at every start with a relay | Fixed: size first, never more than the expected size is read; the configuration files likewise |
+| V-4 | Low, regression | A restore that could not finish (file in use, link) was logged and forgotten | Fixed: kept as owed, tried again at every start |
+| V-5 | Low, regression | Replacing a file fails while another reader has it open; the in-place write did not | Fixed: tried again for half a second; random temporary name |
+| V-6 | Low, regression | A relay entry that used to be tolerated stopped every member's agent | Fixed: left out and reported, nothing else affected |
+| V-7 | Low | `sandbox.relays` that is not a list ended `check` in a traceback | Fixed |
+| V-8, V-9, V-12 | Low | see 16.4 | Fixed |
+| V-10 | Low | A revoke that failed was dropped from the record | Fixed |
+| V-11 | Low | Process and pipe handles not closed on some paths | Fixed in part: the process handle is closed with its object, the caller's pipe ends when process creation fails. **Open:** failures before the process is created |
+| V-13 | Low | Names such as `OPENAI_API_KEY2`, `GITHUB_PAT`, `apiToken` were not recognised; the [OK] line reassured | Fixed: plurals, digits, camel case, more words; the line says it judges names |
+| V-14 | Low | Sentences that overstated: "no link to anything outside", "cannot prevent", "none of the gateway's variables", the CI claim | Corrected |
+| V-15 | Info | Test hygiene (clean-up when the fixture fails half-way, a process that never ends) | Fixed |
+
+Not verified by the reviewer: anything from inside a container (the review was of code), GitHub's Windows image,
+older Windows builds, and a possible reuse of a handle value between the two relay threads of one connection.

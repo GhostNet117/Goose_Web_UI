@@ -424,6 +424,8 @@ def _print_sandbox_summary(settings, refresh: bool = True) -> bool:
     print(f"Extra program folders (sandbox.read_dirs): {settings.get('sandbox', 'read_dirs') or '-'}")
     for p in sm.get("readDirProblems") or []:
         print(f"[!!] sandbox.read_dirs entry {p['path']!r} is never granted to members: {p['why']}")
+    for p in sm.get("relayProblems") or []:
+        print(f"[!!] {p}")
     if not sm["membersCanStart"]:
         print(f"[!!] sandboxed members' agents do NOT start (fail closed): {sm['reason']}")
     elif sm["reason"]:
@@ -918,26 +920,38 @@ def cmd_security(args, settings) -> int:
 
 
 def _registry_line(settings) -> str:
-    """The `check` line about the gateway account's user environment variables (AC-1, SECURITY-ASSESSMENT 16). A
-    sandboxed agent - MXC and AppContainer alike - can read the registry of the account the gateway runs as wherever
-    Windows lets application containers read it, and HKEY_CURRENT_USER\\Environment is such a place. Goose Web gives
-    a sandboxed agent an environment of its own, but cannot keep it from that key. Information only."""
+    """The `check` line about environment variables stored in the registry (AC-1, SECURITY-ASSESSMENT 16). A
+    sandboxed agent - MXC and AppContainer alike - can read the registry wherever Windows lets application containers
+    read it: the user variables of the account the gateway runs as (HKEY_CURRENT_USER\\Environment) and the machine's
+    (HKEY_LOCAL_MACHINE ... Session Manager\\Environment) are such places. Goose Web gives a sandboxed agent an
+    environment of its own but does not keep it from those keys. Names only are judged, no value is read into this
+    line. Information only: it never fails the check."""
     from . import winsec
     from .config import sandbox_on
-    names = winsec.user_environment_names()
-    if names is None:
-        return "[--] account registry: the user environment variables of this account could not be listed"
-    hot = sorted(n for n in names if winsec.secret_looking(n))
-    if not hot:
-        return (f"[OK] account registry: none of this account's {len(names)} user environment variable(s) is named "
-                "like a secret. Keep it so: members' sandboxed agents can read this account's registry")
-    shown = ", ".join(hot[:5]) + (f" and {len(hot) - 5} more" if len(hot) > 5 else "")
+    user, machine = winsec.user_environment_names(), winsec.machine_environment_names()
+    if user is None and machine is None:
+        return "[--] registry: the environment variables stored in the registry could not be listed"
+    hot_u = sorted(n for n in user or [] if winsec.secret_looking(n))
+    hot_m = sorted(n for n in machine or [] if winsec.secret_looking(n))
+    count = f"{len(user or [])} user and {len(machine or [])} machine environment variable(s)"
+    if not hot_u and not hot_m:
+        return (f"[OK] registry: none of the {count} of this account and this machine is NAMED like a secret (values "
+                "are not looked at). Keep secrets out of them: members' sandboxed agents can read them from the "
+                "registry")
+
+    def show(names):
+        return ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+    parts = ([f"user variables of this account: {show(hot_u)}"] if hot_u else []) + \
+            ([f"machine variables: {show(hot_m)}"] if hot_m else [])
     who = ("Members' sandboxed agents (MXC and AppContainer alike)" if sandbox_on(settings)
            else "Members' agents (the sandbox is off)")
-    return (f"[!!] account registry: {len(hot)} user environment variable(s) of this account are named like secrets "
-            f"({shown}). {who} can read them from the registry (HKEY_CURRENT_USER\\Environment), whatever "
-            "environment Goose Web gives them. Keep secrets out of this account's user variables or run the gateway "
-            "under an account used for nothing else (ADMINISTRATION 11.3)")
+    advice = ("Keep secrets out of user variables or run the gateway under an account used for nothing else"
+              if hot_u else "Keep secrets out of machine variables")
+    if hot_u and hot_m:
+        advice += "; machine variables are readable under any account"
+    return (f"[!!] registry: {len(hot_u) + len(hot_m)} environment variable(s) stored in the registry are named like "
+            f"secrets ({'; '.join(parts)}). {who} can read them from the registry, whatever environment Goose Web "
+            f"gives them. {advice} (ADMINISTRATION 11.3)")
 
 
 def _home_library_line(settings) -> str:
@@ -1031,6 +1045,8 @@ def cmd_check(args, settings) -> int:
         m = sm.get("mxc") or {}
         for p in sm.get("readDirProblems") or []:
             line("sandbox.read_dirs", f"{p['path']} is never granted to members: {p['why']}", False)
+        for p in sm.get("relayProblems") or []:
+            line("sandbox.relays", p.split(" ", 1)[1] if p.startswith("sandbox.relays ") else p, False)
         if not sm["membersCanStart"]:
             line("sandbox", f"backend {sm['backend']}: isolated non-admin workers will NOT start (fail closed): "
                  f"{sm['reason']}. See goose-web sandbox status; MXC: goose-web sandbox install-mxc", False)
@@ -1050,7 +1066,7 @@ def cmd_check(args, settings) -> int:
     try:
         print(_registry_line(settings))
     except Exception as e:
-        print(f"[--] account registry: could not be checked ({e.__class__.__name__})")
+        print(f"[--] registry: could not be checked ({e.__class__.__name__})")
     from . import logjanitor, tls
     try:
         st = tls.status(settings, _tls_override(settings, readonly=True))

@@ -1419,22 +1419,25 @@ Implications:
 On Windows the limits below about the shared OS account are closed for non-admin users by the sandbox (11.6), with
 one exception: the registry.
 
-**The registry of the gateway's account is readable from the sandbox.** A member's sandboxed agent - in an MXC
-container and in an AppContainer alike - runs as the gateway's Windows account inside an application container.
-Windows lets every application container read most of that account's registry (`HKEY_CURRENT_USER`), and that
-includes `HKEY_CURRENT_USER\Environment`, where the account's **user environment variables** are stored. Goose Web
-gives a sandboxed agent an environment of its own (an allow-list: none of the gateway's variables), but an agent that
-can run a command can read the variables from the registry (`reg query HKCU\Environment`). Measured with both
+**The registry is readable from the sandbox.** A member's sandboxed agent - in an MXC container and in an
+AppContainer alike - runs as the gateway's Windows account inside an application container. Windows lets every
+application container read most of that account's registry (`HKEY_CURRENT_USER`) and much of the machine's. That
+includes `HKEY_CURRENT_USER\Environment`, where the account's **user environment variables** are stored, and the
+key of the machine's environment variables. Goose Web gives a sandboxed agent an environment of its own (an
+allow-list: system locations such as `PATH` and `SystemRoot`, none of the gateway's other variables), but an agent
+that can run a command can read the variables from the registry (`reg query HKCU\Environment`). Measured with both
 backends and with the real agent; a "less privileged" container is not a way out (Python does not start in one
-without registry access). Goose Web cannot prevent it. What you can do:
+without registry access). Goose Web does not prevent it: that would mean changing the access rights of registry
+keys of your account. What you can do:
 
-- **Keep secrets out of the user environment variables of the gateway's account** (API keys, tokens). Provider keys
-  belong in Goose's own secret store of each profile.
+- **Keep secrets out of environment variables on this machine**: the user variables of the gateway's account (API
+  keys, tokens) and the machine's variables. Provider keys belong in Goose's own secret store of each profile.
 - Or **run the gateway under a Windows account that is used for nothing else**, so that its registry holds nothing
-  of value. This is the recommended set-up when members are not fully trusted.
-- `goose-web check` prints an "account registry" line naming the user variables whose names look like secrets
-  (`KEY`, `TOKEN`, `SECRET`, `PASSWORD` ...). Other programs' settings under `HKEY_CURRENT_USER` are readable the
-  same way; Goose Web does not inspect them.
+  of value. This is the recommended set-up when members are not fully trusted. It does not cover the machine's
+  variables: those are readable under any account.
+- `goose-web check` prints a "registry" line naming the user and machine variables whose names look like secrets
+  (`KEY`, `TOKEN`, `SECRET`, `PASSWORD` ...). It judges names, not values. Other programs' settings under
+  `HKEY_CURRENT_USER` are readable the same way; Goose Web does not inspect them.
 
 The files of the account are not affected: the sandbox refuses them (11.6).
 
@@ -1566,8 +1569,9 @@ from a policy Goose Web builds at every start:
   (at most 5 s / 200,000 entries) and **does not start** the worker when it finds one: the reason names the files
   (`fsutil hardlink list <file>` shows every name; delete the link). Links between two of the member's own folders are
   fine. Processes inside an MXC container cannot create hard links or junctions, and a process in an AppContainer
-  cannot create a link to a file or folder outside its own folders either (measured for both; until 1.21.0 this
-  guide said an AppContainer could). Such links come from the host.
+  cannot create a link to a file or folder it may not write (measured; until 1.21.0 this guide said it could). It
+  can link between its own folders, the team folder included, so a link can outlive a folder being taken away from
+  the team; other links to the outside come from the host. The scan covers both.
 - **Desktop:** clipboard, input injection, desktop and system-settings control and IME are blocked (Win32k stays on:
   goose.exe and node.exe need it).
 - **Network:** the container has none of its own. When `network` is not `none` or `relays` are set, the gateway runs

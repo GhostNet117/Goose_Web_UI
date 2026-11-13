@@ -37,8 +37,9 @@ IS_WINDOWS = os.name == "nt"
 _ISOLATION_STRIP_PREFIXES = ("GOOSE_",)
 _ISOLATION_KEEP = {"GOOSE_DISABLE_KEYRING", "GOOSE_TELEMETRY_ENABLED"}
 # The only variables a SANDBOXED worker gets from the gateway's environment (see WorkerManager._sandbox_env).
-# LOCALAPPDATA stays the account's (a path, not a secret): inside an AppContainer Windows' GetTempPath ignores TEMP
-# and returns %LOCALAPPDATA%\Packages\<container>\AC\Temp, the container's own folder; goose acp panics without it.
+# LOCALAPPDATA must be present (a path, not a secret): CreateProcess fails with error 203 for an AppContainer without
+# it. Windows then REPLACES it, TEMP and TMP for the process by the container's own folder,
+# %LOCALAPPDATA%\Packages\<container>\AC (measured 2026-11-13, SECURITY-ASSESSMENT 16.2).
 SANDBOX_ENV_ALLOW = ("SystemRoot", "windir", "SystemDrive", "ComSpec", "PATHEXT", "PATH", "OS",
                      "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL",
                      "PROCESSOR_REVISION", "LOCALAPPDATA")
@@ -596,7 +597,9 @@ class WorkerManager:
         from . import sandbox as sb
         w.state = "starting"
         w.backend = "appcontainer"
-        self._links_checked.pop(w.key, None)   # MX-3: the agent can make hard links here; rescan before MXC again
+        # MX-3: scan again before the next MXC start. Measured 2026-11-13: an AppContainer agent cannot link to a
+        # file it may not write, but it can link between its own folders, and a grant can be withdrawn later.
+        self._links_checked.pop(w.key, None)
         w.scheduler, _ = self.wants_scheduler(w)
         spec = w.sandbox or {}
         try:
@@ -786,8 +789,8 @@ class WorkerManager:
             old = {}
         new = {r["target"]: r["listen"] for r in spec.get("relays") or []}
         gone = {t: lst for t, lst in old.items() if new.get(t) != lst}
-        if gone:
-            rl.restore_profile_urls(root, gone)
+        # ... and whatever an earlier restore could not finish (a file in use, a link): tried again at every start
+        rl.restore_pending(str(state_file.parent), spec["name"], root, gone, active=new)
         if not new:
             state_file.unlink(missing_ok=True)
             return

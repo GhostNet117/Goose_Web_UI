@@ -427,16 +427,34 @@ def ensure_normal_priority() -> dict:
     return {"before": _priority_names(raw), "after": process_priority(), "changed": changed, "errors": errors}
 
 
-# ------------------------------------------------------------------ the account's user environment (AC-1)
-_SECRET_WORDS = frozenset({"KEY", "APIKEY", "TOKEN", "SECRET", "SECRETS", "PASSWORD", "PASSWD", "PWD", "PASS",
-                           "CREDENTIAL", "CREDENTIALS"})
+# ------------------------------------------------------------------ environment variables in the registry (AC-1)
+_SECRET_WORDS = frozenset({"KEY", "KEYS", "APIKEY", "APIKEYS", "TOKEN", "TOKENS", "SECRET", "SECRETS", "PASSWORD",
+                           "PASSWORDS", "PASSWD", "PWD", "PASS", "PAT", "AUTH", "CREDENTIAL", "CREDENTIALS", "CRED",
+                           "CREDS", "DSN", "CONNECTIONSTRING", "CONNSTR"})
+_MACHINE_ENVIRONMENT = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
 
 
 def secret_looking(name: str) -> bool:
-    """True for a variable name with a word that says secret: CUSTOM_X_API_KEY, GH_TOKEN, DB_PASSWORD. Whole words
-    only (split at anything but letters and digits): GOOSE_DISABLE_KEYRING and MONKEY are not secrets."""
+    """True for a variable name with a word that says secret: CUSTOM_X_API_KEY, GH_TOKEN, dbPassword, GITHUB_PAT,
+    OPENAI_API_KEY2, CONNECTION_STRING. Whole words only - split at anything but letters, at a change from lower to
+    upper case, and with digits at the end of a word dropped: GOOSE_DISABLE_KEYRING, MONKEY and PATH are not secrets.
+    A judgement of NAMES: a secret under a plain name (DATABASE_URL) is not found."""
     import re
-    return any(w in _SECRET_WORDS for w in re.split(r"[^A-Za-z0-9]+", str(name).upper()) if w)
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(name))
+    words = [w.rstrip("0123456789") for w in re.split(r"[^A-Za-z0-9]+", s.upper()) if w]
+    words = [w for w in words if w]
+    return any(w in _SECRET_WORDS for w in words) or "CONNECTIONSTRING" in "".join(words)
+
+
+def _value_names(root: str, key: str) -> list[str] | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(getattr(winreg, root), key) as k:
+            return [winreg.EnumValue(k, i)[0] for i in range(winreg.QueryInfoKey(k)[1])]
+    except OSError:
+        return None
 
 
 def user_environment_names() -> list[str] | None:
@@ -446,11 +464,10 @@ def user_environment_names() -> list[str] | None:
     Why Goose Web asks: an application container - MXC and AppContainer alike - may read this key, as it may read
     most of HKEY_CURRENT_USER, so a member's sandboxed agent can read these variables from the registry whatever
     environment the gateway gives it (measured 2026-11-13, SECURITY-ASSESSMENT 16)."""
-    if sys.platform != "win32":
-        return None
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
-            return [winreg.EnumValue(k, i)[0] for i in range(winreg.QueryInfoKey(k)[1])]
-    except OSError:
-        return None
+    return _value_names("HKEY_CURRENT_USER", "Environment")
+
+
+def machine_environment_names() -> list[str] | None:
+    """The names of the machine's environment variables (HKEY_LOCAL_MACHINE, Session Manager\\Environment), which
+    an application container may read as well (measured with both backends); None when they cannot be listed."""
+    return _value_names("HKEY_LOCAL_MACHINE", _MACHINE_ENVIRONMENT)

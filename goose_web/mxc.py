@@ -627,13 +627,16 @@ def availability(settings, refresh: bool = False) -> dict:
 
 def summary(settings, refresh: bool = False) -> dict:
     """The sandbox state for `sandbox status`, `check` and Admin > System (spec 025 R1/R3)."""
-    from .config import sandbox_backend, sandbox_config_problems, sandbox_fallback, sandbox_on
+    from .config import (sandbox_backend, sandbox_config_problems, sandbox_fallback, sandbox_on,
+                         sandbox_relay_problems)
     on = sandbox_on(settings)
+    relays = settings.get("sandbox", "relays") or []
     backend = sandbox_backend(settings)
     out: dict[str, Any] = {
         "enabled": on, "backend": backend, "configuredBackend": str(settings.get("sandbox", "backend") or "mxc"),
         "fallback": sandbox_fallback(settings), "network": str(settings.get("sandbox", "network") or "internet"),
-        "relays": [str(t) for t in (settings.get("sandbox", "relays") or [])], "problems": sandbox_config_problems(settings),
+        "relays": [str(t) for t in relays] if isinstance(relays, (list, tuple)) else [],     # V-7: any type
+        "relayProblems": sandbox_relay_problems(settings), "problems": sandbox_config_problems(settings),
         "mxcDir": str(mxc_dir(settings)), "membersCanStart": True, "reason": "",
         "readDirProblems": [{"path": p, "why": w} for p, w in read_dir_problems(settings)]}
     if backend == "mxc" or out["fallback"] == "appcontainer":

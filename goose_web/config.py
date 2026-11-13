@@ -111,15 +111,22 @@ def sandbox_config_problems(settings: "Settings") -> list[str]:
                 raise ValueError
         except (TypeError, ValueError):
             out.append(f"sandbox.{key} is {settings.get('sandbox', key)!r}; use a number from {lo} to {hi}")
+    return out
+
+
+def sandbox_relay_problems(settings: "Settings") -> list[str]:
+    """`sandbox.relays` entries that are left out (AC-6). Not among sandbox_config_problems: a relay that is not
+    there can only mean less access, so members' agents still start; `check`, `sandbox status` and the gateway log
+    name the entry."""
     relays = settings.get("sandbox", "relays") or []
     if not isinstance(relays, (list, tuple)):
-        out.append(f"sandbox.relays is {relays!r}; use a list of host:port entries")
-    else:
-        from .relay import target_problem
-        for t in relays:
-            why = target_problem(t) if t else ""
-            if why:
-                out.append(f"sandbox.relays entry {t!r}: {why}; use host:port, for example 127.0.0.1:4000")
+        return [f"sandbox.relays is {relays!r}; use a list of host:port entries (no service is relayed)"]
+    from .relay import target_problem
+    out = []
+    for t in relays:
+        why = target_problem(t) if t else ""
+        if why:
+            out.append(f"sandbox.relays entry {t!r} is left out: {why}; use host:port, for example 127.0.0.1:4000")
     return out
 
 

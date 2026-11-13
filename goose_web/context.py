@@ -233,10 +233,15 @@ class Ctx:
         net = str(self.settings.get("sandbox", "network") or "internet").strip().lower()
         from . import relay as rl
         name = sb.container_name(str(self.settings.profiles_root), user["username"])
-        # AC-6: an entry that is not host:port is a configuration problem (sandbox_config_problems: the worker does
-        # not start and says why); it must not raise here, where it would fail the member's connection instead
+        # AC-6: an entry that is not host:port is left out and reported (config.sandbox_relay_problems: the log,
+        # `check`, `sandbox status`); it must not raise here, where it failed the member's connection
         raw = self.settings.get("sandbox", "relays") or []
         targets = [t for t in (raw if isinstance(raw, (list, tuple)) else []) if t and not rl.target_problem(t)]
+        from .config import sandbox_relay_problems
+        for p in sandbox_relay_problems(self.settings):
+            if p not in _RELAY_PROBLEMS_LOGGED:
+                _RELAY_PROBLEMS_LOGGED.add(p)
+                log.error("sandbox: %s", p)
         # Spec 026: Goose's prompt injection detection inside the sandbox asks the gateway's classification endpoint
         # (loopback, its own port). It is the only part of the gateway a sandboxed agent can reach.
         cls = self.classify
@@ -271,6 +276,9 @@ class Ctx:
     def audit(self, request: HTTPConnection, action: str, user: dict | None, target: str = "",
               detail: dict | None = None, ok: bool = True) -> None:
         self.db.audit(action, user=user, ip=self.client_ip(request), target=target, detail=detail, ok=ok)
+
+
+_RELAY_PROBLEMS_LOGGED: set[str] = set()     # each bad sandbox.relays entry is logged once
 
 
 def url_origin(url: str) -> str:

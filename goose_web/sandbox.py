@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import subprocess
 import sys
 import threading
@@ -219,6 +220,11 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
 
         terminate = kill
 
+        def __del__(self):
+            h, self._handle = getattr(self, "_handle", None), None
+            if h:
+                _k32.CloseHandle(h)
+
     def _pipe() -> tuple[int, int]:
         sa = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), None, True)
         r, w = wintypes.HANDLE(), wintypes.HANDLE()
@@ -270,6 +276,10 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
             if not _k32.CreateProcessW(None, cmd, None, None, True, flags, envbuf, cwd, ctypes.byref(si),
                                        ctypes.byref(pi)):
                 raise SandboxError(f"CreateProcess in AppContainer failed ({ctypes.get_last_error()})")
+        except BaseException:
+            _k32.CloseHandle(in_w)      # the caller's ends: nobody will ever read or write them
+            _k32.CloseHandle(out_r)
+            raise
         finally:
             _k32.DeleteProcThreadAttributeList(buf)
             for s in [app_sid, *cap_sids]:
@@ -342,19 +352,23 @@ def load_state(state_dir: str, name: str) -> dict:
 def write_atomic(path: Path | str, text: str) -> None:
     """The whole file or nothing (AC-5, AC-7): written to a new file beside the target and moved over it, bytes as
     given (no newline translation). A target name that is a link is replaced by a file of its own, never written
-    through; the temporary name is created exclusively, so nothing planted under that name is written through
-    either. On any failure the temporary file is removed and the target is as it was."""
+    through. The temporary file has a random name and is created exclusively, so it is new, whatever sits in the
+    folder. A target that is open elsewhere without delete sharing (a reader of ours) refuses the move for a
+    moment: tried again for half a second. On failure the temporary file is removed and the target is as it was."""
     path = Path(path)
-    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    tmp = path.with_name(f"{path.name}.{secrets.token_hex(6)}.tmp")
     try:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0))
         with os.fdopen(fd, "wb") as f:
             f.write(text.encode("utf-8"))
-        os.replace(tmp, path)
+        for attempt in range(10):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.05)
     except BaseException:
         try:
             tmp.unlink()
@@ -391,6 +405,10 @@ def prepare(name: str, state_dir: str, grants: dict[str, str]) -> dict:
             revoke(p, sid)
         except SandboxError as e:
             log.warning("sandbox %s: %s", name, e)
+            # The entry is still on the folder: keep it on record, so that the next start tries again (V-10). Not
+            # when the folder is granted anew below - that grant replaces it.
+            if os.path.normcase(p) not in {os.path.normcase(k) for k in present}:
+                missing[p] = have[p]
     for p, right in apply.items():
         grant(p, sid, right)
     state = {"name": name, "sid": sid, "grants": present, "pending": missing, "updatedAt": time.time()}

@@ -46,7 +46,8 @@ def parse_target(t: str) -> tuple[str, int]:
     return host.strip("[]"), int(port)
 
 
-_HOST = re.compile(r"[A-Za-z0-9._-]+\Z")
+_LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+_HOST = re.compile(rf"(?=.{{1,253}}\Z){_LABEL}(?:\.{_LABEL})*\Z")
 
 
 def target_problem(t) -> str:
@@ -65,11 +66,15 @@ def target_problem(t) -> str:
     return ""
 
 
-def forward_ip(user_id: int) -> str:
-    """A loopback address of the user's own: 127.64.<hi>.<lo> with lo in 1..254 (the whole 127/8 is loopback on
-    Windows). Unique for the first 65,024 user ids."""
+FORWARD_BLOCKS = 32     # services on one port that a user can be given a forward address for
+
+
+def forward_ip(user_id: int, block: int = 0) -> str:
+    """A loopback address of the user's own: 127.<64 + block>.<hi>.<lo> with lo in 1..254 (the whole 127/8 is
+    loopback on Windows). Unique for the first 65,024 user ids. `block` > 0 gives the same user a further address,
+    for a second relayed service on a port already in use (V-12)."""
     n = int(user_id) % (256 * 254)
-    return f"127.64.{n // 254}.{n % 254 + 1}"
+    return f"127.{64 + int(block)}.{n // 254}.{n % 254 + 1}"
 
 
 PIPE_PREFIX = "\\\\.\\pipe\\goose-web-relay."
@@ -84,11 +89,23 @@ def new_pipe_name() -> str:
 def relay_specs(container: str, user_id: int, targets: list[str]) -> list[dict]:
     """{target, listen} per allow-listed service. The pipe name is chosen per worker start (new_pipe_name), not
     here: the spec must stay the same between calls (a changed spec marks the worker for a restart)."""
-    ip = forward_ip(user_id)
-    out = []
+    out, seen, per_port = [], set(), {}
     for t in targets:
         host, port = parse_target(t)
-        out.append({"target": f"{host}:{port}", "listen": f"{ip}:{port}"})
+        target = f"{host}:{port}"
+        if target.lower() in seen:            # listed twice: one relay
+            continue
+        seen.add(target.lower())
+        # Two services on one port (10.0.0.5:8080 and 127.0.0.1:8080, or a relay on the classification endpoint's
+        # port) cannot share a forward address: the second forwarder could not bind, and that stopped every relay
+        # of every member (V-12). Each gets an address of its own, in the order of the list.
+        block = per_port.get(port, 0)
+        per_port[port] = block + 1
+        if block >= FORWARD_BLOCKS:
+            log.error("relay %s: more than %d relayed services on port %d; this one is left out", target,
+                      FORWARD_BLOCKS, port)
+            continue
+        out.append({"target": target, "listen": f"{forward_ip(user_id, block)}:{port}"})
     return out
 
 
@@ -134,41 +151,62 @@ def state_mapping(state_dir: str | Path, name: str) -> dict[str, str]:
     return out
 
 
-MAX_REWRITE_FILES = 500           # custom provider files looked at per profile
+MAX_REWRITE_FILES = 500           # entries of the custom providers folder that are looked at
 MAX_REWRITE_BYTES = 1024 * 1024   # a larger file is not a Goose configuration file; it is left alone
 
 
-def _own_config_files(profile_root: str) -> list[Path]:
-    """config.yaml and the custom provider files of a profile that the gateway may rewrite (AC-5). The member can
-    write in these folders and the gateway writes with its own rights, so: regular files only, none that is a link
-    or has a second name, nothing below a folder that is a link, a bounded number."""
+def _config_files(profile_root: str) -> tuple[list[Path], list[Path]]:
+    """(files, links): config.yaml and the custom provider files of a profile that the gateway may rewrite (AC-5),
+    and what it must not touch because it is a link. The member can write in these folders and the gateway writes
+    with its own rights, so: regular files only, none that is a link or has a second name, nothing below a folder
+    that is a link, and a bounded number of entries."""
     from itertools import islice
     from .profiles import _is_reparse, _linked
     cfg = Path(profile_root) / "config"
-    if _is_reparse(cfg) or not cfg.is_dir():
-        return []
-    files = [cfg / "config.yaml"]
+    if _is_reparse(cfg):
+        return [], [cfg]
+    if not cfg.is_dir():
+        return [], []
+    files, links = [cfg / "config.yaml"], []
     cp = cfg / "custom_providers"
-    if cp.is_dir() and not _is_reparse(cp):
+    if _is_reparse(cp):
+        links.append(cp)
+    elif cp.is_dir():
         try:
             with os.scandir(cp) as it:
                 files += sorted(Path(e.path) for e in islice(it, MAX_REWRITE_FILES) if e.name.lower().endswith(".json"))
         except OSError:
             pass
-    return [f for f in files if f.is_file() and not _linked(f)]
+    ok = []
+    for f in files:
+        if _is_reparse(f) or (f.is_file() and _linked(f)):
+            links.append(f)
+        elif f.is_file():
+            ok.append(f)
+    return ok, links
 
 
-def rewrite_profile_urls(profile_root: str, mapping: dict[str, str]) -> list[str]:
-    """Replace '<target host>:<port>' by '<forward ip>:<port>' in the profile's config.yaml and custom provider
-    JSON files (mapping target -> listen). Returns the changed files. Idempotent."""
+def _rewrite(profile_root: str, mapping: dict[str, str]) -> tuple[list[str], list[str]]:
+    """(changed files, files left as they are although they may need the change: a link, or a write that failed).
+    Every file that is left out is logged."""
     from .sandbox import write_atomic
-    changed = []
-    for f in _own_config_files(profile_root):
+    changed, left = [], []
+    files, links = _config_files(profile_root)
+    for f in links:
+        log.warning("relay: %s is a link or has a second name; its URLs are not rewritten", f)
+        left.append(str(f))
+    for f in files:
         try:
-            if f.stat().st_size > MAX_REWRITE_BYTES:
+            with open(f, "rb") as fh:
+                raw = fh.read(MAX_REWRITE_BYTES + 1)       # bounded: the member can put any file here (V-3)
+            if len(raw) > MAX_REWRITE_BYTES:
+                log.warning("relay: %s is larger than %d bytes; its URLs are not rewritten", f, MAX_REWRITE_BYTES)
                 continue
-            text = f.read_bytes().decode("utf-8")
-        except (OSError, ValueError):
+            text = raw.decode("utf-8")
+        except OSError:
+            continue
+        except ValueError:
+            log.warning("relay: %s is not UTF-8 text; its URLs are not rewritten", f)
             continue
         new = rewrite_text(text, mapping)
         if new != text:
@@ -176,9 +214,16 @@ def rewrite_profile_urls(profile_root: str, mapping: dict[str, str]) -> list[str
                 write_atomic(f, new)
             except OSError as e:
                 log.warning("relay: %s was not rewritten: %s", f, e)
+                left.append(str(f))
                 continue
             changed.append(str(f))
-    return changed
+    return changed, left
+
+
+def rewrite_profile_urls(profile_root: str, mapping: dict[str, str]) -> list[str]:
+    """Replace '<target host>:<port>' by '<forward ip>:<port>' in the profile's config.yaml and custom provider
+    JSON files (mapping target -> listen). Returns the changed files. Idempotent."""
+    return _rewrite(profile_root, mapping)[0]
 
 
 def restore_profile_urls(profile_root: str, mapping: dict[str, str]) -> list[str]:
@@ -186,15 +231,50 @@ def restore_profile_urls(profile_root: str, mapping: dict[str, str]) -> list[str
         if mapping else []
 
 
+def _pending_file(state_dir: str | Path, name: str) -> Path:
+    # not "<name>.relays.json": state_mapping must not take a restore that is still owed for a running relay
+    return Path(state_dir) / f"{name}.relays.undo.json"
+
+
+def restore_pending(state_dir: str | Path, name: str, profile_root: str | None, extra: dict | None = None,
+                    active: dict | None = None) -> list[str]:
+    """Point the profile's URLs back at the real services for `extra` (target -> listen) and for whatever an
+    earlier restore could not finish. A restore is not finished while a file could not be written (in use) or is a
+    link the gateway does not touch; what is owed is kept in <state_dir>/<name>.relays.undo.json and tried again at
+    the worker's next start (V-4). `active`: relays that run now - never undone. Returns the restored files."""
+    from .sandbox import write_atomic
+    g = _pending_file(state_dir, name)
+    try:
+        owed = json.loads(g.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        owed = {}
+    m = {**(owed if isinstance(owed, dict) else {}), **(extra or {})}
+    m = {t: lst for t, lst in m.items() if isinstance(t, str) and isinstance(lst, str)
+         and (active or {}).get(t) != lst}
+    if not m or not profile_root:
+        g.unlink(missing_ok=True)
+        return []
+    changed, left = _rewrite(profile_root, {lst: t for t, lst in m.items()})
+    if left:
+        Path(state_dir).mkdir(parents=True, exist_ok=True)
+        write_atomic(g, json.dumps(m))
+        log.warning("relay %s: %d file(s) still point at a relay forwarder; tried again at the next start: %s",
+                    name, len(left), left[:5])
+    else:
+        g.unlink(missing_ok=True)
+    return changed
+
+
 def undo_relays(state_dir: str, name: str, profile_root: str | None) -> list[str]:
-    """The user is no longer sandboxed: point their provider URLs back at the real services and forget the
-    record (<state_dir>/<container>.relays.json, written by workers.py). Returns the restored files."""
+    """The user is no longer sandboxed in an AppContainer: point their provider URLs back at the real services and
+    forget the record (<state_dir>/<container>.relays.json, written by workers.py). Returns the restored files.
+    What cannot be restored now stays owed (restore_pending)."""
     f = Path(state_dir) / f"{name}.relays.json"
     try:
         old = json.loads(f.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return []
-    changed = restore_profile_urls(profile_root, old) if profile_root and isinstance(old, dict) else []
+        old = {}
+    changed = restore_pending(state_dir, name, profile_root, old if isinstance(old, dict) else {})
     f.unlink(missing_ok=True)
     return changed
 
@@ -234,7 +314,8 @@ def pump_pipe_to_sock(h, s):
 
 def handle(s):
     try:
-        h = _winapi.CreateFile(PIPE, _winapi.GENERIC_READ | _winapi.GENERIC_WRITE, 0, _winapi.NULL,
+        # read + write data (0x2), not GENERIC_WRITE: the pipe withholds the right to create instances of it
+        h = _winapi.CreateFile(PIPE, _winapi.GENERIC_READ | 0x0002, 0, _winapi.NULL,
                                _winapi.OPEN_EXISTING, _winapi.FILE_FLAG_OVERLAPPED, _winapi.NULL)
     except OSError:
         s.close(); return
@@ -280,6 +361,7 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows tests
     _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
         wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    _k32.LocalFree.argtypes = [ctypes.c_void_p]
 
     class _SA(ctypes.Structure):
         _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p),
@@ -303,7 +385,10 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows tests
             self.max_connections = max(1, int(max_connections))
             self._slots = threading.BoundedSemaphore(self.max_connections)
             self.refused = 0
-            sddl = f"D:P(A;;GA;;;SY)(A;;GA;;;OW)(A;;GRGW;;;{sid})S:(ML;;NW;;;LW)"
+            # The container: read, and write data (0x12008b = FILE_GENERIC_READ | FILE_WRITE_DATA). Not GENERIC_WRITE,
+            # which includes the right to create further instances of this pipe (V-9): with one of its own the
+            # agent could sit in front of the gateway's and keep stop() from ending the serving thread.
+            sddl = f"D:P(A;;GA;;;SY)(A;;GA;;;OW)(A;;0x12008b;;;{sid})S:(ML;;NW;;;LW)"
             self._sd = ctypes.c_void_p()
             if not _adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(self._sd), None):
                 raise OSError(f"pipe security descriptor failed ({ctypes.get_last_error()})")
@@ -362,6 +447,12 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows tests
                 _winapi.CloseHandle(h)
             except OSError:
                 pass
+            self._free_sd()
+
+        def _free_sd(self) -> None:
+            sd, self._sd = self._sd, None     # the kernel copied it into every instance; no instance is made after
+            if sd:
+                _k32.LocalFree(sd)
 
         def _handle(self, h: int) -> None:
             try:
@@ -373,7 +464,7 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows tests
             try:
                 s = socket.create_connection(self.target, timeout=30)
                 s.settimeout(None)
-            except OSError as e:
+            except Exception as e:      # not only OSError: a name that cannot be encoded raises UnicodeError (V-8)
                 log.info("relay %s -> %s:%s refused: %s", self.pipe, *self.target, e)
                 _winapi.CloseHandle(h)
                 return
@@ -422,6 +513,7 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows tests
                         _winapi.CloseHandle(h)
                     except OSError:
                         pass
+                self._free_sd()
                 return
             try:   # unblock the pending ConnectNamedPipe
                 hc = _winapi.CreateFile(self.pipe, _winapi.GENERIC_READ, 0, _winapi.NULL, _winapi.OPEN_EXISTING, 0,
@@ -446,9 +538,13 @@ def write_forwarder(profile_root: str) -> str:
         raise OSError(f"{d} is a link; the relay forwarder is not written through it")
     d.mkdir(parents=True, exist_ok=True)
     p = d / "relay_forwarder.py"
-    try:
-        same = not _is_reparse(p) and p.read_bytes().decode("utf-8") == FORWARDER_SRC
-    except (OSError, ValueError):
+    want = FORWARDER_SRC.encode("utf-8")
+    try:    # the size first, and never more than that is read: the member can put any file here (V-3)
+        same = not _is_reparse(p) and p.stat().st_size == len(want)
+        if same:
+            with open(p, "rb") as fh:
+                same = fh.read(len(want) + 1) == want
+    except OSError:
         same = False
     if not same:
         write_atomic(p, FORWARDER_SRC)

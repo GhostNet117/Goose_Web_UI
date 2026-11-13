@@ -225,8 +225,9 @@ vulnerability, see [SECURITY.md](SECURITY.md).
   profile's Goose loads them.
 - **A sandboxed agent can read the registry of the gateway's Windows account** where Windows lets application
   containers read it - with MXC and with the AppContainer backend. That includes the account's user environment
-  variables (`HKEY_CURRENT_USER\Environment`). Keep secrets out of them, or run the gateway under an account used
-  for nothing else; `goose-web check` names the variables that look like secrets.
+  variables (`HKEY_CURRENT_USER\Environment`) and the machine's environment variables. Keep secrets out of them
+  (for the user variables: or run the gateway under an account used for nothing else); `goose-web check` names the
+  variables whose names look like secrets.
 - **One scheduler per profile.** Goose Desktop and the gateway must not both run the scheduler for the native
   profile, or jobs fire twice. `native_scheduler: auto` (the default) runs it in the gateway only while Desktop is
   closed.
