@@ -1390,3 +1390,23 @@ Open: T-4 (a tab that watches without limit keeps records without limit), T-11 (
 and the open, a path component could be swapped for a link - by somebody who can write there). The fixes were not
 reviewed again.
 
+### 19.4 1.23.1: the members' window station on Windows Server (2026-11-14)
+
+1.23.0's CI failed: on the runners (Windows Server 2022 and 2025, a signed-in logon) the window station of the
+logon that nobody sits at does not name the application-packages groups - on Windows 11 it does (`0x00020327`
+each). `members_desktop(True)`, the MXC path, refused there, so no MXC member could start under a signed-in
+gateway on Windows Server. Section 18's table said "the same on the interactive window station and on the
+non-interactive one of the same logon (build 26100)": true for Windows 11, not for Windows Server 2025 of the
+same build.
+
+**Changed.** When an MXC container is to be started and the members' window station does not let application
+packages in, ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES are given `0x00020327` there - what
+Windows 11 gives them on that object. Judged: additive only (nothing is ever taken off); one object, the
+non-interactive window station of the gateway's own logon, which has no screen; it ends with the logon. It gives
+every application container of that account - not only Goose Web's - what Windows 11 gives it there. The
+AppContainer backend keeps naming its container alone. A window station of SYSTEM, NETWORK SERVICE or LOCAL
+SERVICE is refused before this point (19.3, T-7).
+
+**Not verified.** A real MXC container on a window station where the entry was added by Goose Web. No independent
+review of this change (about 20 lines).
+

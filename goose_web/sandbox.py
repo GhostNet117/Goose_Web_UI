@@ -623,8 +623,9 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
         The desktop names this account, SYSTEM and - with what a program needs (DESKTOP_FOR_CONTAINER) - the
         application-packages groups: MXC containers get a new SID at every start and cannot be named one by one.
         `open_to_all`: the caller cannot name its container on the window station either (MXC), so the window
-        station must let application packages in as Windows made it. SandboxError when it cannot be made: members'
-        agents are then not started at all rather than on the desktop of the signed-in account."""
+        station must let application packages in - as Windows 11 makes it, or by the entry added here where
+        Windows did not (Windows Server). SandboxError when the place cannot be made: members' agents are then
+        not started at all rather than on the desktop of the signed-in account."""
         if not PRIVATE_DESKTOP["on"]:
             return ""
         with _ADMIT_LOCK:
@@ -693,9 +694,23 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
                     if not keep:            # nothing was made: the handle is given back, the next start tries again
                         _u32.CloseWindowStation(ws)
             if open_to_all and _PLACE["name"] and not _PLACE["open"]:
-                raise SandboxError(f"the window station {_PLACE['station']!r} does not let application packages in, "
-                                   "so an MXC container cannot be started there; it is not started on the desktop "
-                                   "of the signed-in account (sandbox.desktop: shared would allow it)")
+                # An MXC container has a new SID at every start, so it cannot be named there one by one as a
+                # container of the AppContainer backend is (admit). Windows 11 names the application-packages
+                # groups on this window station itself; Windows Server 2022 and 2025 do not (measured on both,
+                # 1.23.0's own CI: every MXC start was refused there). They get the entry Windows 11 gives them.
+                # It is only ever added, on this one window station, and ends with the logon.
+                try:
+                    for group in (ALL_APP_PACKAGES, ALL_RESTRICTED_APP_PACKAGES):
+                        _set_entry(_PLACE["ws"], group, WINSTA_FOR_CONTAINER, 1, "window station")
+                    _PLACE["open"] = bool(_lets_in(_PLACE["ws"], [ALL_APP_PACKAGES, ALL_RESTRICTED_APP_PACKAGES]))
+                except SandboxError as e:
+                    log.error("sandbox: %s", e)
+                if not _PLACE["open"]:
+                    raise SandboxError(f"the window station {_PLACE['station']!r} does not let application packages "
+                                       "in and that could not be changed, so an MXC container cannot be started "
+                                       "there; it is not started on the desktop of the signed-in account "
+                                       "(sandbox.desktop: shared would allow it)")
+                log.info("sandbox: application packages are now let in on %s (for MXC containers)", _PLACE["station"])
             return _PLACE["name"]
 
     def _own_objects(desktop: str):

@@ -1390,7 +1390,9 @@ def test_a_members_process_is_not_started_on_the_desktop_of_the_signed_in_accoun
         sb.admit(c.sid, "WinSta0\\Default")                             # only this gateway's own is ever touched
     with pytest.raises(sb.SandboxError), open(os.devnull, "wb") as errf:   # and nothing is started anywhere else
         sb.spawn([c.py, "-I", "-c", "pass"], {}, os.environ["SystemRoot"], c.sid, [], errf, desktop="WinSta0\\Default")
-    assert sb.dismiss(c.sid) == []                                      # looks at both places, finds nothing of its
+    # deleting the container looks at both places; where the members' window station does not let application
+    # packages in by itself (Windows Server), the container was named there and comes off - nowhere else
+    assert all(g.startswith("window station ") and "WinSta0" not in g for g in sb.dismiss(c.sid))
     # a gateway that once could not be put back on its window station starts nothing any more (T-6)
     monkeypatch.setitem(sb._PLACE, "broken", "this gateway could not be put back on its own window station")
     with pytest.raises(sb.SandboxError, match="could not be put back"):
@@ -1402,6 +1404,34 @@ def test_a_members_process_is_not_started_on_the_desktop_of_the_signed_in_accoun
 
 
 @windows
+def test_an_mxc_start_gets_a_window_station_that_lets_application_packages_in(monkeypatch):
+    """1.23.0 refused every MXC start where the members' window station did not name application packages by
+    itself - Windows Server 2022 and 2025, seen in its own CI. An MXC container has a new SID at every start and
+    cannot be named there one by one, so the two groups are named, as Windows 11 names them."""
+    if not sb.session_info()["interactive"]:
+        pytest.skip("nobody is signed in here")
+    monkeypatch.setitem(sb.PRIVATE_DESKTOP, "on", True)
+    place = sb.members_desktop()
+    assert sb.members_desktop(True) == place and sb._PLACE["open"] is True      # whatever Windows this is
+    # ... the case itself, on any Windows: the station does not let them in, then does once they are named
+    calls, state = [], {"open": False}
+    monkeypatch.setitem(sb._PLACE, "open", False)
+    monkeypatch.setattr(sb, "_set_entry", lambda h, sid, mask, mode, what: calls.append((h, sid, mask, mode)) or True)
+    monkeypatch.setattr(sb, "_lets_in", lambda h, sids, need=0: state["open"] or len(calls) == 2)
+    assert sb.members_desktop() == place and calls == []                          # the AppContainer backend: not its way
+    assert sb.members_desktop(True) == place and sb._PLACE["open"] is True
+    assert calls == [(sb._PLACE["ws"], sb.ALL_APP_PACKAGES, sb.WINSTA_FOR_CONTAINER, 1),
+                     (sb._PLACE["ws"], sb.ALL_RESTRICTED_APP_PACKAGES, sb.WINSTA_FOR_CONTAINER, 1)]
+    # it cannot be changed: refused, not started on the desktop of the signed-in account
+    monkeypatch.setitem(sb._PLACE, "open", False)
+    monkeypatch.setattr(sb, "_set_entry", lambda *a: (_ for _ in ()).throw(sb.SandboxError("cannot be changed (5)")))
+    monkeypatch.setattr(sb, "_lets_in", lambda h, sids, need=0: False)
+    with pytest.raises(sb.SandboxError, match="could not be changed"):
+        sb.members_desktop(True)
+    monkeypatch.setitem(sb._PLACE, "open", True)        # as it really is, for the tests that follow
+
+
+@windows
 def test_the_self_test_starts_container_processes_in_this_session():
     res = sb.selftest(rl.python_for_container()[0])
     ok, text = sb.selftest_text(res)
@@ -1409,8 +1439,12 @@ def test_the_self_test_starts_container_processes_in_this_session():
     assert isinstance(res["session"], int) and res["windowStation"] and res["build"] and "starts here" in text
     assert all(not s["detail"] for s in res["steps"]), res        # a step that passed says nothing more
     if res["interactive"]:          # somebody is signed in: the steps ran on the gateway's own desktop for members
-        assert not res["missing"] and not res["admitted"] and "stepsBefore" not in res and not res["remedy"], res
         assert res["membersDesktop"] == sb.members_desktop() and "not on the desktop of the signed-in account" in text
+        # the desktop and window station of the signed-in account are never what had to be changed; the members'
+        # own window station is, where Windows does not let application packages in there (Windows Server)
+        assert res["missing"] == res["admitted"] and all("WinSta0" not in m and "desktop" not in m for m in res["missing"]), res
+        if not res["missing"]:
+            assert "stepsBefore" not in res and not res["remedy"], res
 
 
 @windows

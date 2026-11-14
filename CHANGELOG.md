@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.23.1 - 2026-11-14
+
+**Fixes 1.23.0, which was published with a defect its own CI showed an hour later: on Windows Server, with
+somebody signed in to the gateway's account, no member could start an agent in an MXC container.**
+
+- The desktop that 1.23.0 makes for members sits on the window station of the logon that nobody sits at. Windows
+  11 lets application packages in on that window station by itself; Windows Server 2022 and 2025 do not (seen on
+  the CI runners; the development machine is Windows 11). The AppContainer backend names its container there -
+  that worked. An MXC container has a new SID at every start and cannot be named, and 1.23.0 refused the start
+  ("the window station ... does not let application packages in"). 1.23.1 names the two application-packages
+  groups on that window station, as Windows 11 does, when an MXC container is started and they are not named.
+  Only ever added, only on that window station; it ends with the logon.
+- **Not measured:** a real MXC container on a window station where Goose Web had to add that entry (the CI
+  runners cannot run MXC; the machines that can, name the groups themselves). The AppContainer backend on such a
+  window station is measured (CI, both server versions).
+- Two tests of 1.23.0 expected that nothing has to be named on the members' window station; they now expect what
+  the product promises: nothing is changed on the window station and desktop of the signed-in account.
+- For the record: the container tests reported for Windows Server 2022 were otherwise green (79 passed), with the
+  1.22.2 step-order problem gone.
+
 ## 1.23.0 - 2026-11-14
 
 **Security: a member's agent could read the screen of the account that runs the gateway, when somebody is signed
