@@ -38,6 +38,9 @@ NETWORK_CAPS = {"none": [], "internet": [CAP_INTERNET], "internet+lan": [CAP_INT
 RIGHTS = {"modify": "(OI)(CI)M", "read": "(OI)(CI)RX"}
 NEED = {"modify": 0x1301BF, "read": 0x1200A9}      # the access masks icacls writes for M and RX
 ALL_APP_PACKAGES = "S-1-15-2-1"                     # "ALL APPLICATION PACKAGES": every application container
+ALL_RESTRICTED_APP_PACKAGES = "S-1-15-2-2"          # ... and the less privileged ones too; an entry for it also lets
+#                                                     an ordinary container in (measured, build 26100)
+_CONTAINER_SID = re.compile(r"^S-1-15-2(-\d+){7}$")  # one container's own SID - never one of the two above
 
 
 class SandboxError(RuntimeError):
@@ -236,12 +239,26 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
         return r.value, w.value
 
     def spawn(args: list[str] | str, env: dict, cwd: str, sid: str, capabilities: list[str], stderr_file,
-              job=None) -> ContainedProcess:
+              job=None, desktop: str = "", admit_first: bool = True) -> ContainedProcess:
         """Start args inside the AppContainer `sid` with the given capability SIDs. stdin/stdout are pipes to the
         caller; stderr goes to stderr_file. Only these three handles are inherited (PROC_THREAD_ATTRIBUTE_HANDLE_LIST).
         Started suspended, put in `job` (kill-on-close), then resumed, so no child can escape the job. `job` may be
         a list: the process joins each in order (gateway job first, then the worker's own job, which so becomes a
-        job nested in the gateway's)."""
+        job nested in the gateway's).
+
+        The process connects to the window station and desktop this process is on (`desktop`: to that desktop of
+        the window station instead - the self-test and the tests use it). A program that cannot open them ends
+        before its first instruction with 0xC0000142, so the container is let in first where nothing lets it in
+        (admit; `admit_first=False` leaves the access lists alone)."""
+        if admit_first:
+            try:
+                for what in admit(sid, desktop):
+                    log.info("sandbox: container %s is now named on the %s this gateway runs on", sid, what)
+            except Exception as e:      # never the reason a start fails: a process that is not let in says so itself
+                if sid not in _ADMIT_WARNED:        # once per container, not at every start
+                    _ADMIT_WARNED.add(sid)
+                    log.warning("sandbox: %s. Its processes may end with 0xC0000142",
+                                e if isinstance(e, SandboxError) else f"{type(e).__name__}: {e}")
         in_r, in_w = _pipe()
         out_r, out_w = _pipe()
         _k32.SetHandleInformation(in_w, 1, 0)      # parent ends: not inheritable
@@ -270,6 +287,14 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
             si.StartupInfo.cb = ctypes.sizeof(_StartupInfoExW)
             si.StartupInfo.dwFlags = 0x100           # STARTF_USESTDHANDLES
             si.StartupInfo.hStdInput, si.StartupInfo.hStdOutput, si.StartupInfo.hStdError = in_r, out_w, err_h
+            # Without a name the process goes where THIS process was started (the name in its start-up block), not
+            # where it is now. Where somebody is signed in that is left to Windows, as always; a gateway nobody is
+            # signed in to names the window station and desktop it is on - the ones admit() looked at.
+            ws_name = _object_name(_u32.GetProcessWindowStation())
+            on = desktop or ("" if ws_name.lower() == "winsta0"
+                             else _object_name(_u32.GetThreadDesktop(_k32.GetCurrentThreadId())))
+            if on and ws_name:
+                si.StartupInfo.lpDesktop = ws_name + "\\" + on
             si.lpAttributeList = ctypes.cast(buf, ctypes.c_void_p)
             block = "".join(f"{k}={v}\0" for k, v in sorted(env.items(), key=lambda kv: kv[0].upper())) + "\0"
             envbuf = ctypes.create_unicode_buffer(block, len(block))
@@ -426,6 +451,234 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
         _k32.CloseHandle(h)
         return True
 
+    _u32 = ctypes.WinDLL("user32", use_last_error=True)
+    _u32.GetProcessWindowStation.restype = wintypes.HANDLE
+    _u32.GetThreadDesktop.restype = wintypes.HANDLE
+    _u32.GetThreadDesktop.argtypes = [wintypes.DWORD]
+    _u32.OpenWindowStationW.restype = wintypes.HANDLE
+    _u32.OpenWindowStationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
+    _u32.OpenDesktopW.restype = wintypes.HANDLE
+    _u32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _u32.CloseWindowStation.argtypes = [wintypes.HANDLE]
+    _u32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    _u32.GetUserObjectInformationW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                               ctypes.POINTER(wintypes.DWORD)]
+    _adv.GetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
+                                     ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    _adv.GetSecurityInfo.restype = wintypes.DWORD
+    _adv.SetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
+                                     ctypes.c_void_p, ctypes.c_void_p]
+    _adv.SetSecurityInfo.restype = wintypes.DWORD
+    _k32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    _k32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    class _Trustee(ctypes.Structure):
+        _fields_ = [("pMultipleTrustee", ctypes.c_void_p), ("MultipleTrusteeOperation", ctypes.c_int),
+                    ("TrusteeForm", ctypes.c_int), ("TrusteeType", ctypes.c_int), ("ptstrName", ctypes.c_void_p)]
+
+    class _ExplicitAccess(ctypes.Structure):
+        _fields_ = [("grfAccessPermissions", wintypes.DWORD), ("grfAccessMode", ctypes.c_int),
+                    ("grfInheritance", wintypes.DWORD), ("Trustee", _Trustee)]
+
+    _adv.SetEntriesInAclW.argtypes = [wintypes.ULONG, ctypes.POINTER(_ExplicitAccess), ctypes.c_void_p,
+                                      ctypes.POINTER(ctypes.c_void_p)]
+    _adv.SetEntriesInAclW.restype = wintypes.DWORD
+    _adv.GetSecurityDescriptorControl.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.WORD),
+                                                  ctypes.POINTER(wintypes.DWORD)]
+    # A program that loads user32 (COM does; goose and Python's ctypes do) connects to a window station and a
+    # desktop while it loads. Measured in a container on build 26100 (tests/test_appcontainer.py, the desktop
+    # tests): unless the desktop gives the container - by its own SID or through an application-packages group -
+    # both "read objects" and "write objects", user32 does not initialise: a program that links it ends with
+    # 0xC0000142 before its first instruction (goose), and `import ctypes` says "DLL initialization routine
+    # failed". A console program that does not load user32 (cmd.exe) still runs.
+    #   - The desktop of a signed-in user gives application packages that and more (0x000F00FF).
+    #   - A desktop on the window station of a logon nobody is signed in to ("Service-0x0-...$": a gateway started
+    #     at boot under a service account) gives them, by default, read / list / switch (0x00020141): not enough.
+    # So a container is given, on the desktop this gateway runs on: read and write objects, list, create windows
+    # and menus - not the rights to hook or journal input, to switch desktops, or to change or delete the desktop
+    # (which the interactive desktop gives application packages). On the window station: what Windows gives
+    # application packages on every window station seen (0x00020327), when the container is not named there at all.
+    WINSTA_FOR_CONTAINER = 0x00020327
+    DESKTOP_NEED = 0x00000081           # DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS
+    DESKTOP_FOR_CONTAINER = 0x000200C7  # + ENUMERATE, CREATEWINDOW, CREATEMENU, READ_CONTROL
+    # SYSTEM, NETWORK SERVICE, LOCAL SERVICE: Windows' own services sit on these; their access lists are left alone
+    _SHARED_STATIONS = ("service-0x0-3e7$", "service-0x0-3e4$", "service-0x0-3e5$")
+    _ADMIT_LOCK = threading.Lock()
+    _ADMIT_WARNED: set[str] = set()
+    _ADMITTED: set[tuple[str, str, str]] = set()        # (container SID, what, name): the entries THIS process added
+
+    def _object_name(h) -> str:
+        buf, n = ctypes.create_unicode_buffer(256), wintypes.DWORD()
+        return buf.value if _u32.GetUserObjectInformationW(h, 2, buf, ctypes.sizeof(buf), ctypes.byref(n)) else ""
+
+    def _lets_in(h, sids, need: int = 0) -> bool | None:
+        """Whether the allow entries of a window station or desktop that apply to the object itself give `sids`,
+        together, all of `need` (need 0: anything at all). None when the list cannot be read. An object without an
+        access list lets everybody in."""
+        pdacl, psd = ctypes.c_void_p(), ctypes.c_void_p()
+        if _adv.GetSecurityInfo(h, 7, 4, None, None, ctypes.byref(pdacl), None, ctypes.byref(psd)) != 0:   # SE_WINDOW_OBJECT
+            return None
+        try:
+            if not pdacl:
+                return True
+            info, have = (wintypes.DWORD * 3)(), 0
+            if not _adv.GetAclInformation(pdacl, info, ctypes.sizeof(info), 2):
+                return None
+            for i in range(info[0]):
+                pace = ctypes.c_void_p()
+                if not _adv.GetAce(pdacl, i, ctypes.byref(pace)) or not pace.value:
+                    return None
+                kind = ctypes.c_ubyte.from_address(pace.value).value
+                flags = ctypes.c_ubyte.from_address(pace.value + 1).value
+                mask = wintypes.DWORD.from_address(pace.value + 4).value
+                if kind != 0 or flags & 0x08 or not mask:       # allow entries, and not the "inherit only" ones
+                    continue
+                try:
+                    if _sid_to_str(ctypes.c_void_p(pace.value + 8)) in sids:
+                        have |= mask
+                except SandboxError:
+                    pass
+            return (have & need) == need if need else bool(have)
+        finally:
+            _k32.LocalFree(psd)
+
+    def session_info() -> dict:
+        """Where this process runs, as far as an application container is concerned: the session, the window
+        station and desktop, and whether those let application packages in as they are (the window station names
+        them; the desktop gives them DESKTOP_NEED). A boot task or a service runs in session 0 on a window station
+        of its logon, not on the interactive "WinSta0"."""
+        sess = wintypes.DWORD()
+        _k32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sess))
+        ws, dt = _u32.GetProcessWindowStation(), _u32.GetThreadDesktop(_k32.GetCurrentThreadId())
+        name = _object_name(ws)
+        return {"session": sess.value, "windowStation": name, "desktop": _object_name(dt),
+                "interactive": name.lower() == "winsta0", "build": sys.getwindowsversion().build,
+                "windowStationLetsContainersIn": _lets_in(ws, [ALL_APP_PACKAGES, ALL_RESTRICTED_APP_PACKAGES]),
+                "desktopLetsContainersIn": _lets_in(dt, [ALL_APP_PACKAGES, ALL_RESTRICTED_APP_PACKAGES],
+                                                    DESKTOP_NEED)}
+
+    def _set_entry(h, sid: str, mask: int, mode: int, what: str) -> bool:
+        """Add (mode 1, GRANT_ACCESS) or take off (mode 4, REVOKE_ACCESS) the entry of `sid` on a window station or
+        desktop handle that was opened for changing its access list. False when the object has no access list:
+        everybody is let in then, and a list with one entry would shut everybody else out."""
+        pdacl, psd, new, psid = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p(), None
+        rc = _adv.GetSecurityInfo(h, 7, 4, None, None, ctypes.byref(pdacl), None, ctypes.byref(psd))
+        if rc:
+            raise SandboxError(f"the access list of the {what} cannot be read ({rc})")
+        try:
+            if not pdacl:
+                return False
+            psid = _str_to_sid(sid)
+            ea = _ExplicitAccess(mask, mode, 0, _Trustee(None, 0, 0, 0, psid.value))       # TRUSTEE_IS_SID
+            rc = _adv.SetEntriesInAclW(1, ctypes.byref(ea), pdacl, ctypes.byref(new))
+            if rc or not new.value:     # no list at all would be written as "everybody is let in"
+                raise SandboxError(f"the access list of the {what} cannot be built ({rc})")
+            # a list marked "protected" (takes nothing from above) stays so: only the one entry differs afterwards
+            control, rev = wintypes.WORD(), wintypes.DWORD()
+            _adv.GetSecurityDescriptorControl(psd, ctypes.byref(control), ctypes.byref(rev))
+            rc = _adv.SetSecurityInfo(h, 7, 4 | (0x80000000 if control.value & 0x1000 else 0), None, None, new, None)
+            if rc:
+                raise SandboxError(f"the access list of the {what} cannot be changed ({rc})")
+            return True
+        finally:
+            if psid:
+                _k32.LocalFree(psid)
+            _k32.LocalFree(psd)
+            if new:
+                _k32.LocalFree(new)
+
+    def _own_objects(desktop: str):
+        """(what, name, the handle this process holds or None, open(access), close, what a container needs there,
+        what it is given) for the window station this process is on and for its desktop (or the desktop `desktop`
+        of that window station)."""
+        hws, hdt = _u32.GetProcessWindowStation(), _u32.GetThreadDesktop(_k32.GetCurrentThreadId())
+        ws_name = _object_name(hws)
+        dt_name = desktop or _object_name(hdt) or "Default"
+        return (("window station", ws_name, hws, lambda a: _u32.OpenWindowStationW(ws_name, False, a),
+                 _u32.CloseWindowStation, 0, WINSTA_FOR_CONTAINER),
+                ("desktop", dt_name, None if desktop else hdt, lambda a: _u32.OpenDesktopW(dt_name, 0, False, a),
+                 _u32.CloseDesktop, DESKTOP_NEED, DESKTOP_FOR_CONTAINER))
+
+    def admit(sid: str, desktop: str = "", dry: bool = False) -> list[str]:
+        """Make sure the container can use the window station and the desktop its processes connect to: those of
+        this process (`desktop`: that desktop of its window station). Where the window station names neither the
+        container nor ALL APPLICATION PACKAGES, or the desktop does not give them what user32 needs (DESKTOP_NEED),
+        the container gets an entry of its own (WINSTA_FOR_CONTAINER, DESKTOP_FOR_CONTAINER). Returns what was
+        added - nothing where somebody is signed in: Windows lets application packages in there itself. `dry`: only
+        say what would be added. SandboxError when an entry is needed and this account may not add it, and for a
+        SID that is not one container's own. Nothing here outlives the logon of this process: its window station
+        and desktops end with it."""
+        if not _CONTAINER_SID.fullmatch(sid or ""):
+            raise SandboxError(f"not the SID of one application container: {sid!r}")
+        who = [sid, ALL_APP_PACKAGES, ALL_RESTRICTED_APP_PACKAGES]
+        station = _object_name(_u32.GetProcessWindowStation())
+        added: list[str] = []
+        with _ADMIT_LOCK:       # read, add, write: two members starting at once must not lose each other's entry
+            for what, name, own, opener, closer, need, give in _own_objects(desktop):
+                state = _lets_in(own, who, need) if own else None
+                if state is None:                   # the handle this process holds may not read the list
+                    h = opener(0x00020000)          # READ_CONTROL
+                    if h:
+                        try:
+                            state = _lets_in(h, who, need)
+                        finally:
+                            closer(h)
+                if state:
+                    continue
+                if dry:
+                    added.append(f"{what} {name}")
+                    continue
+                if station.lower() in _SHARED_STATIONS:
+                    raise SandboxError(f"the {what} {name!r} does not let the container in, and this gateway runs on "
+                                       f"{station!r}, the window station of a Windows service account that Windows' "
+                                       "own services share: its access lists are not changed. Run the gateway under "
+                                       "an account of its own")
+                h = opener(0x00060000)              # READ_CONTROL | WRITE_DAC
+                if not h:
+                    raise SandboxError(f"the {what} {name!r} this gateway runs on does not let the container in, "
+                                       f"and this account may not change its access list "
+                                       f"({ctypes.get_last_error()})")
+                try:
+                    state = _lets_in(h, who, need)
+                    if state is None:
+                        raise SandboxError(f"the access list of the {what} {name!r} cannot be read")
+                    if not state and _set_entry(h, sid, give, 1, what):
+                        _ADMITTED.add((sid, what, name))
+                        added.append(f"{what} {name}")
+                finally:
+                    closer(h)
+        return added
+
+    def dismiss(sid: str, desktop: str = "") -> list[str]:
+        """Take off again the entries that admit() added for this container IN THIS PROCESS (its container is
+        deleted). Nothing else is ever taken off a window station or desktop: not an entry somebody else made, and
+        not an entry of any other SID - the SID comes from a record on disk, and a record that named ALL APPLICATION
+        PACKAGES would otherwise shut every application container of this logon out. Never raises: what cannot be
+        taken off ends with the logon of this process."""
+        gone: list[str] = []
+        if not _CONTAINER_SID.fullmatch(sid or ""):
+            return gone
+        try:
+            with _ADMIT_LOCK:
+                for what, name, _own, opener, closer, _need, _give in _own_objects(desktop):
+                    if (sid, what, name) not in _ADMITTED:
+                        continue
+                    try:                    # one that cannot be taken off does not keep the other on
+                        h = opener(0x00060000)
+                        if not h:
+                            continue
+                        try:
+                            if _set_entry(h, sid, 0, 4, what):
+                                gone.append(f"{what} {name}")
+                            _ADMITTED.discard((sid, what, name))
+                        finally:
+                            closer(h)
+                    except Exception as e:
+                        log.debug("sandbox: the entry of %s is left on the %s %s: %s", sid, what, name, e)
+        except Exception as e:
+            log.debug("sandbox: entries of %s left on the window station: %s", sid, e)
+        return gone
+
     def grant(path: str, sid: str, right: str) -> None:
         # :r - the container's entry is REPLACED. Without it icacls adds to an entry that is still there (a revoke
         # that failed), and a folder taken down from modify to read kept modify while the record said read (W-5).
@@ -531,6 +784,149 @@ else:
 
     def can_change_permissions(path: str) -> bool:
         return False
+
+    def session_info() -> dict:
+        return {}
+
+    def admit(sid: str, desktop: str = "", dry: bool = False) -> list[str]:
+        raise SandboxError("the sandbox needs Windows (AppContainer)")
+
+    def dismiss(sid: str, desktop: str = "") -> list[str]:
+        return []
+
+
+# ------------------------------------------------------------------ does a container process start here at all?
+INIT_FAILED = 0xC0000142        # STATUS_DLL_INIT_FAILED: what a process that cannot use its desktop ends with
+
+
+def _selftest_run(sid: str, python: str, desktop: str = "") -> list[dict]:
+    """The steps of the self-test, started as the access lists are (spawn does not touch them here)."""
+    sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+    cwd = os.path.join(sysroot, "System32")
+    env = {k: os.environ[k] for k in ("SystemRoot", "windir", "SystemDrive", "LOCALAPPDATA") if os.environ.get(k)}
+    env["PATH"] = cwd
+    steps = [("a console program (cmd.exe)", [os.path.join(cwd, "cmd.exe"), "/d", "/c", "echo ok"])]
+    if python:
+        steps.append(("a program that uses its desktop, COM and sockets (the gateway's Python)",
+                      [python, "-I", "-c", "import ctypes, socket; ctypes.WinDLL('user32').GetDesktopWindow(); "
+                                           "socket.socket().close(); print('ok')"]))
+    out = []
+    for what, args in steps:
+        import tempfile
+        with tempfile.TemporaryFile() as errf:
+            try:
+                p = spawn(args, env, cwd, sid, [], errf, desktop=desktop, admit_first=False)
+                p.stdin.close()
+                box: list[bytes] = []
+                t = threading.Thread(target=lambda: box.append(p.stdout.read()), daemon=True)
+                t.start()
+                t.join(60)
+                if t.is_alive():
+                    p.kill()
+                code = p.wait(10) & 0xFFFFFFFF
+                errf.seek(0)
+                err = errf.read().decode("utf-8", "replace").strip().splitlines()
+                text = (box[0] if box else b"").decode("utf-8", "replace").strip()
+                out.append({"what": what, "ok": code == 0 and text == "ok", "exit": f"0x{code:08X}",
+                            "detail": (err[-1] if err else "")[:200]})
+            except Exception as e:
+                out.append({"what": what, "ok": False, "exit": "", "detail": f"{type(e).__name__}: {str(e)[:200]}"})
+    return out
+
+
+def selftest(python: str = "", desktop: str = "") -> dict:
+    """Start a console program and - when `python` is given - a program that uses its desktop, COM and sockets in a
+    throwaway AppContainer, from THIS process: in the session and on the window station it runs in (`desktop`: on
+    that desktop of the window station; for tests). A member's agent needs exactly that to work, and only the
+    gateway can measure it for the gateway.
+
+    The case this is for: a gateway started at boot under an account nobody signs in with. Its window station is
+    not the interactive one, and on some Windows versions it does not let application containers in; their
+    processes then end with 0xC0000142 before the first instruction (reported from Windows Server 2022). Where the
+    container is not let in, the steps run first as things are (`stepsBefore`), then the container is named on the
+    window station and desktop (admit - what spawn does for every member) and they run again (`steps`). Where it
+    is let in already, nothing is changed and they run once.
+
+    Returns {ok, steps, stepsBefore?, missing, admitted, remedy, reason, at, session, windowStation, desktop,
+    interactive, build, ...}. When containers cannot read the folder of `python`, the throwaway container is given
+    it for the test and it is taken off again."""
+    if not IS_WINDOWS:
+        return {"ok": False, "reason": "the AppContainer backend needs Windows", "steps": []}
+    info = session_info()
+    name = f"GooseWeb.selftest.{os.getpid()}"
+    res: dict = {**info, "ok": False, "steps": [], "missing": [], "admitted": [], "remedy": "", "reason": "",
+                 "at": time.time()}
+    granted, sid = "", ""
+    try:
+        sid = ensure_container(name)
+        # the folder itself, not a link to it: a grant on a directory link changes the link (uv keeps its Pythons
+        # behind one), and the program then ends with 0xC0000135
+        pyfolder = os.path.realpath(os.path.dirname(python)) if python else ""
+        if not python:
+            res["reason"] = "the desktop and COM were not tried: no Python was given. "
+        elif not allowed(pyfolder, [ALL_APP_PACKAGES], "read"):
+            granted = pyfolder      # before the grant: one that fails half-way is taken off as well
+            try:
+                grant(pyfolder, sid, "read")
+            except SandboxError:
+                python = ""         # cannot be made readable here: only the console program is tried
+                res["reason"] = "the desktop and COM were not tried: containers cannot read the gateway's Python folder. "
+        res["missing"] = admit(sid, desktop, dry=True)
+        if res["missing"]:
+            res["stepsBefore"] = _selftest_run(sid, python, desktop)
+            try:
+                res["admitted"] = admit(sid, desktop)
+            except SandboxError as e:
+                res["remedy"] = str(e)[:300]
+        res["steps"] = _selftest_run(sid, python, desktop)
+        # A console program alone proves nothing: cmd.exe starts exactly where a member's agent ends with
+        # 0xC0000142. Without the program that uses its desktop there is no "ok".
+        res["ok"] = bool(python) and all(s["ok"] for s in res["steps"])
+        before = [s for s in res.get("stepsBefore", []) if not s["ok"]]
+        if res["ok"] and res["admitted"]:
+            where = " and ".join(res["admitted"])
+            res["remedy"] = ((f"only once its container is named on the {where}: without that, {before[0]['what']} "
+                              f"ended with {before[0]['exit'] or before[0]['detail']}. ") if before else
+                             (f"the {where} did not name application containers; the container was named there "
+                              "(the processes started without that too). ")
+                             ) + "Goose Web names every member's container there when it starts their agent"
+        elif res["ok"] and res["missing"] and res["remedy"]:
+            res["remedy"] = "although " + res["remedy"]
+        if not res["ok"]:
+            bad = next((s for s in res["steps"] if not s["ok"]), None)
+            res["reason"] += ((f"a process in an application container does not start in this session: {bad['what']} "
+                               f"ended with {bad['exit'] or bad['detail']}.") if bad else
+                              "A console program started, which says nothing about a member's agent.")
+            res["reason"] += (f" The gateway runs in session {info.get('session')} on window station "
+                              f"{info.get('windowStation')!r}"
+                              + ("" if info.get("interactive") else " (nobody is signed in there)") + ".")
+            if res["admitted"]:
+                res["remedy"] = ("naming the container on the " + " and ".join(res["admitted"]) + " did not help"
+                                 + ("" if before else " (it started before that)"))
+    except Exception as e:
+        res["reason"] = f"the self-test could not run: {type(e).__name__}: {str(e)[:200]}"
+    finally:        # each on its own: one that fails does not keep the others from being cleared away
+        for what, undo in (("entries on the window station and desktop", lambda: sid and dismiss(sid, desktop)),
+                           ("grant on the Python folder",
+                            lambda: granted and sid and own_mask(granted, sid) and revoke(granted, sid)),
+                           ("throwaway container", lambda: delete_container(name))):
+            try:
+                undo()
+            except Exception as e:
+                log.warning("sandbox self-test: the %s could not be cleared away: %s", what, e)
+    return res
+
+
+def selftest_text(res: dict) -> tuple[bool, str]:
+    """(ok, one line) for `check`, `sandbox status` and the log."""
+    where = (f"session {res.get('session')}, window station {res.get('windowStation')!r}"
+             + ("" if res.get("interactive") else ", nobody signed in"))
+    if res.get("ok"):
+        return True, (f"a process in an application container starts here ({where})"
+                      + (f"; {res['remedy']}" if res.get("remedy") else ""))
+    return False, ((res.get("reason") or "failed") + (f" {res['remedy']}." if res.get("remedy") else "")
+                   + " Members' agents cannot run in an AppContainer started by this gateway; see ADMINISTRATION "
+                     "11.6 (a gateway nobody is signed in to)")
 
 
 def _state_path(state_dir: str, name: str) -> Path:
@@ -828,6 +1224,7 @@ def _remove(state_dir: str, name: str) -> dict:
             log.warning("sandbox remove: %s", e)
             left[p] = _still_there(p, st["sid"], r) or r
     delete_container(name)
+    dismiss(st["sid"])      # what admit() gave it on this process's window station and desktop
     if left:
         _save_state(state_dir, name, {"name": name, "sid": st["sid"], "grants": {}, "pending": left,
                                       "removed": True, "updatedAt": time.time()})

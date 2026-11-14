@@ -410,6 +410,8 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .banner-info > .icw { color: var(--info); }
 .banner-warn { background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
 .banner-warn > .icw { color: var(--warn); }
+.banner-success { background: var(--ok-soft, #e9f7ef); border-color: color-mix(in srgb, var(--ok, #1f9d55) 40%, transparent); }
+.banner-success > .icw { color: var(--ok, #1f9d55); }
 .banner-error { background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
 .banner-error > .icw { color: var(--err); }
 .banner .btn { margin-left: auto; }

@@ -1,5 +1,71 @@
 # Changelog
 
+## 1.22.2 - 2026-11-14
+
+**AppContainer backend: a gateway that nobody is signed in to (started at boot under a service account) can start
+its members' agents.** No database schema change, no new setting. Installations that use MXC only are not affected.
+
+Reported from a Windows Server 2022 installation whose gateway is started at boot under a service account: every
+process in a member's container ended with `0xC0000142` - goose itself, and `import ctypes` in Python - while a
+console program still ran. The cause, measured on Windows build 26100 by putting a container process on such a
+desktop (`tests/test_appcontainer.py`):
+
+- A program that loads `user32` - goose does, and so does everything that uses COM - connects to a desktop while it
+  loads. Unless that desktop gives the program's container **read objects and write objects**, `user32` does not
+  initialise and the program ends before its first instruction.
+- The desktop of a signed-in user gives every application package that and more. A desktop made on a window
+  station that nobody is signed in to gets, by default, read, list and switch for application packages - not
+  write. That is where a gateway started at boot sits, so the backend only worked where the account that runs the
+  gateway was signed in. (Measured on the non-interactive window station of a signed-in logon; the desktop a boot
+  task really gets is what the new CI job measures.)
+
+What 1.22.2 does:
+
+- When it starts a member's agent, the gateway makes sure the member's container is let in on the window station
+  and the desktop the gateway itself sits on. Where it is not, the container gets an entry of its own: on the
+  desktop read and write objects, list, create windows and menus - not the rights to hook or journal input, to
+  switch desktops, or to change or delete the desktop. Where somebody is signed in, nothing is changed. The entries
+  end with the gateway's logon, and are taken off when the member's container is deleted.
+- Such a gateway starts the member's processes on its own window station and desktop by name.
+- At its start, with the AppContainer backend or fallback configured, the gateway runs a console program and a
+  program that uses its desktop, COM and sockets in a throwaway container - from its own process - and logs the
+  result (`sandbox self-test: ...`): where it runs, whether containers were let in as things were, and what the
+  programs did without the entry and with it. `goose-web check` and `goose-web sandbox status` show what the
+  running gateway measured; `goose-web sandbox selftest` runs the test in the session of whoever types it.
+- A member's agent that ends with `0xC0000142` at its start says what that means and where to look, instead of
+  "exited with code 3221225794".
+- CI has a new job, "AppContainer as a boot task", on Windows Server 2022 and 2025: it runs the self-test from a
+  scheduled task of a local account that never signs in and reports the result as an annotation of the run. It
+  does not fail the run yet - it was written before it had been seen there - and the container tests are reported
+  the same way for Windows Server 2022, where they had never run.
+
+**Not measured:** a real boot task under a service account on an installation (the CI job is the first
+measurement of one), and the MXC backend under such a gateway.
+
+**Known limits** (SECURITY-ASSESSMENT 18, from a narrow independent review): the members' containers share the
+gateway's desktop and window station, as they share those of a signed-in user - a desktop per member would be
+tighter and is not done yet; a gateway on the window station of SYSTEM, NETWORK SERVICE or LOCAL SERVICE is not
+supported with this backend (those are shared with Windows' own services and are never changed).
+
+**For developers:** `sandbox.dismiss()` takes off only the entries that `sandbox.admit()` added in the same
+process, and only for a container's own SID. While this was written, a test record with the stand-in SID
+`S-1-15-2-1` made a first version take the entries of ALL APPLICATION PACKAGES off the window station and desktop
+of the signed-in session the tests ran in; they were put back as recorded. The test run now fails when the access
+list of the window station or desktop it runs on is not what it was at the start (`tests/conftest.py`).
+
+**The team page says what a team needs, gives things with switches, and saves as you go** (Admin > Teams & policy):
+
+- At the top of a team: "Not ready yet - the members of this team cannot chat", with each thing that is missing and
+  a button that puts it right, or "Ready: the members of this team can chat".
+- **Give a provider to this team**: a switch next to each provider of your own profile. On = the members get the
+  provider and its key, are allowed to use it, and it becomes the team's default when it has none. Off = they lose
+  it. Before, allowing a provider and handing it over were two separate steps in two places.
+- **Everything is saved at once.** Switches, lists, folders, members and hints are stored as you change them; the
+  page shows "Saved" with the time. Before, nothing was stored until "Save team" was pressed, and opening another
+  team dropped what had been changed.
+- "Add from library" shows a switch per item (on = this team has it) instead of an Add button, so the same list
+  also takes an item away.
+
 ## 1.22.1 - 2026-11-13
 
 **The installer lets sandboxes read the program folders; a check of 1.22.0 that failed under PowerShell 7.** No

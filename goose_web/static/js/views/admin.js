@@ -323,11 +323,12 @@ function providerModelPicker(pol, catalog) {
 
 function teamsTab(body) {
   let teams = [], users = [], hints = [], guardSets = [], selId = null;
+  let flush = null;   // saves what is still pending on the open team (before another one is opened)
   const listEl = h('div', { class: 'split-list' }, skeleton(4));
   const detail = h('div', { class: 'split-detail' });
-  body.replaceChildren(h('div', { class: 'row' }, h('p', { class: 'muted grow' }, 'Each user belongs to one team. The team decides their experience: hints, providers and models, approval modes, folders, extensions, recipes and skills. Least privilege: nothing is allowed until you allow it.'), btn('New team', () => newTeam(), { icon: 'plus', variant: 'primary', size: 'sm' })), h('div', { class: 'split' }, listEl, detail));
+  body.replaceChildren(h('div', { class: 'row' }, h('p', { class: 'muted grow' }, 'Each user belongs to one team. The team decides their experience: hints, providers and models, approval modes, folders, extensions, recipes and skills. Least privilege: nothing is allowed until you allow it. Before its members can chat a team needs: a provider switched on (Providers & models - that gives members the provider and its key), a default model, an approval mode, and members. Everything you change is saved at once.'), btn('New team', () => newTeam(), { icon: 'plus', variant: 'primary', size: 'sm' })), h('div', { class: 'split' }, listEl, detail));
   const teamName = (id) => (teams.find((t) => t.id === id) || {}).name || '';
-  const drawList = () => listEl.replaceChildren(...(teams.length ? teams.map((t) => h('button', { type: 'button', class: ['litem', t.id === selId ? 'active' : ''], onclick: () => { selId = t.id; drawList(); drawDetail(); } },
+  const drawList = () => listEl.replaceChildren(...(teams.length ? teams.map((t) => h('button', { type: 'button', class: ['litem', t.id === selId ? 'active' : ''], onclick: () => { if (flush) flush(); selId = t.id; drawList(); drawDetail(); } },
     icon('users', 14), h('div', { class: 'litem-main' }, h('div', { class: 'litem-title' }, t.name, (t.warnings || []).some((w) => w.level === 'err') ? h('span', { class: 'muted small' }, ' · cannot chat') : null), h('div', { class: 'litem-sub' }, ((t.members || []).length) + ' members' + (t.description ? ' · ' + t.description : ''))))) : [empty('users', 'No teams')]));
   const newTeam = async () => {
     const n = input({ placeholder: 'InfoSec Ops' }); const d = input({ placeholder: 'optional' });
@@ -351,43 +352,127 @@ function teamsTab(body) {
     const hp = multiPick(hints.map((x) => ({ value: x.id, label: x.name, sub: x.description || '' })), t.hints || [], { empty: 'Hints library is empty' });
     const ge = teamGuardEditor(pol.guard, guardSets);
     const itemBoxes = {};
+    const secEls = {};
+    let teamItems = [];
+    const meName = (store.get('me').user || {}).username || '';
+    const itemsUrl = '/api/admin/teams/' + encodeURIComponent(t.id) + '/items';
+    // What the page holds, as the server takes it. Saved whenever it differs from what was saved last.
+    const collect = () => {
+      const sel = pm.get();
+      return { name: name.value.trim(), description: desc.value.trim(),
+        policy: { ...pol, allowed_providers: sel.providers, allowed_models: sel.models, allowed_modes: modes.get(),
+          allowed_roots: roots.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
+          default_provider: sel.defaultProvider, default_model: sel.defaultModel, share_folder: share.value.trim(),
+          max_concurrent_runs: maxRuns.value === '' ? null : Number(maxRuns.value), guard: ge.get() },
+        members: members.get(), hints: hp.get() };
+    };
+    const state = h('span', { class: 'muted small', title: 'Every change on this page is saved by itself' }, 'Saved');
+    let saved = null, saving = false, again = false;
+    const save = async () => {
+      const body = collect(); const cur = JSON.stringify(body);
+      if (cur === saved) return;
+      if (!body.name) { state.textContent = 'Not saved: the team needs a name'; return; }
+      if (saving) { again = true; return; }
+      saving = true; state.textContent = 'Saving ...';
+      try {
+        const r = await PATCH('/api/admin/teams/' + encodeURIComponent(t.id), body);
+        saved = cur; state.textContent = 'Saved ' + new Date().toLocaleTimeString();
+        if (r && (r.moved || []).length) { toast('Moved to ' + t.name + ': ' + r.moved.join(', '), { kind: 'info', timeout: 8000 }); saving = false; await load(); return; }
+        if (r && r.team) { Object.assign(t, r.team); drawList(); drawNeeds(); }
+      } catch (e) { state.textContent = 'NOT saved: ' + errMsg(e); }
+      finally { saving = false; if (again) { again = false; save(); } }
+    };
+    const later = debounce(save, 700);
+    flush = save;
+    // The team's own copy of a provider of yours: with it the members have the provider and its key. One switch
+    // gives it and allows it (and makes it the default when the team has none); switching off takes both away.
+    const policyNow = () => ({ ...collect().policy });
+    const patchPolicy = async (p) => { await PATCH('/api/admin/teams/' + encodeURIComponent(t.id), { policy: p }); };
+    const giveProvider = async (id) => {
+      await POST(itemsUrl, { kind: 'provider', fromProfile: meName, ref: id });
+      const p = policyNow(); let changed = false;
+      if (!(p.allowed_providers || []).includes('*') && !(p.allowed_providers || []).includes(id)) { p.allowed_providers = [...(p.allowed_providers || []), id]; changed = true; }
+      if (!p.default_provider) {
+        const c = (Array.isArray(providerCatalog) ? providerCatalog : []).find((x) => x.id === id) || {};
+        p.default_provider = id; p.default_model = p.default_model || c.defaultModel || ((c.models || [])[0] || {}).id || ''; changed = true;
+      }
+      if (changed) await patchPolicy(p);
+      await load();
+    };
+    const takeProvider = async (id, item) => {
+      await DEL(itemsUrl + '/' + encodeURIComponent(item.id));
+      const p = policyNow(); let changed = false;
+      if ((p.allowed_providers || []).includes(id)) { p.allowed_providers = p.allowed_providers.filter((x) => x !== id); changed = true; }
+      if (p.default_provider === id) { p.default_provider = ''; p.default_model = ''; changed = true; }
+      if (changed) await patchPolicy(p);
+      await load();
+    };
+    const provBox = h('div', { class: 'stack-sm' }, spinner(14));
+    const drawProvToggles = async () => {
+      let mine = [];
+      try { mine = arr(await GET('/api/admin/library' + qs({ profile: meName, kind: 'provider' })), 'items'); }
+      catch (e) { provBox.replaceChildren(banner('warn', 'Your providers could not be listed: ' + errMsg(e))); return; }
+      provBox.replaceChildren(h('div', { class: 'strong' }, 'Give a provider to this team'),
+        h('div', { class: 'muted small' }, 'These are the providers of your own profile. Switch one on and the members of this team get it - its address, its models and its key - and are allowed to use it. Switch it off and they lose it. Changes you make to the provider in your profile reach the team by themselves.'),
+        ...(mine.length ? mine.map((i) => {
+          const have = teamItems.find((x) => x.kind === 'provider' && x.name === i.ref);
+          return h('div', { class: 'set-row' }, h('div', { class: 'grow' }, h('div', null, i.name), h('div', { class: 'muted small mono' }, i.ref)),
+            toggle(!!have, async (v) => { try { if (v) await giveProvider(i.ref); else if (have) await takeProvider(i.ref, have); } catch (e) { toastError(e); load(); } }));
+        }) : [h('div', { class: 'muted small' }, 'Your profile has no provider of its own yet (Settings > Providers).')]));
+    };
+    // What is missing before the members can chat, each with the way to put it right
+    const needs = h('div', { class: 'stack-sm' });
+    const goTo = (id) => { const el = secEls[id]; if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' }); };
+    const drawNeeds = () => {
+      const all = t.warnings || [];
+      const errs = all.filter((w) => w.level === 'err'), rest = all.filter((w) => w.level !== 'err');
+      const fix = (w) => {
+        const m = /^Members do not have the provider '([^']+)'/.exec(w.text);
+        if (m) return actionBtn('Give it to this team', () => giveProvider(m[1]), { size: 'sm', variant: 'primary', success: 'The members now get ' + m[1] });
+        if (/default model|providers allowed|models allowed/.test(w.text)) return btn('Choose', () => goTo('models'), { size: 'sm' });
+        if (/approval modes allowed/.test(w.text)) return btn('Choose', () => goTo('modes'), { size: 'sm' });
+        return null;
+      };
+      const noMembers = !(t.members || []).length;
+      needs.replaceChildren(
+        errs.length ? h('div', { class: 'strong' }, 'Not ready yet - the members of this team cannot chat:')
+          : banner('success', noMembers ? 'Ready: providers, models and modes are set. Add members below.' : 'Ready: the members of this team can chat.'),
+        ...errs.map((w) => banner('error', w.text, fix(w))),
+        ...rest.map((w) => banner(WARN_KIND[w.level] || 'info', w.text)));
+    };
     const groupBody = (g) => {
       const parts = g.flags.map(flagRow);
       if (g.id === 'guard') parts.push(ge.el);
       if (g.id === 'hints') parts.unshift(field('Team hints', hp.el, 'Team hints come last in every member\'s hints and take precedence over personal hints.'));
-      if (g.id === 'models') parts.unshift(pm.el);
+      if (g.id === 'models') parts.unshift(provBox, pm.el);
       if (g.id === 'modes') parts.push(modes.el);
       if (g.id === 'folders') parts.push(h('div', { class: 'stack-sm' }, h('div', { class: 'muted small' }, 'Members can always reach their own workspace and the team folder. Nothing else unless listed here.'), field('Team folder', share, 'Shared by all members. Leave empty for the default: ' + (t.teamFolder || '')), field('Extra folders', roots, 'Absolute paths, one per line.'), field('Max concurrent runs', maxRuns, 'Per user. Empty = the default (3). 0 = unlimited.')));
       if (g.kinds) {
         itemBoxes[g.id] = h('div', null, spinner(14));
-        parts.push(h('div', { class: 'row' }, h('span', { class: 'muted small grow' }, 'Library items: ' + g.kinds.join(', ') + 's copied into members\' profiles.'), btn('Add from library', () => libraryPicker(t, loadItems, g.kinds[0]), { icon: 'plus', size: 'sm' })), itemBoxes[g.id]);
+        parts.push(h('div', { class: 'row' }, h('span', { class: 'muted small grow' }, 'Library items: ' + g.kinds.join(', ') + 's copied into members\' profiles.'), btn('Add from library', () => libraryPicker(t, loadItems, g.kinds[0], () => teamItems), { icon: 'plus', size: 'sm' })), itemBoxes[g.id]);
       }
       return parts;
     };
-    detail.replaceChildren(
+    const pane = h('div', { style: 'display:contents' },
       h('div', { class: 'detail-head' }, h('h2', null, t.name), h('div', { class: 'row' },
-        actionBtn('Save team', async () => {
-          const sel = pm.get();
-          const p = { ...pol, allowed_providers: sel.providers, allowed_models: sel.models, allowed_modes: modes.get(),
-            allowed_roots: roots.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
-            default_provider: sel.defaultProvider, default_model: sel.defaultModel, share_folder: share.value.trim(),
-            max_concurrent_runs: maxRuns.value === '' ? null : Number(maxRuns.value), guard: ge.get() };
-          const r = await PATCH('/api/admin/teams/' + encodeURIComponent(t.id), { name: name.value.trim(), description: desc.value.trim(), policy: p, members: members.get(), hints: hp.get() });
-          if (r && (r.moved || []).length) toast('Moved to ' + t.name + ': ' + r.moved.join(', '), { kind: 'info', timeout: 8000 });
-          await load();
-        }, { variant: 'primary', size: 'sm', success: 'Team saved' }),
+        state, btn('Save now', () => save(), { size: 'sm' }),
         iconBtn('trash', 'Delete team', async () => {
           if (!(await confirmDialog({ title: 'Delete team ' + t.name + '?', message: 'Members are left without a team and cannot chat until you move them to another team. The team folder is kept on disk.', confirmText: 'Delete', danger: true }))) return;
           try { await DEL('/api/admin/teams/' + encodeURIComponent(t.id)); selId = null; load(); } catch (e) { toastError(e); }
         }, { variant: 'danger-soft' }))),
       h('div', { class: 'grid2' }, field('Name', name), field('Description', desc)),
-      (t.warnings || []).length ? h('div', { class: 'stack-sm' }, ...t.warnings.map((w) => banner(WARN_KIND[w.level] || 'info', w.text))) : null,
+      needs,
       section('Members', null, members.el, h('div', { class: 'muted small' }, 'One team per user: ticking someone from another team moves them here.')),
       h('h3', { class: 'exp-title' }, 'Experience'),
-      ...EXPERIENCE.map((g) => section(g.title, null, ...groupBody(g))));
+      ...EXPERIENCE.map((g) => (secEls[g.id] = section(g.title, null, ...groupBody(g)))));
+    detail.replaceChildren(pane);
+    saved = JSON.stringify(collect());
+    drawNeeds();
+    for (const ev of ['change', 'input', 'click']) pane.addEventListener(ev, later);
     const loadItems = async () => {
       try {
         const items = arr(await GET('/api/admin/teams/' + encodeURIComponent(t.id) + '/items'), 'items');
+        teamItems = items; drawProvToggles();
         for (const g of EXPERIENCE.filter((x) => x.kinds)) {
           const mine = items.filter((i) => g.kinds.includes(i.kind));
           itemBoxes[g.id].replaceChildren(mine.length ? table([
@@ -400,7 +485,7 @@ function teamsTab(body) {
     };
     loadItems();
   };
-  const libraryPicker = (t, onDone, startKind = 'recipe') => {
+  const libraryPicker = (t, onDone, startKind = 'recipe', current = () => []) => {
     let kind = startKind; let profile = (store.get('me').user || {}).username || '';
     const pSel = select(users.map((u) => ({ value: u.username, label: (u.displayName || u.username) + (u.role === 'admin' ? ' (admin)' : '') })), profile, { class: 'inp' });
     const res = h('div', { class: 'lib-res' });
@@ -413,7 +498,18 @@ function teamsTab(body) {
         res.replaceChildren(items.length ? table([
           { label: 'Name', render: (i) => h('div', null, h('div', { class: 'strong' }, i.name), h('div', { class: 'muted small' }, i.description || '')) },
           { label: 'Source', render: (i) => h('span', { class: 'muted small mono' }, i.source || '') },
-          { label: '', class: 'right', render: (i) => actionBtn('Add', async () => { await POST('/api/admin/teams/' + encodeURIComponent(t.id) + '/items', { kind: i.kind || kind, fromProfile: pSel.value, ref: i.ref }); onDone(); }, { size: 'sm', icon: 'plus', success: 'Added ' + i.name }) },
+          { label: 'In ' + t.name, class: 'right', render: (i) => {
+            // a switch, not a button: on = the team has it, off = it is taken away from every member again
+            const have = current().find((x) => x.kind === (i.kind || kind) && x.source === pSel.value + ':' + i.ref);
+            return toggle(!!have, async (v) => {
+              try {
+                if (v) await POST('/api/admin/teams/' + encodeURIComponent(t.id) + '/items', { kind: i.kind || kind, fromProfile: pSel.value, ref: i.ref });
+                else if (have) await DEL('/api/admin/teams/' + encodeURIComponent(t.id) + '/items/' + encodeURIComponent(have.id));
+                toast((v ? 'Given to ' : 'Taken away from ') + t.name + ': ' + i.name, { kind: 'info' });
+              } catch (e) { toastError(e); }
+              await onDone(); load2();
+            });
+          } },
         ], items) : empty('list', 'Nothing in this profile'));
       } catch (e) { res.replaceChildren(banner('error', errMsg(e))); }
     };

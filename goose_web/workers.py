@@ -677,6 +677,11 @@ class WorkerManager:
             self._close_job(w)
             w.state = "crashed"
             w.last_error = f"goose acp exited with code {w.proc.returncode} (see worker-{w.key}.log)"
+            if (w.proc.returncode or 0) & 0xFFFFFFFF == sb.INIT_FAILED:
+                # 0xC0000142: the process could not initialise - its container cannot read a program folder, or it
+                # cannot use the window station the gateway runs on (a gateway started at boot, session 0)
+                w.last_error += (". 0xC0000142: a process in this member's container could not initialise. See the "
+                                 "\"sandbox self-test\" and \"sandbox folders\" lines of goose-web sandbox status")
             raise RuntimeError(w.last_error)
         w.port, w.secret = 0, ""
         w.state, w.started_at, w.restart_pending, w.last_error = "ready", time.time(), False, ""

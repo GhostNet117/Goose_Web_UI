@@ -1260,3 +1260,313 @@ def test_what_icacls_could_not_change_below_a_granted_folder_is_said(monkeypatch
         sb.grant(r"C:\x", "S-1-15-2-9", "read")
     assert any("could not change 4 file(s)" in r.getMessage() for r in caplog.records)
     assert "WRITE_DAC" in sb.grant_help(r"C:\x", "read") and "WRITE_DAC" in sb.grant_help(r"C:\x", "modify")
+
+
+# ------------------------------------------------------------------ does a container process start where the gateway runs?
+# A program that loads user32 connects to a desktop while it loads, and its container must be let in there. Where
+# somebody is signed in Windows sees to that; a gateway started at boot under an account nobody signs in with sits on
+# a desktop that does not (FIX appcontainer-session0, reported from Windows Server 2022, reproduced on build 26100 by
+# putting the process on such a desktop).
+def _user32():
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    u32.CreateDesktopW.restype = wintypes.HANDLE
+    u32.CreateDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                   ctypes.c_void_p]
+    u32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                                                         ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    adv.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                                                         ctypes.POINTER(wintypes.LPWSTR), ctypes.c_void_p]
+    adv.GetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
+                                    ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    return ctypes, wintypes, u32, adv
+
+
+def _access_list(h) -> str:
+    ctypes, wintypes, _u32, adv = _user32()
+    psd, text = ctypes.c_void_p(), wintypes.LPWSTR()
+    assert adv.GetSecurityInfo(h, 7, 4, None, None, None, None, ctypes.byref(psd)) == 0
+    assert adv.ConvertSecurityDescriptorToStringSecurityDescriptorW(psd, 1, 4, ctypes.byref(text), None)
+    return text.value
+
+
+@pytest.fixture
+def desk():
+    """A desktop on the window station of this test run, made as `desk(access list)`; the default names this account
+    and SYSTEM and no application container. Nothing is shown on it and it ends with the test."""
+    ctypes, wintypes, u32, adv = _user32()
+    made = []
+
+    class SA(ctypes.Structure):
+        _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p), ("bInheritHandle", wintypes.BOOL)]
+
+    def make(sddl: str = ""):
+        psd = ctypes.c_void_p()
+        sddl = sddl or f"D:P(A;;GA;;;{winsec.current_user_sid()})(A;;GA;;;SY)"
+        assert adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(psd), None)
+        name = f"gwtest{uuid.uuid4().hex[:10]}"
+        h = u32.CreateDesktopW(name, None, None, 0, 0x10000000, ctypes.byref(SA(ctypes.sizeof(SA), psd.value, False)))
+        if not h:
+            pytest.skip(f"this account may not make a desktop here ({ctypes.get_last_error()})")
+        made.append(h)
+        return SimpleNamespace(name=name, handle=h)
+    yield make
+    for h in made:
+        u32.CloseDesktop(h)
+
+
+@pytest.fixture
+def throwaway():
+    """A container that has nothing but the right to read the gateway's Python."""
+    py = rl.python_for_container()[0]
+    name = f"GooseWeb.test.{uuid.uuid4().hex[:12]}"
+    sid, granted = sb.ensure_container(name), ""
+    folder = os.path.realpath(os.path.dirname(py))      # the folder, not a link to it (uv's Pythons; AC-11)
+    try:
+        if not sb.allowed(folder, [sb.ALL_APP_PACKAGES], "read"):
+            sb.grant(folder, sid, "read")
+            granted = folder
+        yield SimpleNamespace(sid=sid, py=py)
+    finally:
+        if granted:
+            sb.revoke(granted, sid)
+        sb.delete_container(name)
+
+
+@windows
+def test_the_self_test_starts_container_processes_in_this_session():
+    res = sb.selftest(rl.python_for_container()[0])
+    ok, text = sb.selftest_text(res)
+    assert ok and res["ok"] and [s["ok"] for s in res["steps"]] == [True, True], res
+    assert isinstance(res["session"], int) and res["windowStation"] and res["build"] and "starts here" in text
+    if res["interactive"]:          # somebody is signed in: Windows lets containers in, and nothing was changed
+        assert not res["missing"] and not res["admitted"] and "stepsBefore" not in res and not res["remedy"], res
+
+
+@windows
+def test_a_container_that_its_desktop_does_not_let_in_cannot_load_user32_and_admit_lets_it_in(desk, throwaway, caplog):
+    """The failure reported from a gateway started at boot under a service account, and its cure, on a real
+    desktop: `import ctypes` (COM, user32) ends with "DLL initialization routine failed" - a program that links
+    user32, like goose, ends with 0xC0000142 - while a console program that does not load user32 runs."""
+    d, c = desk(), throwaway
+    before = _access_list(d.handle)
+    steps = sb._selftest_run(c.sid, c.py, d.name)
+    if all(s["ok"] for s in steps):
+        pytest.skip("this Windows lets a container use a desktop that does not name it")
+    assert [s["ok"] for s in steps] == [True, False] and "initialization routine failed" in steps[1]["detail"], steps
+    assert sb.admit(c.sid, d.name, dry=True) == [f"desktop {d.name}"] and _access_list(d.handle) == before
+    assert sb.admit(c.sid, d.name) == [f"desktop {d.name}"]
+    assert f"(A;;CCDCLCDTLORC;;;{c.sid})" in _access_list(d.handle)      # 0x000200C7: no hooks, no switch, no change
+    assert sb.admit(c.sid, d.name) == [] and sb.admit(c.sid, d.name, dry=True) == []
+    assert [s["ok"] for s in sb._selftest_run(c.sid, c.py, d.name)] == [True, True]
+    # taken off again when the container goes: the desktop is as it was and the process fails as before
+    assert sb.dismiss(c.sid, d.name) == [f"desktop {d.name}"] and _access_list(d.handle) == before
+    assert [s["ok"] for s in sb._selftest_run(c.sid, c.py, d.name)] == [True, False]
+    # what a member's start does: spawn lets the container in first, and says so
+    with caplog.at_level("INFO"), open(os.devnull, "wb") as errf:
+        p = sb.spawn([c.py, "-I", "-c", "import ctypes; print('in')"],
+                     {k: os.environ[k] for k in ("SystemRoot", "LOCALAPPDATA")},     # without LOCALAPPDATA: error 203
+                     os.environ["SystemRoot"], c.sid, [], errf, desktop=d.name)
+        p.stdin.close()
+        assert p.stdout.read().strip() == b"in" and p.wait(60) == 0
+    assert any(f"is now named on the desktop {d.name}" in r.getMessage() for r in caplog.records)
+    sb.dismiss(c.sid, d.name)
+
+
+@windows
+def test_a_desktop_that_gives_application_packages_too_little_counts_as_closed(desk, throwaway):
+    """What a desktop on the window station of a logon nobody is signed in to gives ALL APPLICATION PACKAGES by
+    default (read, list, switch: 0x00020141) is not what user32 needs. Being named is not being let in."""
+    d = desk(f"D:P(A;;GA;;;{winsec.current_user_sid()})(A;;GA;;;SY)(A;;CCDTCRRC;;;AC)")
+    c = throwaway
+    assert sb.admit(c.sid, d.name, dry=True) == [f"desktop {d.name}"]
+    steps = sb._selftest_run(c.sid, c.py, d.name)
+    if all(s["ok"] for s in steps):
+        pytest.skip("this Windows lets a container load user32 with less")
+    assert sb.admit(c.sid, d.name) == [f"desktop {d.name}"]
+    assert [s["ok"] for s in sb._selftest_run(c.sid, c.py, d.name)] == [True, True]
+    sb.dismiss(c.sid, d.name)
+    # and a desktop that gives application packages what the desktop of a signed-in user gives them is left alone
+    open_ = desk(f"D:P(A;;GA;;;{winsec.current_user_sid()})(A;;GA;;;SY)(A;;CCDCLCSWRPWPDTLOSDRCWDWO;;;AC)")
+    assert sb.admit(c.sid, open_.name) == [] and [s["ok"] for s in sb._selftest_run(c.sid, c.py, open_.name)] == [True, True]
+
+
+@windows
+def test_nothing_is_taken_off_a_desktop_that_this_process_did_not_put_there(desk, throwaway):
+    """What happened on 2026-11-14: a record on disk said the container's SID was S-1-15-2-1 (a stand-in in a test),
+    and removing "that container" took ALL APPLICATION PACKAGES off the window station and desktop of the signed-in
+    session. Only a container's own SID is ever handled, and only the entry this process added."""
+    me, c = winsec.current_user_sid(), throwaway
+    d = desk(f"D:P(A;;GA;;;{me})(A;;GA;;;SY)(A;;CCDCLCSWRPWPDTLOSDRCWDWO;;;S-1-15-2-2)(A;;CCDCLCSWRPWPDTLOSDRCWDWO;;;AC)")
+    before = _access_list(d.handle)
+    for sid in (sb.ALL_APP_PACKAGES, sb.ALL_RESTRICTED_APP_PACKAGES, "S-1-1-0", me, "", "S-1-15-2-9",
+                "S-1-15-2-99-1-2-3-4-5-6\n"):
+        assert sb.dismiss(sid, d.name) == [] and _access_list(d.handle) == before, sid
+        with pytest.raises(sb.SandboxError):
+            sb.admit(sid, d.name)
+    # an entry of a real container that somebody else made stays as well
+    closed = desk()
+    sb._set_entry(closed.handle, c.sid, 0x000200C7, 1, "desktop")
+    made = _access_list(closed.handle)
+    assert c.sid in made and sb.admit(c.sid, closed.name) == []
+    assert sb.dismiss(c.sid, closed.name) == [] and _access_list(closed.handle) == made
+    # ALL RESTRICTED APPLICATION PACKAGES alone lets an ordinary container in: nothing is added there
+    only = desk(f"D:P(A;;GA;;;{me})(A;;GA;;;SY)(A;;CCDCLCSWRPWPDTLOSDRCWDWO;;;S-1-15-2-2)")
+    assert sb.admit(c.sid, only.name) == [] and [s["ok"] for s in sb._selftest_run(c.sid, c.py, only.name)] == [True, True]
+
+
+@windows
+def test_an_object_without_an_access_list_is_left_without_one(desk):
+    """Everybody is let in there; a list with one entry would shut everybody else out - the gateway included."""
+    d = desk("D:NO_ACCESS_CONTROL")
+    assert sb.admit("S-1-15-2-99-1-2-3-4-5-6", d.name) == [] and sb.dismiss("S-1-15-2-99-1-2-3-4-5-6", d.name) == []
+    assert _access_list(d.handle) == "D:NO_ACCESS_CONTROL"
+
+
+@windows
+def test_the_self_test_on_a_closed_desktop_says_what_it_took_and_leaves_it_as_it_was(desk):
+    d = desk()
+    before = _access_list(d.handle)
+    res = sb.selftest(rl.python_for_container()[0], desktop=d.name)
+    if "stepsBefore" in res and all(s["ok"] for s in res["stepsBefore"]):
+        pytest.skip("this Windows lets a container use a desktop that does not name it")
+    ok, text = sb.selftest_text(res)
+    assert ok and res["missing"] == res["admitted"] == [f"desktop {d.name}"], res
+    assert [s["ok"] for s in res["stepsBefore"]] == [True, False] and [s["ok"] for s in res["steps"]] == [True, True]
+    assert "only once its container is named on the desktop" in text and "names every member's container" in text
+    assert _access_list(d.handle) == before
+
+
+@windows
+def test_a_gateway_nobody_is_signed_in_to_starts_container_processes(tmp_path):
+    """As close as a test gets without a boot task: a process of its own moves onto the window station of this
+    logon that nobody is signed in to ("Service-0x0-...$") and a desktop made there with default security, and
+    runs the self-test from there - the gateway's start. The processes it starts must go THERE (they would go to
+    the desktop this test run was started on, where everything works) and must start."""
+    child = tmp_path / "child.py"
+    child.write_text(f"""
+import ctypes, json, sys
+from ctypes import wintypes
+sys.path.insert(0, {str(Path(sb.__file__).resolve().parents[1])!r})
+from goose_web import relay, sandbox as sb
+u32 = ctypes.WinDLL("user32", use_last_error=True)
+u32.CreateWindowStationW.restype = u32.CreateDesktopW.restype = wintypes.HANDLE
+u32.CreateWindowStationW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+u32.CreateDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+u32.SetProcessWindowStation.argtypes = u32.SetThreadDesktop.argtypes = [wintypes.HANDLE]
+ws = u32.CreateWindowStationW(None, 0, 0x000F037F, None)
+assert ws and u32.SetProcessWindowStation(ws), ctypes.get_last_error()
+dt = u32.CreateDesktopW({('gwsvc' + uuid.uuid4().hex[:8])!r}, None, None, 0, 0x10000000, None)
+assert dt and u32.SetThreadDesktop(dt), ctypes.get_last_error()
+adv = ctypes.WinDLL("advapi32")
+adv.GetSecurityInfo.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+adv.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR), ctypes.c_void_p]
+def lists():
+    out = []
+    for h in (ws, dt):
+        psd, text = ctypes.c_void_p(), wintypes.LPWSTR()
+        assert adv.GetSecurityInfo(h, 7, 4, None, None, None, None, ctypes.byref(psd)) == 0
+        adv.ConvertSecurityDescriptorToStringSecurityDescriptorW(psd, 1, 4, ctypes.byref(text), None)
+        out.append(text.value)
+    return out
+before = lists()
+res = sb.selftest(relay.python_for_container()[0])
+res["text"] = sb.selftest_text(res)[1]
+res["unchanged"] = lists() == before
+print(json.dumps(res))
+""", encoding="utf-8")
+    r = subprocess.run([sys.executable, str(child)], capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and r.stdout.strip(), r.stdout + r.stderr
+    res = json.loads(r.stdout.strip().splitlines()[-1])
+    assert res["ok"] and not res["interactive"] and res["windowStation"].lower() != "winsta0", res
+    assert res["desktop"].startswith("gwsvc") and "nobody signed in" in res["text"]
+    assert res["missing"] == res["admitted"] and res["unchanged"], res      # its entries were taken off again
+    if res["missing"]:      # measured on build 26100: such a desktop does not let containers in
+        assert not res["desktopLetsContainersIn"] and f"desktop {res['desktop']}" in res["missing"]
+        assert [s["ok"] for s in res["stepsBefore"]] == [True, False] and "only once its container is named" in res["text"]
+
+
+def test_the_self_test_believes_what_it_sees(monkeypatch):
+    """The three ways it can end where the container is not let in: cured by naming it, not allowed to name it,
+    named and still failing. No Windows needed."""
+    monkeypatch.setattr(sb, "IS_WINDOWS", True)
+    monkeypatch.setattr(sb, "ensure_container", lambda name: "S-1-15-2-9")
+    monkeypatch.setattr(sb, "delete_container", lambda name: True)
+    monkeypatch.setattr(sb, "dismiss", lambda sid, desktop="": [])
+    monkeypatch.setattr(sb, "allowed", lambda path, sids, right: True)
+    py = r"C:\py\python.exe"
+    monkeypatch.setattr(sb, "session_info", lambda: {"session": 0, "windowStation": "Service-0x0-1a2b3$", "desktop": "Default",
+                                                     "interactive": False, "build": 20348,
+                                                     "windowStationLetsContainersIn": False, "desktopLetsContainersIn": False})
+    where = ["window station Service-0x0-1a2b3$", "desktop Default"]
+    bad = [{"what": "a program", "ok": False, "exit": "0xC0000142", "detail": ""}]
+    good = [{"what": "a program", "ok": True, "exit": "0x00000000", "detail": ""}]
+    runs = iter([bad, good])
+    monkeypatch.setattr(sb, "_selftest_run", lambda sid, python, desktop="": next(runs))
+    monkeypatch.setattr(sb, "admit", lambda sid, desktop="", dry=False: list(where))
+    res = sb.selftest(py)
+    ok, text = sb.selftest_text(res)
+    assert ok and res["stepsBefore"] == bad and res["steps"] == good and res["admitted"] == where
+    assert "only once its container is named on the window station Service-0x0-1a2b3$ and desktop Default" in text
+    assert "ended with 0xC0000142" in text and "session 0" in text and "nobody signed in" in text
+
+    def refused(sid, desktop="", dry=False):
+        if dry:
+            return list(where)
+        raise sb.SandboxError("the desktop 'Default' this gateway runs on does not let the container in, and this "
+                              "account may not change its access list (5)")
+    monkeypatch.setattr(sb, "admit", refused)
+    monkeypatch.setattr(sb, "_selftest_run", lambda sid, python, desktop="": bad)
+    res = sb.selftest(py)
+    ok, text = sb.selftest_text(res)
+    assert not ok and not res["admitted"] and "may not change its access list (5)" in text
+    assert "0xC0000142" in text and "session 0" in text and "nobody is signed in there" in text and "ADMINISTRATION 11.6" in text
+    monkeypatch.setattr(sb, "admit", lambda sid, desktop="", dry=False: list(where))
+    res = sb.selftest(py)
+    assert not res["ok"] and "did not help" in sb.selftest_text(res)[1]
+    # A console program that starts proves nothing - cmd.exe runs exactly where goose ends with 0xC0000142. When the
+    # program that uses its desktop could not be tried, the answer is not "ok" (review S-1).
+    console = [{"what": "a console program (cmd.exe)", "ok": True, "exit": "0x00000000", "detail": ""}]
+    undone = []
+    monkeypatch.setattr(sb, "_selftest_run", lambda sid, python, desktop="": console)
+    monkeypatch.setattr(sb, "allowed", lambda path, sids, right: False)
+    monkeypatch.setattr(sb, "grant", lambda path, sid, right: (_ for _ in ()).throw(sb.SandboxError("no WRITE_DAC")))
+    monkeypatch.setattr(sb, "own_mask", lambda path, sid: 0x1200A9)
+    monkeypatch.setattr(sb, "revoke", lambda path, sid: undone.append(path))
+    monkeypatch.setattr(sb, "admit", refused)
+    res = sb.selftest(py)
+    ok, text = sb.selftest_text(res)
+    assert not ok and "were not tried" in text and "says nothing about a member's agent" in text
+    assert undone == [os.path.realpath(r"C:\py")]       # a grant that failed half-way is taken off as well (S-7)
+    for none in ("", None):
+        res = sb.selftest(none or "")
+        assert not res["ok"] and "no Python was given" in sb.selftest_text(res)[1]
+
+
+def test_removing_a_container_takes_its_entries_off_the_gateways_desktop(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(sb, "delete_container", lambda name: True)
+    monkeypatch.setattr(sb, "dismiss", lambda sid, desktop="": seen.append(sid) or [])
+    sb._save_state(str(tmp_path), "gooseweb.t.alice", {"name": "gooseweb.t.alice", "sid": "S-1-15-2-9", "grants": {},
+                                                      "updatedAt": 0})
+    assert sb.remove(str(tmp_path), "gooseweb.t.alice")["sid"] == "S-1-15-2-9" and seen == ["S-1-15-2-9"]
+
+
+def test_check_shows_what_the_gateway_measured_in_its_own_session(tmp_path):
+    from goose_web.__main__ import _selftest_line
+    s = Settings(_deep_merge(DEFAULTS, {"paths": {"profiles_root": str(tmp_path / "profiles")}}), None)
+    assert _selftest_line(s).startswith("[--] sandbox self-test: no result yet")
+    d = Path(s.system_dir) / "sandbox"
+    d.mkdir(parents=True)
+    (d / "selftest.json").write_text(json.dumps({"ok": False, "session": 0, "windowStation": "Service-0x0-1a2b3$",
+                                                 "interactive": False, "at": 1700000000, "remedy": "",
+                                                 "reason": "a process in an application container does not start in this session: x ended with 0xC0000142."}),
+                                     encoding="utf-8")
+    line = _selftest_line(s)
+    assert line.startswith("[!!] sandbox self-test (by the gateway, ") and "0xC0000142" in line and "ADMINISTRATION 11.6" in line
+    (d / "selftest.json").write_text(json.dumps({"ok": True, "session": 1, "windowStation": "WinSta0", "interactive": True, "at": 1700000000}),
+                                     encoding="utf-8")
+    assert _selftest_line(s).startswith("[OK] sandbox self-test (by the gateway, ") and "session 1" in _selftest_line(s)

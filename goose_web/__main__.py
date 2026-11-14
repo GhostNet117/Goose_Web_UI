@@ -431,6 +431,8 @@ def _print_sandbox_summary(settings, refresh: bool = True) -> bool:
     if "folderProblems" in sm and not sm["folderProblems"]:
         print("[OK] sandbox folders: this account may change permissions in the profiles root; the program folders "
               "are readable by containers or changeable")
+    if "folderProblems" in sm:
+        print(_selftest_line(settings))
     if not sm["membersCanStart"]:
         print(f"[!!] sandboxed members' agents do NOT start (fail closed): {sm['reason']}")
     elif sm["reason"]:
@@ -455,6 +457,21 @@ def cmd_sandbox(args, settings) -> int:
             print(f"MXC not installed: {e.__class__.__name__}: {e}", file=sys.stderr)
             return 4
         return 0
+    if args.action == "selftest":
+        # in THIS session, as THIS account: says nothing about a gateway that runs elsewhere (a boot task)
+        from . import relay as _rl
+        res = sb.selftest(_rl.python_for_container()[0])
+        ok, text = sb.selftest_text(res)
+        print(f"[{'OK' if ok else '!!'}] sandbox self-test (this session): {text}")
+        for s in res.get("stepsBefore") or []:
+            print(f"     as it was: {s['what']}: {'ok' if s['ok'] else 'FAILED'} {s['exit']} {s['detail']}")
+        for s in res.get("steps") or []:
+            print(f"     {s['what']}: {'ok' if s['ok'] else 'FAILED'} {s['exit']} {s['detail']}")
+        print(f"     Windows build {res.get('build')}, session {res.get('session')}, window station "
+              f"{res.get('windowStation')!r}, desktop {res.get('desktop')!r}; they let application packages in as "
+              f"they are: {res.get('windowStationLetsContainersIn')} / {res.get('desktopLetsContainersIn')}; "
+              f"the container had to be named on: {', '.join(res.get('admitted') or []) or 'nothing'}")
+        return 0 if ok else 1
     if args.action == "status":
         can_start = _print_sandbox_summary(settings)
         print("AppContainer backend (spec 012): containers and folder grants recorded"
@@ -932,6 +949,23 @@ def cmd_security(args, settings) -> int:
     return 0
 
 
+def _selftest_line(settings) -> str:
+    """What the RUNNING GATEWAY measured at its last start: does a process in an application container start in the
+    session it runs in (sandbox.selftest; <system_dir>/sandbox/selftest.json)? This command cannot measure it - it
+    runs in the session of whoever types it."""
+    import json as _json
+    from . import sandbox as _sb
+    f = Path(settings.system_dir) / "sandbox" / "selftest.json"
+    try:
+        res = _json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ("[--] sandbox self-test: no result yet - the gateway writes one at its start when the AppContainer "
+                "backend or fallback is configured")
+    ok, text = _sb.selftest_text(res)
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(res.get("at") or 0))
+    return f"[{'OK' if ok else '!!'}] sandbox self-test (by the gateway, {when}): {text}"
+
+
 def _team_lines(settings) -> list[str]:
     """`check` lines for teams that have members who cannot chat as the team is set up: no provider, model or mode
     allowed; a default provider the team was not given (library item); a default provider without a default model.
@@ -1099,6 +1133,8 @@ def cmd_check(args, settings) -> int:
                 line("sandbox folders", p["why"], False)
             else:       # a folder some agents can do without, or the fallback backend: said, not counted
                 print(f"[!!] sandbox folders: {p['why']}")
+        if "folderProblems" in sm:
+            print(_selftest_line(settings))
         if "folderProblems" in sm and not sm["folderProblems"]:
             line("sandbox folders", "for the account running this check (AppContainer backend): it may change "
                  "permissions in the profiles root, and the program folders members' containers need are readable "
@@ -1272,7 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
     nh.add_argument("--doc-name", help="name for the adopted document (default '<user> goose hints')")
     sbx = sub.add_parser("sandbox", help="per-user sandbox: status, install-mxc (the pinned MXC executor), or remove "
                                          "one user's (or all) AppContainers")
-    sbx.add_argument("action", choices=["status", "install-mxc", "remove"])
+    sbx.add_argument("action", choices=["status", "install-mxc", "remove", "selftest"])
     sbx.add_argument("user", nargs="?")
     sbx.add_argument("--all", action="store_true",
                      help="remove: every recorded container, its folder grants and relay rewrites (before an uninstall)")

@@ -807,6 +807,7 @@ A new team starts with every switch off and every list empty.
 | `allowed_models` | Allowed models | nothing | only these model ids; `*` = any. Empty = members cannot chat. |
 | `allowed_roots` | Extra folders | none | use these folders in addition to their workspace and the team folder (chat folders, file browser, uploads, downloads). Every entry must be an absolute path and `*` is not accepted (`400 bad_folder`). Symlinks and junctions are resolved, so a link inside an allowed folder cannot lead outside. |
 | `max_concurrent_runs` | Max concurrent runs | 3 | have at most this many agents running at once. Empty = the default (3), `0` = unlimited. |
+| (the page itself, 1.22.2) | - | - | The team's page saves every change by itself ("Saved" with the time, top right) and starts with what the team still needs before its members can chat, each with a button that puts it right. Under Providers & models, "Give a provider to this team" has a switch per provider of your own profile: on gives the members the provider and its key, allows it and makes it the default when there is none; off takes it away. |
 | `default_provider`, `default_model` | Default provider, Default model | not set | the provider and model new members start with (section 9.6). Both should be in the allowed lists; the page warns if they are not. **Allowing a provider or making it the default does not give it to the members:** a custom provider (its address, its models, its key) is defined in one profile, usually yours. Add it to the team under Library items (section 9.9), which copies the definition and the key to every member; until then members cannot reach a model with it. Since 1.22.0 the team's page says so in red. |
 | `share_folder` | Team folder | empty = `<profiles_root>\_teams\<team id>` | the team's shared folder (section 9.7). Must be an absolute path (`400 bad_folder`). |
 
@@ -1691,6 +1692,31 @@ What it does, for every **isolated, non-admin** user:
 Requirements and limits:
 
 - Windows 10/11 or Server 2019+ (Goose Web refuses to start on other systems; section 2).
+- **A gateway that nobody is signed in to** (started at boot under a service account, `install.ps1 -RunAs`;
+  session 0): supported with this backend since 1.22.2. A program that loads `user32` - goose does, and so does
+  everything that uses COM - connects to a desktop while it loads, and its container must be let in there (read
+  and write objects). The desktop of a signed-in user lets every application package in. A desktop on a window
+  station nobody is signed in to does not, and before 1.22.2 every process in a member's container ended there
+  with `0xC0000142` while a console program such as `cmd.exe` still ran (reported from Windows Server 2022;
+  reproduced on build 26100 by putting a container process on such a desktop).
+  - When the gateway starts a member's agent it names the member's container on the window station and the desktop
+    the gateway itself sits on, where they do not let it in already. On the desktop the container gets: read and
+    write objects, list, create windows and menus. It does not get the rights to hook or journal input, to switch
+    desktops, or to change or delete the desktop. The log says `container ... is now named on the desktop ...`
+    once per container.
+  - Nothing is changed where somebody is signed in. The entries end with the gateway's logon and are taken off when
+    the member's container is deleted. All members' containers share that desktop, as they share the desktop of a
+    signed-in user (SECURITY-ASSESSMENT 18).
+  - The gateway account must be allowed to change those two access lists. It is, on the window station and
+    desktop Windows makes for its own logon. If it is not, the log says so once per container and the member's
+    agent ends with `0xC0000142`.
+  - The gateway tests this at its start with a throwaway container and writes the result to its log (`sandbox
+    self-test: ...`); `goose-web check` and `goose-web sandbox status` show it, with what the programs did before
+    the container was named. `goose-web sandbox selftest` runs the same test in your own session - it says nothing
+    about a gateway that runs elsewhere.
+  - Run the gateway under an account of its own. On the window station of SYSTEM, NETWORK SERVICE or LOCAL SERVICE
+    - which Windows' own services share - Goose Web changes nothing, and members' agents do not start there.
+  - Not measured: the MXC backend under such a gateway.
 - **Model providers must be reachable over the network** (cloud APIs, or a server elsewhere on the LAN with
   `internet+lan`), or be listed in `sandbox.relays` (below). A container cannot reach this machine's own LAN
   address either, so a service on this machine is reachable only through a relay.

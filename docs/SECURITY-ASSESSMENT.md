@@ -1214,3 +1214,92 @@ off). The fixes of that review each have a test; they were not reviewed again.
 - Seen while testing this, and true of section 16.2 as well: a container cannot list a folder it has no access to,
   but it can tell whether a path it guesses exists there - a missing file answers "not found", an existing one
   "access denied". Windows answers every process without access that way.
+
+## 18. Addendum: a gateway nobody is signed in to (2026-11-14), 1.22.2
+
+**What changed.** The AppContainer backend gives a member's container an entry on the window station and the
+desktop the gateway runs on, where those do not let application packages in (`sandbox.admit`, called by
+`sandbox.spawn`); takes it off when the container is deleted (`sandbox.dismiss`); starts the member's processes on
+that window station and desktop by name when the gateway is not on the interactive window station; and tests the
+whole at its start (`sandbox.selftest`). The team page of the admin SPA saves by itself and has switches that give
+and take a provider (browser code only: it calls the same admin endpoints as before, with the same checks).
+
+**Why.** Section 16 measured the backend from a signed-in session only. A gateway started at boot under a service
+account sits on the window station of its own logon; a desktop there gives application packages read, list and
+switch, and `user32` needs read and write objects to initialise. Every process of a member's container that loads
+`user32` ended with `0xC0000142`. Measured on build 26100 with real containers on a desktop made for the purpose.
+
+**What a container gets, and what it does not.**
+
+| Object | Given to the member's container | Compared with a signed-in session |
+|---|---|---|
+| Window station of the gateway | `0x00020327`, only when neither the container nor an application-packages group is named there | Windows gives ALL APPLICATION PACKAGES the same on the interactive window station and on the non-interactive one of the same logon (build 26100) |
+| Desktop of the gateway | `0x000200C7`: read objects, write objects, list, create window, create menu, read the access list - only when the desktop does not give the container read and write objects already | Windows gives ALL APPLICATION PACKAGES `0x000F00FF` on the desktop of a signed-in user: also hook control, journal record and playback, and the rights to change the access list, take ownership and delete. None of those are given here |
+
+**Judged.**
+
+- *Does a member reach more than before?* Where somebody is signed in: nothing changes. Under a gateway nobody is
+  signed in to, the member's processes could not run at all before. They now share one desktop with the other
+  members' containers and with the gateway's own processes, as they always have in a signed-in session. What one
+  process may do to a window of another on a shared desktop is decided by Windows (integrity levels; a container
+  runs at low integrity, the gateway and the administrator's own agent at medium), not by Goose Web. **Not
+  measured:** whether a process in one member's container can reach a window that a process in another member's
+  container created on that desktop. Goose shows no windows; a tool an agent starts might. The residual is the
+  same in a signed-in session and is recorded here for the first time.
+- *Can the entry be turned against the gateway?* The container cannot change or delete the desktop, switch it, or
+  install hooks. It is given nothing on any other desktop or window station.
+- *Can `dismiss` be made to remove something else?* It handles only a SID of the form of one container's own, and
+  only an entry that `admit` added in the same process. This was a real defect of the first version (see below).
+- *An object without an access list* is left without one: adding one entry would have shut everybody else out.
+- *Two members starting at once*: read-add-write of an access list is under one lock.
+- *Failure*: when the gateway account may not change an access list the start goes on, the log says so once per
+  container, and the worker's error names `0xC0000142` and the self-test. Nothing fails open: a process that
+  cannot use its desktop does not run.
+
+**An incident while this was written (2026-11-14, about nine minutes).** `sandbox.remove` called the first
+version of `dismiss` with the SID from the container's record. An existing test writes a record with the stand-in
+SID `S-1-15-2-1`; running the tests therefore took the entries of ALL APPLICATION PACKAGES off the window station
+and the Default desktop of the signed-in session of the development machine. The entries of ALL RESTRICTED
+APPLICATION PACKAGES stayed, and a container process still started in that state (measured). Both access lists were
+put back exactly as recorded before the change. Fixes: `dismiss` as described; `admit` refuses any SID that is not
+one container's own; the test run fails when the window station or desktop it runs on is not left as it was.
+Nothing of the first version was ever committed or deployed.
+
+**Not verified.** A real boot task under a service account on an installation: the CI job "AppContainer as a boot
+task" (Windows Server 2022 and 2025, a scheduled task of a local account that never signs in) is the first
+measurement and reports without failing the run. The MXC backend under such a gateway. Windows versions other than
+build 26100 for the access a desktop must give.
+
+**Review.** One independent, read-only review of the sandbox part and the CI job of the first commit (findings
+S-1 to S-16; it read the code and ran nothing, and ran out of turns before the tests and the worker's call). No
+blocking finding; no path was found that removes or narrows anybody's access but one container's own, and the
+Windows calls and structures were checked for 64-bit. Fixed before publication:
+
+- S-1 (Medium): the self-test said "ok" when only the console program had run - `cmd.exe` starts exactly where a
+  member's agent ends with `0xC0000142`. Without the program that uses its desktop there is no "ok" now.
+- S-2: an access list that was not built is never written (it would have meant "everybody").
+- S-4, in part: the window stations of Windows' own service accounts (SYSTEM, NETWORK SERVICE, LOCAL SERVICE) are
+  never changed; a gateway there is told to run under an account of its own.
+- S-6, S-7, S-9: each clean-up step of the self-test and of `dismiss` stands on its own and says when it fails; a
+  folder grant that failed half-way is taken off.
+- S-10: the test guard says when it could not read the access lists, and on a runner that is itself a service it
+  does not count the entries the product makes by design.
+- S-11, S-12: the CI script masks the account's password in the log, refuses to run outside GitHub Actions,
+  checks `icacls`, and stops the task before it deletes the account.
+- S-13, S-14, S-15: the SID test matches the whole string; nothing `admit` does can be the reason a start fails.
+
+Open, recorded as residuals:
+
+- **S-3 (Medium, design).** The entry on the window station (`0x00020327`) is what Windows gives application
+  packages, not a measured minimum: it includes the clipboard, the global atom table and reading the screen, which
+  everything on one window station shares. It is only added where the window station names no application packages
+  at all; where Windows names them (build 26100, both kinds of window station) every container has the same from
+  Windows, also in a signed-in session. The minimum could not be measured: an account that is not an
+  administrator cannot make a window station that names no application packages.
+- **S-4 (Medium, design).** All members' containers are let in on the gateway's own desktop. Besides the shared
+  windows noted above, one member could use up that desktop's memory and make other agents fail to start. A
+  desktop of its own per member, made by the gateway with only that member's container on it, would end both and
+  leave the gateway's desktop untouched. Not done in this release.
+- Low: S-5 (the lock is per process: two gateways in one logon could lose each other's entry, which the next
+  start of that member puts back), S-8 (a gateway killed in the middle of the self-test leaves the throwaway
+  container), S-16 (pytest is not pinned in CI, as in the existing job).

@@ -37,6 +37,53 @@ jobs:
       - name: Test
         run: python -m pytest -q
 
+  # A gateway started at boot under a service account: nobody is signed in, and the window station and desktop it
+  # sits on are not those of a signed-in user (ADMINISTRATION 11.6). Measured here on both Windows Server versions
+  # the runners offer, as a scheduled task of a local account that never signs in; the results are annotations of
+  # the run. It reports and does not fail the run yet: it was written before it had been seen to pass on a runner.
+  boot-task:
+    name: AppContainer as a boot task (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-latest]
+    steps:
+      - name: Check out with LF line endings
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Install (dependencies hash-locked)
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install --no-deps -e .
+          python -m pip install pytest pytest-asyncio
+      - name: Self-test as a scheduled task of an account that never signs in
+        shell: powershell
+        run: .\tests\ci\selftest-as-service.ps1
+      # The test matrix above runs on windows-latest only. What the container tests say on Windows Server 2022 is
+      # reported here until they have been seen to pass there.
+      - name: Container tests on this Windows (reported, not a gate)
+        if: matrix.os == 'windows-2022'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $o = python -m pytest -q --tb=line tests/test_appcontainer.py tests/test_sandbox.py tests/test_sec_os.py
+          $code = $LASTEXITCODE
+          $o | Select-Object -Last 60
+          $sum = [string]($o | Select-Object -Last 1)
+          $bad = (($o | Where-Object { $_ -match '^FAILED |^ERROR ' }) -join ' | ').Replace('%', '%25')
+          $level = 'notice'
+          if ($code) { $level = 'warning' }
+          Write-Host "::${level} title=Container tests on Windows Server 2022::${sum} ${bad}"
+          exit 0
+
   audit:
     name: pip-audit (requirements.lock)
     runs-on: ubuntu-latest
