@@ -781,6 +781,7 @@ function authTab(body) {
         h('div', { class: 'grid2' }, field('ID (URL slug)', F('id', 'entra')), field('Button label', F('label', 'Sign in with Microsoft')), field('Issuer URL', F('issuer', 'https://login.microsoftonline.com/<tenant>/v2.0')), field('Client ID', F('clientId', '')), field('Client secret', sec), field('Scopes', F('scopes', 'openid profile email')),
           field('Admin claim', F('adminClaim', 'groups')), field('Admin claim value', F('adminValue', '<group id>')), field('Team claim', F('teamClaim', 'groups'))),
         checkbox(!!o.autoCreate, 'Create users automatically on first sign-in', (v) => { o.autoCreate = v; }),
+        checkbox(!!o.allowInsecure, 'Allow an http:// provider (not recommended: only on a network you trust)', (v) => { o.allowInsecure = v; }),
         h('div', { class: 'muted small' }, 'Redirect URI: ', h('code', null, location.origin + '/api/auth/oidc/' + (o.id || '<id>') + '/callback')));
     }));
     drawOidc();

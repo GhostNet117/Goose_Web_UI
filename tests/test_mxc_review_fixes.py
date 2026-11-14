@@ -133,7 +133,7 @@ async def test_mx3_a_hard_link_to_a_file_outside_the_grants_stops_the_mxc_start(
     os.link(prof / "a.txt", prof / "workspace" / "b.txt")                  # both names inside: fine
     launched = []
 
-    def fake_launch(exe, policy_file, stderr_file, jobs):
+    def fake_launch(exe, policy_file, stderr_file, jobs, desktop=""):
         launched.append(policy_file)
         return subprocess.Popen([sys.executable, "-c", FAKE_AGENT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=stderr_file)
@@ -457,7 +457,7 @@ async def test_mx10_the_proxy_credential_is_revoked_when_the_worker_stops(tmp_pa
     from goose_web import api
     from tests.test_mxc import FAKE_AGENT, _manager, _spec
     wm, s, events = _manager(tmp_path, monkeypatch)
-    monkeypatch.setattr(mxc, "launch", lambda exe, pf, err, jobs: subprocess.Popen(
+    monkeypatch.setattr(mxc, "launch", lambda exe, pf, err, jobs, desktop="": subprocess.Popen(
         [sys.executable, "-c", FAKE_AGENT], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err))
     wm.register("alice", "alice", None, False, [], sandbox=_spec(tmp_path, s, network="none"))
     try:

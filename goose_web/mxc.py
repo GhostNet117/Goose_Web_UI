@@ -967,13 +967,15 @@ def host_env() -> dict:
     return env
 
 
-def launch(exe: Path, policy_file: Path, stderr_file, jobs: list) -> subprocess.Popen:
-    """Start `wxc-exec <policy>` with stdin/stdout pipes (start_verified)."""
+def launch(exe: Path, policy_file: Path, stderr_file, jobs: list, desktop: str = "") -> subprocess.Popen:
+    """Start `wxc-exec <policy>` with stdin/stdout pipes (start_verified). `desktop`: "window station\\desktop" the
+    executor - and with it everything in the container - is started on, instead of where the gateway was started."""
     return start_verified(Path(exe), [str(policy_file)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=stderr_file, jobs=jobs)
+                          stderr=stderr_file, jobs=jobs, desktop=desktop)
 
 
-def start_verified(exe: Path, args: list[str], *, stdin, stdout, stderr, jobs: list) -> subprocess.Popen:
+def start_verified(exe: Path, args: list[str], *, stdin, stdout, stderr, jobs: list,
+                   desktop: str = "") -> subprocess.Popen:
     """The one way the executor is started (worker launch and --probe). Every pinned file of its folder is opened
     with writes/deletes/renames denied and hashed through that handle, and the folder must hold nothing else
     (MX-8); the handles stay open until the process runs. On Windows it is created suspended with the image-load
@@ -1001,6 +1003,8 @@ def start_verified(exe: Path, args: list[str], *, stdin, stdout, stderr, jobs: l
             raise MxcError(problem)
         flags = (0x08000000 | 0x00000004) if IS_WINDOWS else 0   # CREATE_NO_WINDOW | CREATE_SUSPENDED
         popen = _HardenedPopen if IS_WINDOWS else subprocess.Popen
+        if IS_WINDOWS and desktop:
+            popen = type("_HardenedPopenOnDesktop", (_HardenedPopen,), {"desktop": desktop})
         proc = popen([str(exe), *args], stdin=stdin, stdout=stdout, stderr=stderr, env=host_env(),  # nosec B603
                      creationflags=flags, cwd=os.environ.get("SystemRoot") if IS_WINDOWS else None)
         if not IS_WINDOWS:
@@ -1050,7 +1054,9 @@ if IS_WINDOWS:
     class _HardenedPopen(subprocess.Popen):
         """subprocess.Popen whose CreateProcessW gets a PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY (EXEC_MITIGATIONS)
         and an explicit handle list (only the child's standard handles are inherited). Everything else - pipes,
-        wait(), kill(), communicate() - is Popen's own (MX-8)."""
+        wait(), kill(), communicate() - is Popen's own (MX-8). `desktop` (a class attribute, set by start_verified):
+        the "window station\\desktop" the process is started on."""
+        desktop = ""
 
         def _execute_child(self, args, executable, preexec_fn, close_fds, pass_fds, cwd, env, startupinfo,
                            creationflags, shell, p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite, *unused):
@@ -1115,6 +1121,8 @@ if IS_WINDOWS:
                     si.StartupInfo.hStdInput = int(p2cread)
                     si.StartupInfo.hStdOutput = int(c2pwrite)
                     si.StartupInfo.hStdError = int(errwrite)
+                if self.desktop:
+                    si.StartupInfo.lpDesktop = self.desktop
                 si.lpAttributeList = attrs
                 block = None
                 if env is not None:

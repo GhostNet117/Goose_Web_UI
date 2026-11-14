@@ -1437,7 +1437,25 @@ Implications:
 ### 11.3 Isolation limits
 
 On Windows the limits below about the shared OS account are closed for non-admin users by the sandbox (11.6), with
-one exception: the registry.
+two exceptions: the screen of a signed-in account, and the registry.
+
+**The screen (and clipboard) of the account that runs the gateway, when somebody is signed in to it.** On the
+window station of a signed-in user Windows lets every application container read the screen. A member's
+sandboxed agent is such a container, with both backends; with the AppContainer backend it could read the
+clipboard as well (MXC closes the clipboard). Measured on Windows build 26100 before 1.23.0: the same pixels and
+the same clipboard text as the signed-in account.
+
+- Since 1.23.0 members' agents are started on a desktop of the gateway's own, on a window station without a
+  screen and with its own clipboard (`sandbox.desktop: private`, the default). An ordinary tool or screenshot
+  library in a member's agent then gets nothing.
+- **A member who sets out to do it is not stopped by this**: a program in the container can start another program
+  on the interactive desktop by name. Goose Web does not close that - it would mean changing the access rights of
+  the window station of your signed-in session for every container.
+- **What closes it: run the gateway under an account nobody is signed in to** - started at boot,
+  `install.ps1 -RunAs` (section 5; AppContainer backend: 11.6). Such a gateway has no screen and no clipboard of
+  a person. If the members of your installation are not people you would let look at your screen, use that
+  arrangement, or do not sign in to the gateway's account on that machine.
+- `goose-web check` says so when `sandbox.desktop` is `shared`.
 
 **The registry is readable from the sandbox.** A member's sandboxed agent - in an MXC container and in an
 AppContainer alike - runs as the gateway's Windows account inside an application container. Windows lets every

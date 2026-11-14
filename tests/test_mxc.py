@@ -401,7 +401,7 @@ async def test_mxc_worker_starts_talks_and_stops(tmp_path, monkeypatch):
         json.dumps({"127.0.0.1:4000": "127.64.0.2:4000"}), encoding="utf-8")
     launched = []
 
-    def fake_launch(exe, policy_file, stderr_file, jobs):
+    def fake_launch(exe, policy_file, stderr_file, jobs, desktop=""):
         launched.append(json.loads(Path(policy_file).read_text(encoding="utf-8")))
         return subprocess.Popen([sys.executable, "-c", FAKE_AGENT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=stderr_file)
@@ -438,7 +438,7 @@ async def test_mxc_early_exit_is_explained(tmp_path, monkeypatch):
     w = wm.register("alice", "alice", None, False, [], sandbox=spec)
     code = ("import sys; sys.stderr.write('{\"error\":{\"code\":\"policy_validation\",\"message\":\"bad path\"}}\\n');"
             "sys.stderr.flush(); sys.exit(1)")
-    monkeypatch.setattr(mxc, "launch", lambda exe, pf, err, jobs: subprocess.Popen(
+    monkeypatch.setattr(mxc, "launch", lambda exe, pf, err, jobs, desktop="": subprocess.Popen(
         [sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err))
     with pytest.raises(SandboxUnavailable):
         await wm.ensure("alice")

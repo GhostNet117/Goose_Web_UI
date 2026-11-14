@@ -1303,3 +1303,90 @@ Open, recorded as residuals:
 - Low: S-5 (the lock is per process: two gateways in one logon could lose each other's entry, which the next
   start of that member puts back), S-8 (a gateway killed in the middle of the self-test leaves the throwaway
   container), S-16 (pytest is not pinned in CI, as in the existing job).
+
+## 19. Addendum: the screen of a signed-in gateway account; Medium findings of the 2026-11-12 review (2026-11-14), 1.23.0
+
+### 19.1 WS-1: a member's agent could read the screen, and with one backend the clipboard
+
+**Found** while measuring section 18: on the window station of a signed-in user Windows names ALL APPLICATION
+PACKAGES with `0x00020327`, which includes "read screen" and the clipboard. **Measured** (build 26100, real
+containers, the product's own start for both backends; the container reports a hash of what it read, nothing of
+the screen or clipboard is stored):
+
+| Started as before 1.23.0 (`sandbox.desktop: shared`) | Screen | Clipboard text |
+|---|---|---|
+| AppContainer backend | read: the same pixels as the signed-in account | read: the same text |
+| MXC backend | read: the same pixels | not read (MXC's own clipboard rule) |
+
+So a member's agent - or whatever steers it - could copy what the administrator has on screen, on every
+installation whose gateway account is signed in. It has been so since the sandbox exists.
+
+**Changed.** Where the gateway is on the interactive window station, members' processes are started on a desktop
+the gateway makes on the window station of its logon that nobody sits at (`sandbox.members_desktop`): the
+AppContainer backend through `STARTUPINFO.lpDesktop` of the process, the MXC backend through that of the executor,
+which the container inherits. The desktop names the gateway's account, SYSTEM and the application-packages groups
+with what a program needs (`0x000200C7`, section 18) - MXC containers get a new SID at every start and cannot be
+named one by one. If the desktop cannot be made, sandboxed workers do not start (fail closed); `sandbox.desktop:
+shared` is the opt-out.
+
+| Started as since 1.23.0 (`private`) | Screen | Clipboard text | Opening `WinSta0` from there |
+|---|---|---|---|
+| AppContainer backend | not read (no copy, a uniform area) | not read (another, empty clipboard) | access denied |
+| MXC backend | not read | not read | access denied |
+
+**Residual (High for an installation with members who are not trusted with the administrator's screen).** A
+process in the container can start a process of its own with `lpDesktop = "WinSta0\Default"`; that one lands on
+the interactive desktop and reads the screen (both backends) and the clipboard (AppContainer backend). Measured.
+Looked at and not done: user-interface restrictions on the worker's job (they close the clipboard, not the screen,
+and the MXC executor does not start under them); deny entries for the container on the interactive window station
+(possible for the AppContainer backend, whose container keeps its SID; an MXC container has a new SID at every
+start; and it means editing the access list of a person's live session for every start). **What closes it is the
+deployment:** a gateway under an account nobody is signed in to has no screen and no clipboard of a person
+(section 18; verified by CI for the AppContainer backend). ADMINISTRATION 11.3 says so.
+
+**Judged.** The private desktop changes no access list that existed before; it creates one object the gateway
+owns. Making it puts the gateway process on the other window station for one call and back, under the lock that
+also guards `admit`; nothing else in the gateway uses windows. All members' containers share that desktop, as
+they shared the interactive one (section 18, S-4).
+
+### 19.2 Medium findings of the whole-product review of 2026-11-12
+
+| Finding | Was | Now |
+|---|---|---|
+| B-8 | The sub-recipe check read any path a member with `allow_shell` named, with the gateway's rights, no size limit; the refusal quoted title and extensions of the file | Only a regular file of at most 1 MB inside the member's own folders (profile and allowed folders, links resolved); never a network or device path |
+| A-2 | OIDC: no signature check of the identity token and no https requirement: an http issuer let somebody on the path sign in as anyone | Issuer and the authorization, token and user-info addresses must be https (or this machine itself); refused when saved and at sign-in; `allowInsecure` per provider opts in. The token is still not signature-checked: the TLS server check stands in (OIDC Core 3.1.3.7) |
+| D-6 | A mistyped setting, or one set in the environment, was silent | Named in the gateway log at start and marked by `check` (the exit code of `check` is unchanged) |
+| D-5 | A start-up failure under the task left no trace | `<system_dir>/logs/startup-error.log`, shown by `check`, removed by the next start that works |
+| B-7 | One session record per client-named id, never dropped | Capped at 2000 per worker; idle ones that no tab shows and no request waits on go first, and what they had buffered leaves the gateway-wide count |
+| D-3 | `upgrade.ps1` could skip the database backup and report it done | Paths come from the package; no database = the upgrade stops |
+
+**Still open** from that review (Medium): B-2, B-3, B-5, B-6, D-2, D-8. From section 18: S-3, S-5, S-8, S-16; S-4
+is not planned (a desktop per member was judged not worth its cost by the owner).
+
+### 19.3 Review
+
+One independent, read-only review of the first commit of 1.23.0 (findings T-1 to T-14; it ran nothing that
+touches windows, and verified T-1 by running the line through Windows PowerShell). Blocking: two regressions and
+one new Medium, all fixed before publication:
+
+- **T-1 (regression).** `upgrade.ps1` asked the package with a line that held double quotes; Windows PowerShell
+  5.1 drops them on the way to a program, so every upgrade would have stopped at its first step. No quotes now; a
+  test runs the line through `powershell.exe`.
+- **T-2 (regression).** The B-8 rule refused the sub-recipes of a recipe a team gave the member: those live in the
+  team's folder, outside the profile. The member's team recipe folders count as hers.
+- **T-3.** Dropping a session record (B-7) left its buffered bytes in the gateway-wide count, which a member could
+  have used to make the gateway clear every user's buffers again and again.
+
+Also fixed: T-5 (a handle given back on every failure path of the members' desktop), T-6 (two paths that could
+have ended on the interactive desktop after an unlikely failure now refuse; a gateway that could not be put back
+on its window station starts nothing more), T-7 (the window stations of Windows' own service accounts are never
+used for members either), T-8 (`dismiss` looks at both places), T-9 (`spawn` refuses a desktop that is not the
+gateway's), T-10 (`sandbox selftest` follows `sandbox.desktop`), T-11 in part (one open, the size judged on what
+is read), T-12 (`check` names a refused provider; the opt-in can be ticked), T-13 (unknown names are shown, the
+exit code of `check` is unchanged), T-14 (a gateway stopped with Ctrl+C is not a failed start; a start that works
+removes the file), T-4 in part (a record a request still waits on is kept).
+
+Open: T-4 (a tab that watches without limit keeps records without limit), T-11 (between the check of the folder
+and the open, a path component could be swapped for a link - by somebody who can write there). The fixes were not
+reviewed again.
+

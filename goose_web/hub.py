@@ -286,6 +286,9 @@ class RpcError(Exception):
         return e
 
 
+SESSION_STATES_MAX = 2000       # session states kept per worker before idle ones are dropped (B-7)
+
+
 @dataclass
 class SessionState:
     sid: str
@@ -578,9 +581,29 @@ class Upstream:
     def sess(self, sid: str) -> SessionState:
         s = self.sessions.get(sid)
         if s is None:
+            if len(self.sessions) >= SESSION_STATES_MAX:
+                self._prune_sessions()
             s = self.sessions[sid] = SessionState(sid=sid)
         s.last_touch = time.time()
         return s
+
+    def _prune_sessions(self) -> None:
+        """Review 2026-11-12, B-7: one state per session id a client names, never dropped - a member's script could
+        grow the gateway's memory without bound. Beyond SESSION_STATES_MAX the states nobody needs go, oldest
+        first: not running, nothing queued or being steered or loaded, no open request, no tab showing them. Such a
+        chat is simply loaded from Goose again when somebody opens it."""
+        watched = {x for c in self.clients for x in c.watch}
+        asked = {a["sessionId"] for a in self.asks.values()}
+        # a request about a session that Goose has not answered yet holds on to that session's state
+        asked |= {str(e[4].get("sessionId") or "") for e in self.pending.values()
+                  if len(e) > 4 and isinstance(e[4], dict)}
+        idle = sorted((s for s in self.sessions.values()
+                       if not s.running() and not s.queue and not s.steers and s.loading_client is None
+                       and s.sid not in watched and s.sid not in asked), key=lambda s: s.last_touch)
+        for s in idle[:max(1, len(self.sessions) - SESSION_STATES_MAX * 9 // 10)]:
+            if self.sessions.pop(s.sid, None) is not None:
+                # what it had buffered leaves the gateway-wide count with it (as when a chat is closed)
+                self.hub.total_buffer = max(0, self.hub.total_buffer - s.buffer_bytes)
 
     async def from_client(self, client: Client, msg: dict) -> None:
         """A frame from a browser socket. While the gateway drains before a restart, new turns are refused; a turn
@@ -1131,7 +1154,12 @@ class Upstream:
                 if recipe is None:
                     raise pol.Denied("the recipe could not be found or read, so it cannot be checked")
                 pol.check_recipe(recipe, client.policy, enabled or {})
-                await asyncio.to_thread(self._check_sub_recipes, recipe, client.policy, enabled or {}, base, 0, [0])
+                # her profile, her allowed folders, and the folders of the recipes her teams gave her (Goose reads
+                # those through GOOSE_RECIPE_PATH; they are outside the profile)
+                mine = [self.hub.profile_root_for(self.username), *(client.roots or []),
+                        *self.hub.recipe_dirs_for(self.username)]
+                await asyncio.to_thread(self._check_sub_recipes, recipe, client.policy, enabled or {}, base, 0, [0],
+                                        mine)
             except pol.Denied:
                 self.hub.audit_recipe(client, self, method, recipe, via, names, False)
                 raise
@@ -1182,8 +1210,14 @@ class Upstream:
         return (None, "recipeId", "")
 
     def _check_sub_recipes(self, recipe: dict, policy: dict, enabled: dict, base: str, depth: int,
-                           count: list) -> None:
-        """Every sub-recipe file must be readable and pass check_recipe too (members; fail closed)."""
+                           count: list, roots: list[str] | None = None) -> None:
+        """Every sub-recipe file must be readable and pass check_recipe too (members; fail closed).
+
+        The file is read by the gateway, with the gateway's rights, at a path the member names (review 2026-11-12,
+        B-8). So only what the member may read anyway is read: a regular file of at most 1 MB inside the member's
+        own folders (`roots`: the profile and the allowed folders; links resolved) - never a network or device
+        path, never another member's file, whose title and extensions the refusal would otherwise quote."""
+        from . import security
         for sr in recipe.get("sub_recipes") or []:
             count[0] += 1
             if depth >= 5 or count[0] > 50:
@@ -1192,15 +1226,26 @@ class Upstream:
             if not path or "\x00" in path:
                 raise pol.Denied("a sub-recipe of this recipe has no readable path")
             p = path if os.path.isabs(path) else os.path.join(base or "", path)
+            if security.is_unc_path(p) or not pol.path_allowed(p, [r for r in (roots or []) if r]):
+                raise pol.Denied(f"the sub-recipe '{path[:120]}' is not in one of your folders, so it cannot be "
+                                 "checked")
             try:
+                import stat
                 import yaml
-                data = yaml.safe_load(Path(p).read_text(encoding="utf-8"))
+                with open(p, "rb") as fh:           # one open: what is judged is what is read
+                    st = os.fstat(fh.fileno())
+                    if not stat.S_ISREG(st.st_mode) or st.st_size > 1_048_576:
+                        raise OSError("not a regular file of at most 1 MB")
+                    blob = fh.read(1_048_577)
+                if len(blob) > 1_048_576:
+                    raise OSError("more than 1 MB")
+                data = yaml.safe_load(blob.decode("utf-8"))
             except Exception:
                 raise pol.Denied(f"the sub-recipe '{path[:120]}' cannot be read, so it cannot be checked")
             if isinstance(data, dict) and isinstance(data.get("recipe"), dict) and "title" not in data:
                 data = data["recipe"]
             pol.check_recipe(data, policy, enabled, what="the sub-recipe")
-            self._check_sub_recipes(data, policy, enabled, os.path.dirname(p), depth + 1, count)
+            self._check_sub_recipes(data, policy, enabled, os.path.dirname(p), depth + 1, count, roots)
 
     async def _guard_recipe_delete(self, params: dict) -> None:
         res = await self.request("_goose/unstable/recipes/list", {})
@@ -1900,6 +1945,7 @@ class Hub:
         self.on_event: Callable[..., None] | None = None
         self.on_schedules: Callable[[str], None] | None = None
         self.profile_root_for: Callable[[str], str] = lambda u: ""
+        self.recipe_dirs_for: Callable[[str], list[str]] = lambda u: []     # a member's team recipe folders
         self.guard: Any = None          # guard.GuardService (spec 018), wired by the app; None = no prompt guard
         self.db: Any = None             # db.Database, wired by the app: chat_state rows (spec 019); None = memory only
         # wired by the app: is a folder writable by members (SD-2), and what to do after a guard bypass (SA-1)

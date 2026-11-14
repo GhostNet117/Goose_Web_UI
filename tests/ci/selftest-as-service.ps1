@@ -9,8 +9,8 @@
   that account, starts the task, reads the result and deletes the task and the account again. For comparison the
   same file is run first in the job's own session. Each result is printed as an annotation of the run.
 
-  -Enforce makes a failed self-test fail the step. Without it the step only reports: this was written before the
-  test had been seen to pass on a runner.
+  -Enforce makes a failed self-test fail the step (CI uses it since the test was seen to pass on Windows Server
+  2022 and 2025, with 1.22.2). Without it the step only reports.
 
   -OwnSessionOnly runs the comparison only and creates nothing (for trying the script on a machine of your own).
   Without it the script refuses to run anywhere but in GitHub Actions: it creates an account and lets every

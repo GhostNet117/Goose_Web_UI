@@ -651,3 +651,37 @@ def test_upgrade_ps1_does_not_build_an_elevated_command_string_from_task_names()
     assert "-EncodedCommand" in text
     assert "'-Command', $restart" not in text
     assert re.search(r"-replace \"'\", \"''\"", text)
+
+
+# ====================================================================== D-3 upgrade: where the data is
+def test_upgrade_ps1_asks_the_package_where_the_data_is_and_never_skips_the_database_backup(tmp_path):
+    """Review 2026-11-12, D-3: a pattern over config.yaml missed a value with a comment behind it and anything set in
+    the environment; the database backup was then skipped - and reported as done."""
+    text = (REPO / "scripts" / "upgrade.ps1").read_text(encoding="utf-8")
+    assert "system_dir:\\s*" not in text and "if (Test-Path $db) {" not in text
+    assert "there is nothing to back up" in text and "Database backup failed; nothing was changed." in text
+    m = re.search(r"@\('-c', '(import sys; from goose_web\.config import load_settings;(?:[^']|'')+)', \$cfg\)", text)
+    assert m, "the line that asks the package"
+    assert '"' not in m.group(1)        # Windows PowerShell 5.1 drops double quotes on the way to a program (T-1)
+    line = m.group(1).replace("''", "'")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text('paths:\n  profiles_root: "%s"   # where the profiles live\n  system_dir: "%s"  # and the database\n'
+                   % (str(tmp_path / "p").replace("\\", "/"), str(tmp_path / "s").replace("\\", "/")), encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GOOSE_WEB")}
+    r = subprocess.run([sys.executable, "-c", line, str(cfg)], capture_output=True, text=True, env=env, timeout=60)
+    assert Path(r.stdout.split("ROOT=")[1].splitlines()[0]) == tmp_path / "p", r.stdout + r.stderr
+    assert Path(r.stdout.split("SYS=")[1].splitlines()[0]) == tmp_path / "s"
+    r = subprocess.run([sys.executable, "-c", line, str(cfg)], capture_output=True, text=True, timeout=60,
+                       env={**env, "GOOSE_WEB__PATHS__SYSTEM_DIR": str(tmp_path / "from-env")})
+    assert Path(r.stdout.split("SYS=")[1].splitlines()[0]) == tmp_path / "from-env", r.stdout + r.stderr
+    if sys.platform != "win32":
+        return
+    # ... and as upgrade.ps1 runs it: by Windows PowerShell, the argument list splatted, the line exactly as written
+    ps1 = tmp_path / "ask.ps1"
+    ps1.write_text("$a = @('-c', '%s', $args[1])\n$out = & $args[0] @a 2>&1 | ForEach-Object { \"$_\" }\n$out\nexit $LASTEXITCODE\n"
+                   % m.group(1), encoding="utf-8")
+    r = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1), sys.executable,
+                        str(cfg)], capture_output=True, text=True, env=env, timeout=120)
+    assert r.returncode == 0 and "ROOT=" in r.stdout and "SYS=" in r.stdout, r.stdout + r.stderr
+    assert Path(r.stdout.split("SYS=")[1].splitlines()[0].strip()) == tmp_path / "s"
+

@@ -1336,14 +1336,81 @@ def throwaway():
         sb.delete_container(name)
 
 
+# What a process sees of the account that runs the gateway: where it is, whether it can copy the screen, and how
+# many formats are on the clipboard it reaches (FIX members-read-screen, WS-1).
+WHERE_AM_I = r'''
+import ctypes, json
+from ctypes import wintypes as w
+u = ctypes.WinDLL("user32", use_last_error=True); k = ctypes.WinDLL("kernel32"); g = ctypes.WinDLL("gdi32", use_last_error=True)
+u.GetProcessWindowStation.restype = w.HANDLE; u.GetThreadDesktop.restype = w.HANDLE
+def n(h):
+    b = ctypes.create_unicode_buffer(256); u.GetUserObjectInformationW(w.HANDLE(h), 2, b, 512, ctypes.byref(w.DWORD())); return b.value
+out = {"where": n(u.GetProcessWindowStation()) + "\\" + n(u.GetThreadDesktop(k.GetCurrentThreadId()))}
+u.GetDC.restype = w.HDC; u.GetDC.argtypes = [w.HWND]
+g.CreateCompatibleDC.restype = w.HDC; g.CreateCompatibleDC.argtypes = [w.HDC]
+g.CreateCompatibleBitmap.restype = w.HANDLE; g.CreateCompatibleBitmap.argtypes = [w.HDC, ctypes.c_int, ctypes.c_int]
+g.SelectObject.restype = w.HANDLE; g.SelectObject.argtypes = [w.HDC, w.HANDLE]
+g.BitBlt.argtypes = [w.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, w.HDC, ctypes.c_int, ctypes.c_int, w.DWORD]
+g.GetBitmapBits.argtypes = [w.HANDLE, ctypes.c_long, ctypes.c_void_p]
+hdc = u.GetDC(None); mem = g.CreateCompatibleDC(hdc); bmp = g.CreateCompatibleBitmap(hdc, 64, 64); g.SelectObject(mem, bmp)
+out["copied"] = bool(g.BitBlt(mem, 0, 0, 64, 64, hdc, 100, 100, 0x00CC0020))
+buf = ctypes.create_string_buffer(64 * 64 * 4); got = g.GetBitmapBits(bmp, len(buf), buf)
+out["distinct"] = len(set(buf.raw[:got]))
+ok = u.OpenClipboard(None); out["formats"] = u.CountClipboardFormats() if ok else -1
+if ok: u.CloseClipboard()
+print(json.dumps(out))
+'''
+
+
+@windows
+def test_a_members_process_is_not_started_on_the_desktop_of_the_signed_in_account(throwaway, monkeypatch):
+    """Measured on build 26100: on the window station of a signed-in user every application container may read the
+    screen, and one of this backend the clipboard too. A member's agent is such a container - so it is started on
+    a desktop of the gateway's own, on a window station without a screen and with a clipboard of its own."""
+    if not sb.session_info()["interactive"]:
+        pytest.skip("nobody is signed in here: there is no screen and no clipboard of a person to keep away from")
+    c = throwaway
+
+    def see() -> dict:
+        with open(os.devnull, "wb") as errf:
+            p = sb.spawn([c.py, "-I", "-c", WHERE_AM_I], {k: os.environ[k] for k in ("SystemRoot", "LOCALAPPDATA")},
+                         os.environ["SystemRoot"], c.sid, [], errf)
+            p.stdin.close()
+            raw = p.stdout.read().decode("utf-8", "replace").strip()
+            assert p.wait(60) == 0 and raw, raw
+        return json.loads(raw.splitlines()[-1])
+    monkeypatch.setitem(sb.PRIVATE_DESKTOP, "on", True)
+    place = sb.members_desktop()
+    assert "\\" in place and not place.lower().startswith("winsta0\\") and sb.members_desktop() == place
+    there = see()
+    assert there["where"] == place, there
+    assert not there["copied"] or there["distinct"] <= 1, there         # no screen to copy
+    assert sb.admit(c.sid, place, dry=True) == []                       # let in there as it is
+    with pytest.raises(sb.SandboxError):
+        sb.admit(c.sid, "WinSta0\\Default")                             # only this gateway's own is ever touched
+    with pytest.raises(sb.SandboxError), open(os.devnull, "wb") as errf:   # and nothing is started anywhere else
+        sb.spawn([c.py, "-I", "-c", "pass"], {}, os.environ["SystemRoot"], c.sid, [], errf, desktop="WinSta0\\Default")
+    assert sb.dismiss(c.sid) == []                                      # looks at both places, finds nothing of its
+    # a gateway that once could not be put back on its window station starts nothing any more (T-6)
+    monkeypatch.setitem(sb._PLACE, "broken", "this gateway could not be put back on its own window station")
+    with pytest.raises(sb.SandboxError, match="could not be put back"):
+        sb.members_desktop()
+    monkeypatch.delitem(sb._PLACE, "broken")
+    # sandbox.desktop: shared - the desktop of the account, as every version before 1.23.0
+    monkeypatch.setitem(sb.PRIVATE_DESKTOP, "on", False)
+    assert sb.members_desktop() == "" and see()["where"].lower() == "winsta0\\default"
+
+
 @windows
 def test_the_self_test_starts_container_processes_in_this_session():
     res = sb.selftest(rl.python_for_container()[0])
     ok, text = sb.selftest_text(res)
     assert ok and res["ok"] and [s["ok"] for s in res["steps"]] == [True, True], res
     assert isinstance(res["session"], int) and res["windowStation"] and res["build"] and "starts here" in text
-    if res["interactive"]:          # somebody is signed in: Windows lets containers in, and nothing was changed
+    assert all(not s["detail"] for s in res["steps"]), res        # a step that passed says nothing more
+    if res["interactive"]:          # somebody is signed in: the steps ran on the gateway's own desktop for members
         assert not res["missing"] and not res["admitted"] and "stepsBefore" not in res and not res["remedy"], res
+        assert res["membersDesktop"] == sb.members_desktop() and "not on the desktop of the signed-in account" in text
 
 
 @windows

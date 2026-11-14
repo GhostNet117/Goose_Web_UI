@@ -89,9 +89,19 @@ def sandbox_fallback(settings: "Settings") -> str:
     return v if v in SANDBOX_FALLBACKS else "invalid"
 
 
+def sandbox_desktop(settings: "Settings") -> str:
+    """sandbox.desktop: "private" (default: where somebody is signed in to the gateway's account, members' agents
+    are started on a desktop of the gateway's own, without that account's screen and clipboard) or "shared" (on
+    the desktop of that account, as before 1.23.0). Anything else is "invalid" and counts as private."""
+    v = str(settings.get("sandbox", "desktop") or "private").strip().lower()
+    return v if v in ("private", "shared") else "invalid"
+
+
 def sandbox_config_problems(settings: "Settings") -> list[str]:
     """Configuration errors of the sandbox section; each one makes sandboxed workers fail closed."""
     out = []
+    if sandbox_desktop(settings) == "invalid":
+        out.append(f"sandbox.desktop is {settings.get('sandbox', 'desktop')!r}; use one of: private, shared")
     if _sandbox_enabled_value(settings) == "invalid":
         out.append(f"sandbox.enabled is {settings.get('sandbox', 'enabled')!r}; use one of: auto, true, false "
                    "(members' agents do not start until it is fixed)")
@@ -196,6 +206,9 @@ DEFAULTS: dict[str, Any] = {
         # start (fail closed) | appcontainer = they start in the AppContainer backend (logged and audited)
         "fallback": "none",
         "network": "internet",            # none | internet | internet+lan (loopback is never reachable)
+        # Where somebody is signed in to the gateway's account: private = members' agents start on a desktop of the
+        # gateway's own (no view of that account's screen or clipboard) | shared = on that account's desktop
+        "desktop": "private",
         "read_dirs": [],                  # extra program folders the workers may read and run (Python, node, uv, git)
         # local services sandboxed workers may reach, e.g. ["127.0.0.1:4000"]: AppContainer through relay.py, MXC
         # through the member's egress proxy (egress.py)
@@ -304,6 +317,10 @@ class Settings:
     def __init__(self, data: dict, source: str | None):
         self.data = data
         self.source = source
+        # review 2026-11-12, D-6: what load_settings met that no setting answers to (a mistyped name is otherwise
+        # a setting that silently keeps its default), and what the environment set over the file
+        self.unknown: list[str] = []
+        self.overrides: list[str] = []
 
     def get(self, section: str, key: str, default: Any = None) -> Any:
         return self.data.get(section, {}).get(key, default)
@@ -351,6 +368,8 @@ def config_path_candidates(explicit: str | None) -> list[Path]:
 def load_settings(explicit: str | None = None) -> Settings:
     data = copy.deepcopy(DEFAULTS)
     source = None
+    unknown: list[str] = []
+    overrides: list[str] = []
     for p in config_path_candidates(explicit):
         if not p.is_file():
             if explicit:
@@ -361,12 +380,36 @@ def load_settings(explicit: str | None = None) -> Settings:
                                   "does not fall back to another configuration.")
             continue
         with open(p, encoding="utf-8") as fh:
-            data = _deep_merge(data, yaml.safe_load(fh) or {})
+            raw = yaml.safe_load(fh) or {}
+        unknown += unknown_settings(raw)
+        data = _deep_merge(data, raw)
         source = str(p)
-    for k, v in os.environ.items():
+    for k, v in sorted(os.environ.items()):
         if not k.startswith("GOOSE_WEB__"):
             continue
         parts = k[len("GOOSE_WEB__"):].lower().split("__")
         if len(parts) == 2:
             data.setdefault(parts[0], {})[parts[1]] = _coerce(v)
-    return Settings(data, source)
+            overrides.append(f"{parts[0]}.{parts[1]} ({k})")
+            if parts[1] not in (DEFAULTS.get(parts[0]) or {}):
+                unknown.append(f"{parts[0]}.{parts[1]} (environment variable {k})")
+        else:
+            unknown.append(f"environment variable {k} (ignored: the name must be GOOSE_WEB__SECTION__KEY)")
+    s = Settings(data, source)
+    s.unknown, s.overrides = unknown, overrides
+    return s
+
+
+def unknown_settings(raw: Any) -> list[str]:
+    """The names in a configuration file that no setting answers to: "section" or "section.key"."""
+    if not isinstance(raw, dict):
+        return ["(the file is not a mapping of sections)"]
+    out = []
+    for sec, val in raw.items():
+        if sec not in DEFAULTS:
+            out.append(str(sec))
+        elif isinstance(val, dict):
+            out += [f"{sec}.{k}" for k in val if k not in DEFAULTS[sec]]
+        elif val is not None:
+            out.append(f"{sec} (must be a section with settings below it)")
+    return out

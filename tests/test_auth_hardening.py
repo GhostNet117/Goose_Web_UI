@@ -515,3 +515,60 @@ def test_additive_migration_on_legacy_database(tmp_path):
         assert db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='ip_blocks'")
         assert db.one("SELECT name FROM sqlite_master WHERE name='ux_users_oidc'")
         db.close()
+
+
+# ---------------------------------------------------------------- A-2: an OIDC provider is reached over TLS
+def test_an_oidc_url_without_tls_is_insecure_unless_it_is_this_machine_or_opted_in():
+    f = auth_mod.oidc_url_insecure
+    assert not f("https://idp.example.org", {}) and not f("https://idp.example.org/realms/x/", {})
+    for local in ("http://localhost:8080", "http://127.0.0.1:9000/x", "http://[::1]:9000"):
+        assert not f(local, {}), local
+    for bad in ("http://idp.example.org", "http://10.0.0.5:8080", "http://127.evil.example", "", None,
+                "idp.example.org", "ftp://idp.example.org", "https://"):
+        assert f(bad, {}), bad
+    assert not f("http://10.0.0.5:8080", {"allowInsecure": True})
+    assert f("http://10.0.0.5:8080", {"allowInsecure": "yes"}) and f("ftp://idp.example.org", {"allowInsecure": True})
+
+
+def test_an_oidc_provider_without_tls_is_refused_when_saved(env):
+    _, db, auth = env
+    lan = {"id": "lan", "issuer": "http://idp.lan:8080", "clientId": "gw"}
+    with pytest.raises(ValueError) as e:
+        auth.save_auth_config({"oidc": [lan]})
+    assert str(e.value) == auth_mod.OIDC_INSECURE_MESSAGE and auth.auth_config()["oidc"] == []
+    with pytest.raises(ValueError):
+        auth.save_auth_config({"oidc": [{**lan, "allowInsecure": "true"}]})      # only a real true opts in
+    auth.save_auth_config({"oidc": [{**lan, "allowInsecure": True}]})
+    assert auth.auth_config()["oidc"][0]["allowInsecure"] is True
+    auth.save_auth_config({"oidc": [{"id": "ok", "issuer": ISSUER, "clientId": "gw"}]})
+    assert auth.auth_config()["oidc"][0]["allowInsecure"] is False
+
+
+async def test_an_oidc_sign_in_over_plain_http_is_refused(env, monkeypatch):
+    """Review 2026-11-12, A-2: the identity token is not signature-checked, the TLS server check stands in for it.
+    With an http issuer or token endpoint there was no check at all: whoever sat on the path could answer the
+    token request and sign in as an administrator."""
+    _, db, auth = env
+    asked: list[str] = []
+    meta = {"authorization_endpoint": ISSUER + "/authorize", "token_endpoint": "http://idp.example.org/token"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(str(request.url))
+        return httpx.Response(200, json=meta)
+    monkeypatch.setattr(auth_mod, "httpx", types.SimpleNamespace(
+        AsyncClient=lambda **kw: httpx.AsyncClient(transport=httpx.MockTransport(handler)), HTTPError=httpx.HTTPError))
+    # a provider stored before this check existed (or written into the database): never saved through it
+    db.set_setting("auth", {"oidc": [{"id": "old", "issuer": "http://idp.lan:8080", "clientId": "gw"}]})
+    with pytest.raises(AuthError) as e:
+        await auth.oidc_start("old", "http://gw/cb")
+    assert e.value.code == "oidc_insecure" and asked == []           # nothing was sent anywhere
+    # an https issuer whose discovery document sends the code to an http token endpoint
+    auth.save_auth_config({"oidc": [{"id": "mixed", "issuer": ISSUER, "clientId": "gw"}]})
+    with pytest.raises(AuthError) as e:
+        await auth.oidc_start("mixed", "http://gw/cb")
+    assert e.value.code == "oidc_insecure" and len(asked) == 1
+    with pytest.raises(AuthError):                                   # and a refused document is not kept
+        await auth.oidc_start("mixed", "http://gw/cb")
+    meta["token_endpoint"] = ISSUER + "/token"
+    assert (await auth.oidc_start("mixed", "http://gw/cb")).startswith(ISSUER + "/authorize?")
+

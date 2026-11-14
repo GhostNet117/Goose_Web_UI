@@ -117,10 +117,22 @@ def cmd_serve(args, settings) -> int:
     logging.getLogger("goose_web").info("starting on %s://%s:%s as %s (integrity %s), profiles %s",
                                         "https" if certfile else "http", host, port, winsec.current_user(),
                                         winsec.integrity_level(), settings.profiles_root)
+    for u in getattr(settings, "unknown", []):       # D-6: a mistyped setting silently keeps its default
+        logging.getLogger("goose_web").warning("configuration: no setting is called %s - it has no effect "
+                                               "(a mistyped name?)", u)
+    if getattr(settings, "overrides", []):
+        logging.getLogger("goose_web").warning("configuration: set by the environment, over the file: %s",
+                                               ", ".join(settings.overrides))
     config = uvicorn.Config(create_app(settings), host=host, port=port, log_config=None, proxy_headers=False,
                             ws_max_size=64 * 1024 * 1024, ws_ping_interval=25, ws_ping_timeout=60,
                             timeout_keep_alive=30, server_header=False, date_header=True,
                             timeout_graceful_shutdown=10, ssl_certfile=certfile or None, ssl_keyfile=keyfile or None)
+    # this start got as far as serving: an older failure is no longer news
+    for old in {Path(settings.system_dir) / "logs" / "startup-error.log", _startup_error_file(_RUN.get("argv") or [])}:
+        try:
+            old.unlink()
+        except OSError:
+            pass
     config.load()                       # builds the SSL context now, so renewals can load new certificates into it
     tls.activate(config.ssl if certfile else None, mode, certfile, keyfile)
     uvicorn.Server(config).run()
@@ -460,6 +472,8 @@ def cmd_sandbox(args, settings) -> int:
     if args.action == "selftest":
         # in THIS session, as THIS account: says nothing about a gateway that runs elsewhere (a boot task)
         from . import relay as _rl
+        from .config import sandbox_desktop
+        sb.PRIVATE_DESKTOP["on"] = sandbox_desktop(settings) != "shared"     # as the gateway of this config starts them
         res = sb.selftest(_rl.python_for_container()[0])
         ok, text = sb.selftest_text(res)
         print(f"[{'OK' if ok else '!!'}] sandbox self-test (this session): {text}")
@@ -1072,6 +1086,9 @@ def cmd_check(args, settings) -> int:
     line("goose-web", __version__)
     line("platform", sys.platform + ("" if platform_supported() else " - " + WINDOWS_ONLY), platform_supported())
     line("config file", settings.source or "(defaults)")
+    for mark, text in _config_lines(settings) + _signin_lines(settings):
+        print(f"[{mark}] {text}")      # shown, not counted: an upgrade must not stop over a leftover line in a file
+    _startup_failure_line()
     gb = settings.goose_binary
     gv = goose_version(gb)
     line("goose binary", f"{gb} ({gv or 'not runnable'})", bool(gv))
@@ -1254,10 +1271,16 @@ def cmd_gateway(args, settings) -> int:
 
 
 class _NullIO:
-    """Stand-in for stdout/stderr under pythonw.exe (no console), where they are None."""
+    """Stand-in for stdout/stderr under pythonw.exe (no console), where they are None. Keeps the last lines
+    written, so that a start that fails can say why (D-5)."""
     _gw_null = True
 
+    def __init__(self):
+        import collections
+        self.tail = collections.deque(maxlen=40)
+
     def write(self, s):
+        self.tail.append(str(s))
         return len(s)
 
     def flush(self):
@@ -1267,7 +1290,130 @@ class _NullIO:
         return False
 
 
+_NOT_SERVE = {"init", "user", "ip", "check", "native-root", "native-hints", "sandbox", "tls", "guard", "gateway",
+              "security", "version"}
+_RUN: dict = {"cmd": None}      # the command of this run, once the arguments were understood
+
+
+def _startup_error_file(argv: list[str]) -> Path:
+    """Where a gateway that could not start leaves its reason: beside the gateway log when the configuration is
+    named (--config or GOOSE_WEB_CONFIG: <its folder>/logs), else in the temp folder."""
+    import tempfile
+    cfg = os.environ.get("GOOSE_WEB_CONFIG") or ""
+    for i, a in enumerate(argv):
+        if a == "--config" and i + 1 < len(argv):
+            cfg = argv[i + 1]
+        elif a.startswith("--config="):
+            cfg = a.split("=", 1)[1]
+    if cfg:
+        return Path(cfg).resolve().parent / "logs" / "startup-error.log"
+    return Path(tempfile.gettempdir()) / "goose-web-startup-error.log"
+
+
+def _record_startup_failure(argv: list[str], what: str) -> None:
+    """Review 2026-11-12, D-5: the gateway is started by a task, with pythonw.exe - nobody sees what it prints, and a
+    start that fails before the log file exists (a broken config.yaml, a missing module, a refused port) left no
+    trace anywhere. Never raises."""
+    try:
+        f = _startup_error_file(argv)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        said = "".join(t for s in (sys.stdout, sys.stderr) for t in getattr(s, "tail", ()))[-4000:]
+        text = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} Goose Web {__version__} did not start "
+                f"(arguments: {' '.join(a for a in argv if not a.lower().startswith('--password'))})\n{what.rstrip()}\n"
+                + (f"--- what it printed ---\n{said.rstrip()}\n" if said.strip() else ""))
+        f.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _config_lines(settings) -> list[tuple[str, str]]:
+    """`check`: (mark, line) for what the configuration holds that is easily missed (review 2026-11-12, D-6): a
+    name no setting answers to ("!!"), what the environment sets over the file, and a sandbox desktop that is
+    shared with the signed-in account. The environment is that of whoever runs `check` - the gateway's task may
+    have another - so none of these lines changes the exit code; the gateway logs its own at start."""
+    from .config import sandbox_desktop
+    out = [("!!", f"config: no setting is called {u} - it has no effect (a mistyped name? see CONFIGURATION.md)")
+           for u in getattr(settings, "unknown", [])]
+    if getattr(settings, "overrides", []):
+        out.append(("--", "config: set by the environment, over the file: " + ", ".join(settings.overrides)))
+    if sandbox_desktop(settings) == "shared":
+        out.append(("--", "sandbox desktop: shared - where somebody is signed in to the gateway's account, members' "
+                          "agents can read that account's screen (and its clipboard, with the AppContainer backend); "
+                          "ADMINISTRATION 11.3"))
+    return out
+
+
+def _signin_lines(settings) -> list[tuple[str, str]]:
+    """`check`: an OIDC provider that is not reached over https - refused at sign-in since 1.23.0 (A-2). Somebody
+    who signs in only through it is locked out until it is changed; this says so before they find out. The
+    database is opened read-only."""
+    import json as _json
+    import sqlite3
+    from .auth import oidc_url_insecure
+    dbf = Path(settings.system_dir) / "goose-web.db"
+    if not dbf.is_file():
+        return []
+    out = []
+    try:
+        con = sqlite3.connect(dbf.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT value FROM settings WHERE key='auth'").fetchone()
+        finally:
+            con.close()
+        for o in (_json.loads(row[0]) if row else {}).get("oidc") or []:
+            if isinstance(o, dict) and oidc_url_insecure(o.get("issuer"), o):
+                out.append(("!!", f"sign-in provider {str(o.get('id'))[:40]!r}: its issuer is not an https address, "
+                                  "so sign-in with it is refused. Change the issuer, or tick \"Allow an http:// "
+                                  "provider\" for it under Admin > Sign-in (only on a network you trust)"))
+    except (sqlite3.Error, ValueError, TypeError):
+        pass
+    return out
+
+
+def _startup_failure_line() -> None:
+    """`check`: a start of the gateway that failed in the last seven days, with its last line."""
+    cfg = [a for a in sys.argv[1:]]
+    try:
+        f = _startup_error_file(cfg)
+        if f.is_file() and time.time() - f.stat().st_mtime < 7 * 86400:
+            lines = [ln for ln in f.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(f.stat().st_mtime))
+            print(f"[!!] the gateway did not start on {when}: {lines[-1][:200] if lines else '?'} ({f})")
+    except OSError:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    """The command line. A `serve` that ends with an error or an exception leaves its reason in a file
+    (_record_startup_failure) before the error goes its usual way."""
+    args_ = list(sys.argv[1:] if argv is None else argv)
+    _RUN["cmd"], _RUN["argv"] = None, args_
+
+    def serve() -> bool:
+        # the command as it was understood; when not even that was reached (a configuration that cannot be read,
+        # arguments nobody understands): whatever does not name another command
+        if _RUN["cmd"] is not None:
+            return _RUN["cmd"] == "serve"
+        return not any(a in _NOT_SERVE for a in args_) and "-h" not in args_ and "--help" not in args_
+    try:
+        rc = _main(argv)
+    except KeyboardInterrupt:           # somebody stopped a gateway that ran in a console: not a failed start
+        raise
+    except SystemExit as e:
+        if serve() and e.code not in (0, None):
+            _record_startup_failure(args_, f"exit code {e.code}")
+        raise
+    except BaseException:
+        if serve():
+            import traceback
+            _record_startup_failure(args_, traceback.format_exc())
+        raise
+    if serve() and rc:
+        _record_startup_failure(args_, f"exit code {rc}")
+    return rc
+
+
+def _main(argv: list[str] | None = None) -> int:
     from .config import load_settings
     if sys.stdout is None:
         sys.stdout = _NullIO()
@@ -1341,6 +1487,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("check", help="diagnostics")
     sub.add_parser("version")
     args = p.parse_args(argv)
+    _RUN["cmd"] = args.cmd or "serve"
     settings = load_settings(args.config)
     cmd = args.cmd or "serve"
     if cmd == "version":

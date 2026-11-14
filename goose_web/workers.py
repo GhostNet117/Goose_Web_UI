@@ -335,6 +335,9 @@ class SandboxUnavailable(RuntimeError):
 class WorkerManager:
     def __init__(self, settings: Settings):
         self.s = settings
+        from . import sandbox as _sb
+        from .config import sandbox_desktop
+        _sb.PRIVATE_DESKTOP["on"] = sandbox_desktop(settings) != "shared"     # an invalid value counts as private
         self.workers: dict[str, Worker] = {}
         self.job = _Job()
         self.log_dir = settings.system_dir / "logs"
@@ -762,7 +765,9 @@ class WorkerManager:
         self._close_job(w)
         w.job = _Job()       # the worker's own job (wxc-exec and the container's processes), nested in self.job
         try:
-            w.proc = await asyncio.to_thread(mxc.launch, mxc.exe_path(self.s), pfile, logf, [self.job, w.job])
+            # not on the desktop of a signed-in gateway account (WS-1); "" where nobody is signed in
+            where = await asyncio.to_thread(sb.members_desktop, True)
+            w.proc = await asyncio.to_thread(mxc.launch, mxc.exe_path(self.s), pfile, logf, [self.job, w.job], where)
         except Exception as e:
             self._close_job(w)
             self._fail_closed(w, f"sandbox unavailable (MXC): {e}")

@@ -715,6 +715,14 @@ def create_app(settings: Settings) -> Starlette:
         hub.on_event = make_event_handler(c)
         hub.db = db   # spec 019: composer queues and herd marks survive a restart
         hub.profile_root_for = lambda username: str(profiles.root_for(db.user_by_name(username) or {"username": username}))
+
+        def _recipe_dirs_for(username: str) -> list[str]:
+            try:
+                u = db.user_by_name(username)
+                return [str(d) for d in profiles.team_recipe_dirs(u)] if u else []
+            except Exception:
+                return []
+        hub.recipe_dirs_for = _recipe_dirs_for
         # Prompt guard (spec 018): rules + the local classifier; loads nothing until some guard is on.
         from .guard import GuardService
         c.guard = hub.guard = GuardService(settings, db)

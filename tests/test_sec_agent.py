@@ -356,6 +356,7 @@ async def test_member_recipe_id_resolved_by_the_gateway(hubenv, tmp_path):
                      "file_path": "\\\\?\\" + str(tmp_path / "n.yaml")},
                     {"id": "gone", "recipe": {"title": "x", "sub_recipes": [{"name": "s", "path": "nope.yaml"}]},
                      "file_path": str(tmp_path / "x.yaml")}]
+    hub.profile_root_for = lambda u: str(tmp_path)      # her recipes are files of her own profile
     up = hub.upstream("alice", "alice")
     c, s = mk()
     hub.attach(up, c)
@@ -373,6 +374,49 @@ async def test_member_recipe_id_resolved_by_the_gateway(hubenv, tmp_path):
     hub.attach(up, c3)
     r = await _new(up, c3, s3, 6, {"recipeId": "nested"})
     assert r["error"]["code"] == -32003 and "sub-recipe" in r["error"]["message"]
+
+
+async def test_the_sub_recipe_check_reads_only_the_members_own_files(hubenv, tmp_path):
+    """Review 2026-11-12, B-8: the gateway reads the file a sub-recipe names with ITS rights. A member with
+    allow_shell could name another member's recipe and read its title and extensions in the refusal, or a file of
+    any size, or a share on another machine."""
+    agent, hub, audit = hubenv
+    mine, other = tmp_path / "alice", tmp_path / "bob"
+    mine.mkdir()
+    other.mkdir()
+    (other / "secret.yaml").write_text(yaml.safe_dump({"title": "BOBS-SECRET-TITLE", "extensions": [STDIO]}),
+                                       encoding="utf-8")
+    (mine / "big.yaml").write_text("title: big\n" + "# x\n" * 300_000, encoding="utf-8")
+    (mine / "folder.yaml").mkdir()
+    (mine / "fine.yaml").write_text(yaml.safe_dump({"title": "fine", "instructions": "x"}), encoding="utf-8")
+    hub.profile_root_for = lambda u: str(mine)
+
+    def nested(rid, path):
+        return {"id": rid, "recipe": {"title": rid, "sub_recipes": [{"name": "s", "path": path}]},
+                "file_path": str(mine / f"{rid}.yaml")}
+    agent.listed = [nested("abs", str(other / "secret.yaml")), nested("rel", "..\\bob\\secret.yaml"),
+                    nested("unc", "\\\\server\\share\\x.yaml"), nested("big", "big.yaml"),
+                    nested("dir", "folder.yaml"), nested("fine", "fine.yaml")]
+    up = hub.upstream("alice", "alice")
+    c, s = mk({**MEMBER, "allow_shell": True, "extensions_edit": True})
+    hub.attach(up, c)
+    for i, rid in enumerate(("abs", "rel", "unc", "big", "dir"), start=1):
+        r = await _new(up, c, s, i, {"recipeId": rid})
+        assert r["error"]["code"] == -32003, (rid, r)
+        assert "BOBS-SECRET-TITLE" not in json.dumps(r) and "evil" not in json.dumps(r), (rid, r)
+    assert "not in one of your folders" in (await _new(up, c, s, 8, {"recipeId": "abs"}))["error"]["message"]
+    assert "result" in await _new(up, c, s, 9, {"recipeId": "fine"})
+    assert not any("BOBS-SECRET-TITLE" in json.dumps(a, default=str) for a in audit)
+    # a recipe her team gave her lives in the team's folder, outside her profile: its sub-recipes are hers to use
+    # (review of 1.23.0, T-2) - and only once the gateway knows the folder as one of hers
+    team = tmp_path / "library" / "teams" / "7" / "recipes"
+    team.mkdir(parents=True)
+    (team / "part.yaml").write_text(yaml.safe_dump({"title": "part", "instructions": "x"}), encoding="utf-8")
+    agent.listed = [{"id": "team", "recipe": {"title": "team", "sub_recipes": [{"name": "s", "path": "part.yaml"}]},
+                     "file_path": str(team / "team.yaml")}]
+    assert (await _new(up, c, s, 10, {"recipeId": "team"}))["error"]["code"] == -32003
+    hub.recipe_dirs_for = lambda u: [str(team)]
+    assert "result" in await _new(up, c, s, 11, {"recipeId": "team"})
 
 
 async def test_member_enabled_extensions_checked_against_config(hubenv):
@@ -655,3 +699,30 @@ def test_deletes_never_follow_junctions(tmp_path, monkeypatch):
     finally:
         os.rmdir(skills / "victim")
         os.rmdir(pr.config_dir(alice) / "custom_providers")
+
+
+async def test_session_states_nobody_needs_are_dropped_beyond_the_cap(hubenv, monkeypatch):
+    """Review 2026-11-12, B-7: a state per session id a client names, never dropped - memory without bound."""
+    import goose_web.hub as hubmod
+    agent, hub, audit = hubenv
+    monkeypatch.setattr(hubmod, "SESSION_STATES_MAX", 50)
+    up = hub.upstream("alice", "alice")
+    c, s = mk()
+    hub.attach(up, c)
+    up.sess("running").prompts = 1
+    up.sess("queued").queue.append({"id": "q1"})
+    up.sess("watched")
+    c.watch.add("watched")
+    up.asks["7"] = {"msg": {"id": 7}, "sessionId": "asked", "ts": 0, "guarded": False}
+    up.sess("asked")
+    up.pending[99] = (c, 1, None, "session/load", {"sessionId": "loading"})    # Goose has not answered yet (T-4)
+    up.sess("loading")
+    up.sess("junk0").buffer_bytes = 100             # what a dropped state had buffered leaves the count too (T-3)
+    hub.total_buffer = 100
+    for i in range(1, 500):
+        up.sess(f"junk{i}")
+    assert len(up.sessions) <= 50, len(up.sessions)
+    assert {"running", "queued", "watched", "asked", "loading", "junk499"} <= set(up.sessions)
+    assert "junk0" not in up.sessions and hub.total_buffer == 0
+    up.pending.pop(99)
+

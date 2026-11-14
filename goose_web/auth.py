@@ -46,6 +46,34 @@ def ldap_transport_insecure(c: dict) -> bool:
     return not (url.startswith("ldaps://") or bool(c.get("startTls")) or c.get("allowInsecure") is True)
 
 
+OIDC_INSECURE_MESSAGE = ("The OIDC issuer or one of its endpoints is not an https:// address. Without TLS nothing "
+                         "protects the identity token on its way, and somebody on the network path could sign in "
+                         "as anyone - an administrator included. Use https, or (only on a trusted network) set "
+                         "allowInsecure to true for this provider.")
+
+
+def oidc_url_insecure(url: Any, o: dict) -> bool:
+    """True when a URL of an OIDC provider would be used without TLS and the admin has not opted in (review
+    2026-11-12, A-2: the identity token is not signature-checked - the TLS server check stands in for that, OIDC
+    Core 3.1.3.7 - so without TLS there is no check at all). http to this machine itself (localhost, 127.x, ::1)
+    never leaves it and is allowed; anything that is neither http nor https never is."""
+    import ipaddress
+    try:
+        u = urllib.parse.urlsplit(str(url or "").strip())
+        scheme, host = (u.scheme or "").lower(), (u.hostname or "").lower()
+    except ValueError:
+        return True
+    if not host or scheme not in ("http", "https"):
+        return True
+    if scheme == "https":
+        return False
+    try:
+        local = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        local = False
+    return not (local or o.get("allowInsecure") is True)
+
+
 def _same_endpoint(a: Any, b: Any) -> bool:
     """True when two server URLs / issuers name the same endpoint (case and a trailing slash ignored)."""
     def norm(v: Any) -> str:
@@ -129,6 +157,9 @@ class AuthService:
                 # kept only while the issuer is unchanged (A-11)
                 same = prev is not None and _same_endpoint(o.get("issuer"), prev.get("issuer"))
                 o["clientSecret"] = prev.get("clientSecret", "") if same else ""
+            o["allowInsecure"] = o.get("allowInsecure") is True      # strict bool; anything else = secure default
+            if oidc_url_insecure(o.get("issuer"), o):
+                raise ValueError(OIDC_INSECURE_MESSAGE)
             if "stripDomain" not in o:
                 # A-5: a new provider keeps the whole e-mail address / user name; an existing one keeps the
                 # behaviour it had (the old default removed the domain).
@@ -355,11 +386,20 @@ class AuthService:
         cached = self._oidc_meta.get(o["id"])
         if cached and time.time() - cached[0] < 3600:
             return cached[1]
+        if oidc_url_insecure(o.get("issuer"), o):       # a provider stored before 1.23.0, or edited in the database
+            log.error("OIDC provider %s: the issuer is not an https address; sign-in refused", o.get("id"))
+            raise AuthError("oidc_insecure", "This sign-in provider is not reached over https; sign-in is refused",
+                            400)
         url = o["issuer"].rstrip("/") + "/.well-known/openid-configuration"
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(url)
             r.raise_for_status()
             meta = r.json()
+        for key in ("authorization_endpoint", "token_endpoint", "userinfo_endpoint"):
+            if meta.get(key) and oidc_url_insecure(meta[key], o):
+                log.error("OIDC provider %s: its %s is not an https address; sign-in refused", o.get("id"), key)
+                raise AuthError("oidc_insecure", "This sign-in provider is not reached over https; sign-in is "
+                                                 "refused", 400)
         self._oidc_meta[o["id"]] = (time.time(), meta)
         return meta
 

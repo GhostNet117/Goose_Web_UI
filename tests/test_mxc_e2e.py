@@ -264,3 +264,39 @@ async def test_goose_acp_initializes_in_an_mxc_worker(tmp_path, monkeypatch):
         await wm.shutdown()
     for n in names:
         assert not Path(s.system_dir, "sandbox", "mxc", specs[n]["name"] + ".json").exists()
+
+
+async def test_an_mxc_container_is_not_started_on_the_desktop_of_the_signed_in_account(tmp_path):
+    """WS-1: a process in an MXC container on the window station of a signed-in user can copy that user's screen
+    (measured on build 26100). The executor is started on the gateway's own desktop for members, and the container
+    with it."""
+    s = _ready(tmp_path)
+    from goose_web import sandbox as sb
+    from goose_web.workers import _Job
+    from test_appcontainer import WHERE_AM_I
+    if not sb.session_info()["interactive"]:
+        pytest.skip("nobody is signed in here")
+    place = sb.members_desktop(True)
+    assert "\\" in place and not place.lower().startswith("winsta0")
+    g = tmp_path / "granted"
+    g.mkdir()
+    (g / "where.py").write_text(WHERE_AM_I, encoding="utf-8")
+    py = sys.base_prefix
+    policy = mxc.build_policy(command=[os.path.join(py, "python.exe"), "-I", str(g / "where.py")], cwd=str(g),
+                              env={"SystemRoot": os.environ["SystemRoot"], "PATH": py,
+                                   "LOCALAPPDATA": os.environ["LOCALAPPDATA"]},
+                              grants={str(g): "modify", py: "read"}, system_drive=os.environ.get("SystemDrive", "C:"))
+    pf = tmp_path / "policy.json"
+    mxc.write_policy(pf, policy)
+    gj, wj = _Job(), _Job()
+    try:
+        with open(tmp_path / "err.log", "wb") as errf:
+            p = mxc.launch(mxc.exe_path(s), pf, errf, [gj, wj], place)
+            out, _ = await asyncio.to_thread(p.communicate, None, 120)
+        assert p.returncode == 0, (tmp_path / "err.log").read_text(errors="replace")
+        seen = json.loads(out.decode().strip().splitlines()[-1])
+        assert seen["where"] == place and (not seen["copied"] or seen["distinct"] <= 1), seen
+    finally:
+        wj.close()
+        gj.close()
+

@@ -18,6 +18,7 @@ const LOGIN_ERRORS = new Map([
   ['oidc_conflict', 'This sign-in identity conflicts with an existing account. Ask an administrator.'],
   ['oidc_unlinked', 'An account with this name already exists but is not linked to your sign-in identity. Ask an administrator to link the account.'],
   ['oidc_browser', 'This sign-in was started in another browser. Start it again here.'],
+  ['oidc_insecure', 'This sign-in provider is not reached over https, so sign-in with it is refused. Ask your administrator.'],
   ['unknown_provider', 'Unknown sign-in provider.'],
 ]);
 export function loginErrorText(code) { return LOGIN_ERRORS.get(String(code)) || 'Sign-in failed. Try again.'; }

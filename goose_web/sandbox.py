@@ -249,7 +249,14 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
         The process connects to the window station and desktop this process is on (`desktop`: to that desktop of
         the window station instead - the self-test and the tests use it). A program that cannot open them ends
         before its first instruction with 0xC0000142, so the container is let in first where nothing lets it in
-        (admit; `admit_first=False` leaves the access lists alone)."""
+        (admit; `admit_first=False` leaves the access lists alone).
+
+        Where somebody is signed in to the gateway's account, that desktop is not the one the gateway is on but
+        one of its own, on a window station without a screen and with a clipboard of its own (members_desktop)."""
+        if not desktop:
+            desktop = members_desktop()         # "" where nobody is signed in, or with sandbox.desktop: shared
+        elif "\\" in desktop and desktop != _PLACE.get("name"):
+            raise SandboxError(f"not a desktop of this gateway: {desktop!r}")
         if admit_first:
             try:
                 for what in admit(sid, desktop):
@@ -293,7 +300,9 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
             ws_name = _object_name(_u32.GetProcessWindowStation())
             on = desktop or ("" if ws_name.lower() == "winsta0"
                              else _object_name(_u32.GetThreadDesktop(_k32.GetCurrentThreadId())))
-            if on and ws_name:
+            if "\\" in on:                  # "window station\desktop": said in full by the caller
+                si.StartupInfo.lpDesktop = on
+            elif on and ws_name:
                 si.StartupInfo.lpDesktop = ws_name + "\\" + on
             si.lpAttributeList = ctypes.cast(buf, ctypes.c_void_p)
             block = "".join(f"{k}={v}\0" for k, v in sorted(env.items(), key=lambda kv: kv[0].upper())) + "\0"
@@ -587,10 +596,120 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
             if new:
                 _k32.LocalFree(new)
 
+    _u32.CreateWindowStationW.restype = wintypes.HANDLE
+    _u32.CreateWindowStationW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+    _u32.CreateDesktopW.restype = wintypes.HANDLE
+    _u32.CreateDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                    ctypes.c_void_p]
+    _u32.SetProcessWindowStation.argtypes = [wintypes.HANDLE]
+    _adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                                                          ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    # Measured on build 26100 (FIX members-read-screen): on the window station of a signed-in user every application
+    # container may read the screen, and one of the AppContainer backend also the clipboard - Windows names ALL
+    # APPLICATION PACKAGES there with those rights. A member's agent is such a container. So where somebody is
+    # signed in to the gateway's account, members' processes are started on a desktop the gateway makes on the
+    # window station of its logon that nobody sits at ("Service-0x0-<luid>$"): it has no screen, and a clipboard
+    # of its own. From there a process cannot open the interactive window station any more (access denied).
+    # NOT closed by this: a process in the container can still start another process on "WinSta0\Default" by name
+    # (measured). Only a gateway that runs under an account nobody is signed in to has nothing to show.
+    PRIVATE_DESKTOP = {"on": True}      # sandbox.desktop: private (default) | shared - set by the worker manager
+    _PLACE: dict = {}                   # the members' desktop of this process, once made
+
+    def members_desktop(open_to_all: bool = False) -> str:
+        """ "window station\\desktop" on which members' processes are started, made on first use and kept for the
+        life of this process; "" where the gateway is not on the interactive window station (nobody is signed in:
+        nothing to hide, and spawn/admit use the gateway's own) or with `sandbox.desktop: shared`.
+
+        The desktop names this account, SYSTEM and - with what a program needs (DESKTOP_FOR_CONTAINER) - the
+        application-packages groups: MXC containers get a new SID at every start and cannot be named one by one.
+        `open_to_all`: the caller cannot name its container on the window station either (MXC), so the window
+        station must let application packages in as Windows made it. SandboxError when it cannot be made: members'
+        agents are then not started at all rather than on the desktop of the signed-in account."""
+        if not PRIVATE_DESKTOP["on"]:
+            return ""
+        with _ADMIT_LOCK:
+            if _PLACE.get("broken"):        # this process is not where it should be: nothing is started any more
+                raise SandboxError(_PLACE["broken"])
+            if "name" not in _PLACE:
+                orig = _u32.GetProcessWindowStation()
+                mine = _object_name(orig)
+                if not mine:
+                    raise SandboxError("the window station of this gateway could not be read, so it is not known "
+                                       "whether somebody is signed in to its account; members' agents are not "
+                                       f"started ({ctypes.get_last_error()})")
+                if mine.lower() != "winsta0":
+                    _PLACE.update(name="")
+                    return ""
+                refuse = ("they are not started on the desktop of the signed-in account (sandbox.desktop: shared "
+                          "would allow it)")
+                # no name = "the window station of this logon that nobody sits at": Windows opens or makes it
+                ws = _u32.CreateWindowStationW(None, 0, 0x000F037F, None)
+                if not ws:
+                    raise SandboxError("a window station of its own for members' agents could not be opened "
+                                       f"({ctypes.get_last_error()}); {refuse}")
+                psd, desk, keep = ctypes.c_void_p(), None, False
+                try:
+                    station = _object_name(ws)
+                    if not station or station.lower() == "winsta0" or station.lower() in _SHARED_STATIONS:
+                        raise SandboxError(f"the window station {station!r} is not one for members' agents (the "
+                                           f"gateway runs as a Windows service account?); {refuse}")
+                    from . import winsec
+                    me = str(winsec.current_user_sid() or "")
+                    if not me.startswith("S-1-"):
+                        raise SandboxError(f"the SID of the gateway's account could not be read; {refuse}")
+                    sddl = (f"D:(A;;GA;;;{me})(A;;GA;;;SY)"
+                            f"(A;;0x{DESKTOP_FOR_CONTAINER:x};;;{ALL_APP_PACKAGES})"
+                            f"(A;;0x{DESKTOP_FOR_CONTAINER:x};;;{ALL_RESTRICTED_APP_PACKAGES})")
+                    if not _adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(psd), None):
+                        raise SandboxError("the access list of the members' desktop could not be built "
+                                           f"({ctypes.get_last_error()}); {refuse}")
+                    name = f"GooseWeb-{os.getpid()}"
+                    sa = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), psd.value, False)
+                    # A desktop is made on the window station of the calling PROCESS: this process is put on the
+                    # other one for this one call and back (under the lock; nothing else here uses windows).
+                    if not _u32.SetProcessWindowStation(ws):
+                        raise SandboxError("the window station for members' agents could not be used "
+                                           f"({ctypes.get_last_error()}); {refuse}")
+                    desk = _u32.CreateDesktopW(name, None, None, 0, 0x10000000, ctypes.byref(sa))   # GENERIC_ALL
+                    err = ctypes.get_last_error()
+                    if not _u32.SetProcessWindowStation(orig):
+                        why = ctypes.get_last_error()
+                        keep = True         # ws is where this process now is: never closed
+                        _PLACE["broken"] = ("this gateway could not be put back on its own window station "
+                                            f"({why}); members' agents are not started until it is restarted")
+                        log.critical("sandbox: %s", _PLACE["broken"])
+                        raise SandboxError(_PLACE["broken"])
+                    if not desk:
+                        raise SandboxError(f"a desktop of its own for members' agents could not be made on "
+                                           f"{station!r} ({err}); {refuse}")
+                    keep = True
+                    _PLACE.update(name=station + "\\" + name, station=station, desktop=name, ws=ws, desk=desk,
+                                  open=bool(_lets_in(ws, [ALL_APP_PACKAGES, ALL_RESTRICTED_APP_PACKAGES])))
+                    log.info("sandbox: members' agents are started on %s, not on the desktop of the signed-in account",
+                             _PLACE["name"])
+                finally:
+                    if psd:
+                        _k32.LocalFree(psd)
+                    if not keep:            # nothing was made: the handle is given back, the next start tries again
+                        _u32.CloseWindowStation(ws)
+            if open_to_all and _PLACE["name"] and not _PLACE["open"]:
+                raise SandboxError(f"the window station {_PLACE['station']!r} does not let application packages in, "
+                                   "so an MXC container cannot be started there; it is not started on the desktop "
+                                   "of the signed-in account (sandbox.desktop: shared would allow it)")
+            return _PLACE["name"]
+
     def _own_objects(desktop: str):
         """(what, name, the handle this process holds or None, open(access), close, what a container needs there,
         what it is given) for the window station this process is on and for its desktop (or the desktop `desktop`
         of that window station)."""
+        if "\\" in desktop:            # the members' desktop of this process: its handles are held, with full access
+            if desktop != _PLACE.get("name"):
+                raise SandboxError(f"not a desktop of this gateway: {desktop!r}")
+            pl = _PLACE
+            return (("window station", pl["station"], pl["ws"], lambda a: pl["ws"], lambda h: None, 0,
+                     WINSTA_FOR_CONTAINER),
+                    ("desktop", pl["desktop"], pl["desk"], lambda a: pl["desk"], lambda h: None, DESKTOP_NEED,
+                     DESKTOP_FOR_CONTAINER))
         hws, hdt = _u32.GetProcessWindowStation(), _u32.GetThreadDesktop(_k32.GetCurrentThreadId())
         ws_name = _object_name(hws)
         dt_name = desktop or _object_name(hdt) or "Default"
@@ -611,7 +730,8 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
         if not _CONTAINER_SID.fullmatch(sid or ""):
             raise SandboxError(f"not the SID of one application container: {sid!r}")
         who = [sid, ALL_APP_PACKAGES, ALL_RESTRICTED_APP_PACKAGES]
-        station = _object_name(_u32.GetProcessWindowStation())
+        # the window station that would be changed: the members' own, or the one this gateway is on
+        station = _PLACE.get("station", "") if "\\" in desktop else _object_name(_u32.GetProcessWindowStation())
         added: list[str] = []
         with _ADMIT_LOCK:       # read, add, write: two members starting at once must not lose each other's entry
             for what, name, own, opener, closer, need, give in _own_objects(desktop):
@@ -658,9 +778,12 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
         gone: list[str] = []
         if not _CONTAINER_SID.fullmatch(sid or ""):
             return gone
+        places = [desktop]
+        if not desktop and _PLACE.get("name"):      # a container that is deleted: wherever this process named it
+            places.append(_PLACE["name"])
         try:
             with _ADMIT_LOCK:
-                for what, name, _own, opener, closer, _need, _give in _own_objects(desktop):
+                for what, name, _own, opener, closer, _need, _give in [o for p in places for o in _own_objects(p)]:
                     if (sid, what, name) not in _ADMITTED:
                         continue
                     try:                    # one that cannot be taken off does not keep the other on
@@ -791,6 +914,11 @@ else:
     def admit(sid: str, desktop: str = "", dry: bool = False) -> list[str]:
         raise SandboxError("the sandbox needs Windows (AppContainer)")
 
+    PRIVATE_DESKTOP = {"on": True}
+
+    def members_desktop(open_to_all: bool = False) -> str:
+        return ""
+
     def dismiss(sid: str, desktop: str = "") -> list[str]:
         return []
 
@@ -827,8 +955,9 @@ def _selftest_run(sid: str, python: str, desktop: str = "") -> list[dict]:
                 errf.seek(0)
                 err = errf.read().decode("utf-8", "replace").strip().splitlines()
                 text = (box[0] if box else b"").decode("utf-8", "replace").strip()
-                out.append({"what": what, "ok": code == 0 and text == "ok", "exit": f"0x{code:08X}",
-                            "detail": (err[-1] if err else "")[:200]})
+                ok = code == 0 and text == "ok"
+                out.append({"what": what, "ok": ok, "exit": f"0x{code:08X}",
+                            "detail": "" if ok else (err[-1] if err else "")[:200]})
             except Exception as e:
                 out.append({"what": what, "ok": False, "exit": "", "detail": f"{type(e).__name__}: {str(e)[:200]}"})
     return out
@@ -858,6 +987,8 @@ def selftest(python: str = "", desktop: str = "") -> dict:
                  "at": time.time()}
     granted, sid = "", ""
     try:
+        desktop = desktop or members_desktop()      # where spawn puts a member's agent
+        res["membersDesktop"] = desktop
         sid = ensure_container(name)
         # the folder itself, not a link to it: a grant on a directory link changes the link (uv keeps its Pythons
         # behind one), and the program then ends with 0xC0000135
@@ -923,6 +1054,8 @@ def selftest_text(res: dict) -> tuple[bool, str]:
              + ("" if res.get("interactive") else ", nobody signed in"))
     if res.get("ok"):
         return True, (f"a process in an application container starts here ({where})"
+                      + (f", on {res['membersDesktop']} - not on the desktop of the signed-in account"
+                         if "\\" in str(res.get("membersDesktop") or "") else "")
                       + (f"; {res['remedy']}" if res.get("remedy") else ""))
     return False, ((res.get("reason") or "failed") + (f" {res['remedy']}." if res.get("remedy") else "")
                    + " Members' agents cannot run in an AppContainer started by this gateway; see ADMINISTRATION "

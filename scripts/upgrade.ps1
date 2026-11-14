@@ -129,8 +129,14 @@ try {
     if (-not (Test-Path $cfg)) { throw "Config not found: $cfg" }
     Say "Task $taskFull ($($task.State)); config $cfg"
     $cfgText = Get-Content $cfg -Raw
-    $root = if ($cfgText -match '(?m)^\s*profiles_root:\s*"?([^"\r\n#]+?)"?\s*$') { $Matches[1].Replace('\\', '\') } else { Split-Path (Split-Path $cfg) }
-    $sysDir = if ($cfgText -match '(?m)^\s*system_dir:\s*"?([^"\r\n#]+?)"?\s*$' -and $Matches[1]) { $Matches[1].Replace('\\', '\') } else { Join-Path $root '_system' }
+    # The folders as the installed package reads them - config.yaml, then the environment. A pattern over the file
+    # missed a value with a comment behind it and anything set in the environment; the database backup was then
+    # skipped and still reported as done (review 2026-11-12, D-3). No double quotes in the line: Windows PowerShell
+    # 5.1 drops them when it hands an argument to a program.
+    $where = Run $venvPy @('-c', 'import sys; from goose_web.config import load_settings; s = load_settings(sys.argv[1]); print(''ROOT='' + str(s.profiles_root)); print(''SYS='' + str(s.system_dir))', $cfg)
+    $root = (@($where.out) | Where-Object { $_ -like 'ROOT=*' } | Select-Object -First 1) -replace '^ROOT=', ''
+    $sysDir = (@($where.out) | Where-Object { $_ -like 'SYS=*' } | Select-Object -First 1) -replace '^SYS=', ''
+    if ($where.code -or -not $root -or -not $sysDir) { throw "The installed Goose Web could not say where its data is (config $cfg); nothing was changed." }
     $bindHost = if ($cfgText -match '(?m)^\s*host:\s*"?([^"\s#]+)') { $Matches[1] } else { '127.0.0.1' }
     if ($bindHost -eq '0.0.0.0' -or $bindHost -eq '::') { $bindHost = '127.0.0.1' }
     $port = if ($cfgText -match '(?m)^\s*port:\s*(\d+)') { $Matches[1] } else { '8710' }
@@ -206,10 +212,9 @@ try {
     New-Item -ItemType Directory -Force -Path $bdir | Out-Null
     Copy-Item $cfg (Join-Path $bdir 'config.yaml')
     $db = Join-Path $sysDir 'goose-web.db'
-    if (Test-Path $db) {
-        $r = Run $venvPy @('-c', 'import sqlite3,sys;s=sqlite3.connect(sys.argv[1]);d=sqlite3.connect(sys.argv[2]);s.backup(d);d.close();s.close()', $db, (Join-Path $bdir 'goose-web.db'))
-        if ($r.code) { throw "Database backup failed; nothing was changed." }
-    }
+    if (-not (Test-Path $db)) { throw "No database at $db, so there is nothing to back up - is this the right configuration ($cfg)? Nothing was changed." }
+    $r = Run $venvPy @('-c', 'import sqlite3,sys;s=sqlite3.connect(sys.argv[1]);d=sqlite3.connect(sys.argv[2]);s.backup(d);d.close();s.close()', $db, (Join-Path $bdir 'goose-web.db'))
+    if ($r.code -or -not (Test-Path (Join-Path $bdir 'goose-web.db'))) { throw "Database backup failed; nothing was changed." }
     Say "Backup: $bdir (config.yaml, goose-web.db)"
     # The backups hold full database copies (password hashes, 2FA and directory secrets): keep the newest 10 only.
     Get-ChildItem (Join-Path $root 'backups') -Directory -Filter 'upgrade-*' | Sort-Object Name -Descending |

@@ -22,7 +22,10 @@ From lowest to highest (`goose_web/config.py: load_settings`):
    The file is deep-merged over the defaults.
 3. **Environment variables** `GOOSE_WEB__<SECTION>__<KEY>=<value>`, for example
    `GOOSE_WEB__SERVER__PUBLIC_URL=https://goose.example.org`. Names are case-insensitive and must have exactly two
-   parts. Values are converted like this (`_coerce`):
+   parts. Since 1.23.0 the gateway log (at start) and `goose-web check` list every setting that comes from the
+   environment, and name every section or key - in the file or in a variable - that no setting answers to (`[!!]`
+   in `check`): a mistyped name is a setting that silently keeps its default. `check` sees the environment of
+   whoever runs it; the gateway logs its own. Values are converted like this (`_coerce`):
    - `true`/`yes`/`on` become true, and `false`/`no`/`off` become false
    - whole numbers become integers
    - values that start with `[` or `{` are parsed as YAML (for example `'["127.0.0.1", "192.168.1.10"]'`)
@@ -109,6 +112,7 @@ host_tasks:
 | `sandbox.backend` | `mxc` | `mxc` = Microsoft Execution Containers (since 1.19.0; needs Windows build 26100.9278+ and `goose-web sandbox install-mxc`) or `appcontainer` = Goose Web's own AppContainer backend (1.8.0 - 1.18). Any other value: sandboxed workers do not start (fail closed). |
 | `sandbox.fallback` | `none` | When MXC cannot run: `none` = sandboxed workers do not start (fail closed, the reason in Admin > System and `goose-web sandbox status`); `appcontainer` = they start in the AppContainer backend (logged and audited as `sandbox.fallback`) and return to MXC when it is available. Never unsandboxed. |
 | `sandbox.network` | `internet` | Network of sandboxed workers: `none`, `internet` (outbound internet) or `internet+lan` (also the local network). Loopback is never reachable. With MXC all of it goes through the member's egress proxy: HTTP/HTTPS only (ADMINISTRATION 11.6). |
+| `sandbox.desktop` | `private` | Where somebody is signed in to the gateway's Windows account: `private` = members' agents are started on a desktop of the gateway's own, on a window station without a screen and with its own clipboard, so they cannot read that account's screen or clipboard by ordinary means (ADMINISTRATION 11.3 says what remains); if it cannot be made, they do not start. `shared` = on the account's desktop, as before 1.23.0. No effect for a gateway nobody is signed in to. |
 | `sandbox.relays` | `[]` | Local services (`host:port` on this machine, for example a model proxy on `127.0.0.1:4000`) sandboxed workers may reach; a relay forwards everything the service exposes on that port (every path, every virtual host). MXC: through the member's egress proxy, at their real address. AppContainer: through a per-user forwarder and a named pipe, with provider URLs rewritten to the forwarder. Everything else on loopback stays closed. A relay to the gateway's own port is ignored. An entry that is not `host:port` (an IPv4 address or a name, port 1 to 65535; no IPv6) is left out and named by `goose-web check`, `sandbox status` and the gateway log; the other relays and members' agents are not affected. AppContainer: two services on the same port each get a forward address of their own. |
 | `sandbox.mxc_dir` | `""` | Where `goose-web sandbox install-mxc` puts the pinned `wxc-exec.exe` (`<dir>\1.0.1\`). Default `<install folder>\vendor\mxc`. Must not be (in or above) the system folder or the profiles root. |
 | `sandbox.proxy_max_connections`, `sandbox.proxy_idle_seconds` | `64`, `900` | MXC egress proxy limits per member: open connections (more get HTTP 503) and seconds without traffic before a connection is closed. The first also limits each AppContainer relay (connections at once per member and service; more are closed at once). |
@@ -310,6 +314,7 @@ stored value.
 | `ldap.allowInsecure` | `false` | A plain `ldap://` URL without `startTls` is refused when the settings are saved (`400 bad_config`) and at sign-in (`503 ldap_insecure`, no bind is attempted), because it would send passwords in clear text. Setting this to `true` (admin UI checkbox "Allow unencrypted LDAP (not recommended)") allows it anyway. |
 | `ldap.autoCreate` | `true` | Create users at their first sign-in. |
 | `oidc[]` | `[]` | Providers: `id` (safe name), `label`, `issuer` (discovery at `<issuer>/.well-known/openid-configuration`), `clientId`, `clientSecret`, `scopes` (default `openid profile email`), `adminClaim`, `adminValue` (if empty, the claim must be `true`), `teamClaim` (matched against team names; the first match becomes the user's one team), `autoCreate` (default true), `stripDomain` (default true: `alice@x` becomes `alice`). Redirect URI: `<public_url>/api/auth/oidc/<id>/callback`. **Needs `server.public_url`.** An OIDC account is bound to the issuer + subject (`sub`) of its first sign-in. Existing unbound OIDC users are bound at their next sign-in. Another identity for the same name gets `oidc_conflict`, and local and LDAP accounts with that name are never taken over. |
+| `oidc[].allowInsecure` | `false` | Since 1.23.0 a provider whose issuer or whose authorization, token or user-info address is not `https://` is refused when the settings are saved (`400 bad_config`) and at sign-in (`400 oidc_insecure`): the identity token is not signature-checked, the TLS check stands in for it. `http://` to this machine itself (`localhost`, `127.x`, `::1`) is allowed. `true` (a real boolean) accepts plain http for this provider - only on a network you trust. |
 
 ## 5. Policies and teams
 

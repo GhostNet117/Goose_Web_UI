@@ -1,5 +1,67 @@
 # Changelog
 
+## 1.23.0 - 2026-11-14
+
+**Security: a member's agent could read the screen of the account that runs the gateway, when somebody is signed
+in to that account** - and, with the AppContainer backend, its clipboard. Found while measuring 1.22.2; it has been
+so since the sandbox exists, with both backends. Windows gives every application container the right to read the
+screen on the window station of a signed-in user, and a member's agent runs in such a container (measured on
+Windows build 26100 with real containers: the same pixels, the same clipboard text; MXC closes the clipboard, not
+the screen).
+
+- Where somebody is signed in to the gateway's account, members' agents are now started on a desktop the gateway
+  makes for them, on a window station that has no screen and a clipboard of its own. Measured with both backends:
+  no screen, no clipboard, and a process there cannot open the interactive window station any more.
+- **This is not complete.** A program in the container that deliberately starts another program on
+  `WinSta0\Default` by name still gets there (measured). What an ordinary tool or screenshot library does is closed;
+  a member who sets out to do it is not stopped. **Only a gateway that runs under an account nobody is signed in
+  to (started at boot, `install.ps1 -RunAs`) has nothing to show** - that is the arrangement for an installation
+  whose members are not trusted with the administrator's screen.
+- New setting `sandbox.desktop`: `private` (default) or `shared` (the desktop of the account, as before). If the
+  private desktop cannot be made, members' agents do not start - they are not put on the account's desktop instead.
+- A gateway nobody is signed in to is not affected: it works as in 1.22.2.
+
+**Fixed, from the whole-product review of 2026-11-12 (Medium):**
+
+- **B-8** The check of a recipe's sub-recipes read any file a member with `allow_shell` named, with the gateway's
+  rights and without a size limit, and the refusal quoted the file's title and extensions - another member's
+  recipe, a file on a share. It now reads only regular files of at most 1 MB inside the member's own folders.
+- **A-2** OIDC: an identity provider that is not reached over `https://` is refused, when it is saved and at every
+  sign-in (issuer, authorization, token and user-info address). The identity token is not signature-checked - the
+  TLS check stands in for it - so with `http://` somebody on the network path could sign in as an administrator.
+  `http://` to the gateway's own machine stays allowed; "Allow an http:// provider" on the provider (Admin >
+  Sign-in; `allowInsecure: true`) opts in for a trusted network. **A provider configured with an `http://` issuer
+  stops working until it is changed or opted in**; `goose-web check` - which `upgrade.ps1` runs - names such a
+  provider. Keep a local administrator account to sign in with.
+- **D-6** A name in `config.yaml` or in a `GOOSE_WEB__` variable that no setting answers to - `netwrok: none` - is
+  no longer swallowed: the gateway log names it at start and `goose-web check` marks it `[!!]`. Both also list what
+  the environment sets over the file. The exit code of `check` does not change for it: a leftover line in a file
+  must not stop an upgrade.
+- **D-5** A gateway that cannot start (a broken `config.yaml`, a missing module, a refused port) leaves its reason
+  in `<system_dir>\logs\startup-error.log`; `goose-web check` shows it, and the next start that works removes it.
+  Started by a task with `pythonw.exe` it used to leave no trace anywhere.
+- **B-7** The gateway kept a record for every session id a client named, for ever. Beyond 2000 per member, records
+  of chats nobody runs or looks at are dropped; such a chat is loaded from Goose again when it is opened.
+- **D-3** `upgrade.ps1` asks the installed package where the data is instead of matching a pattern in
+  `config.yaml`, which missed a value with a comment behind it and anything set in the environment - the database
+  backup was then skipped and still reported as done. No database where it should be now stops the upgrade.
+
+**CI.** The job "AppContainer as a boot task" now fails the run when the self-test fails. On its first run (1.22.2)
+it measured, for a scheduled task of an account that had never signed in, on Windows Server 2022 (build 20348) and
+Windows Server 2025 (build 26100): the window station and desktop did not let application packages in,
+`import ctypes` failed with "DLL initialization routine failed", and it ran once the container was named - the
+failure reported from the field, and its cure, on the real thing. The container tests reported for Windows Server
+2022 now run before the step that changes the Python folder's permissions (three of them failed for that reason).
+
+**Reviewed** independently before publication (read-only; findings T-1 to T-14, SECURITY-ASSESSMENT 19.3). Two
+regressions of the first version of this release were found and fixed: `upgrade.ps1` could not ask the package
+under Windows PowerShell 5.1 (double quotes in the line), and the sub-recipe check refused the sub-recipes of a
+recipe a team had given the member (the team's folder is outside the profile).
+
+**Not fixed, still open from that review:** B-2, B-3, B-5, B-6 (a worker that hangs, the monitor, an open
+permission request after Stop, a restart during a scheduled job), D-2 (no rollback in `upgrade.ps1`), D-8 (the
+build backend is not hash-locked).
+
 ## 1.22.2 - 2026-11-14
 
 **AppContainer backend: a gateway that nobody is signed in to (started at boot under a service account) can start
