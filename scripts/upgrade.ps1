@@ -133,9 +133,10 @@ try {
     # missed a value with a comment behind it and anything set in the environment; the database backup was then
     # skipped and still reported as done (review 2026-11-12, D-3). No double quotes in the line: Windows PowerShell
     # 5.1 drops them when it hands an argument to a program.
-    $where = Run $venvPy @('-c', 'import sys; from goose_web.config import load_settings; s = load_settings(sys.argv[1]); print(''ROOT='' + str(s.profiles_root)); print(''SYS='' + str(s.system_dir))', $cfg)
+    $where = Run $venvPy @('-c', 'import sys; from goose_web.config import load_settings; s = load_settings(sys.argv[1]); print(''ROOT='' + str(s.profiles_root)); print(''SYS='' + str(s.system_dir)); print(''GOOSE='' + str(getattr(s, ''goose_binary'', None) or ''''))', $cfg)
     $root = (@($where.out) | Where-Object { $_ -like 'ROOT=*' } | Select-Object -First 1) -replace '^ROOT=', ''
     $sysDir = (@($where.out) | Where-Object { $_ -like 'SYS=*' } | Select-Object -First 1) -replace '^SYS=', ''
+    $gooseBin = (@($where.out) | Where-Object { $_ -like 'GOOSE=*' } | Select-Object -First 1) -replace '^GOOSE=', ''
     if ($where.code -or -not $root -or -not $sysDir) { throw "The installed Goose Web could not say where its data is (config $cfg); nothing was changed." }
     $bindHost = if ($cfgText -match '(?m)^\s*host:\s*"?([^"\s#]+)') { $Matches[1] } else { '127.0.0.1' }
     if ($bindHost -eq '0.0.0.0' -or $bindHost -eq '::') { $bindHost = '127.0.0.1' }
@@ -240,20 +241,39 @@ try {
         Say ("Code now at " + ((git -C $InstallDir log -1 --format='%h %s') | Select-Object -First 1))
     }
 
-    # 5. dependencies (uv venvs have no pip; Goose ships uv)
+    # 5. dependencies. uv when one can be found: Goose ships it, and a virtualenv made by uv has no pip. Looked for
+    # on PATH, in Goose's own folder of this account, next to the goose binary the configuration names, in the
+    # virtualenv, and as a module of the virtualenv's Python. An account that upgrades but has no Goose of its own
+    # (a service account) had none of the first two, and the upgrade stopped at "Dependency installation failed
+    # (pip)" although nothing was wrong (found in use, 2026-11-16). Without any uv, pip is added when it is missing.
     $uv = (Get-Command uv -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-    if (-not $uv) { $c = Join-Path $env:LOCALAPPDATA 'Goose\bin\uv.exe'; if (Test-Path $c) { $uv = $c } }
+    $uvArgs = @()
+    if (-not $uv) {
+        $candidates = @((Join-Path $env:LOCALAPPDATA 'Goose\bin\uv.exe'), (Join-Path $InstallDir '.venv\Scripts\uv.exe'))
+        if ($gooseBin) { $candidates += (Join-Path (Split-Path $gooseBin) 'uv.exe') }
+        foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { $uv = $c; break } }
+    }
+    if (-not $uv) {
+        $r = Run $venvPy @('-m', 'uv', '--version')
+        if (-not $r.code) { $uv = $venvPy; $uvArgs = @('-m', 'uv') }
+    }
     Push-Location $InstallDir
     try {
         if ($uv) {
-            $r = Run $uv @('pip', 'install', '--python', $venvPy, '--require-hashes', '-r', 'requirements.lock'); if ($r.code) { throw "Dependency installation failed (uv)." }
-            $r = Run $uv @('pip', 'install', '--python', $venvPy, '--no-deps', '-e', '.'); if ($r.code) { throw "Package installation failed (uv)." }
+            $r = Run $uv ($uvArgs + @('pip', 'install', '--python', $venvPy, '--require-hashes', '-r', 'requirements.lock')); if ($r.code) { throw "Dependency installation failed (uv)." }
+            $r = Run $uv ($uvArgs + @('pip', 'install', '--python', $venvPy, '--no-deps', '-e', '.')); if ($r.code) { throw "Package installation failed (uv)." }
         } else {
-            $r = Run $venvPy @('-m', 'pip', 'install', '--require-hashes', '-r', 'requirements.lock'); if ($r.code) { throw "Dependency installation failed (pip). Install uv, or run: $venvPy -m ensurepip" }
+            $r = Run $venvPy @('-m', 'pip', '--version')
+            if ($r.code) {
+                Say "No uv was found and the virtualenv has no pip (it was made by uv): adding pip (ensurepip)"
+                $r = Run $venvPy @('-m', 'ensurepip', '--upgrade')
+                if ($r.code) { throw "No uv was found and pip could not be added to the virtualenv (ensurepip). Put uv on PATH and run this again." }
+            }
+            $r = Run $venvPy @('-m', 'pip', 'install', '--require-hashes', '-r', 'requirements.lock'); if ($r.code) { throw "Dependency installation failed (pip)." }
             $r = Run $venvPy @('-m', 'pip', 'install', '--no-deps', '-e', '.'); if ($r.code) { throw "Package installation failed (pip)." }
         }
     } finally { Pop-Location }
-    Say "Dependencies installed ($(if ($uv) { 'uv' } else { 'pip' }))"
+    Say "Dependencies installed ($(if ($uv) { 'uv: ' + $uv } else { 'pip' }))"
 
     # 5b. prompt guard model (spec 018): downloaded from the pinned GitHub release asset (SHA-256 checked) if missing;
     # an installed, valid model is left alone. Not fatal: without the model the guard fails open (rules still apply)
@@ -312,6 +332,12 @@ try {
     $newVer = RunningVersion
     if (-not $ok) { throw "The gateway did not answer https:// or http://${bindHost}:${port}/healthz within 60 s. Check $sysDir\logs\gateway.log. Backup: $bdir" }
     Say "Upgraded $oldVer -> $newVer; healthz OK; backup $bdir"
+    # Windows Server keeps application containers out of two devices (ADMINISTRATION 11.6); what an administrator
+    # granted is gone after a restart unless the start-up task repeats it. Said here, never done here.
+    $dv = Run $venvPy @('-m', 'goose_web', '--config', $cfg, 'sandbox', 'devices')
+    if ($dv.code -or (@($dv.out) -match 'no start-up task')) {
+        Say "NOTE: members' agents in an AppContainer cannot start programs or load their hints on this Windows unless application containers are let in on two devices. From an elevated prompt: $InstallDir\scripts\register-devices-task.ps1 (see ADMINISTRATION 11.6)."
+    }
     exit 0
 } catch {
     Say "FAILED: $($_.Exception.Message)"

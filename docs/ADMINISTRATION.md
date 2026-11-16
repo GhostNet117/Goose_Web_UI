@@ -1738,15 +1738,20 @@ Requirements and limits:
     device for child stdin: Access is denied` - and the mount manager - without it a program cannot ask for the
     real path of a folder and Goose skips the member's hints (`Import boundary directory not found`; that the
     mount manager is the cause of this one is what the self-test establishes on your machine).
-    `goose-web sandbox devices` shows both. An administrator can let
-    application packages in on them as Windows 11 does: from an elevated prompt,
-    `goose-web --config <config.yaml> sandbox devices grant`. It only ever adds, it applies to every application
-    container on the machine, and it lasts until Windows restarts. To repeat it at every start, register a task
-    that runs it as SYSTEM, for example
-    `schtasks /create /tn "GooseWeb\GooseWeb_Devices" /sc onstart /ru SYSTEM /rl HIGHEST /tr "\"<install
-    folder>\.venv\Scripts\python.exe\" -m goose_web --config \"<config.yaml>\" sandbox devices grant"`
-    (this task line has not been run on a real installation yet). The gateway tests at its own start: when the
-    task runs after it, `sandbox status` shows the earlier state until the gateway is restarted.
+    `goose-web sandbox devices` shows both, and on a server whether the start-up task below is there.
+    An administrator can let application packages in on them as Windows 11 does - it only ever adds, and it
+    applies to every application container on the machine:
+    - **To stay** (since 1.24.1): from an elevated prompt, `scripts\register-devices-task.ps1`. It copies
+      `grant-devices.ps1` - a script that needs nothing but Windows - to `<ProgramData>\GooseWeb`, a folder it
+      gives to the Administrators and that only SYSTEM and administrators can write, registers the task
+      `\GooseWeb\GooseWeb_Devices` (at system start-up, as SYSTEM, Windows PowerShell with that copy), and runs it
+      once. Nothing of Goose Web's own folder runs as SYSTEM. `-Remove` takes it away, `-DryRun` shows what it
+      would do. On a machine that allows only signed scripts the task cannot run the file; the script says so.
+    - **Until Windows restarts**: from an elevated prompt, `goose-web --config <config.yaml> sandbox devices grant`.
+    - Do not make a task of your own that runs Goose Web's Python as SYSTEM: whoever can change the install folder
+      or its Python could then become SYSTEM.
+    The gateway tests at its own start, and once more three minutes later when something was out of reach (the
+    task may run after it); `upgrade.ps1` says when the task is missing.
   - Run the gateway under an account of its own. On the window station of SYSTEM, NETWORK SERVICE or LOCAL SERVICE
     - which Windows' own services share - Goose Web changes nothing, and members' agents do not start there.
   - Not measured: the MXC backend under such a gateway.

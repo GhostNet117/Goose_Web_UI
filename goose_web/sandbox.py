@@ -1044,8 +1044,23 @@ LIMIT_TEXT = {
                 "from the mount manager): Goose skips the member's hints (\"Import boundary directory not found\")",
 }
 LIMIT_REMEDY = ("Windows Server does not let application containers in on the two devices behind this; an "
-                "administrator can, as Windows 11 does: goose-web sandbox devices grant (elevated; until Windows "
-                "restarts) - ADMINISTRATION 11.6")
+                "administrator can, as Windows 11 does: scripts\\register-devices-task.ps1 (elevated; now and at "
+                "every start of Windows), or goose-web sandbox devices grant (elevated; until Windows restarts) - "
+                "ADMINISTRATION 11.6")
+DEVICES_TASK = "\\GooseWeb\\GooseWeb_Devices"      # scripts/register-devices-task.ps1
+
+
+def devices_task() -> bool | None:
+    """Whether the start-up task that repeats the device grant is registered (None: could not be asked)."""
+    if not IS_WINDOWS:
+        return None
+    exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "schtasks.exe")
+    try:
+        r = subprocess.run([exe, "/query", "/tn", DEVICES_TASK], capture_output=True, timeout=30,   # nosec B603
+                           stdin=subprocess.DEVNULL, creationflags=0x08000000)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.returncode == 0
 
 
 def _selftest_limits(sid: str, python: str, desktop: str = "") -> list[str]:

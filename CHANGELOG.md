@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.24.1 - 2026-11-16
+
+**Windows Server: what lets a member's agent start programs and load its hints now survives a restart.** The
+grant of 1.24.0 lasts until Windows restarts - on an installation that used it, everything quietly stopped working
+again at the first restart.
+
+- New: `scripts\register-devices-task.ps1`, from an elevated prompt. It registers a task that repeats the grant at
+  every start of Windows, as SYSTEM - with `scripts\grant-devices.ps1`, a script that needs nothing but Windows,
+  copied to `<ProgramData>\GooseWeb`, which it gives to the Administrators and closes to everybody but SYSTEM and
+  administrators. **Nothing of Goose Web's own folder runs as SYSTEM**: a task that ran Goose Web's Python would
+  let whoever can change the install folder become SYSTEM. `-Remove`, `-DryRun`.
+- `goose-web sandbox devices` says on a server whether that task is there; `upgrade.ps1` says when it is missing;
+  the gateway looks a second time three minutes after its start when something was out of reach, because the
+  task may run after it.
+- Measured for 1.24.0 by its CI run, as an administrator on Windows Server 2022 and 2025: both devices keep
+  application containers out; a program in a container can neither open NUL nor get a real path; after
+  `goose-web sandbox devices grant` it can do both.
+- **Not measured before publication:** the task itself (it needs an administrator on a Windows Server; the CI of
+  this release registers it, runs it as SYSTEM and reports, on both server versions) and a real restart.
+
+**`upgrade.ps1` under an account that has no Goose of its own** (a service account) could not find uv - it looked
+on PATH and in that account's Goose folder only - and, the virtualenv having been made by uv, stopped with
+"Dependency installation failed (pip)". It now also looks next to the goose binary the configuration names, in the
+virtualenv, and for uv as a module of the virtualenv's Python; without any uv it adds pip to the virtualenv
+(`ensurepip`) before it uses it.
+
 ## 1.24.0 - 2026-11-16
 
 **Windows Server, AppContainer backend: a member's agent started, but its shell tool could not start any program

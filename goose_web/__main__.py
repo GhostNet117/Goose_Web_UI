@@ -486,6 +486,11 @@ def cmd_sandbox(args, settings) -> int:
             state = {True: "[OK] lets application packages in", False: "[!!] does NOT let application packages in",
                      None: "[--] its access list cannot be read by this account"}[d["open"]]
             print(f"{state}: {d['device']}")
+        if sys.getwindowsversion().product_type != 1 or sb.devices_task():        # a server, or the task is there
+            print({True: "[OK] the start-up task " + sb.DEVICES_TASK + " repeats this at every start of Windows",
+                   False: "[--] no start-up task: what was granted is gone when Windows restarts "
+                          "(scripts\\register-devices-task.ps1, from an elevated prompt)",
+                   None: "[--] whether a start-up task repeats this could not be asked"}[sb.devices_task()])
         return 0 if all(d["open"] is not False for d in sb.devices_status()) else 1
     if args.action == "selftest":
         # in THIS session, as THIS account: says nothing about a gateway that runs elsewhere (a boot task)

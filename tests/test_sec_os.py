@@ -671,6 +671,12 @@ def test_upgrade_ps1_asks_the_package_where_the_data_is_and_never_skips_the_data
     r = subprocess.run([sys.executable, "-c", line, str(cfg)], capture_output=True, text=True, env=env, timeout=60)
     assert Path(r.stdout.split("ROOT=")[1].splitlines()[0]) == tmp_path / "p", r.stdout + r.stderr
     assert Path(r.stdout.split("SYS=")[1].splitlines()[0]) == tmp_path / "s"
+    assert "GOOSE=" in r.stdout                                 # where uv may sit next to the goose binary
+    # found in use, 2026-11-16: an account that upgrades but has no Goose of its own (a service account) had no uv
+    # on PATH and none in its own Goose folder; the virtualenv, made by uv, has no pip; the upgrade stopped
+    for needle in ("'.venv\\Scripts\\uv.exe'", "(Split-Path $gooseBin) 'uv.exe'", "@('-m', 'uv', '--version')",
+                   "@('-m', 'ensurepip', '--upgrade')", "register-devices-task.ps1"):
+        assert needle in text, needle
     r = subprocess.run([sys.executable, "-c", line, str(cfg)], capture_output=True, text=True, timeout=60,
                        env={**env, "GOOSE_WEB__PATHS__SYSTEM_DIR": str(tmp_path / "from-env")})
     assert Path(r.stdout.split("SYS=")[1].splitlines()[0]) == tmp_path / "from-env", r.stdout + r.stderr

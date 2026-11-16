@@ -1446,3 +1446,25 @@ a bundled extension on when its key is missing. The team page and `check` say wh
 
 No independent review of this release.
 
+### 20.3 1.24.1: the grant at every start of Windows
+
+**Measured for 20.1** by the CI run of 1.24.0 (an administrator on Windows Server 2022 and 2025): both devices
+keep application containers out; the grant works on a device object and a program in a container can then open
+NUL and get a real path.
+
+**Changed.** `scripts/register-devices-task.ps1` registers a start-up task, as SYSTEM, that runs
+`scripts/grant-devices.ps1`.
+
+**Judged - the question is what SYSTEM runs.** Goose Web's own folder and its Python are, in the ordinary
+installation, writable by the account that installed it, which is not an administrator: a SYSTEM task that ran
+`python -m goose_web ...` from there would be a way from that account to SYSTEM. So the task runs Windows
+PowerShell from System32 with one script file that uses nothing but Windows (four Windows calls and .NET), and
+that file is a copy in `<ProgramData>\GooseWeb`: the folder must be a plain folder (a link is refused), is given
+to the Administrators, and its access list is replaced by SYSTEM and Administrators only, nothing inherited; the
+copy is made new (never written through what was there), compared with the original by hash, and its own access
+list is checked before the task is registered. The script only ever adds the two entries Windows 11 has; it has
+no way to take anything off. The administration guide warns against a task that runs Goose Web's Python as SYSTEM.
+
+**Not verified.** The task on a Windows Server and after a real restart; a machine that allows only signed
+scripts (the task then fails and the script says what to do instead). No independent review.
+

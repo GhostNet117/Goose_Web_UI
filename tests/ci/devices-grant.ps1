@@ -1,25 +1,28 @@
 <#
 .SYNOPSIS
-  CI only (a GitHub-hosted runner, thrown away after the job; the job runs as an administrator). Measures what
-  `goose-web sandbox devices grant` does on this Windows: what a program in an application container cannot do
-  before it (the NUL device, real paths), the access lists of the two devices before and after, and what it
-  cannot do afterwards. Each result is an annotation of the run.
+  CI only (a GitHub-hosted runner, thrown away after the job; the job runs as an administrator). Measures on this
+  Windows what lets application containers in on the NUL device and the mount manager: `goose-web sandbox devices
+  grant`, and the start-up task of scripts\register-devices-task.ps1 (registered, run once as SYSTEM, removed).
+  What a program in a container cannot do is asked before, between and after. One annotation of the run.
 
 .DESCRIPTION
-  -Enforce fails the step when something is still out of reach after the grant. Without it the step only reports:
-  this was written before the grant had been seen to work on Windows Server.
+  -TaskFirst lets the start-up task do the granting and the command come second (it then finds nothing to do);
+  without it the other way round. So each of the two is seen to do the work on one of the two Windows versions.
+  -Enforce fails the step when something is still out of reach in the end, or one of the two did not end well.
 #>
 [CmdletBinding()]
 param(
     [string]$Python = (Get-Command python).Source,
+    [switch]$TaskFirst,
     [switch]$Enforce
 )
 $ErrorActionPreference = 'Stop'
-if ($env:GITHUB_ACTIONS -ne 'true') { throw 'This changes the access lists of two devices of this machine: for a GitHub-hosted runner only.' }
+if ($env:GITHUB_ACTIONS -ne 'true') { throw 'This changes the access lists of two devices of this machine and registers a task as SYSTEM: for a GitHub-hosted runner only.' }
 $probe = Join-Path $PSScriptRoot 'selftest_as_service.py'
+$register = (Resolve-Path (Join-Path $PSScriptRoot '..\..\scripts\register-devices-task.ps1')).Path
 $tmp = Join-Path $env:RUNNER_TEMP ('gwdev-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Force $tmp | Out-Null
-$title = 'What a container cannot do and the devices grant'
+$title = 'What a container cannot do and what lets it'
 
 function Say([string]$level, [string]$text) {
     $t = $text.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
@@ -32,24 +35,35 @@ function Limits([string]$name) {
     if (-not $r.ok) { return "self-test FAILED: $($r.text) $($r.error)" }
     return "[$(@($r.limits) -join '; ')]"
 }
-function Lists() {
-    $code = 'from goose_web import sandbox as sb' + "`n" + 'print(sb.devices_status())'
-    return ((& $Python -c $code) -join ' ')
+function Native([string]$exe, [string[]]$a) {
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $o = (& $exe @a 2>&1 | ForEach-Object { "$_" }) -join ' | '
+    $c = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    return @{ code = $c; text = "exit ${c}: $o" }
 }
+function Lists() { return (Native $Python @('-c', 'from goose_web import sandbox as sb; print(sb.devices_status())')).text }
+function Grant() { return Native $Python @('-m', 'goose_web', 'sandbox', 'devices', 'grant') }
+function Task() { return Native 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $register) }
+
 $failed = $false
 try {
     $before = Limits 'before.json'
     $listsBefore = Lists
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    $grant = (& $Python -m goose_web sandbox devices grant 2>&1 | ForEach-Object { "$_" }) -join ' | '
-    $code = $LASTEXITCODE
-    $ErrorActionPreference = $prev
+    if ($TaskFirst) { $one = Task; $oneName = 'START-UP TASK' } else { $one = Grant; $oneName = 'GRANT' }
+    $between = Limits 'between.json'
+    $listsBetween = Lists
+    if ($TaskFirst) { $two = Grant; $twoName = 'GRANT' } else { $two = Task; $twoName = 'START-UP TASK' }
     $after = Limits 'after.json'
-    $line = "BEFORE a program in a container cannot: $before; devices: $listsBefore. GRANT (exit $code): $grant. AFTER it cannot: $after; devices: $(Lists)."
-    if ($after -eq '[]') { Say 'notice' $line } else { Say 'warning' $line; $failed = $true }
+    $status = (Native $Python @('-m', 'goose_web', 'sandbox', 'devices')).text
+    $line = "BEFORE a program in a container cannot: $before; devices: $listsBefore. FIRST $oneName ($($one.text)). " +
+            "THEN it cannot: $between; devices: $listsBetween. SECOND $twoName ($($two.text)). IN THE END it cannot: $after. STATUS: $status"
+    if ($between -eq '[]' -and $after -eq '[]' -and -not $one.code -and -not $two.code) { Say 'notice' $line } else { Say 'warning' $line; $failed = $true }
 } catch {
     Say 'warning' ("it could not be run: " + $_.Exception.Message)
     $failed = $true
+} finally {
+    try { [void](Native 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $register, '-Remove')) } catch { }
 }
 if ($failed -and $Enforce) { exit 1 }
 exit 0

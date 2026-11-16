@@ -765,7 +765,7 @@ def create_app(settings: Settings) -> Starlette:
                         log.error("sandbox folders: %s", fp["why"])
                 except Exception:
                     log.exception("sandbox folders: check failed")
-                try:    # only the gateway can say whether a container process starts in the session IT runs in
+                def _self_test() -> dict:
                     import json as _json
                     from . import relay as _rl
                     from . import sandbox as _sb
@@ -776,6 +776,22 @@ def create_app(settings: Settings) -> Starlette:
                     d = settings.system_dir / "sandbox"
                     d.mkdir(parents=True, exist_ok=True)
                     _sb.write_atomic(d / "selftest.json", _json.dumps(res))
+                    return res
+                try:    # only the gateway can say whether a container process starts in the session IT runs in
+                    if _self_test().get("limits"):
+                        # A start-up task may let application containers in on the devices a moment after this
+                        # gateway started (scripts/register-devices-task.ps1): look once more, so that the status
+                        # an administrator reads is not the state of the first seconds after a restart.
+                        import threading as _threading
+
+                        def _again():
+                            try:
+                                _self_test()
+                            except Exception:
+                                log.exception("sandbox self-test (second look)")
+                        t = _threading.Timer(180, _again)
+                        t.daemon = True
+                        t.start()
                 except Exception:
                     log.exception("sandbox self-test")
             asyncio.get_running_loop().run_in_executor(None, _sandbox_folders)

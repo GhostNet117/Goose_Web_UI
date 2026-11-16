@@ -85,11 +85,13 @@ jobs:
         shell: powershell
         run: .\tests\ci\selftest-as-service.ps1 -Enforce
       # Windows Server keeps application containers out of the NUL device and the mount manager (ADMINISTRATION
-      # 11.6): what that costs a program in a container, and what `goose-web sandbox devices grant` changes, is
-      # measured here and reported. Not a gate: it was written before the grant had been seen on Windows Server.
-      - name: What a container cannot do, before and after the devices grant (reported)
+      # 11.6). What that costs a program in a container, and what lets it in - `goose-web sandbox devices grant`
+      # (seen to work on both with 1.24.0) and the start-up task of scripts\register-devices-task.ps1, run for
+      # real as SYSTEM - is measured here and reported: the task does the granting on Windows Server 2022, the
+      # command on the other. Not a gate: the task was written before it had been seen on Windows Server.
+      - name: What a container cannot do, and what lets it (reported)
         shell: powershell
-        run: .\tests\ci\devices-grant.ps1
+        run: .\tests\ci\devices-grant.ps1 ${{ matrix.os == 'windows-2022' && '-TaskFirst' || '' }}
 
   audit:
     name: pip-audit (requirements.lock)

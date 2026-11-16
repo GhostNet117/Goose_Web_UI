@@ -6,6 +6,7 @@ container with the product's own code - sandbox.prepare, sandbox.spawn, relay.Pi
 forwarder - and ask a Python inside it what it can reach. Nothing needs administrator rights."""
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -1732,4 +1733,45 @@ def test_the_devices_are_only_ever_given_more_and_only_by_an_administrator(monke
     assert main(["sandbox", "devices", "nonsense"]) == 2
     monkeypatch.setattr(sb, "devices_status", lambda: [{"device": n, "open": False} for n in sb.DEVICES])
     assert main(["sandbox", "devices"]) == 1 and "does NOT let application packages in" in capsys.readouterr().out
+
+
+@windows
+def test_the_start_up_task_runs_nothing_of_goose_web_and_its_script_does_the_grant(monkeypatch, capsys):
+    """What `sandbox devices grant` gives is gone when Windows restarts (found in use: the whole cure reverts at
+    the first restart). scripts/register-devices-task.ps1 registers a task that repeats it as SYSTEM - with a
+    script that needs nothing but Windows, copied to a folder only administrators can write: a task that ran Goose
+    Web's own Python as SYSTEM would let whoever can change the install folder become SYSTEM."""
+    scripts = Path(sb.__file__).resolve().parents[1] / "scripts"
+    reg = (scripts / "register-devices-task.ps1").read_text(encoding="utf-8")
+    grant = (scripts / "grant-devices.ps1").read_text(encoding="utf-8")
+    # the only program either of them names is Windows PowerShell; Goose Web's Python is run by neither
+    programs = lambda text: {m.lower() for m in re.findall(r"[\w.-]+\.exe\b", text)}
+    assert programs(reg) == {"powershell.exe"} and programs(grant) == set() and "goose_web" not in grant + reg
+    assert "SetAccessRuleProtection($true, $false)" in reg and "SetOwner($admins)" in reg and "ReparsePoint" in reg
+    assert "0x001201BF" in grant and "0x001200A0" in grant and "S-1-15-2-1" in grant and "S-1-15-2-2" in grant
+    assert "RemoveAce" not in grant and "RemoveAccess" not in grant            # it only ever adds
+    assert {int(m, 16) for m in ("0x001201BF", "0x001200A0")} == set(sb.DEVICES.values())
+    ps = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
+    r = subprocess.run([*ps, str(scripts / "register-devices-task.ps1"), "-DryRun"], capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "as SYSTEM" in r.stdout and "GooseWeb\\grant-devices.ps1" in r.stdout, r.stdout + r.stderr
+    assert "System32\\WindowsPowerShell\\v1.0\\powershell.exe" in r.stdout and "\\GooseWeb\\GooseWeb_Devices" in r.stdout
+    # the script itself: run for real where that changes nothing (the devices are open already: Windows 11) or on
+    # a CI runner, which is thrown away; never on somebody's Windows Server just because the tests ran elevated
+    is_open = all(d["open"] is True for d in sb.devices_status())
+    if is_open or os.environ.get("GITHUB_ACTIONS") == "true":
+        r = subprocess.run([*ps, str(scripts / "grant-devices.ps1")], capture_output=True, text=True, timeout=180)
+        if r.returncode == 0:
+            assert all(d["open"] is True for d in sb.devices_status()), r.stdout
+            assert ("ok " in r.stdout) if is_open else ("granted " in r.stdout), r.stdout
+        else:       # a runner that is not an administrator
+            assert "administrator" in r.stdout, r.stdout + r.stderr
+    # `goose-web sandbox devices` on a server says whether the task is there
+    from goose_web import __main__ as cli
+    monkeypatch.setattr(cli.sys, "getwindowsversion", lambda: SimpleNamespace(product_type=3, build=20348))
+    monkeypatch.setattr(sb, "devices_status", lambda: [{"device": n, "open": True} for n in sb.DEVICES])
+    for there, words in ((False, "no start-up task"), (True, "repeats this at every start"), (None, "could not be asked")):
+        monkeypatch.setattr(sb, "devices_task", lambda there=there: there)
+        capsys.readouterr()
+        assert cli.main(["sandbox", "devices"]) == 0 and words in capsys.readouterr().out
+    assert "register-devices-task.ps1" in sb.LIMIT_REMEDY
 
