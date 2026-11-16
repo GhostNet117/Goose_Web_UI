@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.24.2 - 2026-11-16
+
+CI, one test and documents only; no change of the product.
+
+- What the CI run of 1.24.1 measured (an administrator on Windows Server 2022 and 2025):
+  `scripts\register-devices-task.ps1` copies the script, registers `\GooseWeb\GooseWeb_Devices` and the task runs
+  as SYSTEM and ends well, on both; `scripts\grant-devices.ps1`, run by an administrator, lets application
+  containers in on both devices, on both (a program in a container could then open NUL and get a real path).
+- What it did not measure: the task doing the granting itself. On both runners the devices had been opened before
+  the task ran - on Windows Server 2022 by a test of the suite that runs the script. That test now leaves the
+  devices alone in that job, so that the task, as SYSTEM, is what opens them; the result is an annotation of
+  this release's run.
+
 ## 1.24.1 - 2026-11-16
 
 **Windows Server: what lets a member's agent start programs and load its hints now survives a restart.** The

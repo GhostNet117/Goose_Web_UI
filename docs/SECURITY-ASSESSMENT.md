@@ -1468,3 +1468,12 @@ no way to take anything off. The administration guide warns against a task that 
 **Not verified.** The task on a Windows Server and after a real restart; a machine that allows only signed
 scripts (the task then fails and the script says what to do instead). No independent review.
 
+### 20.4 1.24.2: what CI measured for the start-up task
+
+By the CI run of 1.24.1, as an administrator on Windows Server 2022 and 2025: the script is copied to a folder
+only SYSTEM and Administrators can write, the task is registered, runs as SYSTEM and ends with 0; the grant
+script, run by an administrator, opens both devices to application containers. Not measured by that run: the task
+opening devices that are still closed (they had been opened before it ran). 1.24.2 changes the CI job so that
+this is what its last step sees on Windows Server 2022. No change of the product; nothing new to judge. Still
+not verified: a real restart; a machine that allows only signed scripts.
+

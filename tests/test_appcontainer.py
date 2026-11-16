@@ -1757,8 +1757,10 @@ def test_the_start_up_task_runs_nothing_of_goose_web_and_its_script_does_the_gra
     assert "System32\\WindowsPowerShell\\v1.0\\powershell.exe" in r.stdout and "\\GooseWeb\\GooseWeb_Devices" in r.stdout
     # the script itself: run for real where that changes nothing (the devices are open already: Windows 11) or on
     # a CI runner, which is thrown away; never on somebody's Windows Server just because the tests ran elevated
+    # (GOOSE_WEB_TEST_KEEP_DEVICES=1: a CI job whose next step measures the start-up task on devices still closed)
     is_open = all(d["open"] is True for d in sb.devices_status())
-    if is_open or os.environ.get("GITHUB_ACTIONS") == "true":
+    on_ci = os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("GOOSE_WEB_TEST_KEEP_DEVICES") != "1"
+    if is_open or on_ci:
         r = subprocess.run([*ps, str(scripts / "grant-devices.ps1")], capture_output=True, text=True, timeout=180)
         if r.returncode == 0:
             assert all(d["open"] is True for d in sb.devices_status()), r.stdout

@@ -70,6 +70,10 @@ jobs:
       - name: Container tests on this Windows (reported, not a gate)
         if: matrix.os == 'windows-2022'
         shell: powershell
+        env:
+          # one of these tests runs grant-devices.ps1 for real on a runner; here the devices must stay closed, so
+          # that the last step of this job sees the start-up task do the granting, as SYSTEM
+          GOOSE_WEB_TEST_KEEP_DEVICES: "1"
         run: |
           $ErrorActionPreference = 'Continue'
           $o = python -m pytest -q --tb=line tests/test_appcontainer.py tests/test_sandbox.py tests/test_sec_os.py
