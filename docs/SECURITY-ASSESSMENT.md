@@ -1410,3 +1410,39 @@ SERVICE is refused before this point (19.3, T-7).
 **Not verified.** A real MXC container on a window station where the entry was added by Goose Web. No independent
 review of this change (about 20 lines).
 
+## 20. Addendum: Windows Server devices; a team's guarded extension items (2026-11-16), 1.24.0
+
+### 20.1 The NUL device and the mount manager
+
+**Reported** from Windows Server 2022 (AppContainer backend, gateway at boot, Goose 1.59): a member's agent starts
+but cannot start a program (`NUL` denied to the container, measured there), and Goose skips the member's hints
+(a path it cannot make canonical; whether the mount manager is the cause is what the self-test asks).
+**Measured on Windows 11 (build 26100):** `\\.\NUL` gives ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION
+PACKAGES `0x1201bf`, `\\.\MountPointManager` gives them `0x1200a0`, and a container does everything asked.
+The access lists on Windows Server were not read before this release.
+
+**Changed.** (1) The self-test asks and reports (no change of anything). (2) `goose-web sandbox devices grant`:
+adds, for the two groups on the two devices, the entry Windows 11 has, where it is missing.
+
+**Judged.** The grant needs an administrator - the gateway cannot do it and never tries. It is additive only and
+uses the routine that never writes a list it did not build. It is machine-wide: every application container on
+that server - not only Goose Web's - may then open NUL and ask the mount manager, as on every Windows 11. Neither
+gives access to data: NUL holds nothing; the mount manager answers which drive letter a volume has. It lasts
+until Windows restarts; a start-up task as SYSTEM that runs the product's own Python repeats it - the install
+folder must then be writable by administrators only, which the installer sees to. An administrator who does not
+want a machine-wide change leaves it, and members work without a shell tool and without hints.
+
+**Not verified.** The grant itself, anywhere (it needs an administrator on a Windows Server); that it cures both
+failures; the start-up task line. The CI job reports the first two for Windows Server 2022 and 2025.
+
+### 20.2 A team's item for a guarded extension
+
+Before, a team item for a shell-capable or extension-starting extension was never delivered. Now it is, when the
+team's policy gives what `policy.extension_needs` asks for that extension (Shell; the extension manager also
+"edit extensions"). Judged: a member with Shell can already run any program, so the extension gives nothing the
+permission did not; without the permission nothing changes (the key stays pinned off). The item going, or the
+permission going, switches the extension off in the member's profile - it is not taken out, because Goose turns
+a bundled extension on when its key is missing. The team page and `check` say when an item is not delivered.
+
+No independent review of this release.
+

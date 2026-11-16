@@ -44,6 +44,7 @@ ADMIN_POLICY: dict[str, Any] = {**{k: True for k in BOOL_KEYS}, **{k: [ANY] for 
 
 NO_TEAM_REASON = "You are not in a team yet, so you cannot chat. Ask your administrator to add you to a team."
 _LIST_LABELS = {"allowed_providers": "providers", "allowed_models": "models", "allowed_modes": "approval modes"}
+_PERMISSION_LABELS = {"allow_shell": "the Shell permission", "extensions_edit": "the permission to edit extensions"}
 
 # Extensions that give the model a shell or arbitrary code execution, or that start other extensions / run recipes
 # (a recipe's extensions and retry checks are commands). Measured on Goose 1.57 (security assessment 2026-11-09):
@@ -244,11 +245,21 @@ def check_session_choice(policy: dict, load_result: dict | None) -> None:
                      "allow. Pick an allowed mode for this chat first.")
 
 
-def team_warnings(policy: dict, *, hints: int, members: int, provider_items: set | None = None) -> list[dict]:
+def team_warnings(policy: dict, *, hints: int, members: int, provider_items: set | None = None,
+                  extension_items: set | None = None) -> list[dict]:
     """What the admin should know about a team's experience (Experience page). level: err | warn | info.
-    `provider_items`: the ids of the providers this team has as library items (None = not looked at)."""
+    `provider_items`: the ids of the providers this team has as library items (None = not looked at);
+    `extension_items`: the names of its extension items."""
     p = {**DEFAULT_POLICY, **(policy or {})}
     out: list[dict] = []
+    # A shell-capable or extension-starting extension (Code Mode among them) is delivered only when the team gives
+    # the permission it needs. Found in use, 2026-11-16: the item was accepted and silently never delivered.
+    for name in sorted(extension_items or ()):
+        lack = missing(p, extension_needs(name))
+        if lack:
+            out.append({"level": "warn", "text": (
+                f"Members do not get the extension '{name}' although it is a library item of this team: it needs "
+                f"{' and '.join(_PERMISSION_LABELS.get(x, x) for x in lack)}, which this team does not give.")})
     # Allowing a provider, or making it the team's default, does not put it into the members' profiles. A custom
     # provider is defined in ONE profile - its address, its models, its key. Found in use, 2026-11-13: a team with
     # a default provider whose members could not reach a model, and nothing said why.

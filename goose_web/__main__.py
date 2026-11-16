@@ -469,6 +469,24 @@ def cmd_sandbox(args, settings) -> int:
             print(f"MXC not installed: {e.__class__.__name__}: {e}", file=sys.stderr)
             return 4
         return 0
+    if args.action == "devices":
+        # the two kernel devices a container needs and Windows Server keeps closed to it (sandbox.DEVICES)
+        if (args.user or "status") not in ("status", "grant"):
+            print("usage: goose-web sandbox devices [status | grant]", file=sys.stderr)
+            return 2
+        if args.user == "grant":
+            try:
+                changed = sb.grant_devices()
+            except sb.SandboxError as e:
+                print(f"[!!] {e}", file=sys.stderr)
+                return 3
+            print("Application packages are let in on: " + (", ".join(changed) if changed else "(they were already)")
+                  + ". This lasts until Windows restarts.")
+        for d in sb.devices_status():
+            state = {True: "[OK] lets application packages in", False: "[!!] does NOT let application packages in",
+                     None: "[--] its access list cannot be read by this account"}[d["open"]]
+            print(f"{state}: {d['device']}")
+        return 0 if all(d["open"] is not False for d in sb.devices_status()) else 1
     if args.action == "selftest":
         # in THIS session, as THIS account: says nothing about a gateway that runs elsewhere (a boot task)
         from . import relay as _rl
@@ -476,7 +494,7 @@ def cmd_sandbox(args, settings) -> int:
         sb.PRIVATE_DESKTOP["on"] = sandbox_desktop(settings) != "shared"     # as the gateway of this config starts them
         res = sb.selftest(_rl.python_for_container()[0])
         ok, text = sb.selftest_text(res)
-        print(f"[{'OK' if ok else '!!'}] sandbox self-test (this session): {text}")
+        print(f"[{'OK' if ok and not res.get('limits') else '!!'}] sandbox self-test (this session): {text}")
         for s in res.get("stepsBefore") or []:
             print(f"     as it was: {s['what']}: {'ok' if s['ok'] else 'FAILED'} {s['exit']} {s['detail']}")
         for s in res.get("steps") or []:
@@ -977,7 +995,7 @@ def _selftest_line(settings) -> str:
                 "backend or fallback is configured")
     ok, text = _sb.selftest_text(res)
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(res.get("at") or 0))
-    return f"[{'OK' if ok else '!!'}] sandbox self-test (by the gateway, {when}): {text}"
+    return f"[{'OK' if ok and not res.get('limits') else '!!'}] sandbox self-test (by the gateway, {when}): {text}"
 
 
 def _team_lines(settings) -> list[str]:
@@ -1005,6 +1023,10 @@ def _team_lines(settings) -> list[str]:
                 pol = {}
             items = {r[0] for r in con.execute("SELECT name FROM team_items WHERE team_id=? AND kind='provider'", (t["id"],))}
             errs = [w["text"] for w in _pol.team_warnings(pol, hints=1, members=n, provider_items=items) if w["level"] == "err"]
+            # an extension item the members do not get (a guarded extension without the permission it needs)
+            exts = {r[0] for r in con.execute("SELECT name FROM team_items WHERE team_id=? AND kind='extension'", (t["id"],))}
+            errs += [w["text"] for w in _pol.team_warnings(pol, hints=1, members=n, extension_items=exts)
+                     if w["text"].startswith("Members do not get the extension")]
             for e in errs:
                 out.append(f"[!!] team {t['name']} ({n} member(s)): {e}")
             if not errs:
@@ -1454,7 +1476,7 @@ def _main(argv: list[str] | None = None) -> int:
     nh.add_argument("--doc-name", help="name for the adopted document (default '<user> goose hints')")
     sbx = sub.add_parser("sandbox", help="per-user sandbox: status, install-mxc (the pinned MXC executor), or remove "
                                          "one user's (or all) AppContainers")
-    sbx.add_argument("action", choices=["status", "install-mxc", "remove", "selftest"])
+    sbx.add_argument("action", choices=["status", "install-mxc", "remove", "selftest", "devices"])
     sbx.add_argument("user", nargs="?")
     sbx.add_argument("--all", action="store_true",
                      help="remove: every recorded container, its folder grants and relay rewrites (before an uninstall)")

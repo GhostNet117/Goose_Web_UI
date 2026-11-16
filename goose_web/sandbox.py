@@ -520,12 +520,12 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
         buf, n = ctypes.create_unicode_buffer(256), wintypes.DWORD()
         return buf.value if _u32.GetUserObjectInformationW(h, 2, buf, ctypes.sizeof(buf), ctypes.byref(n)) else ""
 
-    def _lets_in(h, sids, need: int = 0) -> bool | None:
-        """Whether the allow entries of a window station or desktop that apply to the object itself give `sids`,
-        together, all of `need` (need 0: anything at all). None when the list cannot be read. An object without an
-        access list lets everybody in."""
+    def _lets_in(h, sids, need: int = 0, kind: int = 7) -> bool | None:
+        """Whether the allow entries of a window station or desktop (`kind` 7, SE_WINDOW_OBJECT; 6 for a kernel
+        device) that apply to the object itself give `sids`, together, all of `need` (need 0: anything at all).
+        None when the list cannot be read. An object without an access list lets everybody in."""
         pdacl, psd = ctypes.c_void_p(), ctypes.c_void_p()
-        if _adv.GetSecurityInfo(h, 7, 4, None, None, ctypes.byref(pdacl), None, ctypes.byref(psd)) != 0:   # SE_WINDOW_OBJECT
+        if _adv.GetSecurityInfo(h, kind, 4, None, None, ctypes.byref(pdacl), None, ctypes.byref(psd)) != 0:
             return None
         try:
             if not pdacl:
@@ -566,12 +566,12 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
                 "desktopLetsContainersIn": _lets_in(dt, [ALL_APP_PACKAGES, ALL_RESTRICTED_APP_PACKAGES],
                                                     DESKTOP_NEED)}
 
-    def _set_entry(h, sid: str, mask: int, mode: int, what: str) -> bool:
+    def _set_entry(h, sid: str, mask: int, mode: int, what: str, kind: int = 7) -> bool:
         """Add (mode 1, GRANT_ACCESS) or take off (mode 4, REVOKE_ACCESS) the entry of `sid` on a window station or
         desktop handle that was opened for changing its access list. False when the object has no access list:
         everybody is let in then, and a list with one entry would shut everybody else out."""
         pdacl, psd, new, psid = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p(), None
-        rc = _adv.GetSecurityInfo(h, 7, 4, None, None, ctypes.byref(pdacl), None, ctypes.byref(psd))
+        rc = _adv.GetSecurityInfo(h, kind, 4, None, None, ctypes.byref(pdacl), None, ctypes.byref(psd))
         if rc:
             raise SandboxError(f"the access list of the {what} cannot be read ({rc})")
         try:
@@ -585,7 +585,8 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
             # a list marked "protected" (takes nothing from above) stays so: only the one entry differs afterwards
             control, rev = wintypes.WORD(), wintypes.DWORD()
             _adv.GetSecurityDescriptorControl(psd, ctypes.byref(control), ctypes.byref(rev))
-            rc = _adv.SetSecurityInfo(h, 7, 4 | (0x80000000 if control.value & 0x1000 else 0), None, None, new, None)
+            rc = _adv.SetSecurityInfo(h, kind, 4 | (0x80000000 if control.value & 0x1000 else 0), None, None, new,
+                                      None)
             if rc:
                 raise SandboxError(f"the access list of the {what} cannot be changed ({rc})")
             return True
@@ -712,6 +713,58 @@ if IS_WINDOWS:  # pragma: no cover - exercised by the Windows end-to-end test
                                        "(sandbox.desktop: shared would allow it)")
                 log.info("sandbox: application packages are now let in on %s (for MXC containers)", _PLACE["station"])
             return _PLACE["name"]
+
+    # Two kernel devices that ordinary programs lean on, and what Windows 11 gives the application-packages groups
+    # on them (read on build 26100). Windows Server does not let application containers in on them (reported from
+    # Windows Server 2022, 2026-11-16): a program in a member's container then cannot open NUL - so it cannot
+    # start another program without input, which is how Goose's shell tool starts everything ("failed to open NUL
+    # device for child stdin: Access is denied") - and cannot ask for the real path of a folder (the drive letter
+    # comes from the mount manager), which Goose's hints loader needs ("Import boundary directory not found").
+    # Only an administrator can change the access list of a device, and it lasts until Windows restarts.
+    DEVICES = {"\\\\.\\NUL": 0x001201BF, "\\\\.\\MountPointManager": 0x001200A0}
+    _k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                 wintypes.DWORD, ctypes.c_void_p]
+    _k32.CreateFileW.restype = ctypes.c_void_p
+
+    def _device(name: str, access: int):
+        h = _k32.CreateFileW(name, access, 7, None, 3, 0, None)
+        return None if h in (None, ctypes.c_void_p(-1).value) else h
+
+    def devices_status() -> list[dict]:
+        """[{device, open}] - whether the device lets application packages in as Windows 11 does (None: its
+        access list cannot be read by this account)."""
+        out = []
+        for name, mask in DEVICES.items():
+            h, state = _device(name, 0x00020000), None                  # READ_CONTROL
+            if h:
+                try:
+                    state = _lets_in(h, [ALL_APP_PACKAGES, ALL_RESTRICTED_APP_PACKAGES], mask, kind=6)
+                finally:
+                    _k32.CloseHandle(h)
+            out.append({"device": name, "open": state})
+        return out
+
+    def grant_devices() -> list[str]:
+        """Give ALL APPLICATION PACKAGES and ALL RESTRICTED APPLICATION PACKAGES, on the two devices, what Windows
+        11 gives them - where they do not have it. Needs an administrator (an elevated prompt, or SYSTEM); lasts
+        until Windows restarts. Only ever adds. Returns the devices that were changed; SandboxError when one
+        cannot be."""
+        changed = []
+        for name, mask in DEVICES.items():
+            h = _device(name, 0x00060000)                               # READ_CONTROL | WRITE_DAC
+            if not h:
+                raise SandboxError(f"the access list of {name} cannot be changed by this account "
+                                   f"({ctypes.get_last_error()}): run this from an elevated prompt")
+            try:
+                for group in (ALL_APP_PACKAGES, ALL_RESTRICTED_APP_PACKAGES):
+                    if _lets_in(h, [group], mask, kind=6) is False and _set_entry(h, group, mask, 1, name, kind=6):
+                        if name not in changed:
+                            changed.append(name)
+                if not _lets_in(h, [ALL_APP_PACKAGES, ALL_RESTRICTED_APP_PACKAGES], mask, kind=6):
+                    raise SandboxError(f"{name} still does not let application packages in")
+            finally:
+                _k32.CloseHandle(h)
+        return changed
 
     def _own_objects(desktop: str):
         """(what, name, the handle this process holds or None, open(access), close, what a container needs there,
@@ -934,6 +987,12 @@ else:
     def members_desktop(open_to_all: bool = False) -> str:
         return ""
 
+    def devices_status() -> list[dict]:
+        return []
+
+    def grant_devices() -> list[str]:
+        raise SandboxError("the sandbox needs Windows (AppContainer)")
+
     def dismiss(sid: str, desktop: str = "") -> list[str]:
         return []
 
@@ -976,6 +1035,61 @@ def _selftest_run(sid: str, python: str, desktop: str = "") -> list[dict]:
             except Exception as e:
                 out.append({"what": what, "ok": False, "exit": "", "detail": f"{type(e).__name__}: {str(e)[:200]}"})
     return out
+
+
+LIMIT_TEXT = {
+    "nul": "a program in the container cannot open the NUL device, so it cannot start another program without "
+           "input: an agent's shell tool fails with \"failed to open NUL device for child stdin: Access is denied\"",
+    "realpath": "a program in the container cannot ask Windows for the real path of a folder (the drive letter comes "
+                "from the mount manager): Goose skips the member's hints (\"Import boundary directory not found\")",
+}
+LIMIT_REMEDY = ("Windows Server does not let application containers in on the two devices behind this; an "
+                "administrator can, as Windows 11 does: goose-web sandbox devices grant (elevated; until Windows "
+                "restarts) - ADMINISTRATION 11.6")
+
+
+def _selftest_limits(sid: str, python: str, desktop: str = "") -> list[str]:
+    """What a program in the container cannot do although it starts (the keys of LIMIT_TEXT); [] when nothing, or
+    when it could not be asked."""
+    import tempfile
+    cwd = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    env = {k: os.environ[k] for k in ("SystemRoot", "windir", "SystemDrive", "LOCALAPPDATA") if os.environ.get(k)}
+    env["PATH"] = cwd
+    # NUL: opened as a program opens it for a child without input. The real path: asked of Windows itself for the
+    # Windows folder, which every container may open - what Rust's canonicalize and Python's realpath call
+    # (GetFinalPathNameByHandle with a drive letter). 2 = the folder could not even be opened: not this question.
+    code = ("import ctypes, os\n"
+            "from ctypes import wintypes as w\n"
+            "k = ctypes.WinDLL('kernel32', use_last_error=True)\n"
+            "k.CreateFileW.restype = w.HANDLE\n"
+            "k.CreateFileW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, ctypes.c_void_p, w.DWORD, w.DWORD, w.HANDLE]\n"
+            "k.GetFinalPathNameByHandleW.argtypes = [w.HANDLE, w.LPWSTR, w.DWORD, w.DWORD]\n"
+            "def nul():\n"
+            "    try:\n        os.close(os.open(os.devnull, os.O_RDONLY))\n        return 1\n"
+            "    except OSError:\n        return 0\n"
+            "def real():\n"
+            "    h = k.CreateFileW(os.environ['SystemRoot'], 0, 7, None, 3, 0x02000000, None)\n"
+            "    if h in (None, w.HANDLE(-1).value):\n        return 2\n"
+            "    b = ctypes.create_unicode_buffer(600)\n"
+            "    return 1 if k.GetFinalPathNameByHandleW(h, b, 600, 0) else 0\n"
+            "print('limits', nul(), real())\n")
+    try:
+        with tempfile.TemporaryFile() as errf:
+            p = spawn([python, "-I", "-c", code], env, cwd, sid, [], errf, desktop=desktop, admit_first=False)
+            p.stdin.close()
+            box: list[bytes] = []
+            t = threading.Thread(target=lambda: box.append(p.stdout.read()), daemon=True)
+            t.start()
+            t.join(60)
+            if t.is_alive():
+                p.kill()
+            p.wait(10)
+        words = (box[0] if box else b"").decode("utf-8", "replace").split()
+        if len(words) == 3 and words[0] == "limits":
+            return [k for k, w in zip(("nul", "realpath"), words[1:]) if w == "0"]
+    except Exception as e:
+        log.debug("sandbox self-test: the limits could not be asked: %s", e)
+    return []
 
 
 def selftest(python: str = "", desktop: str = "") -> dict:
@@ -1028,6 +1142,8 @@ def selftest(python: str = "", desktop: str = "") -> dict:
         # A console program alone proves nothing: cmd.exe starts exactly where a member's agent ends with
         # 0xC0000142. Without the program that uses its desktop there is no "ok".
         res["ok"] = bool(python) and all(s["ok"] for s in res["steps"])
+        if res["ok"]:       # it starts: what can it not do? (Windows Server: the NUL device, real paths)
+            res["limits"] = _selftest_limits(sid, python, desktop)
         before = [s for s in res.get("stepsBefore", []) if not s["ok"]]
         if res["ok"] and res["admitted"]:
             where = " and ".join(res["admitted"])
@@ -1068,10 +1184,12 @@ def selftest_text(res: dict) -> tuple[bool, str]:
     where = (f"session {res.get('session')}, window station {res.get('windowStation')!r}"
              + ("" if res.get("interactive") else ", nobody signed in"))
     if res.get("ok"):
+        limits = [LIMIT_TEXT[k] for k in res.get("limits") or [] if k in LIMIT_TEXT]
         return True, (f"a process in an application container starts here ({where})"
                       + (f", on {res['membersDesktop']} - not on the desktop of the signed-in account"
                          if "\\" in str(res.get("membersDesktop") or "") else "")
-                      + (f"; {res['remedy']}" if res.get("remedy") else ""))
+                      + (f"; {res['remedy']}" if res.get("remedy") else "")
+                      + (". BUT " + "; and ".join(limits) + ". " + LIMIT_REMEDY if limits else ""))
     return False, ((res.get("reason") or "failed") + (f" {res['remedy']}." if res.get("remedy") else "")
                    + " Members' agents cannot run in an AppContainer started by this gateway; see ADMINISTRATION "
                      "11.6 (a gateway nobody is signed in to)")

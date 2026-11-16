@@ -358,3 +358,49 @@ def test_check_names_teams_whose_members_cannot_chat(env, tmp_path):
     assert [ln[:4] for ln in lines] == ["[OK]", "[!!]", "[!!]"] and not any("Empty" in ln for ln in lines)
     assert "team Good (1 member(s))" in lines[0]
     assert any("do not have the provider 'custom_p'" in ln for ln in lines[1:]) and any("without a default model" in ln for ln in lines[1:])
+
+
+# ------------------------------------------------------------------ a team's item for a guarded extension (1.24.0)
+def test_a_guarded_extension_given_to_a_team_reaches_members_who_have_the_permission_and_goes_again(env, tmp_path):
+    """Found in use, 2026-11-16: the administrator gave a team Code Mode (code_execution) as a library item; the
+    item was accepted and never delivered, because shell-capable extensions were skipped whatever the team allowed.
+    Without Code Mode that installation's model refused every request. A guarded extension is delivered when the
+    team gives the permission it needs - and switched off again when the item or the permission goes."""
+    s, db, pr, c = env
+    entry = {"enabled": True, "type": "platform", "name": "code_execution", "display_name": "Code Mode",
+             "bundled": True}
+    tid = team(db, "Ops", {**ANYCHAT, "allow_shell": True})
+    u = user(db, "dana")
+    db.set_user_team(u["id"], tid)
+    iid = db.execute("INSERT INTO team_items(team_id, kind, name, payload, created_at) VALUES(?,?,?,?,0)",
+                     (tid, "extension", "code_execution", json.dumps({"key": "code_execution", "entry": entry})))
+    cfgp = tmp_path / "profiles" / "dana" / "config" / "config.yaml"
+
+    def ext():
+        return (yaml.safe_load(cfgp.read_text()).get("extensions") or {}).get("code_execution")
+    pr.provision(u)
+    assert ext()["enabled"] is True and not ext().get("description", "").endswith("(disabled by policy)")
+    assert not [w for w in pol.team_warnings({**ANYCHAT, "allow_shell": True}, hints=1, members=1,
+                                             extension_items={"code_execution"}) if "do not get" in w["text"]]
+    # the team takes the permission away: off, and the team page says the item is not delivered
+    db.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps(ANYCHAT), tid))
+    pr.provision(u)
+    assert ext()["enabled"] is False
+    w = [x["text"] for x in pol.team_warnings(ANYCHAT, hints=1, members=1, extension_items={"code_execution", "memory"})]
+    assert any("'code_execution'" in x and "Shell permission" in x for x in w) and not any("'memory'" in x for x in w)
+    # the permission comes back: delivered again
+    db.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps({**ANYCHAT, "allow_shell": True}), tid))
+    pr.provision(u)
+    assert ext()["enabled"] is True
+    # the item is taken away from the team while the permission stays: the member loses it (switched off, not
+    # taken out - Goose turns a bundled extension on when its key is missing)
+    db.execute("DELETE FROM team_items WHERE id=?", (iid,))
+    changes = pr.provision(u)
+    assert ext()["enabled"] is False and any("no longer given by the team" in ch for ch in changes)
+    # extensionmanager needs two permissions; one is not enough
+    db.execute("INSERT INTO team_items(team_id, kind, name, payload, created_at) VALUES(?,?,?,?,0)",
+               (tid, "extension", "extensionmanager", json.dumps({"key": "extensionmanager", "entry": {
+                   "enabled": True, "type": "platform", "name": "extensionmanager", "bundled": True}})))
+    pr.provision(u)
+    assert (yaml.safe_load(cfgp.read_text())["extensions"]["extensionmanager"]["enabled"]) is False
+

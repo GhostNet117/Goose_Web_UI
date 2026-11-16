@@ -1416,7 +1416,9 @@ def _team_view(c: Ctx, t: dict) -> dict:
             "warnings": acp_policy.team_warnings(
                 pol, hints=len(hints), members=len(members),
                 provider_items={r["name"] for r in c.db.query(
-                    "SELECT name FROM team_items WHERE team_id=? AND kind='provider'", (t["id"],))})}
+                    "SELECT name FROM team_items WHERE team_id=? AND kind='provider'", (t["id"],))},
+                extension_items={r["name"] for r in c.db.query(
+                    "SELECT name FROM team_items WHERE team_id=? AND kind='extension'", (t["id"],))})}
 
 
 def _team_members(c: Ctx, team_id: int) -> list[dict]:

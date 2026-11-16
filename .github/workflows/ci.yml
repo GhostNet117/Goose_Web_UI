@@ -84,6 +84,12 @@ jobs:
       - name: Self-test as a scheduled task of an account that never signs in
         shell: powershell
         run: .\tests\ci\selftest-as-service.ps1 -Enforce
+      # Windows Server keeps application containers out of the NUL device and the mount manager (ADMINISTRATION
+      # 11.6): what that costs a program in a container, and what `goose-web sandbox devices grant` changes, is
+      # measured here and reported. Not a gate: it was written before the grant had been seen on Windows Server.
+      - name: What a container cannot do, before and after the devices grant (reported)
+        shell: powershell
+        run: .\tests\ci\devices-grant.ps1
 
   audit:
     name: pip-audit (requirements.lock)

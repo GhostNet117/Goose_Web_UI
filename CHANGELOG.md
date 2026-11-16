@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.24.0 - 2026-11-16
+
+**Windows Server, AppContainer backend: a member's agent started, but its shell tool could not start any program
+and its hints were skipped.** Reported from a Windows Server 2022 installation (gateway at boot under a service
+account, Goose 1.59):
+
+- every `shell` call ended with `failed to open NUL device for child stdin: Access is denied` - Goose starts a
+  program "without input" by opening the NUL device;
+- Goose's log said `Skipping unsafe hint file ... Import boundary directory not found` for the member's hints file,
+  so members chatted without the hints their administrator gave them.
+
+What is established: the report shows NUL closed to a container on Windows Server 2022. Where Goose Web is
+developed (Windows 11, build 26100) the NUL device and the mount manager - which turns a folder into a path with a
+drive letter, what Goose's hints loader asks for - both name the application-packages groups, and a container
+does all of it. **Not established:** that the mount manager is what fails on Windows Server; the self-test of this
+release asks exactly that, so an installation - and this release's CI run on Windows Server 2022 and 2025 - says.
+
+- The gateway's self-test now asks a program in the container for exactly these two things and says what it
+  cannot do, with the error texts above, in the log (`sandbox self-test: ... BUT ...`), in `goose-web check` and
+  `goose-web sandbox status` (`[!!]`). The agent starts either way; this is about what it can do.
+- New: `goose-web sandbox devices` shows whether the two devices let application packages in, and
+  `goose-web sandbox devices grant` - **from an elevated prompt** - gives the two application-packages groups on
+  them what Windows 11 gives (only ever added; it lasts until Windows restarts). ADMINISTRATION 11.6 has the
+  start-up task that repeats it.
+- **Not measured before publication:** the grant on a Windows Server, and that it cures the two failures there.
+  Only an administrator on a Windows Server can run it; the CI job reports both, before and after, on Windows
+  Server 2022 and 2025 as an annotation of this release's run. The real fix belongs in Goose (a program can be
+  started without input through a pipe instead of NUL).
+
+**A team's library item for a shell-capable extension is delivered when the team allows it.** Code Mode
+(`code_execution`), `developer`, `computercontroller`, `orchestrator`, `summon`, `scheduler` and the extension
+manager were skipped as team items whatever the team allowed - accepted in the admin page, never delivered,
+nothing said (found in use: without Code Mode one provider refused every request of the members). Now such an item
+reaches the members when the team gives the permission the extension needs (Shell; the extension manager also
+"edit extensions"); without it the team page and `goose-web check` say that members do not get it. When the item
+or the permission goes, the member's extension is switched off.
+
 ## 1.23.1 - 2026-11-14
 
 **Fixes 1.23.0, which was published with a defect its own CI showed an hour later: on Windows Server, with

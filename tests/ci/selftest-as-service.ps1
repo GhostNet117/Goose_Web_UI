@@ -57,7 +57,7 @@ function Line($r) {
             "desktop '$($r.desktop)'. They let application packages in as they are: $($r.windowStationLetsContainersIn) / " +
             "$($r.desktopLetsContainersIn). Missing: [$(@($r.missing) -join '; ')]. Named by the self-test: " +
             "[$(@($r.admitted) -join '; ')]. AS IT WAS: $(Steps $r.stepsBefore). RESULT: $(Steps $r.steps). " +
-            "$($r.text) $($r.error)").Trim()
+            "CANNOT: [$(@($r.limits) -join '; ')]. $($r.text) $($r.error)").Trim()
 }
 
 # ---- for comparison: the job's own session (a failure here is reported and does not stop the rest)

@@ -1671,3 +1671,65 @@ def test_check_shows_what_the_gateway_measured_in_its_own_session(tmp_path):
     (d / "selftest.json").write_text(json.dumps({"ok": True, "session": 1, "windowStation": "WinSta0", "interactive": True, "at": 1700000000}),
                                      encoding="utf-8")
     assert _selftest_line(s).startswith("[OK] sandbox self-test (by the gateway, ") and "session 1" in _selftest_line(s)
+
+
+# ------------------------------------------------------------------ what a container may not do on Windows Server
+@windows
+def test_the_self_test_says_what_a_program_in_the_container_cannot_do(throwaway, monkeypatch, tmp_path):
+    """Reported from Windows Server 2022, 2026-11-16: the member's agent starts, but its shell tool cannot start
+    any program ("failed to open NUL device for child stdin: Access is denied") and Goose skips the member's hints
+    ("Import boundary directory not found"). Windows Server keeps application containers out of two kernel
+    devices that Windows 11 lets them use. Whatever this Windows does, the self-test must say it."""
+    limits = sb._selftest_limits(throwaway.sid, throwaway.py)
+    assert set(limits) <= set(sb.LIMIT_TEXT)                        # the real answer of this Windows
+    status = {d["device"]: d["open"] for d in sb.devices_status()}
+    assert set(status) == set(sb.DEVICES) and all(v in (True, False, None) for v in status.values())
+    if all(v is True for v in status.values()):
+        assert limits == []                                          # Windows 11: nothing is kept from it
+    # what the administrator is told
+    res = {"ok": True, "session": 0, "windowStation": "Service-0x0-1a2b3$", "interactive": False, "at": 1700000000,
+           "limits": ["nul", "realpath"]}
+    ok, text = sb.selftest_text(res)
+    assert ok and "BUT" in text and "failed to open NUL device for child stdin" in text
+    assert "Import boundary directory not found" in text and "goose-web sandbox devices grant" in text
+    from goose_web.__main__ import _selftest_line
+    s = Settings(_deep_merge(DEFAULTS, {"paths": {"profiles_root": str(tmp_path / "profiles")}}), None)
+    d = Path(s.system_dir) / "sandbox"
+    d.mkdir(parents=True)
+    (d / "selftest.json").write_text(json.dumps(res), encoding="utf-8")
+    assert _selftest_line(s).startswith("[!!] sandbox self-test (by the gateway, ")
+    (d / "selftest.json").write_text(json.dumps({**res, "limits": []}), encoding="utf-8")
+    assert _selftest_line(s).startswith("[OK] sandbox self-test (by the gateway, ")
+
+
+@windows
+def test_the_devices_are_only_ever_given_more_and_only_by_an_administrator(monkeypatch, capsys):
+    """`goose-web sandbox devices grant`: on each of the two devices the two application-packages groups get what
+    Windows 11 gives them, where they do not have it. Nothing is taken off; an account that may not change the
+    list is told to run it elevated."""
+    calls, has = [], set()
+    monkeypatch.setattr(sb, "_device", lambda name, access: None)
+    with pytest.raises(sb.SandboxError, match="elevated prompt"):
+        sb.grant_devices()
+    handles = {name: i + 1000 for i, name in enumerate(sb.DEVICES)}
+    names = {v: k for k, v in handles.items()}
+    monkeypatch.setattr(sb, "_device", lambda name, access: handles[name])
+    monkeypatch.setattr(sb._k32, "CloseHandle", lambda h: 1)
+    monkeypatch.setattr(sb, "_lets_in", lambda h, sids, need=0, kind=7: all((h, g) in has for g in sids) and kind == 6)
+
+    def set_entry(h, sid, mask, mode, what, kind=7):
+        calls.append((names[h], sid, mask, mode, kind))
+        has.add((h, sid))
+        return True
+    monkeypatch.setattr(sb, "_set_entry", set_entry)
+    assert sb.grant_devices() == list(sb.DEVICES)
+    assert calls == [(n, g, sb.DEVICES[n], 1, 6) for n in sb.DEVICES
+                     for g in (sb.ALL_APP_PACKAGES, sb.ALL_RESTRICTED_APP_PACKAGES)]     # GRANT (1) only, never revoke
+    calls.clear()
+    assert sb.grant_devices() == [] and calls == []                 # already so: nothing is written
+    # the command line
+    from goose_web.__main__ import main
+    assert main(["sandbox", "devices", "nonsense"]) == 2
+    monkeypatch.setattr(sb, "devices_status", lambda: [{"device": n, "open": False} for n in sb.DEVICES])
+    assert main(["sandbox", "devices"]) == 1 and "does NOT let application packages in" in capsys.readouterr().out
+

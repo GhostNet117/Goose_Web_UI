@@ -771,7 +771,8 @@ def create_app(settings: Settings) -> Starlette:
                     from . import sandbox as _sb
                     res = _sb.selftest(_rl.python_for_container()[0])
                     ok, text = _sb.selftest_text(res)
-                    (log.info if ok else log.error)("sandbox self-test: %s", text)
+                    (log.error if not ok else log.warning if res.get("limits") else log.info)(
+                        "sandbox self-test: %s", text)
                     d = settings.system_dir / "sandbox"
                     d.mkdir(parents=True, exist_ok=True)
                     _sb.write_atomic(d / "selftest.json", _json.dumps(res))

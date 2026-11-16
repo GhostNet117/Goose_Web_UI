@@ -870,8 +870,11 @@ class Profiles:
                 if not isinstance(entry, dict):
                     continue
                 key = payload.get("key") or name
-                if ext_key(key) in _GUARDED:
-                    continue   # shell-capable / extension-starting: follows the member's permissions (below)
+                if ext_key(key) in _GUARDED and missing(pol, extension_needs(key)):
+                    # shell-capable / extension-starting: only with the permission it needs (allow_shell;
+                    # extensionmanager also extensions_edit). Without it the key is pinned off below, and the team
+                    # page says that the item is not delivered (policy.team_warnings).
+                    continue
                 e = relayed(copy.deepcopy(entry))
                 if is_command_extension(e) and not pol.get("allow_shell"):
                     # not even dormant: a disabled entry can be switched on (B-2). Removed below if it was there.
@@ -955,6 +958,11 @@ class Profiles:
             if key in exts and ext_key(key) not in _GUARDED:
                 exts.pop(key)
                 changes.append(f"extension {key} removed")
+            elif isinstance(exts.get(key), dict) and exts[key].get("enabled") is not False:
+                # a guarded extension the team gave and gives no more: switched off, not taken out - Goose turns
+                # a bundled extension on when its key is missing
+                exts[key]["enabled"] = False
+                changes.append(f"extension {key} switched off (no longer given by the team)")
         for pid in set(old.get("providers") or []) - set(new_manifest["providers"]):
             f = _delete_target(cfg_dir / "custom_providers", pid, ".json", root)
             if f is not None and f.is_file():

@@ -1732,6 +1732,21 @@ Requirements and limits:
     self-test: ...`); `goose-web check` and `goose-web sandbox status` show it, with what the programs did before
     the container was named. `goose-web sandbox selftest` runs the same test in your own session - it says nothing
     about a gateway that runs elsewhere.
+  - **Windows Server keeps application containers out of two devices that Windows 11 lets them use** (reported
+    from Windows Server 2022; since 1.24.0 the self-test says so): the NUL device - without it a program in the
+    container cannot start another program "without input", and Goose's shell tool fails with `failed to open NUL
+    device for child stdin: Access is denied` - and the mount manager - without it a program cannot ask for the
+    real path of a folder and Goose skips the member's hints (`Import boundary directory not found`; that the
+    mount manager is the cause of this one is what the self-test establishes on your machine).
+    `goose-web sandbox devices` shows both. An administrator can let
+    application packages in on them as Windows 11 does: from an elevated prompt,
+    `goose-web --config <config.yaml> sandbox devices grant`. It only ever adds, it applies to every application
+    container on the machine, and it lasts until Windows restarts. To repeat it at every start, register a task
+    that runs it as SYSTEM, for example
+    `schtasks /create /tn "GooseWeb\GooseWeb_Devices" /sc onstart /ru SYSTEM /rl HIGHEST /tr "\"<install
+    folder>\.venv\Scripts\python.exe\" -m goose_web --config \"<config.yaml>\" sandbox devices grant"`
+    (this task line has not been run on a real installation yet). The gateway tests at its own start: when the
+    task runs after it, `sandbox status` shows the earlier state until the gateway is restarted.
   - Run the gateway under an account of its own. On the window station of SYSTEM, NETWORK SERVICE or LOCAL SERVICE
     - which Windows' own services share - Goose Web changes nothing, and members' agents do not start there.
   - Not measured: the MXC backend under such a gateway.
