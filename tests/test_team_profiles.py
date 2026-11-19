@@ -404,3 +404,39 @@ def test_a_guarded_extension_given_to_a_team_reaches_members_who_have_the_permis
     pr.provision(u)
     assert (yaml.safe_load(cfgp.read_text())["extensions"]["extensionmanager"]["enabled"]) is False
 
+
+def test_a_shell_capable_extension_under_another_name_is_not_delivered_without_the_permission(env, tmp_path):
+    """Review 20261119_6, S-6: the rules looked at the KEY an extension is stored under. A bundled extension is
+    started by the name in its entry, so an item "helper" whose entry is {type: builtin, name: developer} was
+    delivered, switched on, to a team without the Shell permission (only an administrator can make such an item)."""
+    s, db, pr, c = env
+    tid = team(db, "Plain", ANYCHAT)
+    u = user(db, "erin")
+    db.set_user_team(u["id"], tid)
+    alias = {"enabled": True, "type": "builtin", "name": "developer", "bundled": True}
+    db.execute("INSERT INTO team_items(team_id, kind, name, payload, created_at) VALUES(?,?,?,?,0)",
+               (tid, "extension", "helper", json.dumps({"key": "helper", "entry": alias})))
+    cfgp = tmp_path / "profiles" / "erin" / "config" / "config.yaml"
+    pr.provision(u)
+    exts = yaml.safe_load(cfgp.read_text()).get("extensions") or {}
+    assert "helper" not in exts and exts["developer"]["enabled"] is False
+    # one that is in the member's configuration already (from a time the team had the permission) is switched off
+    y = yaml.safe_load(cfgp.read_text())
+    y["extensions"]["helper"] = dict(alias)
+    y["extensions"]["notes"] = {"enabled": True, "type": "builtin", "name": "memory", "bundled": True}   # not guarded
+    cfgp.write_text(yaml.safe_dump(y), encoding="utf-8")
+    changes = pr.provision(u)
+    exts = yaml.safe_load(cfgp.read_text())["extensions"]
+    assert exts["helper"]["enabled"] is False and any("helper disabled (it is developer" in ch for ch in changes)
+    assert exts["notes"]["enabled"] is True
+    # with the permission it is delivered, like the extension under its own name
+    db.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps({**ANYCHAT, "allow_shell": True}), tid))
+    pr.provision(u)
+    assert yaml.safe_load(cfgp.read_text())["extensions"]["helper"]["enabled"] is True
+    # the team page names what the members do not get, by the extension's real name
+    boss = user(db, "boss", role="admin")
+    db.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps(ANYCHAT), tid))
+    with client_for(c) as tc:
+        sign_in(tc, c, boss)
+        w = [x["text"] for x in tc.get(f"/api/admin/teams/{tid}").json()["warnings"]]
+    assert any("'developer'" in x and "Shell permission" in x for x in w), w

@@ -161,17 +161,29 @@ class Ctx:
         return p
 
     def roots_for(self, user: dict, policy: dict | None = None) -> list[str]:
+        """Every folder the user may be in (chat folder, file browser): writable first, then read-only (spec 031)."""
         policy = policy or self.policy_for(user)
         return pol.user_roots(policy, str(self.profiles.workspace(user)))
 
-    def path_ok(self, user: dict, path: str) -> bool:
-        """May `user` reach `path` through the file API? Never inside system_dir (database, TLS keys, backups,
-        logs, sandbox records) and never a UNC/device path - for administrators too (A-6, A-12)."""
+    def write_roots_for(self, user: dict, policy: dict | None = None) -> list[str]:
+        """The folders the user may write (uploads, new folders; Modify for the sandbox)."""
+        policy = policy or self.policy_for(user)
+        return pol.user_write_roots(policy, str(self.profiles.workspace(user)))
+
+    def read_roots_for(self, user: dict, policy: dict | None = None) -> list[str]:
+        policy = policy or self.policy_for(user)
+        return pol.user_read_roots(policy, str(self.profiles.workspace(user)))
+
+    def path_ok(self, user: dict, path: str, write: bool = False) -> bool:
+        """May `user` reach `path` through the file API - `write`: create or change something there? Never inside
+        system_dir (database, TLS keys, backups, logs, sandbox records) and never a UNC/device path - for
+        administrators too (A-6, A-12). A member writes only in the writable folders (spec 031); both the path as
+        written and the path with links resolved must lie in them (policy.path_allowed)."""
         if not path or security.is_unc_path(path) or self.in_system_dir(path):
             return False
         if user["role"] == "admin":
             return os.path.isabs(path)
-        return pol.path_allowed(path, self.roots_for(user))
+        return pol.path_allowed(path, self.write_roots_for(user) if write else self.roots_for(user))
 
     def in_system_dir(self, path: str) -> bool:
         """True when `path` is system_dir or below it, compared both as written and after resolving links
@@ -250,14 +262,16 @@ class Ctx:
             if t not in targets:
                 targets.append(t)
         relays = rl.relay_specs(name, int(user["id"]), targets) if targets else []
-        roots = self.roots_for(user)
-        mxc_grants = sb.desired_grants(root, roots, read_dirs, self.settings.goose_binary)
+        policy = self.policy_for(user)
+        roots = self.write_roots_for(user, policy)          # Modify
+        ro_roots = self.read_roots_for(user, policy)        # spec 031: Read & execute only
+        mxc_grants = sb.desired_grants(root, roots, read_dirs, self.settings.goose_binary, read_roots=ro_roots)
         if relays:   # the AppContainer relay forwarder runs on the gateway's base Python (not needed with MXC)
             read_dirs = read_dirs + [rl.python_for_container()[1]]
         # Spec 025: both backends' facts; the worker picks the backend at start (MXC, or the AppContainer fallback).
         # Every value is stable between calls: a changed spec marks the worker for a restart when it is quiet.
         return {"name": name, "profile_root": root, "relays": relays,
-                "grants": sb.desired_grants(root, roots, read_dirs, self.settings.goose_binary),
+                "grants": sb.desired_grants(root, roots, read_dirs, self.settings.goose_binary, read_roots=ro_roots),
                 "caps": sb.NETWORK_CAPS.get(net, sb.NETWORK_CAPS["internet"]),
                 "backend": sandbox_backend(self.settings), "config_problems": sandbox_config_problems(self.settings),
                 "network": net, "relay_targets": [r["target"] for r in relays], "mxc_grants": mxc_grants,

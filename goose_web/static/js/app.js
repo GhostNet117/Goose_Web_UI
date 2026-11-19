@@ -49,7 +49,7 @@ async function boot() {
   } catch (e) {
     if (e.status === 403 && e.code === 'password_change_required') { showChangePassword(null); return; }
     if (e.status === 403 && e.code === 'totp_enrolment_required') { showTotpEnrol(null); return; }
-    if (e.status === 401 || e.status === 403) { clearDrafts(true); showLogin(); return; }   // SC-5: no drafts left
+    if (e.status === 401 || e.status === 403) { clearDrafts(true); clearClientState(); showLogin(); return; }   // SC-5, F-1: nothing of the last person left
     root.replaceChildren(h('div', { class: 'auth-screen' }, h('div', { class: 'auth-card' }, logo(40), h('h1', null, 'Gateway unreachable'), h('p', { class: 'muted' }, errMsg(e)), btn('Retry', () => boot(), { variant: 'primary', icon: 'refresh' }))));
   }
 }
@@ -379,6 +379,9 @@ bus.on('unauthorized', () => {
   authLost = true;
   toast('Your sign-in expired. Please sign in again.', { kind: 'warn' });
   clearDrafts(true);   // SC-5: the next person on this browser must not find them
+  // F-1: a sign-in that ends by itself (after eight hours: the usual end) leaves as little behind as signing out -
+  // folders, pinned chats and provider lists of the last person are not for the next one on this browser
+  clearClientState();
   teardown(); showLogin();
   setTimeout(() => { authLost = false; }, 1500);
 });

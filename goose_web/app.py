@@ -406,7 +406,8 @@ async def ws_endpoint(websocket: WebSocket):
     def still_valid() -> bool:
         now = time.time()
         if session_hash:
-            row = c.db.one("SELECT expires_at FROM auth_sessions WHERE token_hash=?", (session_hash,))
+            # also marks the sign-in as used: an open tab counts as use for the idle limit (spec 032, R-1)
+            row = c.auth.session_alive(session_hash)
         elif token_hash:
             row = c.db.one("SELECT expires_at FROM api_tokens WHERE token_hash=?", (token_hash,))
             if row is not None and not row["expires_at"]:
@@ -711,6 +712,12 @@ def create_app(settings: Settings) -> Starlette:
         c = Ctx(settings=settings, db=db, auth=AuthService(db, settings), profiles=profiles, workers=workers,
                 hub=hub, version=__version__)
         c.goose_version = await asyncio.to_thread(goose_version, settings.goose_binary)
+        try:    # spec 032: sign-ins made by an earlier version (30 days, up to 720 hours) end at today's limit
+            cut = c.auth.clamp_sessions()
+            if cut:
+                log.info("sign-ins: %d stored sign-in(s) were cut to the %g-hour limit", cut, c.auth.session_hours())
+        except Exception:
+            log.exception("cutting stored sign-ins to the lifetime limit")
         hub.on_audit = make_audit_handler(c)
         hub.on_event = make_event_handler(c)
         hub.db = db   # spec 019: composer queues and herd marks survive a restart

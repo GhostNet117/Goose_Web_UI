@@ -9,7 +9,7 @@ import { router } from '../router.js';
 import { THEMES, ACCENTS, prefs, pref, setPref, patchPref, activityPrefs } from '../prefs.js';
 import { mdElement } from '../markdown.js';
 import { hiddenList, setHiddenProviders, hideAllExcept, rememberProviderMeta } from '../providervis.js';
-import { groupsConfig, setGroups, newGroupId, groupOfProvider, groupPicker, rememberInventory } from '../providergroups.js';
+import { groupsConfig, ownGroups, teamGroups, setGroups, newGroupId, groupOfProvider, groupPicker, rememberInventory } from '../providergroups.js';
 import { passwordForm } from './login.js';
 import { sessionsState, sessionTitle } from '../sessions.js';
 import { currentChat } from '../chatsession.js';
@@ -149,25 +149,27 @@ function providersTab(body) {
     const name = await promptDialog({ title: 'New provider group', label: 'Name shown in the chat pickers', placeholder: 'e.g. Team gateway', confirmText: 'Create',
       validate: (x) => (!x.trim() ? 'Name required' : x.trim().length > 80 ? 'At most 80 characters' : null) });
     if (!name) return;
-    const cfg = groupsConfig();
+    const cfg = ownGroups();
     cfg.groups.push({ id: newGroupId(), name: name.trim(), members: [] });
     saveGroups(cfg);
   };
   let showAllModels = false;
   const drawGroups = () => {
-    const cfg = groupsConfig();
+    const cfg = ownGroups();
+    const team = teamGroups();     // spec 033: set by an administrator for the team; shown, not edited here
     const rows = entries.filter((e) => e.configured && allowed(e) && !e.gwVariantOf);
     const byId = new Map(entries.map((e) => [e.providerId, e]));
     const groupCard = (g) => {
       const nameInp = input({ value: g.name, class: 'inp inp-sm', 'aria-label': 'Group name', maxlength: '80' });
-      nameInp.addEventListener('change', () => { const c = groupsConfig(); const x = c.groups.find((y) => y.id === g.id); if (x && nameInp.value.trim()) { x.name = nameInp.value.trim(); saveGroups(c); } else nameInp.value = g.name; });
+      nameInp.addEventListener('change', () => { const c = ownGroups(); const x = c.groups.find((y) => y.id === g.id); if (x && nameInp.value.trim()) { x.name = nameInp.value.trim(); saveGroups(c); } else nameInp.value = g.name; });
       const memberRow = (e) => {
-        const owner = groupOfProvider(e.providerId, cfg);
-        const mine = owner && owner.id === g.id;
+        const teamOwner = groupOfProvider(e.providerId, team);
+        const owner = teamOwner || groupOfProvider(e.providerId, cfg);
+        const mine = !teamOwner && owner && owner.id === g.id;
         const m = mine ? g.members.find((x) => x.provider === e.providerId) : null;
         const cb = checkbox(!!mine, h('span', null, e.providerName, ' ', h('span', { class: 'muted small mono' }, e.providerId),
-          owner && !mine ? h('span', { class: 'muted small' }, ' (in ' + owner.name + ')') : null), (v) => {
-          const c = groupsConfig(); const x = c.groups.find((y) => y.id === g.id); if (!x) return;
+          owner && !mine ? h('span', { class: 'muted small' }, ' (in ' + owner.name + (teamOwner ? ', from your team' : '') + ')') : null), (v) => {
+          const c = ownGroups(); const x = c.groups.find((y) => y.id === g.id); if (!x) return;
           if (v) { if (!groupOfProvider(e.providerId, c)) x.members.push({ provider: e.providerId, prefix: '' }); } else x.members = x.members.filter((y) => y.provider !== e.providerId);
           saveGroups(c);
         }, { disabled: !!owner && !mine });
@@ -175,7 +177,7 @@ function providersTab(body) {
         const pre = mine ? input({ value: m.prefix, class: 'inp inp-sm mono grp-prefix', placeholder: 'prefix (optional)', 'aria-label': 'Model label prefix for ' + e.providerName, maxlength: '40' }) : null;
         if (pre) {
           pre.dataset.provider = e.providerId;
-          pre.addEventListener('change', () => { const c = groupsConfig(); const x = c.groups.find((y) => y.id === g.id); const mm = x && x.members.find((y) => y.provider === e.providerId); if (mm) { mm.prefix = pre.value.trim(); saveGroups(c); } });
+          pre.addEventListener('change', () => { const c = ownGroups(); const x = c.groups.find((y) => y.id === g.id); const mm = x && x.members.find((y) => y.provider === e.providerId); if (mm) { mm.prefix = pre.value.trim(); saveGroups(c); } });
         }
         return h('div', { class: 'grp-member' }, cb, pre);
       };
@@ -188,12 +190,12 @@ function providersTab(body) {
         h('div', { class: 'row wrap' }, field('Name', nameInp, null, { inline: true }), h('span', { class: 'grow' }),
           btn('Delete group', async () => {
             if (!(await confirmDialog({ title: 'Delete the group "' + g.name + '"?', message: 'Its providers show separately again. Nothing else changes.', confirmText: 'Delete', danger: true }))) return;
-            const c = groupsConfig(); c.groups = c.groups.filter((y) => y.id !== g.id); saveGroups(c);
+            const c = ownGroups(); c.groups = c.groups.filter((y) => y.id !== g.id); saveGroups(c);
           }, { size: 'sm', icon: 'trash' })),
-        h('div', { class: 'muted small' }, 'Tick the providers to show as "' + g.name + '". Each model is listed as <prefix>-<model name>; leave the prefix empty to list the plain name.'),
+        h('div', { class: 'muted small' }, 'Tick the providers to show as "' + g.name + '". Each model is listed as "<prefix> - <model name>", in the order of the providers here; leave the prefix empty to list the plain name.'),
         h('div', { class: 'grp-members', role: 'group', 'aria-label': g.name + ' members' }, ...rows.map(memberRow),
           ...gone.map((m) => h('div', { class: 'grp-member' }, checkbox(true, h('span', null, (byId.get(m.provider) || {}).providerName || m.provider, ' ', h('span', { class: 'muted small' }, '(not available)')), () => {
-            const c = groupsConfig(); const x = c.groups.find((y) => y.id === g.id); if (x) { x.members = x.members.filter((y) => y.provider !== m.provider); saveGroups(c); }
+            const c = ownGroups(); const x = c.groups.find((y) => y.id === g.id); if (x) { x.members = x.members.filter((y) => y.provider !== m.provider); saveGroups(c); }
           })))),
         labels.length ? h('div', { class: 'muted small grp-preview', title: labels.join('\n') }, 'Model list: ' + labels.slice(0, 8).join(', ') + (labels.length > 8 ? ', … (' + labels.length + ' in all)' : '')) : null);
     };
@@ -205,12 +207,22 @@ function providersTab(body) {
     const nameRow = (id, gooseName) => {
       const inp = input({ value: cfg.modelNames[id] || '', class: 'inp inp-sm', placeholder: gooseName, 'aria-label': 'Display name for ' + id, maxlength: '120' });
       inp.dataset.model = id;
-      inp.addEventListener('change', () => { const c = groupsConfig(); const v = inp.value.trim(); if (v) c.modelNames[id] = v; else delete c.modelNames[id]; saveGroups(c); });
+      inp.addEventListener('change', () => { const c = ownGroups(); const v = inp.value.trim(); if (v) c.modelNames[id] = v; else delete c.modelNames[id]; saveGroups(c); });
       return h('div', { class: 'grp-name-row' }, h('span', { class: 'mono small' }, id), inp);
     };
+    const teamCard = (g) => {
+      const picker = groupPicker(rows.map((e) => ({ id: e.providerId, name: e.providerName, defaultModel: e.defaultModel || '', models: (e.models || []).map((x) => ({ id: x.id, name: x.name || x.id })) })),
+        { groups: [g], modelNames: { ...team.modelNames, ...cfg.modelNames } }, {}).find((x) => x.group);
+      const labels = picker ? picker.models.map((x) => x.label) : [];
+      return h('div', { class: 'grp-card grp-team', 'data-team-group': g.id },
+        h('div', { class: 'row wrap' }, h('strong', null, g.name), h('span', { class: 'badge badge-accent' }, 'From your team')),
+        h('div', { class: 'muted small' }, g.members.map((m) => ((byId.get(m.provider) || {}).providerName || m.provider) + (m.prefix ? ' = "' + m.prefix + '"' : '')).join(', ')),
+        labels.length ? h('div', { class: 'muted small grp-preview', title: labels.join('\n') }, 'Model list: ' + labels.slice(0, 8).join(', ') + (labels.length > 8 ? ', … (' + labels.length + ' in all)' : '')) : null);
+    };
     grpBox.replaceChildren(
-      h('div', { class: 'muted small' }, 'Show several providers as one entry in the New chat and chat header pickers (for example providers that serve the same models). Picking a model label still uses the real provider and model. Only the display changes; only you see it, and it follows you to every browser.'),
-      cfg.groups.length ? h('div', { class: 'stack' }, ...cfg.groups.map(groupCard)) : h('div', { class: 'muted' }, 'No groups yet. Use "New group".'),
+      h('div', { class: 'muted small' }, 'Show several providers as one entry in the New chat and chat header pickers (for example one provider per effort level, all serving the same models). Each model is then listed as "<prefix> - <model name>". Picking one still uses the real provider and model. Only the display changes; only you see your own groups, and they follow you to every browser.'),
+      team.groups.length ? h('div', { class: 'stack' }, h('div', { class: 'muted small' }, 'Set by your administrator for your team (not changed here):'), ...team.groups.map(teamCard)) : null,
+      cfg.groups.length ? h('div', { class: 'stack' }, ...cfg.groups.map(groupCard)) : h('div', { class: 'muted' }, team.groups.length ? 'No groups of your own. Use "New group" for providers your team has not combined.' : 'No groups yet. Use "New group".'),
       h('div', { class: 'grp-names' },
         h('div', { class: 'row wrap' }, h('strong', null, 'Model display names'), h('span', { class: 'muted small grow' }, 'Optional friendly names, used in the chat pickers for every provider.'),
           toggle(showAllModels, (v) => { showAllModels = v; drawGroups(); }, { text: 'All models' })),
@@ -314,6 +326,9 @@ function providersTab(body) {
       }, { variant: 'primary' })] });
   };
   const loadSecrets = async () => {
+    // a member whose team does not let them add providers has no keys of their own to look at: the team's
+    // providers come with their keys (asking would be answered "forbidden", which is not an error of theirs)
+    if (!canEdit) { secretsBox.replaceChildren(h('div', { class: 'muted small' }, 'The keys of your providers are managed by your administrator for your team.')); return; }
     try {
       const r = await rpc.call(G('providers/secrets/list'), {});
       secretsBox.replaceChildren(table([
@@ -533,6 +548,10 @@ function toolsTab(body) {
 
 // ===================================================================== Advanced config
 function advancedTab(body) {
+  if (!policy('config_edit')) {
+    body.replaceChildren(banner('info', 'The raw Goose configuration of your profile is managed by your administrator for your team. The other pages of Settings hold what you can change yourself.'));
+    return;
+  }
   const out = h('div', null, skeleton(6));
   const q = input({ type: 'search', placeholder: 'Filter keys…', class: 'inp inp-sm' });
   let cfg = {};

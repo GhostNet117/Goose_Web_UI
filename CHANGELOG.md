@@ -1,5 +1,87 @@
 # Changelog
 
+## 1.25.0 - 2026-11-19
+
+**Folders a team may only read.** A team's extra folders were all-or-nothing: whoever could open one could change
+it. Admin > Teams & policy > Folders now has one row per folder with a switch "Members may write here". Off =
+read only: the members can list, open and download what is in it, start a chat there and let the agent read it;
+nothing is created, changed or deleted there - not by the member in the file browser, not by an upload, and not by
+the member's agent, which the sandbox holds to it (MXC `readonlyPaths`, AppContainer Read & execute). Stored as
+`read_roots` beside `allowed_roots`.
+- Read-only wins: a folder that is in both lists, or a writable folder that contains a read-only one, is only
+  read. The page refuses a read-only folder inside a folder the same team can write and says why.
+- With the AppContainer backend a folder switched to read-only is narrowed at once, also for an agent that is
+  running. An MXC container cannot be narrowed from outside: a running agent keeps what it started with until its
+  run has finished (it restarts then), and the page names the members concerned.
+- Without the sandbox the operating system does not stop an agent writing; the team page warns.
+
+**Files attached in the browser go to `Web_Uploads`** inside the chat's folder (before: a hidden
+`.goose-web-uploads`). The server names the folder; the page only names the chat folder. Without write access to
+the chat folder the attachment is refused - "You do not have write access to this folder, so files cannot be
+uploaded here." - and nothing is written. Images are saved there too and are still shown to the model directly.
+Files of earlier versions stay where they are.
+
+**A sign-in lasts eight hours at most, and there is no "Keep me signed in".** The checkbox (ticked by default: 30
+days, stored by the browser) is gone, with `auth.remember_days`. `auth.session_hours` and Admin > Settings >
+Sign-in lifetime take 1 to 8 (default 8; more counts as 8). The cookie is a session cookie. **Upgrading ends every
+sign-in older than the limit**: everybody signs in again. An open tab ends with its sign-in; a running agent is not
+stopped. Optional and off by default: `auth.idle_minutes` ends a sign-in no browser has used for that long (an
+open tab counts as use). `goose-web check` prints the lifetime and names `auth.remember_days` as removed.
+
+**A team's providers in one list, and provider aliases a team can be given.** Providers & models showed a team's
+providers three times (switches for your own providers, tick boxes for what is allowed, a table of what was
+copied). Now: one row per provider, one switch. For a provider of your own profile the switch hands it to the
+members (address, models, key) and allows it; off takes both back. For a provider Goose knows it allows only.
+- "Show several providers as one (aliases)": a name and, per provider, a prefix. The members see one provider and
+  each model as `<prefix> - <model>` - for example one provider per effort level shown as one, with `Max - ...`,
+  `High - ...`. Stored in the team policy (`provider_groups`); only the pickers change, the policy is still
+  checked on the real provider and model.
+- A person's own groups (Settings > Models & Providers > Provider groups, 1.18.0) stay; the team's aliases come
+  first and are shown there as "From your team". Labels are now `<prefix> - <model>` (was `<prefix>-<model>`), in
+  the order of the group's providers (was alphabetical by prefix).
+
+**Fixed.**
+- On a phone the home page's menu button did nothing when the page was taller than the screen: the strip that
+  holds it was shrunk under the content, which then lay over the button.
+- A steer was shown twice when Goose's echo of it reached the tab before the answer to the steer call. One message
+  was sent; the second bubble was the tab's. Also: a steer Goose has already echoed is no longer queued again when
+  its call fails, and one whose connection dropped while it was sent waits in the queue instead of being sent
+  again by itself.
+- A team's item for an extension that starts a program (stdio) is not delivered without the Shell permission - by
+  design - and the team page did not say so. It does now. An item whose source is gone from the profile it was
+  taken from is marked.
+- Settings no longer shows "forbidden" where a member simply may not do the thing (keys, raw configuration); the
+  Schedules page no longer shows "Method not found" while the scheduler is off.
+- The team page: a pane that has been drawn again no longer saves over what was just stored; a folder path is
+  taken when the field is left, not letter by letter.
+- One person's policy overrides are held to the folder rules of a team's.
+
+**Security: the start-up task for Windows Server (1.24.1, 1.24.2) could be prepared by an account that is not an
+administrator.** `scripts\register-devices-task.ps1` put the script that SYSTEM runs at every start into
+`<ProgramData>\GooseWeb` and used a folder of that name that was already there. Any account of the machine can
+create a folder in ProgramData beforehand and then owns it; such an account could change what SYSTEM runs. Found
+by an independent review of this release (SECURITY-ASSESSMENT 21.8, S-1, S-2); not known to have been used.
+- The copy now lives in `<Program Files>\GooseWeb.Startup`, where only administrators can create anything. A new
+  folder is made with its access list; one that is already there is used only when it is the administrators' alone.
+- The script stops when the two script files, or their folders, can be changed by anybody but administrators
+  and you (`-TrustSource` to go on), and prints the SHA-256 of what it installed. The guide says where the files
+  must come from when the install folder is writable by the gateway's account.
+- **If you registered the task with 1.24.1 or 1.24.2: run the new script again from an elevated Windows
+  PowerShell prompt, then restart Windows.** It moves the copy and removes the old one. (Windows 11 installations
+  never needed the task.)
+- `upgrade.ps1` no longer takes `uv.exe` from the folder of the goose binary.
+
+**Also from that review**, all Low: the sub-recipe check reads the file that was opened, not the name that was
+looked at; a bundled shell-capable extension stored under another name is not delivered without the Shell
+permission; a prompt for a made-up session id no longer holds memory; a sign-in that ends by itself clears the
+browser's storage like signing out; markdown no longer lets media elements fetch an address.
+
+**Reviewed** independently before publication, twice. The new code (SECURITY-ASSESSMENT 21.6): two Medium
+findings - the idle limit would have ended the sign-in of somebody chatting, and a folder switched to read-only
+was not narrowed for a running agent - and five lower ones; fixed in this release except one cosmetic one that is
+stated there. What no reviewer had read before - the changes of 1.23.1 to 1.24.2 and the browser code as a whole
+(21.8): the two findings above about the start-up task, and the Low ones.
+
 ## 1.24.2 - 2026-11-16
 
 CI, one test and documents only; no change of the product.

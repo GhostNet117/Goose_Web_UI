@@ -115,7 +115,10 @@ export function renderSchedules(ctx) {
 
   async function load() {
     try { jobs = ((await rpc.call(G('schedules/list'), {})).jobs || []).sort((a, b) => a.id.localeCompare(b.id)); draw(); }
-    catch (e) { listEl.replaceChildren(banner('error', errMsg(e))); }
+    catch (e) {
+      // the scheduler is not active here (the banner above says why): Goose answers "Method not found", which is not an error to show
+      listEl.replaceChildren(sched.enabled === false ? h('div', { class: 'muted' }, 'Schedules cannot be listed while the scheduler is not active here.') : banner('error', errMsg(e)));
+    }
   }
 
   const el = h('div', { class: 'view view-page' },

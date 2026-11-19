@@ -44,7 +44,33 @@ function Native([string]$exe, [string[]]$a) {
 }
 function Lists() { return (Native $Python @('-c', 'from goose_web import sandbox as sb; print(sb.devices_status())')).text }
 function Grant() { return Native $Python @('-m', 'goose_web', 'sandbox', 'devices', 'grant') }
-function Task() { return Native 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $register) }
+function Seen() {
+    # What this Windows gives the things the task rests on (review 20261119_6: nobody had looked): the owner and
+    # access list of the task folder and of the task, and of the folder the copy SYSTEM runs is in.
+    $out = @()
+    try {
+        $svc = New-Object -ComObject Schedule.Service
+        $svc.Connect()
+        foreach ($p in '\GooseWeb', '\GooseWeb.Startup') {
+            try {
+                $f = $svc.GetFolder($p)
+                $out += "task folder ${p}: " + $f.GetSecurityDescriptor(7)
+                try { $out += "task ${p}\GooseWeb_Devices: " + $f.GetTask('GooseWeb_Devices').GetSecurityDescriptor(7) } catch { }
+            } catch { }
+        }
+    } catch { $out += "task scheduler could not be asked: $($_.Exception.Message)" }
+    $pf = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+    foreach ($p in (Join-Path $pf 'GooseWeb.Startup'), (Join-Path $pf 'GooseWeb.Startup\grant-devices.ps1'), (Join-Path $env:ProgramData 'GooseWeb')) {
+        if (Test-Path -LiteralPath $p) { $out += "${p}: " + (Get-Acl -LiteralPath $p).Sddl } else { $out += "${p}: not there" }
+    }
+    return ($out -join ' ; ')
+}
+function Task() {
+    # -TrustSource: the checkout of a throw-away runner; what the source check found is in the script's own output
+    $r = Native 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $register, '-TrustSource')
+    $r.text = $r.text + ' || SEEN: ' + (Seen)
+    return $r
+}
 
 $failed = $false
 try {

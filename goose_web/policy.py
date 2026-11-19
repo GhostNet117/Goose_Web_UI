@@ -13,13 +13,17 @@ from typing import Any
 
 BOOL_KEYS = ["recipes_edit", "skills_edit", "extensions_edit", "providers_edit", "schedules", "apps",
              "prompts_edit", "hints_edit", "tools_permissions", "config_edit", "allow_shell", "notify_webhook"]
-LIST_KEYS = ["allowed_modes", "allowed_providers", "allowed_models", "allowed_roots"]
+LIST_KEYS = ["allowed_modes", "allowed_providers", "allowed_models", "allowed_roots", "read_roots"]
 # Lists that gate chatting. "*" = any value; empty = none. allowed_roots has no "*" (folders are explicit).
+# allowed_roots: extra folders the members may read AND write. read_roots (spec 031): extra folders they may only
+# read - list, open, download, chat there, let the agent read; nothing is created or changed there by a member,
+# the member's agent (held by the sandbox) or an upload.
 CHAT_LISTS = ["allowed_modes", "allowed_providers", "allowed_models"]
 ANY = "*"
 # Extra keys a team policy may carry besides BOOL_KEYS / LIST_KEYS / max_concurrent_runs.
 # guard: the team's prompt guard (spec 018, guard.clean_team_guard); missing = off.
-TEAM_EXTRA_KEYS = ["default_provider", "default_model", "share_folder", "guard", "require_totp"]
+# provider_groups: provider aliases for the chat pickers (spec 033; a display rule, api._clean_provider_groups).
+TEAM_EXTRA_KEYS = ["default_provider", "default_model", "share_folder", "guard", "require_totp", "provider_groups"]
 # Approval modes in which Goose does not ask before every tool call: Auto never asks, Smart approve skips tools
 # annotated (or judged) read-only. A guarded team cannot use them (spec 018): the guard sees tool calls only through
 # Goose's permission requests.
@@ -35,12 +39,12 @@ LEGACY_DEFAULT_POLICY: dict[str, Any] = {
     "recipes_edit": True, "skills_edit": True, "extensions_edit": False, "providers_edit": False,
     "schedules": True, "apps": True, "prompts_edit": False, "hints_edit": True, "tools_permissions": True,
     "config_edit": False, "allow_shell": False, "notify_webhook": False,
-    "allowed_modes": [], "allowed_providers": [], "allowed_models": [], "allowed_roots": [],
+    "allowed_modes": [], "allowed_providers": [], "allowed_models": [], "allowed_roots": [], "read_roots": [],
     "max_concurrent_runs": 3,
 }
 
 ADMIN_POLICY: dict[str, Any] = {**{k: True for k in BOOL_KEYS}, **{k: [ANY] for k in CHAT_LISTS},
-                                "allowed_roots": [], "max_concurrent_runs": 0, "chat_blocked": ""}
+                                "allowed_roots": [], "read_roots": [], "max_concurrent_runs": 0, "chat_blocked": ""}
 
 NO_TEAM_REASON = "You are not in a team yet, so you cannot chat. Ask your administrator to add you to a team."
 _LIST_LABELS = {"allowed_providers": "providers", "allowed_models": "models", "allowed_modes": "approval modes"}
@@ -200,6 +204,8 @@ def effective_policy(user: dict, teams: list[dict]) -> dict:
         pol["team"] = {"id": team.get("id"), "name": team.get("name")}
         from .guard import clean_team_guard
         pol["guard"] = clean_team_guard(tp.get("guard"))
+        if isinstance(tp.get("provider_groups"), dict):     # spec 033: the member's pickers show the team's aliases
+            pol["provider_groups"] = tp["provider_groups"]
     for k, v in (user.get("policy_overrides") or {}).items():
         if k in DEFAULT_POLICY:
             pol[k] = v
@@ -246,12 +252,24 @@ def check_session_choice(policy: dict, load_result: dict | None) -> None:
 
 
 def team_warnings(policy: dict, *, hints: int, members: int, provider_items: set | None = None,
-                  extension_items: set | None = None) -> list[dict]:
+                  extension_items: set | None = None, command_items: set | None = None,
+                  sandbox: bool | None = None) -> list[dict]:
     """What the admin should know about a team's experience (Experience page). level: err | warn | info.
     `provider_items`: the ids of the providers this team has as library items (None = not looked at);
-    `extension_items`: the names of its extension items."""
+    `extension_items`: the names of its extension items; `command_items`: those of them that start a program
+    (stdio, inline_python); `sandbox`: is the members' sandbox on (None = not looked at)."""
     p = {**DEFAULT_POLICY, **(policy or {})}
     out: list[dict] = []
+    # An extension that starts a program on the server is parked while the team has no Shell permission
+    # (profiles._apply_extension_permissions). Found 2026-11-19: the item sat in the team's list and nothing said
+    # that the members never got it.
+    if not p.get("allow_shell"):
+        for name in sorted(command_items or ()):
+            if ext_key(name) in _GUARDED_KEYS:
+                continue        # said below, with the permissions it needs
+            out.append({"level": "warn", "text": (
+                f"Members do not get the extension '{name}' although it is a library item of this team: it starts "
+                "a program on the server, which needs the Shell permission, and this team does not give it.")})
     # A shell-capable or extension-starting extension (Code Mode among them) is delivered only when the team gives
     # the permission it needs. Found in use, 2026-11-16: the item was accepted and silently never delivered.
     for name in sorted(extension_items or ()):
@@ -289,6 +307,11 @@ def team_warnings(policy: dict, *, hints: int, members: int, provider_items: set
     if not dp and p.get("allowed_providers"):
         out.append({"level": "info", "text": "No default model: members keep their profile's model if it is "
                                              "allowed, otherwise the first allowed provider."})
+    if [r for r in (p.get("read_roots") or []) if r and r != ANY] and sandbox is False:
+        out.append({"level": "warn", "text": (
+            "Read-only folders are set, but the sandbox is off: the members' agents then run as the gateway's Windows "
+            "account, and nothing stops an agent writing where that account can. Only the file browser and uploads "
+            "are held to read-only. Switch the sandbox on (sandbox.enabled).")})
     if p.get("allow_shell"):
         out.append({"level": "warn", "text": "Shell is on: members' agents can run commands as the gateway's "
                                              "Windows account and read other profiles (known risk)."})
@@ -542,7 +565,8 @@ def folder_grant_problem(path: str, *, profiles_root: str, system_dir: str = "",
 def check_team_folders(policy: dict, **where: Any) -> None:
     """Raise ValueError(reason) if the team policy's allowed_roots or share_folder is a dangerous folder
     (folder_grant_problem). For the API's team policy normaliser (api._clean_policy)."""
-    for r in policy.get("allowed_roots") or []:
+    own_team_folder = str(where.pop("own_team_folder", "") or "")
+    for r in [*(policy.get("allowed_roots") or []), *(policy.get("read_roots") or [])]:
         if r == ANY:
             continue
         why = folder_grant_problem(str(r), **where)
@@ -553,13 +577,72 @@ def check_team_folders(policy: dict, **where: Any) -> None:
         why = folder_grant_problem(sf, **where)
         if why:
             raise ValueError(f"{sf}: {why}")
+    why = read_only_nesting_problem(policy.get("read_roots") or [],
+                                    [*(policy.get("allowed_roots") or []), sf, own_team_folder])
+    if why:
+        raise ValueError(why)
+
+
+def read_only_nesting_problem(read_roots: list, writable: list, who: str = "this team") -> str:
+    """Spec 031: "" or why a read-only folder is not held - it is, or lies inside, a folder that can be written.
+    A folder is writable when it lies inside ANY writable folder (Windows hands the outer folder's Modify entry
+    down to it, and the file API checks the same way), so a read-only entry there would promise what is not kept.
+    Compared as written and with links resolved."""
+    ws = [str(w) for w in writable if w and w != ANY]
+    for r in read_roots or []:
+        if not r or r == ANY:
+            continue
+        for w in ws:
+            pairs = [(_plain_path(str(r)), _plain_path(w))]
+            rr, rw = _real(str(r)), _real(w)
+            if rr and rw:
+                pairs.append((_plain_path(rr), _plain_path(rw)))
+            if any(_same_or_inside(a, b) for a, b in pairs):
+                return (f"{r}: a read-only folder cannot be, or lie inside, a folder {who} can write "
+                        f"({w}) - the write access to the outer folder would reach it")
+    return ""
+
+
+def _split_roots(policy: dict, workspace: str) -> tuple[list[str], list[str]]:
+    """(writable, read-only) folders of a member. READ-ONLY WINS (spec 031; review 20261119_5, R-3): a folder of
+    the team that is, or contains, a read-only folder is itself only read - a writable folder would hand its
+    write access down to the read-only one (Windows inherits the entry; the file API looks at the outer folder).
+    The lists can meet this way when they come from different places (a person's overrides and their team), which
+    no check at saving time sees. The member's own workspace is always writable. Compared as written and with
+    links resolved; nothing is resolved when there is no read-only folder."""
+    extra = [str(r) for r in policy.get("allowed_roots") or [] if r and r != ANY]
+    team = [str(policy["team_folder"])] if policy.get("team_folder") else []
+    ro = list(dict.fromkeys(str(r) for r in policy.get("read_roots") or [] if r and r != ANY))
+    if not ro:
+        return [workspace, *team, *extra], []
+    write, demoted = [workspace], []
+    for w in [*team, *extra]:
+        (demoted if read_only_nesting_problem(ro, [w]) else write).append(w)
+    seen = {_plain_path(x) for x in write if x}
+    read: list[str] = []
+    for r in [*demoted, *ro]:
+        if _plain_path(r) not in seen:      # one folder once, however it is spelled
+            seen.add(_plain_path(r))
+            read.append(r)
+    return write, read
+
+
+def user_write_roots(policy: dict, workspace: str) -> list[str]:
+    """The folders a member may read AND write: own workspace, the team's shared folder, then the team's extra
+    folders ("*" is never a folder) - without any that is, or contains, a read-only folder (_split_roots)."""
+    return _split_roots(policy, workspace)[0]
+
+
+def user_read_roots(policy: dict, workspace: str = "") -> list[str]:
+    """The folders a member may only read (spec 031): the read-only folders, and any folder that would be writable
+    but is, or contains, one of them."""
+    return _split_roots(policy, workspace)[1]
 
 
 def user_roots(policy: dict, workspace: str) -> list[str]:
-    """Own workspace, the team's shared folder, then the team's extra folders ("*" is never a folder)."""
-    extra = [r for r in policy.get("allowed_roots") or [] if r and r != ANY]
-    team = [policy["team_folder"]] if policy.get("team_folder") else []
-    return [workspace, *team, *extra]
+    """Every folder a member may be in: the writable ones first (the workspace is always the first), then the
+    read-only ones. What may be WRITTEN is user_write_roots."""
+    return [*user_write_roots(policy, workspace), *user_read_roots(policy, workspace)]
 
 
 def _ext_name(ext: dict | None) -> str:

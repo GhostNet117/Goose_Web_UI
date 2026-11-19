@@ -621,7 +621,7 @@ C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles
 | Rate limit | at most 40 sign-in attempts per 5 minutes per client IP and 10 per 5 minutes per IP and user name (`429`, in memory, cleared by a gateway restart) |
 | Lockout | after `auth.lockout_threshold` (8) failed factors - wrong passwords and wrong or replayed TOTP codes both count - the account is locked for `auth.lockout_minutes` (15) (`423`, also with the right password) |
 | Address block | after `auth.ip_block_threshold` (10) failed sign-ins in a row from one client address within `auth.ip_block_window_days` (30), that address is blocked for `auth.ip_block_days` (30; `0` = until an admin unblocks it). Stored in the database, so it survives restarts. See section 7.9. |
-| Session length | fixed from sign-in, never extended. Without "Keep me signed in": `session_hours` (Admin > Settings > Sign-in lifetime, 1 to 720 hours, default `auth.session_hours` = 12). With "Keep me signed in" (ticked by default on the sign-in page): `auth.remember_days` (30 days, config only) |
+| Session length | fixed from sign-in, never extended: `session_hours` (Admin > Settings > Sign-in lifetime, 1 to 8 hours, default `auth.session_hours` = 8). There is no "Keep me signed in" (removed in 1.25.0) and the cookie is a session cookie. Lowering the lifetime, and every start of the gateway, cuts the sign-ins that exist to it. An open tab is closed within 30 seconds of its sign-in ending; a running agent is not stopped. Optional: "End an unused sign-in after" (`auth.idle_minutes`, off by default, 5 to 480): a sign-in no browser has used for that long ends - an open tab counts as use, so it ends forgotten sign-ins, not open ones |
 | Cookie | `HttpOnly`, `SameSite=Strict`; `__Host-gw` with `Secure` when `public_url` is `https://`, otherwise `gw` |
 | Writes | need the CSRF header and an allowed Origin |
 | Signed-in devices | users see and revoke their own sessions in their account settings |
@@ -766,7 +766,7 @@ grouped by topic:
 | Group | What you set there |
 |---|---|
 | Hints | **Team hints** (documents from the Hints library) and "Members may add personal hints" (`hints_edit`) |
-| Providers & models | **Allowed providers** and **Allowed models**, picked from lists (1.12): the providers your own Goose knows (configured ones first, "Show all" for the rest) and, per allowed provider, its models with their context size and All/None buttons; each list has an **Any** switch, and ids Goose does not list can be added by hand. **Default provider** and **Default model** are drop-downs of what is allowed. "Edit providers & models" (`providers_edit`), provider library items |
+| Providers & models | **Providers this team can use** (1.25.0): one row per provider, one switch. A provider of your own profile (marked *yours*, or *given* once the team holds a copy): on = the members get it - address, models, key - and may use it; off = both taken back. A provider Goose knows: on = allowed only, no key is handed out. A row that is half done says so. **Any provider** for teams whose members bring their own. **Models**, per provider switched on, with All/None and an **Any model** switch. **Default provider** and **Default model**. **Show several providers as one (aliases)**: section 9.9a. "Edit providers & models" (`providers_edit`) |
 | Approval modes | **Allowed approval modes**: Auto, Approve, Smart approve, Chat only, or **Any** |
 | Folders | **Team folder**, **Extra folders**, **Max concurrent runs** |
 | Extensions & tools | `allow_shell`, `extensions_edit`, `tools_permissions`, `apps`, extension library items |
@@ -805,10 +805,10 @@ A new team starts with every switch off and every list empty.
 | `allowed_modes` | Allowed approval modes | nothing | only these Goose modes (`auto`, `approve`, `smart_approve`, `chat`); `*` = any. Empty = members cannot chat. |
 | `allowed_providers` | Allowed providers | nothing | only these provider ids; `*` = any. Empty = members cannot chat. |
 | `allowed_models` | Allowed models | nothing | only these model ids; `*` = any. Empty = members cannot chat. |
-| `allowed_roots` | Extra folders | none | use these folders in addition to their workspace and the team folder (chat folders, file browser, uploads, downloads). Every entry must be an absolute path and `*` is not accepted (`400 bad_folder`). Symlinks and junctions are resolved, so a link inside an allowed folder cannot lead outside. |
+| `allowed_roots`, `read_roots` | Extra folders | none | use these folders in addition to their workspace and the team folder. One row per folder with the switch **Members may write here**: on (`allowed_roots`) = chat folders, file browser, uploads, and Modify for the member's agent; off (`read_roots`, 1.25.0) = **read only**, section 9.9b. Every entry must be an absolute path and `*` is not accepted (`400 bad_folder`). Symlinks and junctions are resolved, so a link inside an allowed folder cannot lead outside. |
 | `max_concurrent_runs` | Max concurrent runs | 3 | have at most this many agents running at once. Empty = the default (3), `0` = unlimited. |
-| (the page itself, 1.22.2) | - | - | The team's page saves every change by itself ("Saved" with the time, top right) and starts with what the team still needs before its members can chat, each with a button that puts it right. Under Providers & models, "Give a provider to this team" has a switch per provider of your own profile: on gives the members the provider and its key, allows it and makes it the default when there is none; off takes it away. |
-| `default_provider`, `default_model` | Default provider, Default model | not set | the provider and model new members start with (section 9.6). Both should be in the allowed lists; the page warns if they are not. **Allowing a provider or making it the default does not give it to the members:** a custom provider (its address, its models, its key) is defined in one profile, usually yours. Add it to the team under Library items (section 9.9), which copies the definition and the key to every member; until then members cannot reach a model with it. Since 1.22.0 the team's page says so in red. |
+| (the page itself, 1.22.2) | - | - | The team's page saves every change by itself ("Saved" with the time, top right; "NOT saved" with the reason) and starts with what the team still needs before its members can chat, each with a button that puts it right. A folder path is saved when its field is left. After a change of folders the page names the members whose running agent keeps the earlier folders until its run has finished (1.25.0). |
+| `default_provider`, `default_model` | Default provider, Default model | not set | the provider and model new members start with (section 9.6). Both should be in the allowed lists; the page warns if they are not. **Allowing a provider or making it the default does not give it to the members:** a custom provider (its address, its models, its key) is defined in one profile, usually yours. Switch it on in the team's provider list (1.25.0; before: Library items, section 9.9), which copies the definition and the key to every member; until then members cannot reach a model with it. Since 1.22.0 the team's page says so in red. |
 | `share_folder` | Team folder | empty = `<profiles_root>\_teams\<team id>` | the team's shared folder (section 9.7). Must be an absolute path (`400 bad_folder`). |
 
 Chat checks for non-admins:
@@ -924,9 +924,69 @@ team for that. Removing an item, or taking a member out of the team, removes it 
 the provider file and its key, the extension entry, the skill folder, the recipe; a chat that is running at that
 moment keeps what it has loaded until its agent restarts, which happens as soon as it is idle.
 
+#### 9.9a Provider aliases for a team (1.25.0)
+
+Several providers that serve the same models - one per effort level, one per person - can be shown to the members
+as ONE provider. Admin > Teams & policy > the team > Providers & models > **Show several providers as one
+(aliases)**: **New alias**, the name the members see, then add providers and give each a **prefix**. The members'
+New chat and chat header pickers then list one provider under that name and every model as `<prefix> - <model>`,
+in the order of the providers in the alias (the arrow moves one up). The line under the alias shows what the
+members will see. **Copy my own aliases** takes the groups of your own Settings.
+
+- Only the pickers change. Picking `High - model-x` starts the chat on the real provider behind "High" and the real
+  model; the allowed lists above decide what may be used, on the real ids, as before.
+- A member's own groups (Settings > Models & Providers > Provider groups) stay possible for providers the team
+  has not put in an alias; the team's aliases are shown there as "From your team" and cannot be changed by a
+  member.
+- An administrator's own pickers follow the administrator's own Settings, not a team's aliases.
+- Stored in the team policy as `provider_groups`.
+
+#### 9.9b Read-only folders (1.25.0)
+
+For a folder the members' agents should consult and never change - a knowledge base that one person maintains.
+Admin > Teams & policy > the team > Folders > **Add folder**, the path, and leave **Members may write here** off.
+
+| Who | In a read-only folder |
+|---|---|
+| the member, in the file browser and folder picker | lists, opens, downloads; the folder is marked "read only"; no "New folder" |
+| a chat | can work there (the agent reads the folder); files cannot be attached: "You do not have write access to this folder, so files cannot be uploaded here." |
+| the member's agent (its tools, a shell) | reads; the sandbox refuses every create, change, rename and delete (MXC: `readonlyPaths`; AppContainer: a Read & execute entry) |
+| an administrator | not restricted by a team's folders |
+
+Rules, and what to know:
+
+- **Read-only wins.** A folder in both lists is read-only. A writable folder that contains a read-only folder is
+  itself only read. The page refuses a read-only folder that is, or lies inside, a folder the same team can write
+  (its extra folders, its team folder) and says so; the same holds for one person's policy overrides. A writable
+  folder inside a read-only one is fine.
+- **When it takes effect.** The file browser and uploads: at once. The member's agent: with the AppContainer
+  backend at once (the folder's entry is narrowed, also for a running agent); with MXC at the agent's next start,
+  which the gateway does as soon as its run has finished - the page names the members whose agent is still
+  running with the earlier folders, and Admin > System > Workers > Restart applies it now.
+- **Without the sandbox** (`sandbox.enabled: false`) the agent runs as the gateway's Windows account and the
+  operating system does not stop it writing; only the file browser and uploads are held to read-only. The team
+  page warns.
+- The gateway's account must be able to read the folder; with the AppContainer backend it must also be allowed to
+  change the folder's permissions (as for writable folders).
+- Read-only folders are held to the same rules as writable ones: no drive roots, system folders, the profiles
+  root, Goose's own data or other people's profiles (C-11).
+
+#### 9.9c Where attached files go (1.25.0)
+
+Files attached in the message box are written to `Web_Uploads` inside the chat's folder; the folder is created
+when needed. The server names it - the page only says which chat folder. An attachment is refused, and nothing is
+written, when the person may not write in the chat folder (a read-only folder), when a `Web_Uploads` there is a
+link to somewhere they may not write, or when Windows refuses. Existing files are never overwritten
+(`report (1).pdf`). Earlier versions wrote to `.goose-web-uploads`; those files stay where they are.
+
 A team can hand recipes, skills, extensions and providers to its members. In the team's "Library items" section,
 choose "Add from library", pick a profile (any user, including your own native profile) and a kind, then add an
-item. It is copied into the team:
+item. It is copied into the team. (Providers: since 1.25.0 the switch in the team's provider list does this for
+your own providers; "Give a provider from another profile" there opens the same picker.) An item whose source
+is no longer in the profile it was taken from is marked "source removed": the team keeps its copy until you
+remove it - but a provider's key is read from the source at every provisioning, so such a provider has no key
+for the members any more. An extension that starts a program (stdio) is delivered only to a team with the
+Shell permission; the page says when a team's item is therefore not delivered (1.25.0).
 
 | Kind | Delivered to members as |
 |---|---|
@@ -1741,15 +1801,36 @@ Requirements and limits:
     `goose-web sandbox devices` shows both, and on a server whether the start-up task below is there.
     An administrator can let application packages in on them as Windows 11 does - it only ever adds, and it
     applies to every application container on the machine:
-    - **To stay** (since 1.24.1): from an elevated prompt, `scripts\register-devices-task.ps1`. It copies
-      `grant-devices.ps1` - a script that needs nothing but Windows - to `<ProgramData>\GooseWeb`, a folder it
-      gives to the Administrators and that only SYSTEM and administrators can write, registers the task
-      `\GooseWeb\GooseWeb_Devices` (at system start-up, as SYSTEM, Windows PowerShell with that copy), and runs it
-      once. Nothing of Goose Web's own folder runs as SYSTEM. `-Remove` takes it away, `-DryRun` shows what it
-      would do. On a machine that allows only signed scripts the task cannot run the file; the script says so.
+    - **To stay** (since 1.24.1; changed in 1.25.0): from an elevated Windows PowerShell prompt,
+      `scripts\register-devices-task.ps1`. It copies `grant-devices.ps1` - a script that needs nothing but
+      Windows - to `<Program Files>\GooseWeb.Startup`, registers the task `\GooseWeb\GooseWeb_Devices` (at system
+      start-up, as SYSTEM, Windows PowerShell with that copy), and runs it once. `-Remove` takes it away,
+      `-DryRun` shows what it would do. On a machine that allows only signed scripts the task cannot run the
+      file; the script says so.
+      - **What you trust when you run it.** The copy is made from the `grant-devices.ps1` beside the script, and
+        the script itself runs elevated: whoever can change those two files decides what runs as SYSTEM at every
+        start. They must come from a place that only administrators (and you) can change. The script looks at
+        the two files, their folder and the folder above, and stops when somebody else can write them. If Goose
+        Web's install folder is writable by the account the gateway runs as - or by anybody who is not an
+        administrator - copy the two scripts from the published release into a folder only administrators can
+        write, compare them with the release (`Get-FileHash`), and run them from there; `-TrustSource` is for
+        when you have compared them yourself. The script prints the SHA-256 of what it installed.
+      - **If you ran it with 1.24.1 or 1.24.2**: those versions put the copy in `<ProgramData>\GooseWeb` and used
+        a folder of that name that was already there. Any account of the machine can create a folder in
+        ProgramData beforehand and then owns it; an account that did could change the script SYSTEM runs. Run
+        the 1.25.0 script again (it registers the task anew with the copy in Program Files and removes the old
+        copy) and restart Windows. If you want to know whether the old folder was somebody's: before running it,
+        `Get-Acl C:\ProgramData\GooseWeb | Format-List Owner,AccessToString` and the folder's creation time
+        against the time you first ran the script.
+      - When the task folder `\GooseWeb\` in Task Scheduler belongs to an account that is not an administrator
+        (it was made by registering the gateway's own task without elevation), the task is registered in
+        `\GooseWeb.Startup\` instead; `goose-web sandbox devices` looks in both.
     - **Until Windows restarts**: from an elevated prompt, `goose-web --config <config.yaml> sandbox devices grant`.
     - Do not make a task of your own that runs Goose Web's Python as SYSTEM: whoever can change the install folder
-      or its Python could then become SYSTEM.
+      or its Python could then become SYSTEM. For the same reason, an administrator who runs anything of the
+      install folder elevated (`install.ps1`, `upgrade.ps1`, `goose-web sandbox devices grant`) trusts every
+      account that can change that folder: keep it writable by administrators and the installing account only
+      (`install.ps1` sets that; `goose-web check` says when it is not so).
     The gateway tests at its own start, and once more three minutes later when something was out of reach (the
     task may run after it); `upgrade.ps1` says when the task is missing.
   - Run the gateway under an account of its own. On the window station of SYSTEM, NETWORK SERVICE or LOCAL SERVICE
@@ -2317,8 +2398,8 @@ everything gone (back up first).
 8. Set up each team on its Experience page, starting with **Everyone** (which allows nothing on a new install):
    allowed providers, models and approval modes, a default model, team hints, folders and run limits. Clear every
    warning marked as an error.
-9. Set the default team, the sign-in lifetime and the branding in Admin > Settings. Consider lowering
-   `auth.remember_days`.
+9. Set the default team, the sign-in lifetime (8 hours at most) and the branding in Admin > Settings. Consider
+   an idle limit (`auth.idle_minutes`) where devices are shared.
 10. Add shared providers, extensions, skills and recipes as team items, and shared hints documents.
 11. Create user accounts (or let LDAP/OIDC create them) and check one user's experience with a non-admin account.
 12. Decide who owns the native profile's scheduler (`goose.native_scheduler`) if Goose Desktop is used on the same
@@ -2339,7 +2420,7 @@ This list follows the code's behaviour; the full reasoning is in
 | Proxies | Put only the proxy's own address in `server.trusted_proxies`, and make the proxy overwrite `X-Forwarded-For`. |
 | Host and Origin | Keep `server.allowed_hosts` and `server.allowed_origins` empty unless users really use another name or a direct address. |
 | Admin accounts | Few admins. Two-factor for all of them, then "Require two-factor for administrators". One local break-glass admin with a strong password stored safely. |
-| Sessions | Lower `auth.remember_days` and the sign-in lifetime if devices are shared. Users can revoke sessions in their settings. |
+| Sessions | A sign-in lasts 8 hours at most; lower the sign-in lifetime, and set "End an unused sign-in after", if devices are shared. Users can revoke sessions in their settings. |
 | Failed sign-ins | Keep the address block on (`auth.ip_block_threshold` 10). Check Admin > Blocked addresses now and then; exempt only networks you control. |
 | Directory sign-in | LDAP over `ldaps://` or StartTLS with `caFile` for a private CA, least-privilege bind account, `allowInsecure` off. OIDC with an `https://` issuer, exact redirect URI, and `stripDomain: false` if the identity provider has more than one domain. |
 | Policies | Leave `allow_shell`, `config_edit`, `extensions_edit`, `providers_edit` and `notify_webhook` off for ordinary teams. Set `allowed_modes`, `allowed_providers`, `allowed_models`, `allowed_roots` and `max_concurrent_runs`, with explicit values rather than Any where you can. Keep personal hints off where team hints must be final. Remember that all teams share one Windows account (section 11.3). |

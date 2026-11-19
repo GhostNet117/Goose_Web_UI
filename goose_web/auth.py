@@ -22,6 +22,35 @@ from .ipblock import BLOCKED_MESSAGE, IPBlocker
 log = logging.getLogger("goose_web.auth")
 
 API_TOKEN_PREFIX = "gwt_"
+
+# Spec 032: a sign-in is good for eight hours at most, whatever is configured. A copied cookie is a working sign-in
+# for as long as it lives, and this product starts programs for whoever is signed in.
+SESSION_HOURS_MAX = 8.0
+IDLE_MINUTES_MAX = 480.0
+IDLE_MINUTES_MIN = 5.0
+
+
+def clamp_session_hours(raw: Any) -> float:
+    """A configured sign-in lifetime in hours -> what is used: above the limit, empty, zero or not a number =
+    SESSION_HOURS_MAX; never below a minute."""
+    try:
+        h = float(raw)
+    except (TypeError, ValueError):
+        return SESSION_HOURS_MAX
+    if not (h > 0) or h > SESSION_HOURS_MAX:      # also NaN
+        return SESSION_HOURS_MAX
+    return max(h, 1 / 60)
+
+
+def clamp_idle_minutes(raw: Any) -> float:
+    """0 (or nothing, or not a number) = no idle limit; otherwise IDLE_MINUTES_MIN .. IDLE_MINUTES_MAX."""
+    try:
+        m = float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (m > 0):
+        return 0.0
+    return max(IDLE_MINUTES_MIN, min(IDLE_MINUTES_MAX, m))
 MASK = "********"
 
 DEFAULT_AUTH = {
@@ -590,37 +619,75 @@ class AuthService:
         return bool(user.get("totp_enabled")) and bool(code) and self.accept_totp(user, code)
 
     # ------------------------------------------------------------ sessions
-    def session_seconds(self, remember: bool) -> float:
-        if remember:
-            return 86400 * float(self.s.get("auth", "remember_days") or 30)
-        return 3600 * float(self.db.get_setting("session_hours") or self.s.get("auth", "session_hours") or 12)
+    def session_hours(self) -> float:
+        """How long a sign-in lasts (spec 032): the administrator's setting, else `auth.session_hours`, never more
+        than SESSION_HOURS_MAX. Fixed at sign-in, never extended. There is no "keep me signed in"."""
+        return clamp_session_hours(self.db.get_setting("session_hours") or self.s.get("auth", "session_hours"))
 
-    def create_session(self, user: dict, ip: str, ua: str, method: str, remember: bool = False) -> tuple[str, str]:
+    def session_seconds(self) -> float:
+        return 3600 * self.session_hours()
+
+    def idle_seconds(self) -> float:
+        """A sign-in no browser has used for this long ends; 0 = no such limit (the default). "Used" is any request
+        and the 30-second re-check of an open tab's connection, so this ends forgotten sign-ins, not open tabs."""
+        raw = self.db.get_setting("idle_minutes")
+        return 60 * clamp_idle_minutes(self.s.get("auth", "idle_minutes") if raw is None else raw)
+
+    def create_session(self, user: dict, ip: str, ua: str, method: str) -> tuple[str, str]:
         token = security.new_token()
         csrf = security.new_token(24)
         now = time.time()
         self.db.execute(
             "INSERT INTO auth_sessions(token_hash, user_id, csrf, created_at, expires_at, last_seen, ip, user_agent,"
             " method) VALUES(?,?,?,?,?,?,?,?,?)",
-            (security.token_hash(token), user["id"], csrf, now, now + self.session_seconds(remember), now, ip,
+            (security.token_hash(token), user["id"], csrf, now, now + self.session_seconds(), now, ip,
              (ua or "")[:300], method))
         self.db.execute("DELETE FROM auth_sessions WHERE expires_at < ?", (now,))
         return token, csrf
 
+    def clamp_sessions(self) -> int:
+        """Start-up (spec 032): no stored sign-in outlives the lifetime counted from when it was made. Sign-ins of
+        an earlier version ("keep me signed in": 30 days; an administrator's setting of up to 720 hours) end here.
+        Returns how many were cut short or removed."""
+        now, limit = time.time(), self.session_seconds()
+        n = self.db.execute_count("UPDATE auth_sessions SET expires_at = created_at + ? WHERE expires_at > created_at + ?",
+                                  (limit, limit))
+        self.db.execute("DELETE FROM auth_sessions WHERE expires_at < ?", (now,))
+        return n
+
+    def session_alive(self, token_hash: str) -> dict | None:
+        """The stored sign-in when it is still good, else None: not past its lifetime and - with an idle limit -
+        used recently enough (an idle one is ended here, on the server). Marks it as used.
+
+        Called for every request that carries the cookie AND by the 30-second re-check of an open tab's connection
+        (app.ws_endpoint.still_valid): chatting goes over that connection, not over requests, so without the second
+        caller somebody who had been chatting for longer than the idle limit was signed out by their next upload
+        (review 20261119_5, R-1). An open tab therefore counts as use."""
+        row = self.db.one("SELECT * FROM auth_sessions WHERE token_hash=?", (token_hash,))
+        now = time.time()
+        if not row or row["expires_at"] < now:
+            return None
+        idle = self.idle_seconds()
+        if idle and now - row["last_seen"] > idle:
+            # spec 032: nobody has used this sign-in for longer than the idle limit
+            self.db.execute("DELETE FROM auth_sessions WHERE token_hash=?", (row["token_hash"],))
+            return None
+        if now - row["last_seen"] > (min(60.0, idle / 4) if idle else 60.0):
+            # Session lifetimes are fixed: expires_at is set once at sign-in and never extended (no sliding
+            # expiry). last_seen is the "signed-in devices" list's bookkeeping and what the idle limit measures
+            # (written often enough for it: at most a quarter of the limit late).
+            self.db.execute("UPDATE auth_sessions SET last_seen=? WHERE token_hash=?", (now, row["token_hash"]))
+        return row
+
     def resolve_cookie(self, token: str) -> Identity | None:
         if not token or len(token) > 200:
             return None
-        row = self.db.one("SELECT * FROM auth_sessions WHERE token_hash=?", (security.token_hash(token),))
-        now = time.time()
-        if not row or row["expires_at"] < now:
+        row = self.session_alive(security.token_hash(token))
+        if not row:
             return None
         user = self.db.user_by_id(row["user_id"])
         if not user or user["disabled"]:
             return None
-        if now - row["last_seen"] > 60:
-            # Session lifetimes are fixed: expires_at is set once at sign-in and never extended (no sliding
-            # expiry). last_seen is only activity bookkeeping for the "signed-in devices" list.
-            self.db.execute("UPDATE auth_sessions SET last_seen=? WHERE token_hash=?", (now, row["token_hash"]))
         return Identity(user=user, session=row, via="cookie")
 
     def resolve_token(self, token: str) -> Identity | None:

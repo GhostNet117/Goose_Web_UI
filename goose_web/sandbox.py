@@ -72,11 +72,13 @@ def legacy_container_name(profiles_root: str, username: str) -> str:
     return f"GooseWeb.{_root_hash(profiles_root)}.{user}"
 
 
-def desired_grants(profile_root: str, roots: list[str], read_dirs: list[str], goose_binary: str) -> dict[str, str]:
-    """{path: 'modify'|'read'} the container needs. Modify wins over read for the same path."""
+def desired_grants(profile_root: str, roots: list[str], read_dirs: list[str], goose_binary: str,
+                   read_roots: list[str] | tuple = ()) -> dict[str, str]:
+    """{path: 'modify'|'read'} the container needs. Modify wins over read for the same path. `roots`: the folders
+    the member may write; `read_roots`: the team's read-only folders (spec 031) - granted like a program folder."""
     out: dict[str, str] = {}
     for d in [os.path.dirname(os.path.abspath(goose_binary)) if goose_binary and os.path.isabs(goose_binary) else "",
-              *read_dirs]:
+              *read_dirs, *read_roots]:
         if d:
             out[os.path.normpath(d)] = "read"
     for d in [profile_root, *roots]:
@@ -1048,6 +1050,8 @@ LIMIT_REMEDY = ("Windows Server does not let application containers in on the tw
                 "every start of Windows), or goose-web sandbox devices grant (elevated; until Windows restarts) - "
                 "ADMINISTRATION 11.6")
 DEVICES_TASK = "\\GooseWeb\\GooseWeb_Devices"      # scripts/register-devices-task.ps1
+# ... which registers it here instead when the usual task folder was made by an account that is no administrator
+DEVICES_TASK_FALLBACK = "\\GooseWeb.Startup\\GooseWeb_Devices"
 
 
 def devices_task() -> bool | None:
@@ -1056,11 +1060,14 @@ def devices_task() -> bool | None:
         return None
     exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "schtasks.exe")
     try:
-        r = subprocess.run([exe, "/query", "/tn", DEVICES_TASK], capture_output=True, timeout=30,   # nosec B603
-                           stdin=subprocess.DEVNULL, creationflags=0x08000000)
+        for name in (DEVICES_TASK, DEVICES_TASK_FALLBACK):
+            r = subprocess.run([exe, "/query", "/tn", name], capture_output=True, timeout=30,   # nosec B603
+                               stdin=subprocess.DEVNULL, creationflags=0x08000000)
+            if r.returncode == 0:
+                return True
     except (OSError, subprocess.SubprocessError):
         return None
-    return r.returncode == 0
+    return False
 
 
 def _selftest_limits(sid: str, python: str, desktop: str = "") -> list[str]:
@@ -1463,11 +1470,24 @@ def shrink(name: str, state_dir: str, grants: dict[str, str]) -> dict:
         if not sid:
             return {}
         wanted = {norm(p) for p in grants}
-        keep, pending, gone = {}, {}, []
+        want_right = {norm(p): r for p, r in grants.items()}
+        keep, pending, gone, narrowed = {}, {}, [], []
         for source, target in ((st.get("grants") or {}, keep), (st.get("pending") or {}, pending)):
             for p, r in source.items():
+                if norm(p) in wanted and r == "modify" and want_right[norm(p)] == "read" and os.path.isdir(p):
+                    # Spec 031 (review 20261119_5, R-2): the folder is now read-only for this member. The Modify
+                    # entry is replaced by a read entry at once - a running agent must not go on writing there
+                    # until its next start. (A right that GROWS is still the next start's business.)
+                    try:
+                        grant(p, sid, "read")
+                        keep[p] = "read"
+                        narrowed.append(p)
+                    except SandboxError as e:
+                        log.warning("sandbox %s: %s could not be narrowed to read: %s", name, p, e)
+                        pending[p] = _still_there(p, sid, r) or r
+                    continue
                 if norm(p) in wanted or not os.path.isdir(p):
-                    target[p] = r       # still wanted (a changed right is the next start's business), or not there now
+                    target[p] = r       # still wanted (a right that grows is the next start's business), or not there now
                     continue
                 try:
                     _take_off(p, sid, keep=grants)
@@ -1479,7 +1499,9 @@ def shrink(name: str, state_dir: str, grants: dict[str, str]) -> dict:
             _save_state(state_dir, name, {**st, "grants": keep, "pending": pending, "updatedAt": time.time()})
         if gone:
             log.info("sandbox %s: entries taken off at once (no longer permitted): %s", name, sorted(gone))
-        return {"revoked": gone, "pending": pending}
+        if narrowed:
+            log.info("sandbox %s: entries narrowed to read at once (now read-only): %s", name, sorted(narrowed))
+        return {"revoked": gone, "pending": pending, "narrowed": narrowed}
 
 
 def remove(state_dir: str, name: str) -> dict:

@@ -1236,6 +1236,11 @@ class Upstream:
                     st = os.fstat(fh.fileno())
                     if not stat.S_ISREG(st.st_mode) or st.st_size > 1_048_576:
                         raise OSError("not a regular file of at most 1 MB")
+                    # S-5: the path was judged before it was opened. Where the open really ended (a link put in
+                    # between) is asked of the open file; elsewhere than in the member's folders = not read.
+                    final = security.final_path(fh.fileno())
+                    if final is not None and not pol.path_allowed(final, [r for r in (roots or []) if r]):
+                        raise OSError("the file that was opened is not in one of the member's folders")
                     blob = fh.read(1_048_577)
                 if len(blob) > 1_048_576:
                     raise OSError("more than 1 MB")
@@ -1562,6 +1567,10 @@ class Upstream:
                     s.run_id = None
                     self._set_status(s, "error", error=err)
                     self.hub.notify_event(self, s.sid, "error")
+                    # S-8: a prompt for a session Goose never loaded here (any id a script makes up) must not keep
+                    # its state alive by being "watched" for as long as the socket lives
+                    if client is not None and s.load_result is None:
+                        client.watch.discard(s.sid)
         elif method == STEER:
             s = self.sessions.get(sid0)
             e = next((x for x in s.steers if x["blocks"] is params.get("prompt")), None) if s else None

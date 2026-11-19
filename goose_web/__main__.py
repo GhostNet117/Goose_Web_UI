@@ -1376,17 +1376,39 @@ def _signin_lines(settings) -> list[tuple[str, str]]:
     database is opened read-only."""
     import json as _json
     import sqlite3
-    from .auth import oidc_url_insecure
+    from .auth import SESSION_HOURS_MAX, clamp_idle_minutes, clamp_session_hours, oidc_url_insecure
     dbf = Path(settings.system_dir) / "goose-web.db"
-    if not dbf.is_file():
-        return []
     out = []
-    try:
-        con = sqlite3.connect(dbf.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    stored: dict = {}
+    row = None
+    if dbf.is_file():
         try:
-            row = con.execute("SELECT value FROM settings WHERE key='auth'").fetchone()
-        finally:
-            con.close()
+            con = sqlite3.connect(dbf.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+            try:
+                row = con.execute("SELECT value FROM settings WHERE key='auth'").fetchone()
+                for k in ("session_hours", "idle_minutes"):
+                    r = con.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+                    if r:
+                        stored[k] = _json.loads(r[0])
+            finally:
+                con.close()
+        except (sqlite3.Error, ValueError, TypeError):
+            row = None
+    # spec 032: how long a sign-in lasts, and a configured value that is above the limit (it counts as the limit)
+    asked = stored.get("session_hours") or settings.get("auth", "session_hours")
+    hours = clamp_session_hours(asked)
+    idle = clamp_idle_minutes(stored["idle_minutes"] if "idle_minutes" in stored else settings.get("auth", "idle_minutes"))
+    out.append(("--", f"sign-in: lasts {hours:g} h from signing in, never extended; no \"keep me signed in\"; "
+                      + (f"an unused sign-in ends after {idle:g} min" if idle else "no idle limit (auth.idle_minutes)")))
+    try:
+        if asked not in (None, "") and float(asked) > SESSION_HOURS_MAX:
+            out.append(("!!", f"sign-in lifetime: {asked} hours is configured, the limit is {SESSION_HOURS_MAX:g} - "
+                              f"{SESSION_HOURS_MAX:g} is used"))
+    except (TypeError, ValueError):
+        out.append(("!!", f"sign-in lifetime: {asked!r} is not a number of hours - {SESSION_HOURS_MAX:g} is used"))
+    if not dbf.is_file():
+        return out
+    try:
         for o in (_json.loads(row[0]) if row else {}).get("oidc") or []:
             if isinstance(o, dict) and oidc_url_insecure(o.get("issuer"), o):
                 out.append(("!!", f"sign-in provider {str(o.get('id'))[:40]!r}: its issuer is not an https address, "

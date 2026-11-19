@@ -261,8 +261,8 @@ DEFAULTS: dict[str, Any] = {
         "max_items": 40,                  # entries (groups) in the list
     },
     "auth": {
-        "session_hours": 12,
-        "remember_days": 30,
+        "session_hours": 8,               # how long a sign-in lasts; 8 is also the most (spec 032)
+        "idle_minutes": 0,                # end a sign-in no browser has used for this long; 0 = off (5 to 480)
         "lockout_threshold": 8,
         "lockout_minutes": 15,
         "min_password_length": 12,        # never below 12 (strong-password floor, security.PASSWORD_MIN_LENGTH)
@@ -400,6 +400,13 @@ def load_settings(explicit: str | None = None) -> Settings:
     return s
 
 
+# Settings that existed once: named with the reason when a configuration file still has them.
+REMOVED_SETTINGS = {
+    ("auth", "remember_days"): "removed in 1.25.0: there is no \"keep me signed in\" any more; a sign-in lasts "
+                               "auth.session_hours, 8 hours at most",
+}
+
+
 def unknown_settings(raw: Any) -> list[str]:
     """The names in a configuration file that no setting answers to: "section" or "section.key"."""
     if not isinstance(raw, dict):
@@ -409,7 +416,8 @@ def unknown_settings(raw: Any) -> list[str]:
         if sec not in DEFAULTS:
             out.append(str(sec))
         elif isinstance(val, dict):
-            out += [f"{sec}.{k}" for k in val if k not in DEFAULTS[sec]]
+            out += [f"{sec}.{k}" + (f" ({REMOVED_SETTINGS[(sec, k)]})" if (sec, k) in REMOVED_SETTINGS else "")
+                    for k in val if k not in DEFAULTS[sec]]
         elif val is not None:
             out.append(f"{sec} (must be a section with settings below it)")
     return out

@@ -13,7 +13,8 @@ export async function fsRoots() {
 
 export function pickFolder({ title = 'Choose a working folder', initial = '', confirmText = 'Use this folder', files = false } = {}) {
   return new Promise((resolve) => {
-    let current = null; let entries = []; let parent = null; let filter = '';
+    let current = null; let entries = []; let parent = null; let filter = ''; let access = 'write';
+    const roNote = h('div', { class: 'fp-ro', hidden: true }, icon('lock', 13), ' Read only: your team may read this folder, not change it. Files cannot be attached to a chat that works here.');
     const pathInp = input({ placeholder: 'Type or paste a path and press Enter', 'aria-label': 'Path' });
     const listEl = h('div', { class: 'fp-list', role: 'listbox' });
     const rootsEl = h('div', { class: 'fp-roots' });
@@ -25,7 +26,8 @@ export function pickFolder({ title = 'Choose a working folder', initial = '', co
       listEl.replaceChildren(h('div', { class: 'fp-loading' }, spinner(16)));
       try {
         const r = await GET('/api/fs/list' + qs({ path: p }));
-        current = r.path; parent = r.parent; entries = r.entries || [];
+        current = r.path; parent = r.parent; entries = r.entries || []; access = r.access || 'write';
+        roNote.hidden = access !== 'read'; if (newBtn) newBtn.hidden = access === 'read';
         pathInp.value = current; filter = ''; filterInp.value = '';
         renderCrumbs(); renderList();
       } catch (e) { listEl.replaceChildren(h('div', { class: 'fp-err' }, icon('alert', 14), ' ', e.message)); }
@@ -58,6 +60,13 @@ export function pickFolder({ title = 'Choose a working folder', initial = '', co
     pathInp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); go(pathInp.value.trim()); } });
 
     let m;
+    const newBtn = iconBtn('folderPlus', 'New folder', async () => {
+      if (!current) return;
+      const name = await promptDialog({ title: 'New folder', label: 'Folder name', confirmText: 'Create', validate: (v) => (!v.trim() ? 'Required' : /[\\/:*?"<>|]/.test(v) ? 'Invalid characters' : null) });
+      if (!name) return;
+      const p = joinPath(current, name.trim());
+      try { await POST('/api/fs/mkdir', { path: p }); await go(p); } catch (e) { toastError(e, 'Create folder'); }
+    });
     const finish = (p) => { if (!files) addRecentFolder(p); m.close(p); };
     const recent = (pref('recentFolders') || []).slice(0, 8);
     m = modal({
@@ -67,14 +76,9 @@ export function pickFolder({ title = 'Choose a working folder', initial = '', co
           recent.length ? h('div', { class: 'fp-side-head' }, 'Recent') : null,
           ...recent.map((r) => h('button', { type: 'button', class: 'fp-root', title: r, onclick: () => go(r) }, icon('schedule', 13), h('span', null, baseName(r))))),
         h('div', { class: 'fp-main' },
-          h('div', { class: 'fp-bar' }, pathInp, iconBtn('folderPlus', 'New folder', async () => {
-            if (!current) return;
-            const name = await promptDialog({ title: 'New folder', label: 'Folder name', confirmText: 'Create', validate: (v) => (!v.trim() ? 'Required' : /[\\/:*?"<>|]/.test(v) ? 'Invalid characters' : null) });
-            if (!name) return;
-            const p = joinPath(current, name.trim());
-            try { await POST('/api/fs/mkdir', { path: p }); await go(p); } catch (e) { toastError(e, 'Create folder'); }
-          })),
+          h('div', { class: 'fp-bar' }, pathInp, newBtn),
           h('div', { class: 'fp-bar2' }, crumbs, filterInp),
+          roNote,
           listEl)),
       footer: [h('div', { class: 'fp-sel muted' }), btn('Cancel', () => m.close(null)), btn(confirmText, () => {
         if (files) { if (selectedFile) finish(selectedFile); return; }
@@ -85,7 +89,8 @@ export function pickFolder({ title = 'Choose a working folder', initial = '', co
     (async () => {
       try {
         const r = await fsRoots();
-        rootsEl.replaceChildren(...(r.roots || []).map((x) => h('button', { type: 'button', class: 'fp-root', title: x.path, onclick: () => go(x.path) }, icon('folder', 13), h('span', null, x.label || baseName(x.path)))));
+        rootsEl.replaceChildren(...(r.roots || []).map((x) => h('button', { type: 'button', class: 'fp-root', title: x.path + (x.access === 'read' ? ' (read only)' : ''), onclick: () => go(x.path) },
+          icon(x.access === 'read' ? 'lock' : 'folder', 13), h('span', null, x.label || baseName(x.path)), x.access === 'read' ? h('span', { class: 'fp-ro-tag' }, 'read only') : null)));
         if (r.home && !(r.roots || []).some((x) => x.path === r.home)) rootsEl.prepend(h('button', { type: 'button', class: 'fp-root', onclick: () => go(r.home) }, icon('user', 13), h('span', null, 'Home')));
         go(initial || pref('lastCwd') || r.defaultCwd || r.home || (r.roots && r.roots[0] && r.roots[0].path) || '');
       } catch (e) { toastError(e, 'Folders'); listEl.replaceChildren(h('div', { class: 'fp-err' }, e.message)); }

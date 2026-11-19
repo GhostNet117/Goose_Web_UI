@@ -282,3 +282,33 @@ def safe_name(value: str, max_len: int = 64) -> str:
                                    *(f"LPT{i}" for i in range(10))} or v.startswith("_") or v.endswith("."):
         raise ValueError("reserved name")
     return v
+
+
+def final_path(fd: int) -> str | None:
+    """Where an OPEN file really is - the path of the handle, links resolved by the open itself - or None when it
+    cannot be asked (not Windows, an error). For checks that must hold for the file that was opened rather than
+    for the name that was looked at a moment before (review 20261119_6, S-5)."""
+    import os
+    if os.name != "nt":
+        try:
+            return os.path.realpath(f"/proc/self/fd/{fd}") if os.path.exists(f"/proc/self/fd/{fd}") else None
+        except OSError:
+            return None
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+        k32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        h = msvcrt.get_osfhandle(fd)
+        buf = ctypes.create_unicode_buffer(32768)
+        n = k32.GetFinalPathNameByHandleW(h, buf, len(buf), 0)      # 0: normalised, with a drive letter
+        if not n or n >= len(buf):
+            return None
+        p = buf.value
+        if p.startswith("\\\\?\\UNC\\"):
+            return "\\\\" + p[8:]
+        return p[4:] if p.startswith("\\\\?\\") else p
+    except Exception:
+        return None

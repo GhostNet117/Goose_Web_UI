@@ -31,7 +31,7 @@ is a number.
 |---|---|---|
 | GET | `/healthz` | `ok` (text) |
 | GET | `/api/auth/config` | `{ brand:{name, tagline}, version, local:true, ldap:{enabled, label}, oidc:[{id,label}] }` |
-| POST | `/api/auth/login` | `{username, password, totp?, remember?}` → `{user, csrf, mustChangePassword, totpEnrolmentRequired}`. Errors: `401 invalid_credentials`, `401 totp_required` (ask for the code and resend), `401 totp_invalid` (wrong or already used code; counts toward the lockout), `423 locked`, `429 rate_limited`, `403 ip_blocked` (too many failed sign-ins from this address; while blocked, every request from it gets this 403), `503 ldap_insecure` (LDAP configured without TLS, see `ldap.allowInsecure`), `403 bad_origin` |
+| POST | `/api/auth/login` | `{username, password, totp?}` → `{user, csrf, mustChangePassword, totpEnrolmentRequired}` and the sign-in cookie (a session cookie: no `Max-Age`; the sign-in ends on the server after `session_hours`, 8 at most; a `remember` field is ignored since 1.25.0). Errors: `401 invalid_credentials`, `401 totp_required` (ask for the code and resend), `401 totp_invalid` (wrong or already used code; counts toward the lockout), `423 locked`, `429 rate_limited`, `403 ip_blocked` (too many failed sign-ins from this address; while blocked, every request from it gets this 403), `503 ldap_insecure` (LDAP configured without TLS, see `ldap.allowInsecure`), `403 bad_origin` |
 | POST | `/api/auth/logout` | `{}` → `{ok:true}` |
 | GET | `/api/auth/oidc/{id}/start` | 302 to the IdP. On an error, 302 to `/#/login?error=<code>`, for example `oidc_needs_public_url` (OIDC needs `server.public_url`) |
 | GET | `/api/auth/oidc/{id}/callback` | 302 to `/` (or to `/#/login?error=...`, for example `oidc_conflict` when the name belongs to a local/LDAP account or is bound to another issuer + subject) |
@@ -60,10 +60,10 @@ is a number.
 
 | Method | Path | Body / result |
 |---|---|---|
-| GET | `/api/fs/roots` | `{roots:[{path,label}], home, defaultCwd}`. For non-admins: the workspace (`Workspace`), the team folder (label `Team: ` + the team name), then the team's extra folders (labelled with the folder name) |
-| GET | `/api/fs/list?path=` | `{path, parent, entries:[{name, path, dir, size, mtime}]}` (max 2000 entries) |
-| POST | `/api/fs/mkdir` | `{path}`. Non-admins get `403 hint_file_refused` when the new folder is named `AGENTS.md`, `.goosehints` or `.goose-web-hints.md` (any case) |
-| POST | `/api/fs/upload?dir=<abs dir>` | multipart `file` (one or more, at most 20) → `{files:[{name,path,size,mime}]}`. Max size per file `server.max_upload_mb` (`413 too_large`). Names are sanitised: last path component only, Windows-invalid characters and trailing dots/spaces removed, device names such as `CON` prefixed with `_`, `upload.bin` if nothing is left. Non-admins get `403 hint_file_refused` for a file named `AGENTS.md`, `.goosehints` or `.goose-web-hints.md` (team hints are managed by the administrator). Existing files are never overwritten: the file is saved as `name (1).ext`, `name (2).ext` and so on. `name` and `path` in the result are the names actually used |
+| GET | `/api/fs/roots` | `{roots:[{path,label,access}], home, defaultCwd}`. For non-admins: the workspace (`Workspace`), the team folder (label `Team: ` + the team name), the team's extra folders (labelled with the folder name), then its read-only folders. `access` is `write` or `read` (1.25.0) |
+| GET | `/api/fs/list?path=` | `{path, parent, entries:[{name, path, dir, size, mtime}], access}` (max 2000 entries). `access`: `write`, or `read` when the caller may not create or change anything there |
+| POST | `/api/fs/mkdir` | `{path}`. `403 read_only_folder` in a folder the caller's team may only read. Non-admins get `403 hint_file_refused` when the new folder is named `AGENTS.md`, `.goosehints` or `.goose-web-hints.md` (any case) |
+| POST | `/api/fs/upload?dir=<chat folder>` | multipart `file` (one or more, at most 20) → `{files:[{name,path,size,mime}]}`. Since 1.25.0 the files are written to `<dir>\Web_Uploads` (created when needed; the server names it). `403 read_only_folder` ("You do not have write access to this folder, so files cannot be uploaded here.") when the caller may not write there - a read-only folder, a `Web_Uploads` that is a link to somewhere they may not write, or the file system refusing; `409 name_taken` when `Web_Uploads` exists and is not a folder; nothing is written then. Max size per file `server.max_upload_mb` (`413 too_large`). Names are sanitised: last path component only, Windows-invalid characters and trailing dots/spaces removed, device names such as `CON` prefixed with `_`, `upload.bin` if nothing is left. Non-admins get `403 hint_file_refused` for a file named `AGENTS.md`, `.goosehints` or `.goose-web-hints.md` (team hints are managed by the administrator). Existing files are never overwritten: the file is saved as `name (1).ext`, `name (2).ext` and so on. `name` and `path` in the result are the names actually used |
 | GET | `/api/fs/download?path=` | the file as an attachment: always `Content-Type: application/octet-stream`, `Content-Disposition: attachment`, `Content-Security-Policy: sandbox; default-src 'none'`, `Cache-Control: no-store` |
 | GET | `/api/fs/read?path=` | `{path, content, truncated}` (text, max 1 MB) |
 
@@ -121,7 +121,7 @@ is a number.
 | GET/PUT/DELETE | `/api/admin/hints/{id}` | |
 | GET | `/api/admin/library?profile=<username>&kind=recipe\|skill\|extension\|provider` | read-only listing of items in a profile that can be added to a team `[{kind, ref, name, description, source}]` |
 | GET/PUT | `/api/admin/auth` | `{ldap:{enabled, url, bindDn, bindPassword?, userBase, userFilter, adminGroupDn?, groupTeamMap:{groupDn: teamId}, startTls, caFile?, allowInsecure, label}, oidc:[{id,label,issuer,clientId,clientSecret?,scopes,adminClaim?,adminValue?,teamClaim?,autoCreate,stripDomain}], localEnabled}`. Secrets are write-only: reads return `"********"` when they are set. `400 bad_config` for an invalid configuration, for example an enabled `ldap://` URL without `startTls` while `allowInsecure` is false |
-| GET/PUT | `/api/admin/settings` | `{brand:{name,tagline}, defaultTeamId, sessionHours, allowSelfTotp, requireTotpForAdmins, peers:[{name,url,token?}]}`. Turning `requireTotpForAdmins` on returns `409 totp_needed_first` unless the calling admin already uses TOTP |
+| GET/PUT | `/api/admin/settings` | `{brand:{name,tagline}, defaultTeamId, sessionHours, sessionHoursMax, idleMinutes, allowSelfTotp, requireTotpForAdmins, requireTotpForAll, peers:[{name,url,token?}]}`. `sessionHours` 1 to 8 (`sessionHoursMax`, read only; more is stored as 8; lowering it cuts existing sign-ins), `idleMinutes` 0 or 5 to 480. Turning `requireTotpForAdmins` on returns `409 totp_needed_first` unless the calling admin already uses TOTP |
 | GET | `/api/admin/audit?limit=&before=&user=&action=` | `[{id, ts, username, ip, action, target, detail, ok}]` |
 | GET | `/api/admin/system` | `{version, gooseVersion, gooseBinary, integrity, elevated, user, profilesRoot, nativeRoot, desktopRunning, scheduler:{owner}, sandbox:{enabled, backend, configuredBackend, fallback, network, relays, problems, mxcDir, membersCanStart, reason, mxc:{available, reason, exe, version, contract, build, probe, signature, installed}, proxies:{<key>: {port, network, connections, relays, allowed, refused, unauthorized}}}, workers:[{key, username, pid, port, state, startedAt, clients, activeRuns, scheduler, restarts, lastError, sandboxed, sandboxBackend, proxyPort}]}` (`sandbox` since 1.19.0) |
 | POST | `/api/admin/system/workers/{key}/{action}` | `action` = `restart` \| `stop` |
@@ -138,8 +138,12 @@ is a number.
   `providers_edit`, `schedules`, `apps`, `prompts_edit`, `hints_edit`, `tools_permissions`, `config_edit`,
   `allow_shell`, `notify_webhook`), the lists `allowed_modes`, `allowed_providers` and `allowed_models`
   (`["*"]` = any, `[]` = nothing; a list that contains `*` is stored as `["*"]`), `allowed_roots` (absolute
-  paths), `max_concurrent_runs` (empty or missing = 3, `0` = unlimited), and optional `default_provider`,
-  `default_model` and `share_folder`.
+  paths: read and write) and `read_roots` (absolute paths: read only, 1.25.0; a folder in both lists is stored
+  as read-only), `max_concurrent_runs` (empty or missing = 3, `0` = unlimited), and optional `default_provider`,
+  `default_model`, `share_folder` and `provider_groups` (provider aliases for the members' pickers, 1.25.0).
+* A team PATCH also returns `restartPending`: the members whose running agent keeps the folders and network it
+  started with until its run has finished. Team items carry `sourceGone` (the profile it was taken from no
+  longer has it).
 * `teamFolder` is the team's shared folder: `share_folder`, or `<profiles_root>/_teams/<id>`.
 * `warnings[].level` is `err` (for example "No models allowed: members can't chat."), `warn` or `info`.
 
@@ -149,7 +153,7 @@ Team and policy errors:
 |---|---|
 | `400 one_team` | a user body sends `teams` with more than one id (a user belongs to one team at most) |
 | `400 bad_team` | the `team` value is not a team id, or the team does not exist |
-| `400 bad_folder` | a team's `share_folder` or an `allowed_roots` entry is not an absolute path, or `allowed_roots` contains `*` |
+| `400 bad_folder` | a team's `share_folder`, or an `allowed_roots` / `read_roots` entry, is not an absolute path or is a folder that must not be shared; a list contains `*`; a read-only folder is, or lies inside, a folder the same team (or person, for overrides) can write |
 | `403 hint_file_refused` | a non-admin uploads or creates something named `AGENTS.md`, `.goosehints` or `.goose-web-hints.md` |
 
 Team policies accept `guard` (see CONFIGURATION 5). `GET /api/me` returns `guard` (classifier health) for administrators while a prompt guard is on, else `null`.

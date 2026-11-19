@@ -508,12 +508,28 @@ export class ChatSession extends Emitter {
       const res = await rpc.call(G('session/steer'), { sessionId: this.id, prompt: blocks, expectedRunId: this.activeRunId });
       this.transcript.markUserSent(item);
       if (res && res.messageId) {
+        // Goose's echo may have come first: then our bubble already carries the id (transcript.addUser adopted
+        // it) and says "delivered". Should the echo have made a bubble of its own, ours goes - never two.
+        const shown = this.transcript.users.get(res.messageId);
+        if (shown && shown !== item) { this.transcript.removeItem(item); return; }
         item.messageId = res.messageId; this.transcript.users.set(res.messageId, item);
         if (item.steerState === 'sending') this.transcript.setSteerState(item, 'pending');
       }
     } catch (e) {
-      if (item.el) item.el.remove();
+      // Goose's echo arrived although the call failed: the agent has the steer. Sending it again would be a second
+      // message.
+      if (item.messageId || item.steerState === 'delivered') { this.transcript.markUserSent(item); return; }
+      this.transcript.removeItem(item);
       if (e && e.code === -32003) { this.transcript.sys('Steer refused: ' + errMsg(e), 'error'); return; }
+      if (e && e.disconnected) {
+        // The connection dropped while the call was on its way: Goose may or may not have it. Queued as held, so
+        // nothing sends it again by itself (that could give the agent the same message twice).
+        const note = 'The connection dropped while this steer was being sent, so it may or may not have reached the agent. Look at the chat before you send it again.';
+        this.queue.push({ id: 'local-' + (++localSeq), blocks, local: true, held: true, steer: true, tag: 'Steer may not have arrived', note });
+        this.emit('queue');
+        this.transcript.sys('The connection dropped while the steer was being sent. It waits in the queue below and is not sent by itself: look at the chat first.', 'warn');
+        return;
+      }
       this.transcript.sys('Steer failed: ' + errMsg(e) + ' (queued instead)', 'warn');
       this.enqueue(blocks);
     }

@@ -1753,7 +1753,11 @@ def test_the_start_up_task_runs_nothing_of_goose_web_and_its_script_does_the_gra
     assert {int(m, 16) for m in ("0x001201BF", "0x001200A0")} == set(sb.DEVICES.values())
     ps = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
     r = subprocess.run([*ps, str(scripts / "register-devices-task.ps1"), "-DryRun"], capture_output=True, text=True, timeout=120)
-    assert r.returncode == 0 and "as SYSTEM" in r.stdout and "GooseWeb\\grant-devices.ps1" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0 and "as SYSTEM" in r.stdout, r.stdout + r.stderr
+    # review 20261119_6, S-1: the copy lives where only administrators can create anything (Program Files), never
+    # in ProgramData, where any account can make the folder beforehand and own it
+    assert "\\GooseWeb.Startup\\grant-devices.ps1" in r.stdout and "Program Files" in r.stdout
+    assert "ProgramData" not in r.stdout.split("[dry run] then:")[0]
     assert "System32\\WindowsPowerShell\\v1.0\\powershell.exe" in r.stdout and "\\GooseWeb\\GooseWeb_Devices" in r.stdout
     # the script itself: run for real where that changes nothing (the devices are open already: Windows 11) or on
     # a CI runner, which is thrown away; never on somebody's Windows Server just because the tests ran elevated

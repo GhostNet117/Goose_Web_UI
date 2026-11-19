@@ -242,15 +242,16 @@ try {
     }
 
     # 5. dependencies. uv when one can be found: Goose ships it, and a virtualenv made by uv has no pip. Looked for
-    # on PATH, in Goose's own folder of this account, next to the goose binary the configuration names, in the
-    # virtualenv, and as a module of the virtualenv's Python. An account that upgrades but has no Goose of its own
-    # (a service account) had none of the first two, and the upgrade stopped at "Dependency installation failed
-    # (pip)" although nothing was wrong (found in use, 2026-11-16). Without any uv, pip is added when it is missing.
+    # on PATH, in Goose's own folder of this account, in the virtualenv, and as a module of the virtualenv's Python.
+    # An account that upgrades but has no Goose of its own (a service account) had none of the first two, and the
+    # upgrade stopped at "Dependency installation failed (pip)" although nothing was wrong (found in use,
+    # 2026-11-16). Without any uv, pip is added when it is missing. NOT looked for next to the goose binary
+    # (1.24.1 did): that folder can be writable by accounts with fewer rights than whoever runs the upgrade, and a
+    # uv.exe put there would have been run by the upgrade (review 20261119_6, S-3).
     $uv = (Get-Command uv -ErrorAction SilentlyContinue | Select-Object -First 1).Source
     $uvArgs = @()
     if (-not $uv) {
         $candidates = @((Join-Path $env:LOCALAPPDATA 'Goose\bin\uv.exe'), (Join-Path $InstallDir '.venv\Scripts\uv.exe'))
-        if ($gooseBin) { $candidates += (Join-Path (Split-Path $gooseBin) 'uv.exe') }
         foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { $uv = $c; break } }
     }
     if (-not $uv) {

@@ -7,6 +7,7 @@ import { store } from '../store.js';
 import { setBaseTitle } from '../herd.js';
 import { router } from '../router.js';
 import { mdElement } from '../markdown.js';
+import { groupPicker, ownGroups } from '../providergroups.js';
 
 const TABS = [
   { id: 'users', label: 'Users', icon: 'users' },
@@ -177,7 +178,7 @@ export const POLICY_FLAGS = [
 const FLAG_LABEL = Object.fromEntries(POLICY_FLAGS);
 const EXPERIENCE = [
   { id: 'hints', title: 'Hints', flags: ['hints_edit'] },
-  { id: 'models', title: 'Providers & models', flags: ['providers_edit'], kinds: ['provider'] },
+  { id: 'models', title: 'Providers & models', flags: ['providers_edit'] },   // spec 033: its providers are rows with a switch, not a table of library items
   { id: 'modes', title: 'Approval modes', flags: [] },
   { id: 'folders', title: 'Folders', flags: [] },
   { id: 'ext', title: 'Extensions & tools', flags: ['allow_shell', 'extensions_edit', 'tools_permissions', 'apps'], kinds: ['extension'] },
@@ -240,7 +241,37 @@ async function loadProviderCatalog(force = false) {
   return providerCatalog;
 }
 
-function providerModelPicker(pol, catalog) {
+// Spec 031: a team's extra folders, one row each. The switch says whether the members (and their agents) may
+// write there; off = read only. Stored as two lists: allowed_roots (read and write) and read_roots.
+function folderList(rw, ro) {
+  const rows = [...(rw || []).map((p) => ({ path: p, write: true })), ...(ro || []).map((p) => ({ path: p, write: false }))];
+  const box = h('div', { class: 'stack-sm folder-list' });
+  const draw = () => box.replaceChildren(
+    ...rows.map((r, i) => {
+      const inp = input({ value: r.path, class: 'inp mono', placeholder: 'D:\\Shared\\Knowledge', 'aria-label': 'Folder path' });
+      // taken when the field is left or Enter is pressed - not letter by letter: a half-typed path that happens to
+      // name a folder (D:\\Data on the way to D:\\Data\\Team) must never be given to anyone
+      inp.addEventListener('change', () => { r.path = inp.value.trim(); inp.value = r.path; });
+      return h('div', { class: 'row folder-row', 'data-access': r.write ? 'write' : 'read' }, h('div', { class: 'grow' }, inp),
+        toggle(r.write, (v) => { r.write = v; draw(); }, { text: r.write ? 'Members may write here' : 'Read only', label: 'Members may write in ' + (r.path || 'this folder') }),
+        iconBtn('x', 'Remove this folder', () => { rows.splice(i, 1); draw(); }));
+    }),
+    rows.length ? null : h('div', { class: 'muted small' }, 'No extra folders.'),
+    h('div', null, btn('Add folder', () => { rows.push({ path: '', write: false }); draw(); const all = box.querySelectorAll('input.inp'); if (all.length) all[all.length - 1].focus(); }, { size: 'sm', icon: 'plus', variant: 'ghost' })));
+  draw();
+  const list = (w) => [...new Set(rows.filter((r) => r.write === w).map((r) => r.path.trim()).filter(Boolean))];
+  return { el: box, get: () => ({ write: list(true), read: list(false) }) };
+}
+
+// Spec 033: the providers of a team in ONE list, one switch per provider.
+//  - a provider of the administrator's own profile (or one the team already holds a copy of): on = the members get
+//    it (address, models, key: a team library item) AND may use it; off = both are taken back (hooks.give / .take);
+//  - any other provider Goose knows: on = allowed only (nothing to hand out);
+//  - "Any provider" keeps the wildcard for teams whose members bring their own.
+// Below it: the models allowed, the team's default, and the team's provider aliases ("show several providers as
+// one"; policy.provider_groups, the members' pickers show them). hooks: { me, mine(): [{ref, name}] the
+// administrator's own providers, items(): the team's library items, give(id, item), take(id, item), fromOther() }.
+function providerModelPicker(pol, catalog, hooks = {}) {
   const bad = !Array.isArray(catalog);
   const cat = bad ? [] : catalog;
   let anyP = (pol.allowed_providers || []).includes('*');
@@ -248,27 +279,67 @@ function providerModelPicker(pol, catalog) {
   const selP = new Set(anyP ? [] : pol.allowed_providers || []);
   const selM = new Set(anyM ? [] : pol.allowed_models || []);
   let showAll = false;
-  const known = new Set(cat.map((c) => c.id));
-  const modelOwner = new Map(); cat.forEach((c) => c.models.forEach((m) => { if (!modelOwner.has(m.id)) modelOwner.set(m.id, c.id); }));
-  const pBox = h('div', { class: 'chk-list picker' });
+  const mine = () => (hooks.mine ? hooks.mine() : []);
+  const items = () => (hooks.items ? hooks.items() : []).filter((x) => x.kind === 'provider');
+  const pBox = h('div', { class: 'stack-sm picker prov-list' });
   const mBox = h('div', { class: 'stack-sm picker' });
+  const gBox = h('div', { class: 'stack-sm' });
   const dProv = select([], '', { class: 'inp' });
   const dModel = select([], '', { class: 'inp' });
   const extraP = input({ placeholder: 'other provider id', class: 'inp inp-sm' });
   const extraM = input({ placeholder: 'other model id', class: 'inp inp-sm' });
   const chk = (checked, onchange, label, sub) => h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked, onchange: (e) => onchange(e.target.checked) }), h('span', null, label, sub ? h('span', { class: 'muted small mono' }, ' ' + sub) : null));
-  const provName = (id) => (cat.find((c) => c.id === id) || {}).name || id;
-  const allowedProviders = () => (anyP ? cat.filter((c) => c.configured || selP.has(c.id)).map((c) => c.id) : [...selP]);
+  const provName = (id) => (cat.find((c) => c.id === id) || {}).name || (mine().find((i) => i.ref === id) || {}).name || id;
+  const allowedProviders = () => (anyP ? [...new Set([...cat.filter((c) => c.configured || selP.has(c.id)).map((c) => c.id), ...items().map((x) => x.name)])] : [...selP]);
+  const all = () => { drawP(); drawM(); drawDefaults(); drawG(); };
+  const busy = new Set();
+  const act = async (id, fn) => { if (busy.has(id)) return; busy.add(id); try { await fn(); } catch (e) { toastError(e); all(); } finally { busy.delete(id); } };
 
   const drawP = () => {
-    const rows = cat.filter((c) => showAll || c.configured || selP.has(c.id));
-    const unknown = [...selP].filter((id) => !known.has(id));
-    pBox.hidden = anyP;
+    const my = mine(); const its = items();
+    const myIds = new Set(my.map((i) => i.ref));
+    const ids = [];
+    const add = (id) => { if (id && id !== '*' && !ids.includes(id)) ids.push(id); };
+    my.forEach((i) => add(i.ref)); its.forEach((x) => add(x.name));
+    cat.filter((c) => showAll || c.configured || selP.has(c.id)).forEach((c) => add(c.id));
+    [...selP].forEach(add);
+    const row = (id) => {
+      const item = its.find((x) => x.name === id);
+      const giveable = myIds.has(id) || !!item;
+      const allowed = anyP || selP.has(id);
+      const c = cat.find((x) => x.id === id);
+      const on = giveable ? !!item && allowed : allowed;
+      const half = giveable && !on && (!!item || (allowed && !anyP));
+      const from = item ? String(item.source || '').split(':')[0] : '';
+      let note; let warn = false;
+      if (giveable && on) {
+        note = 'Members get ' + (from && from === hooks.me ? 'your copy' : from && from !== 'manual' ? 'the copy from ' + from : 'the team\'s copy') + ': its address, its models and its key.';
+        if (item.sourceGone) { note += ' Its source is gone from that profile, so its key is no longer delivered: put the provider back there, or take it away here.'; warn = true; }
+      } else if (half && item) { note = 'Half done: the members have it but may not use it. Switch on to allow it.'; warn = true; }
+      else if (half) { note = 'Half done: allowed, but the members do not have it. Switch on to give it to them.'; warn = true; }
+      else if (giveable) note = 'A provider of your own profile. On = the members get it (address, models, key) and may use it.';
+      else if (on) note = (anyP ? 'Allowed by "Any provider". ' : 'Allowed. ') + 'Nothing is copied: a member needs a key of their own' + (pol.providers_edit ? '.' : ' - and cannot add one while "' + (FLAG_LABEL.providers_edit || 'providers_edit') + '" is off.');
+      else note = (c && !c.configured ? 'Not set up in your Goose. ' : '') + 'A provider Goose knows. On = allowed only; no key is handed out.';
+      const tg = toggle(on, (v) => act(id, async () => {
+        if (giveable) { if (v) await hooks.give(id, item); else await hooks.take(id, item); return; }   // both reload the team
+        if (v) selP.add(id); else selP.delete(id);
+        all();
+      }), { disabled: !giveable && anyP, label: 'Members can use ' + provName(id) });
+      return h('div', { class: 'set-row prov-row', 'data-provider': id, 'data-state': on ? 'on' : half ? 'half' : 'off' },
+        h('div', { class: 'grow' },
+          h('div', null, provName(id), ' ', h('span', { class: 'muted small mono' }, id), giveable ? h('span', null, ' ', badge(item ? 'given' : 'yours', item ? 'accent' : '')) : null),
+          h('div', { class: 'small ' + (warn ? 'warn-text' : 'muted') }, note)),
+        half ? btn('Take away', () => act(id, () => hooks.take(id, item)), { size: 'sm', variant: 'ghost' }) : null, tg);
+    };
+    const unknownOnly = ids.filter((id) => !cat.some((c) => c.id === id) && !myIds.has(id) && !its.some((x) => x.name === id));
     pBox.replaceChildren(
-      ...rows.map((c) => chk(selP.has(c.id), (v) => { if (v) selP.add(c.id); else selP.delete(c.id); drawM(); drawDefaults(); }, c.name, c.id + (c.configured ? '' : ' (not configured)'))),
-      ...unknown.map((id) => chk(true, (v) => { if (!v) selP.delete(id); drawP(); drawM(); drawDefaults(); }, id, '(not listed by Goose)')),
-      cat.some((c) => !c.configured) ? h('div', null, toggle(showAll, (v) => { showAll = v; drawP(); }, { text: 'Show all ' + cat.length + ' providers' })) : null,
-      h('div', { class: 'row' }, extraP, btn('Add', () => { const v = extraP.value.trim(); if (v) { selP.add(v); extraP.value = ''; drawP(); drawM(); drawDefaults(); } }, { size: 'sm' })));
+      ...ids.map(row),
+      ids.length ? null : h('div', { class: 'muted small' }, 'No provider yet. Add one to your own profile (Settings > Models & Providers), or show the providers Goose knows.'),
+      unknownOnly.length ? h('div', { class: 'muted small' }, 'Not listed by Goose: ' + unknownOnly.join(', ') + ' (kept; switch off to remove).') : null,
+      h('div', { class: 'row wrap' },
+        cat.some((c) => !c.configured) ? toggle(showAll, (v) => { showAll = v; drawP(); }, { text: 'Show all ' + cat.length + ' providers Goose knows' }) : null,
+        hooks.fromOther ? btn('Give a provider from another profile', () => hooks.fromOther(), { size: 'sm', variant: 'ghost', icon: 'plus' }) : null),
+      h('div', { class: 'row' }, extraP, btn('Add', () => { const v = extraP.value.trim(); if (v) { selP.add(v); extraP.value = ''; all(); } }, { size: 'sm' })));
   };
   const drawM = () => {
     mBox.hidden = anyM;
@@ -276,7 +347,7 @@ function providerModelPicker(pol, catalog) {
     const listed = new Set(groups.flatMap((g) => g.models.map((m) => m.id)));
     const unknown = [...selM].filter((id) => !listed.has(id));
     mBox.replaceChildren(
-      groups.length ? null : h('div', { class: 'muted small' }, 'Choose providers first (their models are listed here).'),
+      groups.length ? null : h('div', { class: 'muted small' }, 'Switch providers on first (their models are listed here).'),
       ...groups.map((g) => {
         const count = h('span', { class: 'muted small' });
         const setCount = () => { count.textContent = ' ' + g.models.filter((m) => selM.has(m.id)).length + ' of ' + g.models.length + ' selected'; };
@@ -284,9 +355,9 @@ function providerModelPicker(pol, catalog) {
         return h('details', { class: 'pick-group', open: g.models.some((m) => selM.has(m.id)) || groups.length <= 2 },
           h('summary', null, h('span', { class: 'strong' }, g.name), count,
             h('span', { class: 'row', style: { display: 'inline-flex', marginLeft: '8px' } },
-              btn('All', (ev) => { ev.preventDefault(); g.models.forEach((m) => selM.add(m.id)); drawM(); drawDefaults(); }, { size: 'sm', variant: 'ghost' }),
-              btn('None', (ev) => { ev.preventDefault(); g.models.forEach((m) => selM.delete(m.id)); drawM(); drawDefaults(); }, { size: 'sm', variant: 'ghost' }))),
-          h('div', { class: 'chk-list' }, ...g.models.map((m) => chk(selM.has(m.id), (v) => { if (v) selM.add(m.id); else selM.delete(m.id); setCount(); drawDefaults(); }, m.name, (m.name !== m.id ? m.id : '') + (m.ctx ? ' ' + Math.round(m.ctx / 1000) + 'k' : '')))));
+              btn('All', (ev) => { ev.preventDefault(); g.models.forEach((m) => selM.add(m.id)); drawM(); drawDefaults(); drawG(); }, { size: 'sm', variant: 'ghost' }),
+              btn('None', (ev) => { ev.preventDefault(); g.models.forEach((m) => selM.delete(m.id)); drawM(); drawDefaults(); drawG(); }, { size: 'sm', variant: 'ghost' }))),
+          h('div', { class: 'chk-list' }, ...g.models.map((m) => chk(selM.has(m.id), (v) => { if (v) selM.add(m.id); else selM.delete(m.id); setCount(); drawDefaults(); drawG(); }, m.name, (m.name !== m.id ? m.id : '') + (m.ctx ? ' ' + Math.round(m.ctx / 1000) + 'k' : '')))));
       }),
       unknown.length ? h('div', { class: 'chk-list' }, ...unknown.map((id) => chk(true, (v) => { if (!v) { selM.delete(id); drawM(); drawDefaults(); } }, id, '(not listed for these providers)'))) : null,
       h('div', { class: 'row' }, extraM, btn('Add', () => { const v = extraM.value.trim(); if (v) { selM.add(v); extraM.value = ''; drawM(); drawDefaults(); } }, { size: 'sm' })));
@@ -295,7 +366,7 @@ function providerModelPicker(pol, catalog) {
     const curP = dProv.value || pol.default_provider || '';
     const provs = allowedProviders();
     dProv.replaceChildren(h('option', { value: '' }, '- none (keep each member\'s choice) -'),
-      ...[...new Set([...provs, ...(curP && !provs.includes(curP) ? [curP] : [])])].map((id) => h('option', { value: id }, provName(id) + (provs.includes(id) ? '' : ' (not allowed above)'))));
+      ...[...new Set([...provs, ...(curP && !provs.includes(curP) ? [curP] : [])])].map((id) => h('option', { value: id }, provName(id) + (provs.includes(id) ? '' : ' (not switched on above)'))));
     dProv.value = curP;
     const c = cat.find((x) => x.id === dProv.value);
     const curM = dModel.value || pol.default_model || '';
@@ -306,21 +377,84 @@ function providerModelPicker(pol, catalog) {
     dModel.value = curM;
   };
   dProv.addEventListener('change', () => { dModel.value = ''; drawDefaults(); });
-  const tgP = toggle(anyP, (v) => { anyP = v; drawP(); drawM(); drawDefaults(); }, { text: 'Any provider' });
-  const tgM = toggle(anyM, (v) => { anyM = v; drawM(); drawDefaults(); }, { text: 'Any model' });
-  drawP(); drawM(); drawDefaults();
+
+  // ----- the team's provider aliases (spec 033) -----
+  const pg0 = pol.provider_groups && typeof pol.provider_groups === 'object' ? pol.provider_groups : {};
+  const groups = (Array.isArray(pg0.groups) ? pg0.groups : []).map((g) => ({ id: g.id, name: g.name || '', members: (g.members || []).map((m) => ({ provider: m.provider, prefix: m.prefix || '' })) }));
+  const modelNames = { ...(pg0.modelNames || {}) };
+  const newAliasId = () => 'a' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+  const labelsOf = (g) => {
+    const provs = g.members.map((m) => cat.find((c) => c.id === m.provider)).filter(Boolean)
+      .map((c) => ({ id: c.id, name: c.name, defaultModel: c.defaultModel || '', models: c.models.filter((m) => anyM || selM.has(m.id)).map((m) => ({ id: m.id, name: m.name })) }));
+    const entry = groupPicker(provs, { groups: [{ id: g.id, name: g.name || 'Group', members: g.members.map((m) => ({ provider: m.provider, prefix: (m.prefix || '').trim() })) }], modelNames }, {}).find((x) => x.group);
+    return entry ? entry.models.map((x) => x.label) : [];
+  };
+  const drawG = () => {
+    const taken = new Map(); groups.forEach((g) => g.members.forEach((m) => taken.set(m.provider, g)));
+    const provs = [...new Set([...allowedProviders(), ...taken.keys()])];
+    gBox.replaceChildren(
+      ...groups.map((g, gi) => {
+        const nameInp = input({ value: g.name, class: 'inp inp-sm', maxlength: '80', 'aria-label': 'Alias name', placeholder: 'the name members see, e.g. Lab AI' });
+        const pv = h('div', { class: 'muted small grp-preview' });
+        const setPv = () => { const l = labelsOf(g); pv.title = l.join('\n'); pv.textContent = l.length ? 'Members see "' + (g.name.trim() || 'Group') + '" with: ' + l.slice(0, 8).join(', ') + (l.length > 8 ? ', … (' + l.length + ' in all)' : '') : 'Add providers to see the model list.'; };
+        nameInp.addEventListener('input', () => { g.name = nameInp.value; setPv(); });
+        const free = provs.filter((id) => !taken.has(id));
+        const addSel = select([{ value: '', label: free.length ? '+ add a provider to this alias' : 'every provider is in an alias already' }, ...free.map((id) => ({ value: id, label: provName(id) + ' (' + id + ')' }))], '', { class: 'inp inp-sm', 'aria-label': 'Add a provider to the alias' });
+        addSel.disabled = !free.length;
+        addSel.addEventListener('change', () => { if (addSel.value) { g.members.push({ provider: addSel.value, prefix: '' }); drawG(); } });
+        setPv();
+        return h('div', { class: 'grp-card', 'data-alias': g.id },
+          h('div', { class: 'row wrap' }, field('Shown as', nameInp, null, { inline: true }), h('span', { class: 'grow' }),
+            btn('Remove alias', () => { groups.splice(gi, 1); drawG(); }, { size: 'sm', icon: 'trash', variant: 'ghost' })),
+          ...g.members.map((m, mi) => {
+            const pre = input({ value: m.prefix, class: 'inp inp-sm grp-prefix', maxlength: '40', placeholder: 'prefix, e.g. Max', 'aria-label': 'Model prefix for ' + provName(m.provider) });
+            pre.dataset.provider = m.provider;
+            pre.addEventListener('input', () => { m.prefix = pre.value; setPv(); });
+            return h('div', { class: 'grp-member' }, h('div', { class: 'grow' }, provName(m.provider), ' ', h('span', { class: 'muted small mono' }, m.provider),
+              provs.includes(m.provider) && allowedProviders().includes(m.provider) ? null : h('span', { class: 'small warn-text' }, ' (not switched on for this team)')), pre,
+              iconBtn('chevronUp', 'Move up - models are listed in this order', () => { if (mi > 0) { g.members.splice(mi - 1, 0, g.members.splice(mi, 1)[0]); drawG(); } }, { size: 'sm' }),
+              iconBtn('x', 'Take out of the alias', () => { g.members.splice(mi, 1); drawG(); }, { size: 'sm' }));
+          }),
+          addSel, pv);
+      }),
+      groups.length ? null : h('div', { class: 'muted small' }, 'No alias: the members see each provider under its own name.'),
+      h('div', { class: 'row wrap' },
+        btn('New alias', () => { groups.push({ id: newAliasId(), name: '', members: [] }); drawG(); const n = gBox.querySelectorAll('.grp-card input.inp'); if (n.length) n[n.length - 1 - 0].focus(); }, { size: 'sm', icon: 'plus' }),
+        btn('Copy my own aliases', () => {
+          const mineCfg = ownGroups(); const taken2 = new Set(groups.flatMap((g) => g.members.map((m) => m.provider))); let n = 0;
+          for (const g of mineCfg.groups) {
+            const members = g.members.filter((m) => !taken2.has(m.provider)).map((m) => ({ provider: m.provider, prefix: m.prefix || '' }));
+            if (!members.length) continue;
+            members.forEach((m) => taken2.add(m.provider));
+            groups.push({ id: newAliasId(), name: g.name, members }); n += 1;
+          }
+          for (const [k, v] of Object.entries(mineCfg.modelNames || {})) if (!modelNames[k]) modelNames[k] = v;
+          toast(n ? 'Copied ' + n + ' alias' + (n > 1 ? 'es' : '') + ' from your own Settings' : 'Nothing to copy: you have no provider group of your own (Settings > Models & Providers), or its providers are in an alias here already', { kind: 'info' });
+          drawG(); gBox.dispatchEvent(new Event('change', { bubbles: true }));
+        }, { size: 'sm', variant: 'ghost' })));
+  };
+
+  const tgP = toggle(anyP, (v) => { anyP = v; all(); }, { text: 'Any provider - members may use every provider they have' });
+  const tgM = toggle(anyM, (v) => { anyM = v; drawM(); drawDefaults(); drawG(); }, { text: 'Any model' });
+  all();
   const el = h('div', { class: 'stack' },
-    bad ? banner('warn', 'Could not list your providers (' + ((catalog && catalog.error) || 'no answer') + '). You can still add ids by hand.') : null,
-    h('div', { class: 'grid2' },
-      field('Allowed providers', h('div', { class: 'stack-sm' }, tgP, pBox), 'Listed from your Goose configuration. Members get these providers\' settings through team library items or their own keys.'),
-      field('Allowed models', h('div', { class: 'stack-sm' }, tgM, mBox), 'Grouped by the providers allowed on the left.')),
-    h('div', { class: 'grid2' }, field('Default provider', dProv, 'New chats start here.'), field('Default model', dModel, 'Members\' profile default follows this.')));
+    bad ? banner('warn', 'Could not list the providers Goose knows (' + ((catalog && catalog.error) || 'no answer') + '). Your own providers are still listed; other ids can be added by hand.') : null,
+    field('Providers this team can use', h('div', { class: 'stack-sm' }, pBox, tgP),
+      'One switch per provider. For a provider of your own profile the switch also hands it to the members - its address, its models and its key - and takes it back when switched off. Changes you make to it in your profile reach the team by themselves.'),
+    field('Models', h('div', { class: 'stack-sm' }, tgM, mBox), 'Grouped by the providers switched on above.'),
+    h('div', { class: 'grid2' }, field('Default provider', dProv, 'New chats start here.'), field('Default model', dModel, 'Members\' profile default follows this.')),
+    field('Show several providers as one (aliases)', gBox,
+      'For providers that serve the same models - for example one per effort level. The members see ONE provider under the name you give, and every model as "<prefix> - <model>", in the order of the providers here. Only the pickers change: a chat still runs on the real provider and model, and the lists above still decide what is allowed.'));
   return {
     el,
-    get: () => ({ providers: anyP ? ['*'] : [...selP], models: anyM ? ['*'] : [...selM], defaultProvider: dProv.value, defaultModel: dModel.value }),
+    refresh: all,
+    get: () => ({ providers: anyP ? ['*'] : [...selP], models: anyM ? ['*'] : [...selM], defaultProvider: dProv.value, defaultModel: dModel.value,
+      groups: { groups: groups.filter((g) => g.members.length).map((g) => ({ id: g.id, name: g.name.trim() || 'Group', members: g.members.map((m) => ({ provider: m.provider, prefix: (m.prefix || '').trim() })) })), modelNames } }),
   };
 }
 
+let paneGen = 0;
+let pendingSaid = '';
 function teamsTab(body) {
   let teams = [], users = [], hints = [], guardSets = [], selId = null;
   let flush = null;   // saves what is still pending on the open team (before another one is opened)
@@ -343,34 +477,38 @@ function teamsTab(body) {
     const pol = { ...(t.policy || {}) };
     const name = input({ value: t.name }); const desc = input({ value: t.description || '' });
     const flagRow = (k) => h('div', { class: 'set-row' }, h('div', { class: 'grow' }, h('div', null, FLAG_LABEL[k]), h('div', { class: 'muted small mono' }, k)), toggle(!!pol[k], (v) => { pol[k] = v; }));
-    const pm = providerModelPicker(pol, providerCatalog);
+    let teamItems = [];      // the team's library items, and the administrator's own providers: both are read
+    let myProviders = [];    // by the provider list when it is drawn, so they are declared before it
+    const pm = providerModelPicker(pol, providerCatalog, { me: (store.get('me').user || {}).username || '', mine: () => myProviders, items: () => teamItems,
+      give: (id, item) => giveProvider(id, item), take: (id, item) => takeProvider(id, item), fromOther: () => libraryPicker(t, loadItems, 'provider', () => teamItems) });
     const modes = anyList('Allowed approval modes', pol.allowed_modes, 'Chat only = no tool calls; Approve = ask before every tool call.', MODE_CHOICES);
     const share = input({ value: pol.share_folder || '', placeholder: t.teamFolder || '' });
-    const roots = textarea({ rows: 3, class: 'inp mono', value: (pol.allowed_roots || []).join('\n'), placeholder: 'none - one absolute path per line' });
+    const folders = folderList(pol.allowed_roots, pol.read_roots);
     const maxRuns = input({ type: 'number', min: '0', value: pol.max_concurrent_runs ?? '', placeholder: '3', class: 'inp inp-sm' });
     const members = multiPick(users.filter((u) => u.role !== 'admin' || (t.members || []).includes(u.id)).map((u) => ({ value: u.id, label: u.displayName || u.username, sub: u.username + (u.team && u.team !== t.id ? ' · now in ' + teamName(u.team) + ' (moves here)' : '') })), t.members || [], { empty: 'No users' });
     const hp = multiPick(hints.map((x) => ({ value: x.id, label: x.name, sub: x.description || '' })), t.hints || [], { empty: 'Hints library is empty' });
     const ge = teamGuardEditor(pol.guard, guardSets);
     const itemBoxes = {};
     const secEls = {};
-    let teamItems = [];
     const meName = (store.get('me').user || {}).username || '';
     const itemsUrl = '/api/admin/teams/' + encodeURIComponent(t.id) + '/items';
     // What the page holds, as the server takes it. Saved whenever it differs from what was saved last.
     const collect = () => {
-      const sel = pm.get();
+      const sel = pm.get(); const fl = folders.get();
       return { name: name.value.trim(), description: desc.value.trim(),
         policy: { ...pol, allowed_providers: sel.providers, allowed_models: sel.models, allowed_modes: modes.get(),
-          allowed_roots: roots.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
+          allowed_roots: fl.write, read_roots: fl.read, provider_groups: sel.groups,
           default_provider: sel.defaultProvider, default_model: sel.defaultModel, share_folder: share.value.trim(),
           max_concurrent_runs: maxRuns.value === '' ? null : Number(maxRuns.value), guard: ge.get() },
         members: members.get(), hints: hp.get() };
     };
     const state = h('span', { class: 'muted small', title: 'Every change on this page is saved by itself' }, 'Saved');
     let saved = null, saving = false, again = false;
+    const gen = ++paneGen;      // R-10: once the page has been drawn again, this pane's pending save is dropped
     const save = async () => {
+      if (gen !== paneGen) return;
       const body = collect(); const cur = JSON.stringify(body);
-      if (cur === saved) return;
+      if (cur === saved) { if (/^not saved/i.test(state.textContent)) state.textContent = 'Saved - the page is as it was stored'; return; }
       if (!body.name) { state.textContent = 'Not saved: the team needs a name'; return; }
       if (saving) { again = true; return; }
       saving = true; state.textContent = 'Saving ...';
@@ -379,6 +517,10 @@ function teamsTab(body) {
         saved = cur; state.textContent = 'Saved ' + new Date().toLocaleTimeString();
         if (r && (r.moved || []).length) { toast('Moved to ' + t.name + ': ' + r.moved.join(', '), { kind: 'info', timeout: 8000 }); saving = false; await load(); return; }
         if (r && r.team) { Object.assign(t, r.team); drawList(); drawNeeds(); }
+        // a running agent keeps the folders and network it started with until its run has finished (it restarts then)
+        const rp = ((r && r.restartPending) || []).join(', ');
+        if (rp && rp !== pendingSaid) toast('Still running with the earlier settings until the current run has finished: ' + rp + '. To apply the change now, restart their agent under Admin > System > Workers.', { kind: 'info', timeout: 10000 });
+        pendingSaid = rp;
       } catch (e) { state.textContent = 'NOT saved: ' + errMsg(e); }
       finally { saving = false; if (again) { again = false; save(); } }
     };
@@ -388,8 +530,9 @@ function teamsTab(body) {
     // gives it and allows it (and makes it the default when the team has none); switching off takes both away.
     const policyNow = () => ({ ...collect().policy });
     const patchPolicy = async (p) => { await PATCH('/api/admin/teams/' + encodeURIComponent(t.id), { policy: p }); };
-    const giveProvider = async (id) => {
-      await POST(itemsUrl, { kind: 'provider', fromProfile: meName, ref: id });
+    const giveProvider = async (id, item) => {
+      await save();      // what was typed just before the switch is stored first (the page is drawn again below)
+      if (!item) await POST(itemsUrl, { kind: 'provider', fromProfile: meName, ref: id });   // the team already holds a copy otherwise
       const p = policyNow(); let changed = false;
       if (!(p.allowed_providers || []).includes('*') && !(p.allowed_providers || []).includes(id)) { p.allowed_providers = [...(p.allowed_providers || []), id]; changed = true; }
       if (!p.default_provider) {
@@ -400,25 +543,13 @@ function teamsTab(body) {
       await load();
     };
     const takeProvider = async (id, item) => {
-      await DEL(itemsUrl + '/' + encodeURIComponent(item.id));
+      await save();
+      if (item) await DEL(itemsUrl + '/' + encodeURIComponent(item.id));
       const p = policyNow(); let changed = false;
       if ((p.allowed_providers || []).includes(id)) { p.allowed_providers = p.allowed_providers.filter((x) => x !== id); changed = true; }
       if (p.default_provider === id) { p.default_provider = ''; p.default_model = ''; changed = true; }
       if (changed) await patchPolicy(p);
       await load();
-    };
-    const provBox = h('div', { class: 'stack-sm' }, spinner(14));
-    const drawProvToggles = async () => {
-      let mine = [];
-      try { mine = arr(await GET('/api/admin/library' + qs({ profile: meName, kind: 'provider' })), 'items'); }
-      catch (e) { provBox.replaceChildren(banner('warn', 'Your providers could not be listed: ' + errMsg(e))); return; }
-      provBox.replaceChildren(h('div', { class: 'strong' }, 'Give a provider to this team'),
-        h('div', { class: 'muted small' }, 'These are the providers of your own profile. Switch one on and the members of this team get it - its address, its models and its key - and are allowed to use it. Switch it off and they lose it. Changes you make to the provider in your profile reach the team by themselves.'),
-        ...(mine.length ? mine.map((i) => {
-          const have = teamItems.find((x) => x.kind === 'provider' && x.name === i.ref);
-          return h('div', { class: 'set-row' }, h('div', { class: 'grow' }, h('div', null, i.name), h('div', { class: 'muted small mono' }, i.ref)),
-            toggle(!!have, async (v) => { try { if (v) await giveProvider(i.ref); else if (have) await takeProvider(i.ref, have); } catch (e) { toastError(e); load(); } }));
-        }) : [h('div', { class: 'muted small' }, 'Your profile has no provider of its own yet (Settings > Providers).')]));
     };
     // What is missing before the members can chat, each with the way to put it right
     const needs = h('div', { class: 'stack-sm' });
@@ -444,9 +575,9 @@ function teamsTab(body) {
       const parts = g.flags.map(flagRow);
       if (g.id === 'guard') parts.push(ge.el);
       if (g.id === 'hints') parts.unshift(field('Team hints', hp.el, 'Team hints come last in every member\'s hints and take precedence over personal hints.'));
-      if (g.id === 'models') parts.unshift(provBox, pm.el);
+      if (g.id === 'models') parts.unshift(pm.el);
       if (g.id === 'modes') parts.push(modes.el);
-      if (g.id === 'folders') parts.push(h('div', { class: 'stack-sm' }, h('div', { class: 'muted small' }, 'Members can always reach their own workspace and the team folder. Nothing else unless listed here.'), field('Team folder', share, 'Shared by all members. Leave empty for the default: ' + (t.teamFolder || '')), field('Extra folders', roots, 'Absolute paths, one per line.'), field('Max concurrent runs', maxRuns, 'Per user. Empty = the default (3). 0 = unlimited.')));
+      if (g.id === 'folders') parts.push(h('div', { class: 'stack-sm' }, h('div', { class: 'muted small' }, 'Members can always reach their own workspace and the team folder. Nothing else unless listed here.'), field('Team folder', share, 'Shared by all members. Leave empty for the default: ' + (t.teamFolder || '')), field('Extra folders', folders.el, 'Absolute paths. "Members may write here" on: the members and their agents can change the folder. Off = read only: they can open it, start a chat there and let the agent read it; nothing is created or changed in it, and files cannot be attached to a chat that works there. A read-only folder cannot lie inside a folder this team can write.'), field('Max concurrent runs', maxRuns, 'Per user. Empty = the default (3). 0 = unlimited.')));
       if (g.kinds) {
         itemBoxes[g.id] = h('div', null, spinner(14));
         parts.push(h('div', { class: 'row' }, h('span', { class: 'muted small grow' }, 'Library items: ' + g.kinds.join(', ') + 's copied into members\' profiles.'), btn('Add from library', () => libraryPicker(t, loadItems, g.kinds[0], () => teamItems), { icon: 'plus', size: 'sm' })), itemBoxes[g.id]);
@@ -471,12 +602,13 @@ function teamsTab(body) {
     for (const ev of ['change', 'input', 'click']) pane.addEventListener(ev, later);
     const loadItems = async () => {
       try {
-        const items = arr(await GET('/api/admin/teams/' + encodeURIComponent(t.id) + '/items'), 'items');
-        teamItems = items; drawProvToggles();
+        const [items, mine] = await Promise.all([GET(itemsUrl).then((r) => arr(r, 'items')),
+          GET('/api/admin/library' + qs({ profile: meName, kind: 'provider' })).then((r) => arr(r, 'items')).catch(() => [])]);
+        teamItems = items; myProviders = mine; pm.refresh();
         for (const g of EXPERIENCE.filter((x) => x.kinds)) {
           const mine = items.filter((i) => g.kinds.includes(i.kind));
           itemBoxes[g.id].replaceChildren(mine.length ? table([
-            { label: 'Kind', render: (i) => badge(i.kind) }, { label: 'Name', render: (i) => h('span', { class: 'strong' }, i.name) },
+            { label: 'Kind', render: (i) => badge(i.kind) }, { label: 'Name', render: (i) => h('span', null, h('span', { class: 'strong' }, i.name), i.sourceGone ? h('span', { title: 'It is no longer in the profile it was taken from. The team keeps its copy until you remove it here.' }, ' ', badge('source removed', 'warn')) : null) },
             { label: 'Source', render: (i) => h('span', { class: 'muted small' }, i.fromProfile || i.source || '') },
             { label: '', class: 'right', render: (i) => iconBtn('trash', 'Remove', async () => { try { await DEL('/api/admin/teams/' + encodeURIComponent(t.id) + '/items/' + encodeURIComponent(i.id)); loadItems(); } catch (e) { toastError(e); } }, { variant: 'danger-soft' }) },
           ], mine) : h('div', { class: 'muted small' }, 'None.'));
@@ -816,7 +948,9 @@ function settingsTab(body) {
     const brand = { name: 'Goose Web', tagline: '', ...(s.brand || {}) };
     const bn = input({ value: brand.name }); const bt = input({ value: brand.tagline || '', placeholder: 'Your AI agent, anywhere' });
     const dt = select([{ value: '', label: '— none —' }, ...teams.map((t) => ({ value: t.id, label: t.name }))], s.defaultTeamId || '');
-    const hrs = input({ type: 'number', min: '1', max: '720', value: s.sessionHours ?? 12, class: 'inp inp-sm' });
+    const hrsMax = Number(s.sessionHoursMax) || 8;
+    const hrs = input({ type: 'number', min: '1', max: String(hrsMax), step: '1', value: s.sessionHours ?? hrsMax, class: 'inp inp-sm' });
+    const idle = input({ type: 'number', min: '0', max: '480', step: '5', value: s.idleMinutes || 0, class: 'inp inp-sm' });
     let allowSelfTotp = s.allowSelfTotp !== false, reqTotp = !!s.requireTotpForAdmins, reqTotpAll = !!s.requireTotpForAll;
     const peers = (s.peers || []).map((p) => ({ ...p }));
     const peersBox = h('div', { class: 'stack-sm' });
@@ -829,14 +963,15 @@ function settingsTab(body) {
     drawPeers();
     body.replaceChildren(
       section('Branding', null, h('div', { class: 'card grid2' }, field('Name', bn), field('Tagline', bt))),
-      section('Accounts', null, h('div', { class: 'card stack' }, h('div', { class: 'grid2' }, field('Default team for new users', dt), field('Sign-in lifetime (hours)', hrs)),
+      section('Accounts', null, h('div', { class: 'card stack' }, h('div', { class: 'grid2' }, field('Default team for new users', dt), field('Sign-in lifetime (hours)', hrs, 'From 1 to ' + hrsMax + '. Counted from signing in and never extended: after it, everyone signs in again. There is no "keep me signed in".'),
+          field('End an unused sign-in after (minutes)', idle, '0 = off. From 5 to 480. A sign-in that no browser has used for this long ends. An open tab counts as use, so this ends forgotten sign-ins, not open ones.')),
         h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Users may enable two-factor themselves'), toggle(allowSelfTotp, (v) => { allowSelfTotp = v; })),
         h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Require two-factor for administrators'), toggle(reqTotp, (v) => { reqTotp = v; })),
         h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Require two-factor for everyone (a team can require it for its members: Teams > Experience > Other)'), toggle(reqTotpAll, (v) => { reqTotpAll = v; })))),
       section('Herd peers', null, h('p', { class: 'muted small' }, 'Other Goose Web gateways shown in everyone’s Herd (“every machine in one sidebar”). The token must belong to a user on that machine.'), peersBox),
       h('div', { class: 'row sticky-foot' }, actionBtn('Save settings', async () => {
         const pp = peers.filter((p) => p.url).map((p) => { const x = { name: p.name || p.url, url: p.url }; if (p._tok) x.token = p._tok; else if (p.token) x.token = p.token; return x; });
-        await PUT('/api/admin/settings', { brand: { name: bn.value.trim() || 'Goose Web', tagline: bt.value.trim() }, defaultTeamId: dt.value || null, sessionHours: Number(hrs.value) || 12, allowSelfTotp, requireTotpForAdmins: reqTotp, requireTotpForAll: reqTotpAll, peers: pp });
+        await PUT('/api/admin/settings', { brand: { name: bn.value.trim() || 'Goose Web', tagline: bt.value.trim() }, defaultTeamId: dt.value || null, sessionHours: Math.min(hrsMax, Number(hrs.value) || hrsMax), idleMinutes: Number(idle.value) || 0, allowSelfTotp, requireTotpForAdmins: reqTotp, requireTotpForAll: reqTotpAll, peers: pp });
         const ac = store.get('authConfig'); if (ac) store.set('authConfig', { ...ac, brand: { name: bn.value.trim(), tagline: bt.value.trim() } });
       }, { variant: 'primary', success: 'Settings saved' })));
   })();

@@ -91,7 +91,7 @@ export class Composer {
         : ((q.preview || '') + (q.attachments ? ' [+' + q.attachments + ' attachment' + (q.attachments > 1 ? 's' : '') + ']' : '') || '[attachment]');
       const foreign = !q.local && (foreignOnly || (!!q.by && !!me && q.by.toLowerCase() !== me.toLowerCase()));
       const held = !!q.held || foreign;
-      const tag = q.held ? (q.steer ? 'Steer not delivered' : 'Not sent yet') : foreign ? 'Queued by ' + (q.by || 'someone else') : null;
+      const tag = q.held ? (q.tag || (q.steer ? 'Steer not delivered' : 'Not sent yet')) : foreign ? 'Queued by ' + (q.by || 'someone else') : null;
       return h('div', { class: ['queued', held ? 'held' : ''], title: q.held ? (q.note || '') : foreign ? 'Not sent automatically: send it, edit it or remove it' : 'Sent when the current run finishes' },
         icon(held ? 'alert' : 'queue', 13), tag ? h('span', { class: 'queued-tag' }, tag) : null,
         h('span', { class: 'queued-text' }, text),
@@ -192,19 +192,20 @@ export class Composer {
       this.attachments.push(att);
       this.renderAtts();
       try {
+        // Spec 031: every attached file is written to <chat folder>\Web_Uploads - the server names that folder
+        // and refuses when this person may not write there (a read-only folder): then nothing is attached.
+        const cwd = this.o.getCwd && this.o.getCwd();
+        if (!cwd) throw new Error('Choose a working folder first');
+        const res = await upload(cwd, [f]);
+        const up = (res.files || [])[0];
+        if (!up) throw new Error('Upload returned no file');
+        const link = { type: 'resource_link', uri: fileUri(up.path), name: up.name || f.name, mimeType: up.mime || f.type || undefined, size: up.size ?? f.size };
+        att.path = up.path;
         if (f.type.startsWith('image/') && f.size <= IMAGE_MAX) {
-          att.block = { type: 'image', data: await readFileBase64(f), mimeType: f.type };
+          // an image is also shown to the model itself; the link says where the file is for the agent's tools
+          att.blocks = [{ type: 'image', data: await readFileBase64(f), mimeType: f.type }, link];
           att.preview = URL.createObjectURL(f);
-        } else {
-          const cwd = this.o.getCwd && this.o.getCwd();
-          if (!cwd) throw new Error('Choose a working folder first');
-          const dir = joinPath(cwd, '.goose-web-uploads');
-          const res = await upload(dir, [f]);
-          const up = (res.files || [])[0];
-          if (!up) throw new Error('Upload returned no file');
-          att.block = { type: 'resource_link', uri: fileUri(up.path), name: up.name || f.name, mimeType: up.mime || f.type || undefined, size: up.size ?? f.size };
-          att.path = up.path;
-        }
+        } else att.blocks = [link];
         att.status = 'ready';
       } catch (e) {
         att.status = 'error'; toastError(e, 'Attach ' + f.name);
@@ -226,7 +227,7 @@ export class Composer {
     const text = this.ta.value.replace(/\s+$/, '');
     const blocks = [];
     if (text.trim()) blocks.push({ type: 'text', text });
-    for (const a of this.attachments) if (a.block) blocks.push(a.block);
+    for (const a of this.attachments) for (const b of a.blocks || []) blocks.push(b);
     return blocks;
   }
 

@@ -7,6 +7,7 @@ import { icon, logo } from './icons.js';
 import { setMarkdown } from './markdown.js';
 import { askCard } from './asks.js';
 import { prefs, activityPrefs } from './prefs.js';
+import { ownSteerFor } from './steerecho.js';
 
 // Items attached at once (Settings > Chat > Messages shown in a chat; 0 = all) and per "show earlier" step.
 const windowSize = () => { const v = Number(prefs().historyWindow ?? 300); return v > 0 ? Math.max(50, v) : Infinity; };
@@ -472,6 +473,18 @@ export class Transcript {
       this.renderUserBlocks(it);
       return it;
     }
+    // Goose's echo of a steer whose id this tab does not know yet (the echo came before the answer to the steer
+    // call): it belongs to our own steer bubble with the same content, not to a second one (steerecho.js)
+    if (messageId && steer && !this.bulk) {
+      const own = ownSteerFor(this.items, blocks);
+      if (own) {
+        own.messageId = messageId; this.users.set(messageId, own);
+        if (Number.isInteger(created)) own.created = created;
+        this.markUserSent(own);
+        this.setSteerState(own, 'delivered');
+        return own;
+      }
+    }
     // adopt a local echo (never for a steer: the newest local bubble is then the prompt's echo, not this message)
     if (messageId && !this.bulk && !steer) {
       for (let i = this.items.length - 1; i >= Math.max(0, this.items.length - 6); i--) {
@@ -491,6 +504,15 @@ export class Transcript {
     return this.push(item);
   }
   markUserSent(item) { if (item) { item.pending = false; if (item.el) item.el.classList.remove('is-pending'); } }
+  // Take a bubble out of the transcript for good (a send that never happened; a bubble shown twice).
+  removeItem(item) {
+    const i = this.items.indexOf(item);
+    if (i < 0) { if (item && item.el) item.el.remove(); return; }
+    this.items.splice(i, 1);
+    if (i < this.firstAttached) { this.firstAttached -= 1; this.updateMore(); }
+    if (item.el) item.el.remove();
+    if (item.messageId && this.users.get(item.messageId) === item) this.users.delete(item.messageId);
+  }
   // Steer bubble state (bug steer-lost-on-slow-turn): sending -> pending (Goose accepted it; the agent reads it at its
   // next step) -> delivered, or returned (the run ended first; the gateway put it back in the queue).
   setSteerState(item, state) {

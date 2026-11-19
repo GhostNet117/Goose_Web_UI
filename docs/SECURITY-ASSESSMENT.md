@@ -178,7 +178,7 @@ Severity assumes a LAN deployment behind a TLS reverse proxy and describes the r
 | GW-25 | Trusted proxy configuration | Low | Mitigated | `context.py: Ctx.client_ip`, `from_trusted_proxy`, `allowed_origins`; `app.py: HostGuard` | `X-Forwarded-For` (rightmost entry) and `X-Forwarded-Proto/Host` are used only when the TCP peer is in `trusted_proxies` (default: loopback only). A trusted `X-Forwarded-Host` must also be on the Host allow-list. Trusting a broad range, such as the commented `172.16.0.0/12` in `docker/compose.yaml`, lets any host in it fake client IPs for the rate limiter and the audit log. |
 | GW-26 | Account lockout can be triggered by others | Low | Accepted risk | `auth.py: login`, `_record_failure` | 8 wrong passwords or TOTP codes lock an account for 15 minutes. The per-IP limiter slows a single source. Admins can unlock (`api.admin_user_unlock`, `goose-web user reset`). Lockout does not apply to names that have no database row yet (first LDAP sign-in). |
 | GW-27 | Password storage and policy | Info | Mitigated | `security.py: hash_password` (scrypt N=2^15, r=8, p=1, 16-byte salt, 32-byte key), `verify_password` (constant time, dummy hash for unknown users), `needs_rehash`, `password_problems` (min length 10, not the username, common-password list, 3 character classes below 16 characters) | Hashes are upgraded at sign-in when the parameters change. |
-| GW-28 | Session cookies and lifetime | Info | Mitigated | `auth.py: create_session`, `resolve_cookie`, `session_seconds`; `api.py: _set_cookie`; `context.py: Ctx.cookie_name` | HttpOnly, SameSite=Strict, Secure and `__Host-gw` with an https `public_url`; 12 h default (DB `session_hours`, 1-720) or `remember_days` (30). Sessions are revoked on password change (other sessions), reset and disable. Lifetimes are fixed: `last_seen` is updated, `expires_at` is never extended. v1.0.0 corrected the code comment that called it a sliding expiry. |
+| GW-28 | Session cookies and lifetime | Info | Mitigated | `auth.py: create_session`, `session_alive`, `resolve_cookie`, `session_hours`, `clamp_sessions`; `api.py: _set_cookie`; `context.py: Ctx.cookie_name` | HttpOnly, SameSite=Strict, Secure and `__Host-gw` with an https `public_url`; a session cookie (no Max-Age). Since 1.25.0: 8 h at most (DB `session_hours` / `auth.session_hours`, 1-8), no "remember me", stored sign-ins cut to the lifetime at start-up, optional idle limit (section 21.3). Sessions are revoked on password change (other sessions), reset and disable. Lifetimes are fixed: `last_seen` is updated, `expires_at` is never extended. |
 | GW-29 | CSRF protection | Info | Mitigated | `context.py: Ctx.require` (non-GET with cookie auth: Origin in the allow-list if present, `X-CSRF-Token` equal to the session's token, constant time); `api.py: login` (Origin check) | Bearer-token requests do not need CSRF (no ambient credential). |
 | GW-30 | WebSocket origin and gating | Info | Mitigated | `app.py: ws_endpoint`, `HostGuard` | Cookie sockets need an allowed Origin. Token sockets need the `Authorization` header and no Origin. Sockets are closed before accept for unauthenticated users or a pending password change. `?profile=` is admin-only and audited. Since v1.0.0 the Host header is allow-listed as well (NEW-04), so a DNS-rebinding page can no longer reach the gateway under its own host name. |
 | GW-31 | Security headers and XSS | Info | Mitigated | `app.py: SecurityHeaders`, `SPA_CSP`; `static/js/markdown.js` (DOMPurify, forbidden tags and `style`, `javascript:` links removed, remote images dropped); `static/js/ui.js: h()` (NEW-06); `api.py: fs_download` (NEW-08) | CSP `script-src 'self'`, `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`; X-Frame-Options DENY, nosniff, Referrer-Policy same-origin, COOP/CORP same-origin, Permissions-Policy, `no-store` on `/api/`, HSTS (1 year) with an https `public_url`, no Server header. `style-src` allows `'unsafe-inline'`. |
@@ -1468,6 +1468,14 @@ no way to take anything off. The administration guide warns against a task that 
 **Not verified.** The task on a Windows Server and after a real restart; a machine that allows only signed
 scripts (the task then fails and the script says what to do instead). No independent review.
 
+**Corrected 2026-11-19 (section 21.8, S-1 and S-2).** Two things in this judgement were wrong. The folder: a
+folder in `<ProgramData>` can be created beforehand by any account of the machine, which then owns it, and the
+script used a folder that was already there - "is given to the Administrators" does not help against a handle
+that was opened before. And "nothing of Goose Web's own folder runs as SYSTEM": the copy is made from the install
+folder by a script that is itself run elevated from the install folder, so whoever can change that folder
+decides what SYSTEM runs - once, at registration, but that is enough. 1.25.0 changes the first and says the
+second.
+
 ### 20.4 1.24.2: what CI measured for the start-up task
 
 By the CI run of 1.24.1, as an administrator on Windows Server 2022 and 2025: the script is copied to a folder
@@ -1477,3 +1485,165 @@ opening devices that are still closed (they had been opened before it ran). 1.24
 this is what its last step sees on Windows Server 2022. No change of the product; nothing new to judge. Still
 not verified: a real restart; a machine that allows only signed scripts.
 
+## 21. Addendum: 1.25.0 (2026-11-19) - read-only folders, uploads, the sign-in lifetime, team provider aliases
+
+Requested by the owner; built as specs 031-033 and one fix record. Assessed with the working tree that became
+the release: the test suites on Python 3.13 (real Goose, real MXC) and 3.11, a headless browser against a gateway
+running the tree (an administrator and a member, desktop and phone), and one independent read-only review (21.6).
+
+### 21.1 Folders a team may only read (`read_roots`)
+
+**What is promised.** A member - in the file browser, by an upload, and through the member's agent - can read a
+read-only folder and cannot create, change, rename or delete anything in it.
+
+| Path | Control | Verified by |
+|---|---|---|
+| File API writes (`fs/mkdir`, `fs/upload`) | `context.path_ok(write=True)`: inside the writable roots, as written AND with links resolved | `test_file_api_reads_but_does_not_write_...`: 403 `read_only_folder`, nothing created; a `Web_Uploads` junction into the read-only folder and one to outside are refused |
+| File API reads | allowed in both kinds of root | same test |
+| The agent, MXC backend | the folder is in the container's `readonlyPaths` | `test_mxc_reads_a_read_only_folder_and_cannot_write_it`: a Python in a real container reads and lists; create, append, delete, rename, mkdir, a write below, and a child process writing all fail; the folder is unchanged |
+| The agent, AppContainer backend | a Read & execute entry for the container | `test_appcontainer_reads_a_read_only_folder_and_cannot_write_it` (real container, `cmd.exe`) |
+| A folder switched from writable to read-only | AppContainer: `sandbox.shrink` replaces the Modify entry by a read entry at once; the next start does the same | `test_appcontainer_a_folder_switched_...`: after the switch a program in the container cannot write, also not a file it made while the folder was writable |
+| Two lists that meet | read-only wins (`policy._split_roots`): a folder in both lists, or a writable folder containing a read-only one, is only read; refused at saving for a team and for one person's overrides | `test_read_only_wins_where_the_lists_meet`, `test_admin_api_refuses_a_nested_read_only_folder_and_checks_overrides` |
+| Folders that must not be shared at all (C-11) | `read_roots` goes through `folder_grant_problem` like `allowed_roots` | `test_a_read_only_folder_cannot_lie_inside_a_writable_one` |
+
+**Residual, stated.**
+- *MXC, a running agent.* A container's folders are fixed when it starts. After a switch to read-only (or after
+  a folder is taken away) an agent that is in a run keeps what it started with until the run has finished; the
+  gateway restarts it then. The file API refuses at once. The team page names the members concerned; an
+  administrator can restart the agent at once. Not closable from outside the container.
+- *Sandbox off.* The agent then runs as the gateway's Windows account; only the gateway's own file API is held to
+  read-only. The team page warns. (Unchanged: without the sandbox a member's agent is not confined at all.)
+- *Reading is not confidentiality between members:* every member of the team reads the folder; that is its purpose.
+- *Administrators* are not restricted by folders (unchanged).
+
+### 21.2 Uploads: `<chat folder>\Web_Uploads`
+
+The server appends the folder name; the page cannot choose where a file lands inside the chat folder. The write
+check runs on the resolved `<dir>\Web_Uploads` (the gateway is not sandboxed, so this check is the guard against
+a link of that name), before the body is read and again right before each file is created (21.6, R-5). Files are
+created exclusively (never overwritten); names are sanitised as before; hint-file names and `.agents` folders are
+refused as before. A refusal writes nothing. Images, which were sent inline only, are now written too: an image
+attached to a chat exists as a file in the chat folder.
+
+### 21.3 Sign-ins: eight hours, no persistent sign-in
+
+**Threat.** A copied sign-in cookie is a working sign-in for as long as it lives, and this product starts
+programs for whoever is signed in. Before: 30 days when "Keep me signed in" was ticked (it was, by default), kept
+on disk by the browser; 12 hours otherwise, up to 720 by an administrator's setting. An installation in use
+therefore collects sign-ins that are good for weeks on devices nobody uses any more.
+
+**Now.** One lifetime, 1 to 8 hours, fixed at sign-in and never extended (`auth.SESSION_HOURS_MAX`); no
+persistent sign-in; a session cookie; sign-ins stored by an earlier version are cut at start-up
+(`clamp_sessions`) - the upgrade signs everybody out; an open socket is closed within 30 seconds of its sign-in
+ending (measured in the browser: the tab is at the sign-in page). Optional idle limit, off by default.
+
+**Checked against** the OWASP Session Management Cheat Sheet, ASVS V3 and NIST SP 800-63B (AAL2: re-authentication
+every 12 hours at most, 30 minutes of inactivity): absolute lifetime - yes, stricter; inactivity - available, off
+by default (below); no persistent sign-in - yes; cookie attributes - HttpOnly, SameSite=Strict, Secure and the
+`__Host-` prefix over https; token stored as a hash; a new token at every sign-in, the others ended on password
+change, reset and disable; sign-out ends the token on the server; a CSRF token per sign-in on every write.
+
+**Decisions left to the owner, stated.**
+- *The idle limit is off by default.* An open tab counts as use (the tab's connection is re-checked every 30
+  seconds and that marks the sign-in as used; chatting goes over that connection). So the limit ends forgotten
+  sign-ins, not an unattended open browser - measuring a person's own activity would need the browser to report
+  it, and whoever holds the cookie could report it too. With a limit set, a phone that has been in a pocket for
+  longer signs in again. Recommended where devices are shared: 30 to 60 minutes.
+- *API tokens* (Settings > Account) can still be created without an expiry. Not changed in this release.
+- *Not done:* tying a sign-in to an address or a browser name (phones change address; whoever copies a cookie
+  copies the browser name).
+
+### 21.4 Provider aliases for a team (`provider_groups`)
+
+A display rule. The value is cleaned by the function that cleans a person's own groups (size limits, ids, one
+group per provider) and travels in the member's policy. Names, prefixes and model names reach the page only as
+text nodes and option labels (`ui.h`), never as HTML. Choosing an alias entry sets the real provider, then the
+real model, through the calls that existed; the allowed lists are checked on the real ids by the gateway
+(`policy.check`), so an alias cannot make a chat use what the policy does not allow. A member cannot change the
+team's aliases: they are not in the member's preferences, and the member's own groups cannot take a provider out
+of a team alias.
+
+The team page's provider switch: for a provider of the administrator's own profile it creates the team's copy
+(definition and key, as the library item always did) and allows it; for other providers it only allows - no key
+of the administrator's own account is handed out by a switch that says "allow".
+
+### 21.5 Fixes
+
+- Home page on a phone: the menu button was covered by the page content (CSS). No security bearing.
+- A steer shown twice: one message was sent; the tab made a second bubble when Goose's echo came before the
+  answer to the call. Two paths that could really have sent a message twice are closed with it: a steer Goose had
+  already echoed was queued again when its call failed, and a steer whose connection dropped in flight was queued
+  and sent again by itself (it now waits for the person).
+- Team items: an extension that starts a program is not delivered without the Shell permission (unchanged, by
+  design); the page now says so, and marks an item whose source is gone.
+- One person's policy overrides: the folder lists were stored unchecked (an administrator's own typing only);
+  they now pass the rules of a team's lists.
+
+### 21.6 Independent review of the working tree (2026-11-19, read-only, by reading)
+
+| # | Severity | Finding | Outcome |
+|---|---|---|---|
+| R-1 | Medium | The idle limit would have ended the sign-in of somebody chatting: `last_seen` was written by requests only, and chatting goes over the socket | Fixed: the socket's 30-second re-check goes through `auth.session_alive`, which marks the sign-in as used. Test `test_an_open_tab_counts_as_use` |
+| R-2 | Medium | A folder switched to read-only was not narrowed for a running agent (AppContainer: "a changed right is the next start's business") | Fixed for AppContainer: `sandbox.shrink` narrows at once (tested in a real container). MXC cannot be narrowed from outside: stated in 21.1; the page names the members |
+| R-3 | Low/Medium | The nesting rule was checked only on the side being saved; overrides and a team's lists could meet so that a "read-only" folder was writable | Fixed at use: read-only wins (`policy._split_roots`); also checked when overrides are saved |
+| R-4 | Low | A new team's own folder was not in the nesting check | Fixed: checked once the team has its id |
+| R-5 | Low | The upload folder was checked before the body was read, not when the file was made | Fixed: checked again right before each file. A race inside that instant remains in theory; it needs somebody who can create a link in a folder they may write to a place they may not, which an application container is not expected to be able to do - not measured |
+| R-6 | Low | Two tabs steering the same words into one chat at the same moment: one bubble can stand for both | Open, cosmetic: nothing is lost, a reload shows both |
+| R-7 | Low | Documents and version still described 1.24.2 | Done with this release |
+| R-8 | Note | Images are now written to disk | Intended (21.2); in the changelog and the guides |
+| R-9 | Note | A real service's name as an example in the page and a test | Replaced by a neutral one before the commit |
+| R-10 | Note | The team page: a pane drawn again could save over what a switch had just stored; folder rows were saved while being typed | Fixed: an old pane never saves, a path is taken when its field is left |
+
+The reviewer read; it ran nothing. What it marked as not checked: API tokens, LDAP/OIDC internals, three
+front-end files line by line, and the cost of looking up an item's source.
+
+### 21.7 Audit of the whole product, 2026-11-19 (summary)
+
+Mechanical: all 64 routes ask for an identity except the seven that must be open (health, sign-in, sign-in
+configuration, sign-out, the two OIDC steps, the second-factor step); all 37 `/api/admin` routes ask for an
+administrator. `pip-audit`: no known vulnerabilities. Functional: 116 page loads (every page and every Settings
+and Admin section, as an administrator and as a member, desktop and phone) without a script error, a failed
+request or a dead menu button after the fixes of this release; chat, stop, queue, steer, an ended sign-in and
+sign-out in the browser.
+
+Still open from earlier reviews, unchanged by this release: B-2, B-3, B-5, B-6 (a worker's life cycle), D-2 (no
+rollback in `upgrade.ps1`), D-8 (the build backend is not hash-locked); Low: S-3, S-5, S-8, S-16, T-4, T-11, R-6.
+Not verified by anybody: OIDC against a real provider; a Windows Server restart with the devices task; MXC under
+a gateway nobody is signed in to; Goose 1.59 with this release.
+
+### 21.8 Second independent review: what nobody but the author had read (2026-11-19, read-only, by reading)
+
+Scope: the changes from the last reviewed commit to 1.24.2 (the self-test's limits, the device grant, the start-up
+task and its two scripts, the upgrade script's search for uv, the sub-recipe check, session pruning, guarded
+extension items), and the browser code as a whole by sink.
+
+| # | Severity | Finding | Outcome |
+|---|---|---|---|
+| S-1 | High | **Published in 1.24.1 and 1.24.2.** `register-devices-task.ps1` put the script that SYSTEM runs at every start into `<ProgramData>\GooseWeb` and used a folder of that name that was already there. Any account of the machine can create that folder first and owns it then; a handle it keeps open with the right to change the access list outlasts the script's new access list, and a folder swapped for a link between two steps sends the access list and the copy elsewhere. Either way that account decides what SYSTEM runs. Measured here: `<ProgramData>` lets ordinary accounts create folders (`BUILTIN\Users:(CI)(WD,AD,WEA,WA)`), `<Program Files>` does not. Not measured: the attack itself | Fixed: the copy lives in `<Program Files>\GooseWeb.Startup`; a new folder is made WITH its access list (no moment with another one); a folder that is already there is used only when nobody but SYSTEM, the Administrators and Windows' installer owns it or can change it; the old copy is removed. Who can pull it: an account of the machine that is not an administrator - the gateway's own account included; not a member's sandboxed agent, which cannot write to ProgramData. **An installation that registered the task with 1.24.1 or 1.24.2 should run the new script and restart Windows** (ADMINISTRATION 11.6) |
+| S-2 | High (where the install folder is writable by an account that is no administrator) | The copy is made from the install folder, and the script is run elevated from the install folder. The hash check compared the copy with that same file. So an account that can change the install folder decides what runs elevated at once and as SYSTEM afterwards - against what 20.3 said | The script now looks at the two files, their folder and the folder above and stops when anybody but SYSTEM, the Administrators, Windows' installer and the caller can change them (`-TrustSource` to go on); it prints the SHA-256 of what it installed. This helps against an honest mistake, not against somebody who has already changed the script - which is why the guide now says where the two files must come from. The same holds for everything an administrator runs elevated out of the install folder; `install.ps1` leaves that folder writable by administrators and the installing account only, and `check` says when it is not so |
+| S-3 | Low | `upgrade.ps1` also took `uv.exe` from the folder of the goose binary, which can be writable by accounts with fewer rights than whoever runs the upgrade | That place is not searched any more |
+| S-4 | Low | The build backend is fetched unpinned at every upgrade | Open (it is D-8 of the 2026-11-12 review) |
+| S-5 | Low | A sub-recipe's path was judged and then opened by name; a link put in between made the gateway read up to 1 MB of YAML outside the member's folders (what leaks: a title and an extension name in the refusal) | Fixed: where the open really ended is asked of the open file (`security.final_path`); elsewhere = not read |
+| S-6 | Low | A team item stored under another key whose entry is a bundled shell-capable extension (`{type: builtin, name: developer}`) was delivered, switched on, to a team without the Shell permission. Only an administrator can make such an item | Fixed: delivery, switching off and the team page's warning go by the name in the entry as well |
+| S-7 | Low | With the Shell permission still given, taking a guarded item away from a team switches the extension off for good | Intended: taking the item away takes the extension away; giving it again brings it back |
+| S-8 | Low | A prompt for a made-up session id made a state that counted as watched for as long as the socket lived, past the cap | Fixed: a prompt Goose refuses for a session it never loaded here is not watched |
+| S-9 | Note | The members' window station gives all members' agents one clipboard (it is S-3 of the 2026-11-14 review, open); `sandbox.grant_devices` merges the entry where the script adds one - "only ever adds" is exact for the script; the grant script compiles four Windows declarations as SYSTEM in the system's temporary folder at each start; under PowerShell 7 the registration stopped at the first access-list call | The script now says at once that it needs Windows PowerShell; the rest stands as described |
+| F-1 | Low | A sign-in that ended by itself left folders, pinned chats and provider lists in the browser's storage for the next person (signing out cleared them) | Fixed: both ways clear the same |
+| F-2 | Low | Markdown: only an image's address was held to this site; `video`, `audio`, `source`, `track`, `poster` and `background` passed the sanitiser, so only the Content-Security-Policy stood between a model's text and a request to an address of its choosing | Fixed: those elements and attributes are removed |
+| F-3 | Note | A link `#/new?cwd=..&recipe=..` in a message prefills the New chat page; an image address on this site makes a signed-in request | Stands: nothing is started without the person |
+| F-4 | Note | A link with `?profile=` puts an administrator's tab on another profile without asking (audited) | Stands |
+| F-5 | Note | A grid app can open an http(s) or mailto link without asking, and its frame may send what it is given anywhere (its origin is opaque) | By design of the apps bridge; stated |
+
+Found sound by that review (by reading): the Content-Security-Policy has no inline script and no eval; `innerHTML`
+is used for constants, sanitised markdown and highlighted flat text only; `ui.h` drops `javascript:` and `data:`
+addresses; app frames are sandboxed without same-origin and the bridge checks the sender; downloads are served as
+attachments; the CSRF token is in memory only and no secret is in the browser's storage; there is no "next"
+parameter at sign-in; the service worker caches the shell only; a socket needs an allowed origin; both device
+names are fixed and the rights given carry no delete, no change of access list and no write to the mount manager
+(the last assumed from the Windows header, not measured); the task runs Windows PowerShell by its full path with
+`-NoProfile`; a failure to make the members' desktop stops the start instead of using the interactive desktop.
+
+Not verified by anybody: the new registration on a Windows Server (the CI job of this release registers it, runs
+it as SYSTEM and reports the owners and access lists Windows gives the task folder, the task and the copy's
+folder); what Task Scheduler lets an account do with a task folder it created itself; a real restart; a machine
+that allows only signed scripts.

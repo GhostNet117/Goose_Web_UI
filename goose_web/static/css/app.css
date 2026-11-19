@@ -905,7 +905,9 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 
 /* ---------- Home ---------- */
 .view-home { overflow-y: auto; }
-.home-top { display: flex; padding: 10px 14px 0; min-height: 10px; }
+/* flex: none - the strip keeps the height of its menu button. With a min-height it was shrunk to that when the page
+   was taller than a phone's screen, and .home-center covered the button (bug menu-steer-extension-2026-11-19). */
+.home-top { display: flex; flex: none; padding: 10px 14px 0; }
 .home-center { width: 100%; max-width: 760px; margin: 0 auto; padding: 9vh 24px 40px; display: flex; flex-direction: column; gap: 14px; }
 .home-title { font-size: 2em; font-weight: 650; letter-spacing: -.025em; background: linear-gradient(90deg, var(--fg) 30%, color-mix(in srgb, var(--accent) 70%, var(--fg))); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .home-sub { color: var(--fg-2); margin: -6px 0 6px; }
@@ -1129,6 +1131,20 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .lib-res { display: flex; flex-direction: column; gap: 4px; max-height: 340px; overflow-y: auto; }
 .logs { max-height: calc(100dvh - 260px); min-height: 300px; font-size: 12px; }
 
+/* spec 033: a team's providers in one list; spec 031: its folders, one row each */
+.warn-text { color: var(--warn); }
+.prov-list { max-height: 460px; }
+.prov-row { padding: 8px 0; gap: 12px; }
+.prov-row[data-state="half"] { background: color-mix(in srgb, var(--warn) 7%, transparent); }
+.folder-row { gap: 10px; align-items: center; flex-wrap: wrap; }
+.folder-row .grow { flex: 1 1 280px; min-width: 0; }
+.folder-row .tgl { flex: none; min-width: 190px; }
+.grp-team { background: color-mix(in srgb, var(--accent) 4%, transparent); }
+/* spec 031: a folder the team may only read */
+.fp-ro { display: flex; align-items: center; gap: 6px; padding: 6px 10px; margin: 0 0 6px; border-radius: var(--r-sm); background: color-mix(in srgb, var(--warn, #d97706) 12%, transparent); color: var(--fg-2); font-size: .86em; }
+.fp-ro[hidden] { display: none; }
+.fp-ro-tag { margin-left: auto; font-size: .72em; text-transform: uppercase; letter-spacing: .05em; color: var(--fg-3); }
+
 /* ---------- Responsive ---------- */
 @media (max-width: 1100px) {
   .grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1136,6 +1152,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 }
 @media (max-width: 860px) {
   .only-mobile { display: inline-flex !important; }
+  .btn.only-mobile { flex: none; }   /* the menu button is never squeezed by a long page title */
   .side-wrap {
     position: fixed; top: 0; bottom: 0; left: 0; width: min(var(--side-w), 86vw); margin-left: 0 !important;
     transform: translateX(-102%); transition: transform 220ms var(--ease); box-shadow: var(--shadow); z-index: 60;

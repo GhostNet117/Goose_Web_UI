@@ -1,9 +1,12 @@
 // Spec 024: provider groups and model labels - a display alias for the chat pickers (New chat, chat header).
 // Several providers (for example one per person or per effort level, all serving the same models) can be shown as ONE
-// provider entry. Its model list is the union of the members' models, each labelled `<prefix>-<model display name>`
-// (prefix per member, optional). Picking a label sets the REAL provider and model of the chat. Nothing in Goose's
-// configuration changes: the groups are a per-user preference stored with the others (prefs.providerGroups,
-// PUT /api/me/prefs, cleaned by the server, api._clean_provider_groups).
+// provider entry. Its model list is the union of the members' models, each labelled `<prefix> - <model display
+// name>` (prefix per member, optional), in the order the group lists its providers. Picking a label sets the REAL
+// provider and model of the chat. Nothing in Goose's configuration changes. Two sources (spec 033):
+//   - the person's own groups: a preference stored with the others (prefs.providerGroups, /api/me/prefs, cleaned
+//     by the server, api._clean_provider_groups) - Settings > Models & Providers > Provider groups;
+//   - the TEAM's aliases, set by an administrator on the team page: policy.provider_groups of /api/me.
+// The team's come first: a provider in a team alias cannot be taken into a group of one's own.
 //
 // Data model:
 //   prefs.providerGroups = {
@@ -55,10 +58,26 @@ export function splitValue(v) {
 }
 // A model's display name: the user's name for the id, else Goose's name, else the id.
 export function modelName(id, name, names) { return (names && names[id]) || name || id; }
-// The label in a group's model list: `<prefix>-<display name>`, or the display name without a prefix.
+// The label in a group's model list: `<prefix> - <display name>`, or the display name without a prefix.
 export function modelLabel(prefix, id, name, names) {
   const n = modelName(id, name, names);
-  return prefix ? prefix + '-' + n : n;
+  return prefix ? prefix + ' - ' + n : n;
+}
+// Spec 033: what the pickers use - the team's aliases first (marked `team`), then the person's own groups for the
+// providers the team left alone. An own group with the id of a team alias, or whose providers are all in team
+// aliases now, is left out. Model display names: the team's, the person's own name for a model wins.
+export function mergeGroups(team, own) {
+  const t = normGroups(team); const o = normGroups(own);
+  const taken = new Set(t.groups.flatMap((g) => g.members.map((m) => m.provider)));
+  const ids = new Set(t.groups.map((g) => g.id));
+  const groups = t.groups.map((g) => ({ ...g, team: true }));
+  for (const g of o.groups) {
+    if (ids.has(g.id)) continue;
+    const members = g.members.filter((m) => !taken.has(m.provider));
+    if (!members.length && g.members.length) continue;
+    groups.push({ ...g, members });
+  }
+  return { groups, modelNames: { ...t.modelNames, ...o.modelNames } };
 }
 
 // The entries a provider picker offers. `providers` = [{id, name, models: [{id, name}], defaultModel, engine,
@@ -66,8 +85,8 @@ export function modelLabel(prefix, id, name, names) {
 // ctx = providervis visibilityContext() (+ `current`: the provider an open chat uses).
 // Ungrouped provider -> itself (models with display names; `hiddenInSettings` when kept only as `current`).
 // Group -> { id: 'group:<id>', group: true, groupId, name, members: [{provider, prefix, name, defaultModel, engine,
-// hiddenInSettings}] in the group's order, models: [{value, provider, model, prefix, label, hidden}] sorted by
-// prefix then label }. Entries sorted by name.
+// hiddenInSettings}] in the group's order, models: [{value, provider, model, prefix, label, hidden}] in the order
+// of the group's providers, then by label }. Entries sorted by name.
 export function groupPicker(providers, cfg, ctx = {}) {
   cfg = cfg || { groups: [], modelNames: {} };
   const list = (providers || []).filter((p) => p && p.id);
@@ -95,13 +114,14 @@ export function groupPicker(providers, cfg, ctx = {}) {
     }
     if (!members.length) continue;
     const models = [];
-    for (const m of members) {
+    members.forEach((m, order) => {
       for (const x of m.models) {
-        models.push({ value: joinValue(m.provider, x.id), provider: m.provider, model: x.id, prefix: m.prefix,
+        models.push({ value: joinValue(m.provider, x.id), provider: m.provider, model: x.id, prefix: m.prefix, order,
           label: modelLabel(m.prefix, x.id, x.name, cfg.modelNames), sortName: modelName(x.id, x.name, cfg.modelNames), hidden: m.hiddenInSettings });
       }
-    }
-    models.sort((a, b) => cmpText(a.prefix, b.prefix) || cmpText(a.sortName, b.sortName) || cmpText(a.provider, b.provider));
+    });
+    // in the order the group lists its providers ("Max - ..., High - ..., Low - ..."), then by name
+    models.sort((a, b) => (a.order - b.order) || cmpText(a.sortName, b.sortName));
     out.push({ id: GROUP_PREFIX + g.id, group: true, groupId: g.id, name: g.name, members: members.map(({ models: _m, ...r }) => r), models });
   }
   return out.sort((a, b) => cmpText(a.name, b.name));
@@ -169,7 +189,15 @@ export function headerPickers(provOptions, curProvider, curModel, curModels, ent
 }
 // ----- end pure rules -----
 
-export function groupsConfig() { return normGroups(pref(GROUPS_PREF)); }
+// The person's own groups (what Settings edits and setGroups stores).
+export function ownGroups() { return normGroups(pref(GROUPS_PREF)); }
+// The aliases of the person's team (spec 033); an administrator has none - their policy is not a team's.
+export function teamGroups() {
+  const me = store.get('me');
+  return normGroups(me && !me.isAdmin && me.policy ? me.policy.provider_groups : null);
+}
+// What the pickers show: the team's aliases, then one's own.
+export function groupsConfig() { return mergeGroups(teamGroups(), ownGroups()); }
 export function setGroups(cfg) { setPref(GROUPS_PREF, normGroups(cfg)); }
 export function newGroupId() { return 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5); }
 

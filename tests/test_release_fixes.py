@@ -341,12 +341,13 @@ def test_create_exclusive_never_overwrites(tmp_path):
 def test_upload_endpoint_sanitises_and_keeps_existing(stack, tmp_path):
     _, db, auth, c, _ = stack()
     root = mk_user(db, "root", role="admin")
-    d = tmp_path / "up"
-    d.mkdir()
+    base = tmp_path / "up"
+    d = base / "Web_Uploads"                                    # spec 031: where an upload to `base` is written
+    d.mkdir(parents=True)
     (d / "_CON.txt").write_bytes(b"keep me")
     with TestClient(make_app(c), base_url="http://localhost") as client:
         h = sign_in(client, auth, root)
-        r = client.post("/api/fs/upload", params={"dir": str(d)}, headers=h,
+        r = client.post("/api/fs/upload", params={"dir": str(base)}, headers=h,
                         files=[("f", ("CON.txt", b"one")), ("f", ("notes.md. ", b"two"))])
         assert r.status_code == 200, r.text
         names = [f["name"] for f in r.json()["files"]]

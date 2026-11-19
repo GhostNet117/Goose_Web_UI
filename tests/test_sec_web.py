@@ -221,7 +221,7 @@ def test_upload_checks_every_name_before_writing(tmp_path):
         assert r.status_code == 403 and r.json()["error"] == "hint_file_refused"
         assert list(ws.iterdir()) == []                               # nothing saved before the refusal
         r = client.post("/api/fs/upload", params={"dir": str(ws)}, headers=h, files=[("f", ("a.txt", b"a"))])
-        assert r.status_code == 200 and (ws / "a.txt").read_bytes() == b"a"
+        assert r.status_code == 200 and (ws / "Web_Uploads" / "a.txt").read_bytes() == b"a"   # spec 031
 
 
 # ====================================================================== A-3 lockout

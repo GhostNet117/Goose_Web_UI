@@ -63,7 +63,9 @@ Use this for local accounts and for directory (LDAP or Active Directory) account
 configured, the username field is labelled with its name, for example "Directory username".
 
 1. Enter your username and password.
-2. Leave **Keep me signed in** ticked on your own device. Untick it on a shared computer.
+2. There is no "Keep me signed in": a sign-in lasts eight hours at most (your administrator can make it
+   shorter), and then you sign in again. An agent that is working is not stopped by that; it is there when you
+   are back.
 3. Click **Sign in**.
 
 ### Sign in with single sign-on
@@ -276,7 +278,7 @@ and a row of option pickers for the new chat.
    | Picker | What it sets |
    |---|---|
    | Provider | The model provider. Only providers set up in your profile (and allowed by your policy) are listed, minus the ones you hid in **Settings > Models & Providers > Chat pickers** (version 1.17.0 and later; your default provider is always listed). A **provider group** (version 1.18.0 and later) is listed once, under its group name. |
-   | Model | The model of that provider. Changing the provider resets the model to its default. For a provider group, the models of all its providers, labelled `<prefix>-<model name>` (for example `B-High-Model X`); picking a label starts the chat on that label's real provider and model. Model display names you set in Settings are used here for every provider. |
+   | Model | The model of that provider. Changing the provider resets the model to its default. For a provider group, the models of all its providers, labelled `<prefix> - <model name>` (for example `High - Model X`); picking a label starts the chat on that label's real provider and model. Model display names you set in Settings are used here for every provider. |
    | Thinking effort | How much the model reasons before answering (Off, Low, Medium, High, Max, or the values the provider offers). The list shows the values Goose offered last time for that model. |
    | Approval mode | When Goose asks before it runs a tool: Auto, Approve, Smart approve or Chat only (see [Mode](#mode)). |
 
@@ -376,7 +378,7 @@ for models that support it, a thinking level picker.
   **(hidden in settings)**; once you switch away it is no longer offered in that chat.
 - **Provider groups** (version 1.18.0 and later, set up in **Settings > Models & Providers > Provider groups**): a
   chat on one of a group's providers shows the group name as its provider, and its model picker lists the labelled
-  models of all the group's providers (`<prefix>-<model name>`). Picking a label switches the chat to that label's
+  models of all the group's providers (`<prefix> - <model name>`). Picking a label switches the chat to that label's
   real provider, then its model; the conversation so far is kept and the next message goes to the new one. Picking
   the group in the provider picker (from a provider outside it) switches to the group's first provider, or to your
   default provider when it is in the group. The thinking-effort picker is unchanged: for providers whose effort is
@@ -454,8 +456,10 @@ You can attach in three ways: click the paper-clip button, paste from the clipbo
 message box.
 
 - **Images up to 8 MB** are sent to the model as images. A thumbnail appears in the message box.
-- **Other files, and larger images,** are uploaded into a `.goose-web-uploads` folder inside the chat's working
-  folder. Goose gets a link to the uploaded file. Existing files are never overwritten: a second `report.pdf`
+- **Every attached file** is written into a `Web_Uploads` folder inside the chat's working folder (1.25.0;
+  images too). Goose gets a link to the file. In a folder your team may only read, attaching is refused:
+  "You do not have write access to this folder, so files cannot be uploaded here." - choose your workspace,
+  or another folder you may write, as the chat's folder. Existing files are never overwritten: a second `report.pdf`
   becomes `report (1).pdf`.
 - You need a working folder before you can upload a file.
 - The administrator sets the maximum file size. Up to 20 files can be uploaded at once.
@@ -1042,8 +1046,10 @@ list).
 header pickers - for example one provider per person or per effort level that all serve the same models. Click
 **New group** and name it (the name the pickers show). Tick the providers that belong to it (a provider can be in
 one group only; one that is in another group is shown greyed out with that group's name) and give each an optional
-**prefix**. The group's model list is every model of its providers, labelled `<prefix>-<model name>` (no prefix:
-just the model name), sorted by prefix and then model, and previewed under the group. **Model display names**
+**prefix**. The group's model list is every model of its providers, labelled `<prefix> - <model name>` (no prefix:
+just the model name), in the order of the group's providers and then by model, and previewed under the group.
+Aliases your administrator set for your team are listed first as **From your team**; they cannot be changed
+here, and a provider that is in one cannot be ticked into a group of your own. **Model display names**
 gives a model id a friendly name (for example `vendor-model-4.1-flash` -> `Model 4.1 Flash`) wherever the pickers
 list it, for grouped and ungrouped providers alike; the list shows the models of grouped providers (turn on **All
 models** for the rest); clear a name to go back to Goose's. Rename a group in its name field; **Delete group** shows
@@ -1328,8 +1334,14 @@ them. Unsent text you typed in the message box is kept on the same device (brows
 sign out; it does not follow you to another device.
 
 **Where do my uploaded files go?**
-Into `.goose-web-uploads` inside the chat's working folder, for example
-`C:\work\project\.goose-web-uploads\report.pdf`. Images up to 8 MB are sent directly to the model instead.
+Into `Web_Uploads` inside the chat's working folder, for example
+`C:\work\project\Web_Uploads\report.pdf` (before 1.25.0: `.goose-web-uploads`; older files stay there).
+Images up to 8 MB are also shown to the model directly.
+
+**Why does a folder say "read only"?**
+Your administrator gave your team that folder to read, not to change - a knowledge base, for example. You and
+your agent can open what is in it and you can start a chat there; nothing can be created or changed in it, and
+files cannot be attached to a chat that works there. Keep your own notes in your workspace.
 
 **I use Goose Desktop too. Do I see the same chats?**
 If your account uses the same Goose profile as Goose Desktop, yes. Chats continued in Desktop, the CLI or a

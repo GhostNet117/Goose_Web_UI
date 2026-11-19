@@ -116,7 +116,8 @@ def test_check_names_a_sign_in_provider_that_is_refused_for_plain_http(tmp_path)
     from pathlib import Path
     from goose_web.db import Database
     s = Settings(_deep_merge(DEFAULTS, {"paths": {"profiles_root": str(tmp_path)}}), None)
-    assert cli._signin_lines(s) == []                       # no database yet
+    # no database yet: only the line that says how long a sign-in lasts (spec 032)
+    assert [m for m, _ in cli._signin_lines(s)] == ["--"] and "lasts 8 h" in cli._signin_lines(s)[0][1]
     Path(s.system_dir).mkdir(parents=True, exist_ok=True)
     db = Database(Path(s.system_dir) / "goose-web.db")
     try:
@@ -126,5 +127,5 @@ def test_check_names_a_sign_in_provider_that_is_refused_for_plain_http(tmp_path)
                                          {"id": "opted", "issuer": "http://idp.lan", "allowInsecure": True}]})
     finally:
         db.close()
-    lines = cli._signin_lines(s)
+    lines = [x for x in cli._signin_lines(s) if x[0] == "!!"]
     assert len(lines) == 1 and lines[0][0] == "!!" and "'lan'" in lines[0][1] and "refused" in lines[0][1]

@@ -870,6 +870,11 @@ class Profiles:
                 if not isinstance(entry, dict):
                     continue
                 key = payload.get("key") or name
+                # S-6: a bundled extension is started by the NAME in its entry, whatever key it is stored under: an
+                # item "x" whose entry is {type: builtin, name: developer} is the developer extension.
+                inner = str(entry.get("name") or "") if entry.get("type") in ("builtin", "platform") else ""
+                if ext_key(inner) in _GUARDED and ext_key(key) not in _GUARDED and missing(pol, extension_needs(inner)):
+                    continue
                 if ext_key(key) in _GUARDED and missing(pol, extension_needs(key)):
                     # shell-capable / extension-starting: only with the permission it needs (allow_shell;
                     # extensionmanager also extensions_edit). Without it the key is pinned off below, and the team
@@ -1203,6 +1208,16 @@ class Profiles:
                 if key not in exts and isinstance(e, dict):
                     exts[key] = e
                     changes.append(f"extension {key} restored (allow_shell on)")
+        # S-6: a bundled shell-capable extension under ANOTHER key (an entry whose name is a guarded one) is
+        # switched off without the permission, like the key of that name
+        for key, e in exts.items():
+            if key in GUARDED_EXTENSIONS or not isinstance(e, dict) or e.get("type") not in ("builtin", "platform"):
+                continue
+            inner = ext_key(e.get("name"))
+            if inner in _GUARDED and missing(pol, extension_needs(str(e.get("name")))) and e.get("enabled") is not False:
+                e["enabled"] = False
+                changes.append(f"extension {key} disabled (it is {e.get('name')}: needs "
+                               f"{' and '.join(extension_needs(str(e.get('name'))))})")
         new_manifest["pinned"] = pinned
         new_manifest["parked"] = parked
 

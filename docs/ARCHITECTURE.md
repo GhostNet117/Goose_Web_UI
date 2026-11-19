@@ -162,7 +162,7 @@ The main ideas:
 | `js/api.js` | `fetch` wrapper for the REST API (CSRF header, errors, uploads). |
 | `js/prefs.js` | User preferences (server-stored, cached in `localStorage`, synced live between tabs), themes. |
 | `js/providervis.js` | Spec 023 (1.17.0): which providers the chat pickers offer. The user's hidden list (`prefs.providerVisibility.hidden`, server-stored), applied after the policy; never hides the default provider or (in a chat header) the chat's own provider; leaves out providers Goose lists but that are not configured, and effort variants (`variantOf`, a spec 022 hook). Pure rules `pickerHidden` / `pickerProviders` / `cleanHidden` / `hideAllExcept`; default provider, unconfigured ids and variants remembered in `localStorage` `gw-provider-vis` (ids only, per user) so the chat header needs no request. |
-| `js/providergroups.js` | Spec 024 (1.18.0): provider groups, a display alias for the chat pickers. `prefs.providerGroups = {groups: [{id, name, members: [{provider, prefix}]}], modelNames: {id: name}}` (server-cleaned, `api._clean_provider_groups`; a provider in one group only). Pure rules `groupPicker` (policy-filtered providers -> picker entries: ungrouped providers with display names, one `group:<id>` entry per group with the members that pass spec 023's `pickerHidden` - the chat's own and the default provider always - and models `{value: '<provider>\|<model>', label: '<prefix>-<name>'}` sorted by prefix then name), `headerPickers` (collapses Goose's provider option for the chat header), `groupDefault`, `labelIn`, `splitValue`. Picks always resolve to the REAL provider + model (header: `set_config_option provider`, then `model`). The members' model lists come from the `providers/list` New chat and Settings load (`localStorage` `gw-provider-models`, ids and names, per user; `loadInventoryOnce` fetches it at most once per page otherwise). |
+| `js/providergroups.js` | Spec 024 (1.18.0): provider groups, a display alias for the chat pickers. `prefs.providerGroups = {groups: [{id, name, members: [{provider, prefix}]}], modelNames: {id: name}}` (server-cleaned, `api._clean_provider_groups`; a provider in one group only). Pure rules `groupPicker` (policy-filtered providers -> picker entries: ungrouped providers with display names, one `group:<id>` entry per group with the members that pass spec 023's `pickerHidden` - the chat's own and the default provider always - and models `{value: '<provider>\|<model>', label: '<prefix> - <name>'}` in the order of the group's providers, then by name). `groupsConfig()` = `mergeGroups(teamGroups(), ownGroups())` (1.25.0): the team's aliases (`policy.provider_groups` of `/api/me`) first, then the person's own groups for providers the team left alone, `headerPickers` (collapses Goose's provider option for the chat header), `groupDefault`, `labelIn`, `splitValue`. Picks always resolve to the REAL provider + model (header: `set_config_option provider`, then `model`). The members' model lists come from the `providers/list` New chat and Settings load (`localStorage` `gw-provider-models`, ids and names, per user; `loadInventoryOnce` fetches it at most once per page otherwise). |
 | `js/chatoptions.js` | Per-chat options shared by the chat header and the New chat screen: `pillSelect`, Goose's approval `MODES`, the learned thinking-effort values (`localStorage` `gw-effort-options`), `loadNewChatOptions()` and `applyNewChatOptions()` (spec 008). |
 | `js/chatsession.js` | `ChatSession`: per-session controller. Maps ACP updates to transcript calls. Handles send, queue, steer, cancel and modes. |
 | `js/transcript.js` | `Transcript`: incremental, windowed rendering of messages, thoughts, tool cards, plans, asks and inline MCP Apps. |
@@ -1193,7 +1193,7 @@ Goose sends each thinking block as one `agent_thought_chunk` once the model fini
 
 | Module | Notes |
 |---|---|
-| `composer.js` | Auto-sizing textarea (up to 360 px). Slash commands from `_goose/unstable/slash-commands/list` (cached 60 s) or the session's available commands. `@` mentions from `agent-mentions/list`. Attachments: images up to 8 MB are sent inline as base64 image blocks. Other files are uploaded to `<cwd>/.goose-web-uploads` through `/api/fs/upload` and sent as `resource_link` `file://` URIs. Enter to send (preference). Ctrl+Enter steers a running agent. Send, stop, steer and queue buttons. |
+| `composer.js` | Auto-sizing textarea (up to 360 px). Slash commands from `_goose/unstable/slash-commands/list` (cached 60 s) or the session's available commands. `@` mentions from `agent-mentions/list`. Attachments (1.25.0): every file is uploaded through `/api/fs/upload?dir=<cwd>`, which writes it to `<cwd>/Web_Uploads`, and sent as a `resource_link` `file://` URI; an image up to 8 MB is sent inline as a base64 image block as well. An upload that is refused (`read_only_folder`) attaches nothing. Enter to send (preference). Ctrl+Enter steers a running agent. Send, stop, steer and queue buttons. |
 | `asks.js` | `ASK_METHODS` maps the three agent requests to `permission`, `elicitation` and `recipe_params`. Permission options are sorted (allow once, allow always, reject once, reject always). Elicitation renders a form from a restricted JSON schema. Recipe parameters open a modal. Answers use `rpc.respond`. |
 | `herd.js` | Herd map keyed `profile:sessionId`. Status transitions raise browser notifications, toasts, or a WebAudio chime, depending on preferences. The page title gets an `(n)` prefix, and the favicon gets a dot (amber for needs-you, green for done). Sort order: needs_you, working, error, done, idle, offline. |
 | `sessions.js` | `session/list` with `_meta {types, goose {includeLastMessageSnippet}, query}` and cursor paging. Debounced refresh merges. Sessions are grouped by working folder, using the same grouping rules as Goose Desktop. |
@@ -1532,10 +1532,14 @@ lists the mechanisms.
   token, returned to the SPA in the login and `/api/me` responses.
 - **Cookie.** `__Host-gw` when `public_url` is `https`, otherwise `gw`. It is
   `HttpOnly`, `SameSite=Strict`, `Secure` on https, and `Path=/`. It is
-  persistent (`max_age`) only when "remember me" is chosen.
-- **Lifetime.** `remember_days` (30) or `session_hours` (12). The
+  always a session cookie (no `Max-Age`); there is no "remember me" (1.25.0).
+- **Lifetime.** `session_hours`, 1 to 8 (`auth.SESSION_HOURS_MAX`; default 8). The
   `session_hours` database setting overrides the configuration. Expiry is
-  fixed, not sliding. `last_seen` is updated at most once a minute.
+  fixed, not sliding. `clamp_sessions` cuts stored sign-ins to the lifetime at
+  start-up and when an administrator lowers it. `last_seen` is updated at most
+  once a minute - by requests and by the 30-second re-check of an open socket
+  (`session_alive`). With `idle_minutes` (off by default) a sign-in whose
+  `last_seen` is older than that is deleted when it is next presented.
 - **Revocation.**
   - A password change revokes all other sessions and all API tokens.
   - An admin password reset, disabling the account, or `python -m goose_web
@@ -1634,7 +1638,9 @@ sign-in.
 | `allow_shell` | off | Shell-capable extensions (`developer`, `computercontroller`, `code_execution`, `orchestrator`), stdio extensions, inline `mcpServers` |
 | `notify_webhook` | off | Personal webhook notifications |
 | `allowed_modes`, `allowed_providers`, `allowed_models` | `[]` (none) | Allow-lists for session mode and model selection; `["*"]` = any |
-| `allowed_roots` | `[]` | Extra absolute folders beyond the workspace and the team folder (no `"*"`) |
+| `allowed_roots` | `[]` | Extra absolute folders beyond the workspace and the team folder (no `"*"`): read and write |
+| `read_roots` | `[]` | Extra absolute folders the members may only read (1.25.0) |
+| `provider_groups` | not set | Provider aliases for the members' chat pickers (1.25.0; a display rule) |
 | `max_concurrent_runs` | 3 | Running sessions per user (0 = unlimited) |
 
 `team_warnings(policy, hints, members)` returns the Experience page warnings
@@ -1669,8 +1675,13 @@ denied with "method not available to your account". Extra argument checks:
 - It must be inside a root both lexically (`normpath`/`abspath`) and after
   resolving symlinks and junctions (`realpath`).
 - Comparison is case-insensitive on Windows.
-- A user's roots are `[workspace, team folder, *allowed_roots]`
-  (`user_roots`). Admins may use any absolute path.
+- A user's roots are `[workspace, team folder, *allowed_roots, *read_roots]`
+  (`user_roots`); what may be written is `user_write_roots`. Read-only wins
+  (`_split_roots`): a team folder or extra folder that is, or contains, a
+  read-only folder is itself only read. The file API writes (`fs/mkdir`,
+  `fs/upload`) only inside the writable roots, checked on the resolved path;
+  the sandbox gets `modify` for the writable roots and `read` for the others.
+  Admins may use any absolute path.
 
 The REST file endpoints (`/api/fs/*`) use the same check through
 `Ctx.path_ok`.

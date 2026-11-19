@@ -726,3 +726,52 @@ async def test_session_states_nobody_needs_are_dropped_beyond_the_cap(hubenv, mo
     assert "junk0" not in up.sessions and hub.total_buffer == 0
     up.pending.pop(99)
 
+
+async def test_the_sub_recipe_that_was_opened_is_the_one_that_was_allowed(hubenv, tmp_path, monkeypatch):
+    """Review 20261119_6, S-5: the path of a sub-recipe was judged and then opened by name. A link put in between
+    made the gateway read a file outside the member's folders. Where the open really ended is now asked of the
+    open file (security.final_path), and elsewhere means: not read."""
+    from goose_web import security as sec
+    agent, hub, audit = hubenv
+    mine, other = tmp_path / "alice", tmp_path / "ben"
+    mine.mkdir()
+    other.mkdir()
+    (mine / "part.yaml").write_text(yaml.safe_dump({"title": "LOOKS-FINE", "instructions": "x"}), encoding="utf-8")
+    hub.profile_root_for = lambda u: str(mine)
+    agent.listed = [{"id": "r", "recipe": {"title": "r", "sub_recipes": [{"name": "s", "path": "part.yaml"}]},
+                     "file_path": str(mine / "r.yaml")}]
+    up = hub.upstream("alice", "alice")
+    c, s = mk({**MEMBER, "allow_shell": True, "extensions_edit": True})
+    hub.attach(up, c)
+    # the real answer for a real file: its own path
+    with open(mine / "part.yaml", "rb") as fh:
+        assert os.path.normcase(sec.final_path(fh.fileno())) == os.path.normcase(os.path.realpath(mine / "part.yaml"))
+    assert "result" in await _new(up, c, s, 1, {"recipeId": "r"})
+    # the open ended somewhere else (as after a link swapped in between the check and the open)
+    monkeypatch.setattr(sec, "final_path", lambda fd: str(other / "secret.yaml"))
+    r = await _new(up, c, s, 2, {"recipeId": "r"})
+    assert r["error"]["code"] == -32003 and "cannot be read" in r["error"]["message"] and "LOOKS-FINE" not in json.dumps(r)
+    # it cannot be asked (None): the earlier check of the name stands, as before
+    monkeypatch.setattr(sec, "final_path", lambda fd: None)
+    assert "result" in await _new(up, c, s, 3, {"recipeId": "r"})
+
+
+async def test_a_refused_prompt_does_not_keep_a_made_up_session_alive(hubenv, monkeypatch):
+    """Review 20261119_6, S-8: session/prompt with any session id made a state and marked it as watched by that
+    socket before Goose answered; watched states are never dropped, so a script could pass the cap while its socket
+    lived. A prompt Goose refuses for a session it never loaded here is not watched any more."""
+    import goose_web.hub as hubmod
+    agent, hub, audit = hubenv
+    monkeypatch.setattr(hubmod, "SESSION_STATES_MAX", 50)
+    up = hub.upstream("alice", "alice")
+    c, s = mk()
+    hub.attach(up, c)
+    real = up.sess("real")
+    real.load_result = {"modes": {}}
+    for sid in ("real", *[f"made-up-{i}" for i in range(200)]):
+        st = up.sess(sid)
+        st.prompts += 1
+        c.watch.add(sid)
+        up._post_response("session/prompt", {"sessionId": sid}, {"error": {"code": -32002, "message": "no such session"}}, c)
+    assert "real" in c.watch and not any(x.startswith("made-up-") for x in c.watch)
+    assert len(up.sessions) <= 50 and "real" in up.sessions

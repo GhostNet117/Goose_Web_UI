@@ -22,6 +22,7 @@ from starlette.responses import (FileResponse, HTMLResponse, JSONResponse, Plain
                                  Response)
 from starlette.routing import Route
 
+from . import auth as auth_mod
 from . import guard as guardmod
 from . import guardmodel, hosttasks, logjanitor, prefsync, security, tls, winsec
 from . import policy as acp_policy
@@ -92,9 +93,10 @@ async def auth_config(request: Request):
     return ok({"brand": brand, "version": c.version, **c.auth.public_auth_config()})
 
 
-def _set_cookie(c: Ctx, resp: Response, token: str, remember: bool) -> None:
-    resp.set_cookie(c.cookie_name, token, httponly=True, secure=c.secure, samesite="strict", path="/",
-                    max_age=int(c.auth.session_seconds(remember)) if remember else None)
+def _set_cookie(c: Ctx, resp: Response, token: str) -> None:
+    """The sign-in cookie. A session cookie (no Max-Age: the browser is not asked to keep it on disk); the server
+    ends the sign-in after auth.session_hours whatever the browser does (spec 032)."""
+    resp.set_cookie(c.cookie_name, token, httponly=True, secure=c.secure, samesite="strict", path="/")
 
 
 async def login(request: Request):
@@ -109,14 +111,14 @@ async def login(request: Request):
                                        b.get("totp"), ip)
     except AuthError as e:
         return JSONResponse({"error": e.code, "message": e.message}, status_code=e.status)
-    remember = bool(b.get("remember"))
-    token, csrf = c.auth.create_session(user, ip, request.headers.get("user-agent", ""), "password", remember)
+    # spec 032: there is no "keep me signed in"; a `remember` an old page still sends changes nothing
+    token, csrf = c.auth.create_session(user, ip, request.headers.get("user-agent", ""), "password")
     c.audit(request, "auth.login", user)
     if not c.profiles.is_native(user) and not (c.profiles.root_for(user) / ".goose-web").exists():
         await asyncio.to_thread(c.profiles.provision, user)
     resp = ok({"user": c.public_user(user), "csrf": csrf, "mustChangePassword": bool(user["must_change_pw"]),
                "totpEnrolmentRequired": c.auth.totp_enrolment_required(user)})
-    _set_cookie(c, resp, token, remember)
+    _set_cookie(c, resp, token)
     return resp
 
 
@@ -222,7 +224,7 @@ async def _finish_sign_in(c: Ctx, request: Request, user: dict, method: str, res
     resp.headers["location"] = "/"
     _clear_cookie(c, resp, _oidc_cookie(c))
     _clear_cookie(c, resp, _mfa_cookie(c))
-    _set_cookie(c, resp, token, False)
+    _set_cookie(c, resp, token)
     return resp
 
 
@@ -663,15 +665,26 @@ async def fs_roots(request: Request):
         p = c.policy_for(u)
         team_folder = p.get("team_folder")
         team_label = "Team: " + str((p.get("team") or {}).get("name") or "")
+        ro = set(c.read_roots_for(u, p))
         roots = [{"path": r, "label": "Workspace" if i == 0 else team_label if r == team_folder else
-                  os.path.basename(r.rstrip("\\/")) or r}
+                  os.path.basename(r.rstrip("\\/")) or r, "access": "read" if r in ro else "write"}
                  for i, r in enumerate(c.roots_for(u, p))]
     return ok({"roots": roots, "home": str(ws), "defaultCwd": str(ws)})
 
 
-def _check_path(c: Ctx, u: dict, p: str) -> Path:
+# Spec 031: files attached in the browser are written to this folder inside the chat folder. The server names it.
+UPLOAD_FOLDER = "Web_Uploads"
+READ_ONLY_MESSAGE = "You do not have write access to this folder, so files cannot be uploaded here."
+
+
+def _check_path(c: Ctx, u: dict, p: str, write: bool = False) -> Path:
+    """The path as a Path when the user may be there; `write`: when the user may create or change things there
+    (403 read_only_folder otherwise - a folder the team may only read, spec 031)."""
     if not p or not c.path_ok(u, p):
         raise HTTPError(403, "path_forbidden", "That folder is outside your allowed folders")
+    if write and not c.path_ok(u, p, write=True):
+        raise HTTPError(403, "read_only_folder", "Your team may only read this folder; nothing can be created or "
+                                                 "changed in it.")
     return Path(p)
 
 
@@ -702,17 +715,21 @@ async def fs_list(request: Request):
     except PermissionError:
         raise HTTPError(403, "denied", "Access denied by the file system")
     parent = str(p.parent) if p.parent != p and c.path_ok(u, str(p.parent)) else None
-    return ok({"path": str(p), "parent": parent, "entries": entries})
+    return ok({"path": str(p), "parent": parent, "entries": entries,
+               "access": "write" if c.path_ok(u, str(p), write=True) else "read"})
 
 
 async def fs_mkdir(request: Request):
     c = ctx(request)
     u = c.require(request).user
     b = await body_json(request)
-    p = _check_path(c, u, os.path.abspath(str(b.get("path") or "")))
+    p = _check_path(c, u, os.path.abspath(str(b.get("path") or "")), write=True)
     _refuse_hint_name(u, p.name)
     _refuse_agents_dir(u, p)
-    p.mkdir(parents=True, exist_ok=True)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        raise HTTPError(403, "denied", "Access denied by the file system")
     return ok({"path": str(p)})
 
 
@@ -788,9 +805,24 @@ def _create_exclusive(d: Path, name: str):
 
 
 async def fs_upload(request: Request):
+    """Files attached in the browser. `dir` is the chat's folder; the files are written to <dir>\\Web_Uploads
+    (spec 031) - the server names that folder, not the page. Refused with 403 read_only_folder when the person may
+    not write there: a folder their team may only read, a Web_Uploads that is a link to somewhere they may not
+    write, or the file system saying no. Nothing is written then."""
     c = ctx(request)
     u = c.require(request).user
-    d = _check_path(c, u, os.path.abspath(request.query_params.get("dir") or ""))
+    base = os.path.abspath(request.query_params.get("dir") or "")
+    try:
+        _check_path(c, u, base, write=True)
+        # the folder that is written to, as it resolves: the gateway is not in a sandbox, so this check is what
+        # keeps a link called Web_Uploads from leading out of the folders this person may write
+        d = _check_path(c, u, os.path.join(base, UPLOAD_FOLDER), write=True)
+    except HTTPError as e:
+        if e.code == "read_only_folder":
+            raise HTTPError(403, "read_only_folder", READ_ONLY_MESSAGE)
+        raise
+    if os.path.lexists(d) and not d.is_dir():
+        raise HTTPError(409, "name_taken", f"{UPLOAD_FOLDER} exists in this folder and is not a folder")
     limit = int(c.settings.get("server", "max_upload_mb") or 25) * 1024 * 1024
     # app.BodyLimit caps the whole body while it streams in (chunked bodies too), so request.form() never
     # spools more than max_upload_mb to disk (A-2); this early check only gives the same 413 without the middleware.
@@ -809,9 +841,21 @@ async def fs_upload(request: Request):
         for _, name in files:   # every name is checked before anything is written (A-14)
             _refuse_hint_name(u, name)
             _refuse_agents_dir(u, d / name)
-        d.mkdir(parents=True, exist_ok=True)
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            raise HTTPError(403, "read_only_folder", READ_ONLY_MESSAGE)
         for f, name in files:
-            target, out = _create_exclusive(d, name)
+            # R-5: the body took as long as the sender wished; the folder is looked at again right before each
+            # file is made, so a Web_Uploads swapped for a link meanwhile leads nowhere
+            try:
+                _check_path(c, u, str(d), write=True)
+            except HTTPError as e:
+                raise HTTPError(403, e.code, READ_ONLY_MESSAGE if e.code == "read_only_folder" else e.message)
+            try:
+                target, out = _create_exclusive(d, name)
+            except PermissionError:
+                raise HTTPError(403, "read_only_folder", READ_ONLY_MESSAGE)
             size = 0
             with out:
                 while chunk := await f.read(1024 * 1024):
@@ -1061,6 +1105,8 @@ async def _sync_grants(c: Ctx, u: dict) -> list[str]:
         gone = sorted(res.get("revoked") or [])
         if gone:
             c.db.audit("sandbox.revoke", target=u["username"], detail={"folders": gone[:10]})
+        if res.get("narrowed"):
+            c.db.audit("sandbox.narrow", target=u["username"], detail={"folders": sorted(res["narrowed"])[:10]})
         if res.get("pending"):
             log.warning("sandbox: %s: entries that could not be taken off stay on record: %s", u.get("username"),
                         sorted(res["pending"])[:10])
@@ -1243,7 +1289,21 @@ async def admin_user(request: Request):
     if "authSource" in b and b["authSource"] in ("local", "ldap", "oidc"):
         fields["auth_source"] = b["authSource"]
     if "policyOverrides" in b and isinstance(b["policyOverrides"], dict):
-        fields["policy_overrides"] = {k: v for k, v in b["policyOverrides"].items() if k in DEFAULT_POLICY}
+        ov = {k: v for k, v in b["policyOverrides"].items() if k in DEFAULT_POLICY}
+        # the folder lists of one person's overrides are held to the rules of a team's (C-11, spec 031)
+        folders = {k: ov[k] for k in ("allowed_roots", "read_roots") if k in ov}
+        if folders:
+            ov.update(_clean_policy({**folders}, c))
+            # ... and a read-only folder must not lie inside what this person may write through their team
+            teams = c.db.user_teams(u["id"])
+            eff = acp_policy.effective_policy({**u, "policy_overrides": ov}, teams)
+            writable = [*(eff.get("allowed_roots") or []), str(c.profiles.workspace(u))]
+            if teams and u["role"] != "admin":
+                writable.append(str(c.profiles.team_folder(teams[0])))
+            why = acp_policy.read_only_nesting_problem(eff.get("read_roots") or [], writable, who="this person")
+            if why:
+                raise HTTPError(400, "bad_folder", f"Not allowed as a folder: {why}")
+        fields["policy_overrides"] = ov
     if b.get("password"):
         probs = security.password_problems(b["password"], _min_pw(c), u["username"])
         if probs:
@@ -1353,7 +1413,9 @@ async def admin_user_provision(request: Request):
 
 
 # ====================================================================== admin: teams
-def _clean_policy(p: dict, c: Ctx | None = None) -> dict:
+def _clean_policy(p: dict, c: Ctx | None = None, team: dict | None = None) -> dict:
+    """A team policy as it is stored. `team`: the team it is for (its own folder counts as writable when a
+    read-only folder is checked for lying inside one)."""
     out = _clean_policy_fields(p)
     if c is not None:
         # C-11: no drive roots, system folders, the profiles root, Goose's own data or other users' folders.
@@ -1364,7 +1426,9 @@ def _clean_policy(p: dict, c: Ctx | None = None) -> dict:
             acp_policy.check_team_folders(out, profiles_root=str(c.settings.profiles_root),
                                           system_dir=str(c.settings.system_dir),
                                           native_roots=[n for n in natives if n],
-                                          users_root=os.path.dirname(os.path.expanduser("~")))
+                                          users_root=os.path.dirname(os.path.expanduser("~")),
+                                          own_team_folder=str(c.profiles.team_folder({**team, "policy": out}))
+                                          if team else "")
         except ValueError as e:
             raise HTTPError(400, "bad_folder", f"Not allowed as a team folder: {e}")
     return out
@@ -1383,11 +1447,16 @@ def _clean_policy_fields(p: dict) -> dict:
             v = [str(x).strip() for x in (v or []) if str(x).strip()][:200]
             if k in CHAT_LISTS and ANY in v:
                 v = [ANY]                     # "Any" makes the rest of the list meaningless
-            if k == "allowed_roots":
+            if k in ("allowed_roots", "read_roots"):
                 bad = [r for r in v if r == ANY or not os.path.isabs(r)]
                 if bad:
                     raise HTTPError(400, "bad_folder", f"Extra folders must be absolute paths: {bad[0]}")
+                v = list(dict.fromkeys(v))
             out[k] = v
+    if out.get("read_roots") and out.get("allowed_roots"):
+        # spec 031: the same folder in both lists is read-only (the lesser access), whatever order they came in
+        ro = {os.path.normcase(os.path.normpath(r)) for r in out["read_roots"]}
+        out["allowed_roots"] = [r for r in out["allowed_roots"] if os.path.normcase(os.path.normpath(r)) not in ro]
     if p.get("max_concurrent_runs") not in (None, ""):
         out["max_concurrent_runs"] = max(0, min(100, int(p.get("max_concurrent_runs") or 0)))
     for k in ("default_provider", "default_model"):
@@ -1402,7 +1471,35 @@ def _clean_policy_fields(p: dict) -> dict:
         out["guard"] = guardmod.clean_team_guard(p["guard"])   # spec 018
     if p.get("require_totp") is True:
         out["require_totp"] = True      # spec 029: this team's members must sign in with two-factor
+    if isinstance(p.get("provider_groups"), dict):
+        # spec 033: provider aliases the members see in the chat pickers; a display rule, cleaned like a person's own
+        pg = _clean_provider_groups(p["provider_groups"])
+        if pg["groups"] or pg["modelNames"]:
+            out["provider_groups"] = pg
     return out
+
+
+def _sandbox_on(c: Ctx) -> bool:
+    from .config import sandbox_on
+    return bool(sandbox_on(c.settings))
+
+
+def _source_gone(c: Ctx, row: dict) -> bool:
+    """A team item taken from a profile whose source is not there any more (the profile, or the thing in it).
+    The team keeps its copy (profiles.refresh_team_items); a provider's key, which is read from the source at
+    every provisioning, is then missing for the members - so the page says it."""
+    src = str(row.get("source") or "")
+    who, _, ref = src.partition(":")
+    if not who or not ref or src == "manual":
+        return False
+    u = c.db.user_by_name(who)
+    if not u:
+        return True
+    try:
+        c.profiles.export_item(u, row["kind"], ref)
+        return False
+    except (ValueError, KeyError, OSError):
+        return True
 
 
 def _team_view(c: Ctx, t: dict) -> dict:
@@ -1410,6 +1507,7 @@ def _team_view(c: Ctx, t: dict) -> dict:
     hints = [r["hints_id"] for r in c.db.query("SELECT hints_id FROM team_hints WHERE team_id=?", (t["id"],))]
     n = c.db.one("SELECT COUNT(*) AS n FROM team_items WHERE team_id=?", (t["id"],))["n"]
     pol = {**DEFAULT_POLICY, **(t.get("policy") or {})}
+    ext_rows = c.db.query("SELECT name, payload FROM team_items WHERE team_id=? AND kind='extension'", (t["id"],))
     return {"id": t["id"], "name": t["name"], "description": t["description"],
             "policy": pol, "members": members, "hints": hints,
             "itemCount": n, "createdAt": t["created_at"], "teamFolder": str(c.profiles.team_folder(t)),
@@ -1417,8 +1515,13 @@ def _team_view(c: Ctx, t: dict) -> dict:
                 pol, hints=len(hints), members=len(members),
                 provider_items={r["name"] for r in c.db.query(
                     "SELECT name FROM team_items WHERE team_id=? AND kind='provider'", (t["id"],))},
-                extension_items={r["name"] for r in c.db.query(
-                    "SELECT name FROM team_items WHERE team_id=? AND kind='extension'", (t["id"],))})}
+                # by the item's name and, for a bundled extension, by the name in its entry (S-6)
+                extension_items={r["name"] for r in ext_rows} | {
+                    str(e.get("name")) for e in ((r.get("payload") or {}).get("entry") for r in ext_rows)
+                    if isinstance(e, dict) and e.get("type") in ("builtin", "platform") and e.get("name")},
+                command_items={r["name"] for r in ext_rows
+                               if acp_policy.is_command_extension((r.get("payload") or {}).get("entry"))},
+                sandbox=_sandbox_on(c))}
 
 
 def _team_members(c: Ctx, team_id: int) -> list[dict]:
@@ -1437,9 +1540,15 @@ async def admin_teams(request: Request):
     if c.db.one("SELECT id FROM teams WHERE name=?", (name,)):
         raise HTTPError(409, "exists", "A team with that name exists")
     import json as _json
+    cleaned = _clean_policy(b.get("policy") or {}, c)
     tid = c.db.execute("INSERT INTO teams(name, description, policy, created_at) VALUES(?,?,?,?)",
-                       (name, str(b.get("description") or "")[:500], _json.dumps(_clean_policy(b.get("policy") or {}, c)),
-                        time.time()))
+                       (name, str(b.get("description") or "")[:500], _json.dumps(cleaned), time.time()))
+    # the team's own folder is known only now (its id): a read-only folder must not lie inside it (R-4)
+    why = acp_policy.read_only_nesting_problem(cleaned.get("read_roots") or [],
+                                               [str(c.profiles.team_folder({"id": tid, "policy": cleaned}))])
+    if why:
+        c.db.execute("DELETE FROM teams WHERE id=?", (tid,))
+        raise HTTPError(400, "bad_folder", f"Not allowed as a team folder: {why}")
     _guard_changed(c)
     c.audit(request, "team.create", admin, target=name)
     return ok({"id": tid, "team": _team_view(c, c.db.one("SELECT * FROM teams WHERE id=?", (tid,)))})
@@ -1466,7 +1575,8 @@ async def admin_team(request: Request):
     if "name" in b or "description" in b or "policy" in b:
         c.db.execute("UPDATE teams SET name=?, description=?, policy=? WHERE id=?",
                      (str(b.get("name", t["name"]))[:80], str(b.get("description", t["description"]))[:500],
-                      _json.dumps(_clean_policy(b["policy"], c) if "policy" in b else (t.get("policy") or {})), tid))
+                      _json.dumps(_clean_policy(b["policy"], c, t) if "policy" in b else (t.get("policy") or {})),
+                      tid))
     moved: list[str] = []
     if "members" in b:
         ids = sorted({int(m) for m in b["members"] or []})
@@ -1486,7 +1596,22 @@ async def admin_team(request: Request):
     changes = await _reprovision(c, [c.db.user_by_id(i) for i in seen])
     c.audit(request, "team.update", admin, target=t["name"], detail={"fields": sorted(b.keys()), "moved": moved})
     return ok({"team": _team_view(c, c.db.one("SELECT * FROM teams WHERE id=?", (tid,))), "changes": changes,
-               "moved": moved})
+               "moved": moved, "restartPending": _restart_pending(c, seen.values())})
+
+
+def _restart_pending(c: Ctx, users) -> list[str]:
+    """The members whose agent is still running with what it started with and restarts when its run has finished
+    (a changed sandbox: folders, network). With the MXC backend a running container cannot be narrowed from
+    outside; the AppContainer backend takes a folder away, or narrows it to read, at once (sandbox.shrink)."""
+    out = []
+    for u in users:
+        try:
+            w = c.workers.get(str(u["username"]).lower()) if u else None
+        except Exception:
+            w = None
+        if w is not None and getattr(w, "restart_pending", False):
+            out.append(u["username"])
+    return sorted(out)
 
 
 async def admin_team_items(request: Request):
@@ -1498,8 +1623,9 @@ async def admin_team_items(request: Request):
     if request.method == "GET":
         rows = c.db.query("SELECT id, kind, name, source, created_at, payload FROM team_items WHERE team_id=? "
                           "ORDER BY kind, name", (tid,))
+        gone = await asyncio.to_thread(lambda: {r["id"]: _source_gone(c, r) for r in rows})
         return ok([{"id": r["id"], "kind": r["kind"], "name": r["name"], "source": r["source"],
-                    "createdAt": r["created_at"],
+                    "createdAt": r["created_at"], "sourceGone": gone[r["id"]],
                     "description": (r["payload"] or {}).get("origin") or (r["payload"] or {}).get("key") or ""}
                    for r in rows])
     b = await body_json(request, 8 * 1024 * 1024)
@@ -1884,7 +2010,8 @@ async def admin_settings(request: Request):
         peers = [{**p, "token": "********" if p.get("token") else ""} for p in (c.db.get_setting("peers") or [])]
         return ok({"brand": c.db.get_setting("brand") or {"name": "Goose Web", "tagline": ""},
                    "defaultTeamId": c.db.get_setting("default_team_id"),
-                   "sessionHours": c.db.get_setting("session_hours") or c.settings.get("auth", "session_hours"),
+                   "sessionHours": c.auth.session_hours(), "sessionHoursMax": auth_mod.SESSION_HOURS_MAX,
+                   "idleMinutes": c.auth.idle_seconds() / 60,
                    "allowSelfTotp": c.db.get_setting("allow_self_totp", True),
                    "requireTotpForAdmins": bool(c.db.get_setting("require_totp_admins")),
                    "requireTotpForAll": bool(c.db.get_setting("require_totp_all")), "peers": peers})
@@ -1902,7 +2029,17 @@ async def admin_settings(request: Request):
     if "defaultTeamId" in b:
         c.db.set_setting("default_team_id", int(b["defaultTeamId"]) if b["defaultTeamId"] else None)
     if "sessionHours" in b:
-        c.db.set_setting("session_hours", max(1, min(720, int(b["sessionHours"] or 12))))
+        # spec 032: 1 to 8 hours; anything above (an old page's 12, a typed 720) is stored as the limit
+        try:
+            hours = float(b["sessionHours"] or auth_mod.SESSION_HOURS_MAX)
+        except (TypeError, ValueError):
+            hours = auth_mod.SESSION_HOURS_MAX
+        c.db.set_setting("session_hours", max(1.0, auth_mod.clamp_session_hours(hours)))
+        cut = c.auth.clamp_sessions()      # a shorter lifetime holds for the sign-ins that exist, too
+        if cut and c.hub is not None:
+            c.hub.revalidate_clients()
+    if "idleMinutes" in b:
+        c.db.set_setting("idle_minutes", auth_mod.clamp_idle_minutes(b["idleMinutes"]))
     if "allowSelfTotp" in b:
         c.db.set_setting("allow_self_totp", bool(b["allowSelfTotp"]))
     if "requireTotpForAdmins" in b:

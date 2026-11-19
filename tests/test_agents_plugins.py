@@ -193,4 +193,4 @@ def test_admin_may_create_agents_folder(env, tmp_path):
         assert tc.post("/api/fs/mkdir", json={"path": str(target)}, headers=h).status_code == 200
         r = tc.post("/api/fs/upload", params={"dir": str(target)}, headers=h, files=[("f", ("SKILL.md", b"x"))])
         assert r.status_code == 200
-    assert (target / "SKILL.md").is_file()
+    assert (target / "Web_Uploads" / "SKILL.md").is_file()      # spec 031: uploads land in <dir>\Web_Uploads

@@ -1,6 +1,8 @@
 """Spec 024 (1.18.0): provider groups and model labels (Settings > Models & Providers > Provider groups).
 A per-user display alias stored with the preferences: several providers shown as one entry in the chat pickers, each
-member's models labelled `<prefix>-<model display name>`; a pick still sets the real provider and model."""
+member's models labelled `<prefix> - <model display name>` in the order of the group's providers; a pick still
+sets the real provider and model. Spec 033 (1.25.0): a team can be given aliases (policy.provider_groups); the
+pickers show the team's first, then the person's own."""
 import json
 import os
 import shutil
@@ -118,12 +120,13 @@ console.log(JSON.stringify([
     r = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout.strip().splitlines()[-1])
-    labs = ["High-Flash v1=p_high|m-flash", "High-m-pro=p_high|m-pro", "Low-Flash v1=p_low|m-flash", "Low-m-pro=p_low|m-pro",
-            "Max-Flash v1=p_max|m-flash", "Max-m-pro=p_max|m-pro"]
+    # spec 033: "<prefix> - <name>", in the order the group lists its providers (Max, High, Low), then by name
+    labs = ["Max - Flash v1=p_max|m-flash", "Max - m-pro=p_max|m-pro", "High - Flash v1=p_high|m-flash",
+            "High - m-pro=p_high|m-pro", "Low - Flash v1=p_low|m-flash", "Low - m-pro=p_low|m-pro"]
     assert out == [
         # a provider is in its first group only; an empty name -> "Group"; blank display names are dropped
         [["lab", "Lab", ["p_max:Max", "p_high:High", "p_low:Low", "gone:X"]], ["dup", "Group", []]], {"m-flash": "Flash v1"},
-        # one entry for the group (members in the group's order, labels sorted by prefix then model); the variant is not
+        # one entry for the group (members and labels in the group's order, then by model); the variant is not
         # offered; ungrouped providers get display names
         [["group:lab", "Lab", ["p_max", "p_high", "p_low"], labs], ["solo", ["m-pro"]]],
         # a hidden member leaves the group; a hidden ungrouped provider leaves the picker
@@ -136,16 +139,16 @@ console.log(JSON.stringify([
         "group:lab", "solo", None,
         # a group's default: the default provider when it is a member, else the first member with its default model
         {"provider": "p_high", "model": "m-flash"}, {"provider": "p_max", "model": "m-flash"}, {"provider": "", "model": ""},
-        "Low-m-pro", "Low-m-new", "m-pro",
+        "Low - m-pro", "Low - m-new", "m-pro",
         {"provider": "p_max", "model": "m-flash"}, {"provider": "", "model": "m"}, True, False,
-        "Flash v1", "High-Zed",
+        "Flash v1", "High - Zed",
         # chat header: members collapse into the group (once, where the first one was), the group is selected
         {"options": [{"value": "solo", "label": "Solo"}, {"value": "group:lab", "label": "Lab", "title": "Provider group"},
                      {"value": "goose", "label": "Goose"}], "value": "group:lab"},
         "p_low|m-pro", [x.split("=")[0] for x in labs],
         # no inventory yet: still one group entry, and the chat's own models with its prefix
         [{"options": [{"value": "group:lab", "label": "Lab", "title": "Provider group"}], "value": "group:lab"},
-         {"options": [{"value": "p_max|m-flash", "label": "Max-Flash v1"}], "value": "p_max|m-flash"}],
+         {"options": [{"value": "p_max|m-flash", "label": "Max - Flash v1"}], "value": "p_max|m-flash"}],
         # an ungrouped chat: Goose's model list with display names, real ids as values
         {"options": [{"value": "m-pro", "label": "m-pro"}, {"value": "m-flash", "label": "Flash v1"}], "value": "m-pro"},
     ]
@@ -183,8 +186,75 @@ def test_frontend_wiring():
     grp = tab.split("const drawGroups = () => {", 1)[1].split("\n  };", 1)[0]
     assert "providers_edit" not in grp and "canEdit" not in grp                 # members may group their providers
     assert "grp-prefix" in grp and "'Model display names'" in grp and "{ disabled: !!owner && !mine }" in grp
+    # spec 033: the editor works on the person's own groups; the team's aliases are shown, not edited, and a
+    # provider a team alias holds cannot be ticked into an own group
+    assert "groupsConfig()" not in grp and "ownGroups()" in grp and "teamGroups()" in grp
+    assert "const mine = !teamOwner && owner && owner.id === g.id;" in grp and "'From your team'" in grp
     vis = tab.split("const drawVis = () => {", 1)[1].split("\n  };", 1)[0]
     assert "gcb.dataset.group = g.id" in vis and "else if (e.providerId !== def) ids.add(e.providerId)" in vis
     assert "rememberInventory(p.entries || [])" in tab
-    # admin pages are not grouped
-    assert "providergroups" not in _js("views/admin.js")
+    # spec 033: the team page edits the TEAM's aliases (policy.provider_groups) and never writes a preference
+    adm = _js("views/admin.js")
+    assert "provider_groups: sel.groups" in adm and "setGroups" not in adm and "setPref" not in adm
+    pg = _js("providergroups.js")
+    assert "export function groupsConfig() { return mergeGroups(teamGroups(), ownGroups()); }" in pg
+    assert "export function setGroups(cfg) { setPref(GROUPS_PREF, normGroups(cfg)); }" in pg     # own groups only
+
+
+def test_team_aliases_come_first_in_node():
+    """Spec 033: the pickers use the team's aliases, then the person's own groups for what the team left alone."""
+    node = _node()
+    if not node:
+        pytest.skip("node not available")
+    script = _pure("providervis.js") + _pure("providergroups.js") + """
+const team = { groups: [{ id:'tri', name:'Lab One', members:[{provider:'t_max', prefix:'Max'}, {provider:'t_high', prefix:'High'}] }], modelNames: { m1: 'Model One', m2: 'Team Two' } };
+const own = { groups: [
+  { id:'tri', name:'Mine with the team id', members:[{provider:'x', prefix:''}] },
+  { id:'steal', name:'Steal', members:[{provider:'t_max', prefix:'Mine'}] },
+  { id:'mix', name:'Mix', members:[{provider:'t_high', prefix:'H'}, {provider:'solo', prefix:'S'}] },
+  { id:'empty', name:'Empty', members:[] } ], modelNames: { m2: 'My Two' } };
+const m = mergeGroups(team, own);
+const P = ['t_high', 't_max', 'solo'].map((id) => ({ id, name: id, models: [{id:'m1', name:'m1'}, {id:'m2', name:'m2'}] }));
+const pick = groupPicker(P, m, { hidden: new Set() });
+console.log(JSON.stringify([
+  m.groups.map((g) => [g.id, g.name, !!g.team, g.members.map((x) => x.provider + ':' + x.prefix)]), m.modelNames,
+  pick.map((e) => [e.name, e.models.map((x) => x.label)]),
+  mergeGroups(null, own).groups.map((g) => g.id), mergeGroups(team, null).groups.length, mergeGroups(undefined, undefined),
+]));
+"""
+    r = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    assert out == [
+        # the team's alias first; an own group with its id is dropped; one whose providers are all the team's is
+        # dropped; one that mixes keeps what the team left alone; an empty own group stays (it is being edited)
+        [["tri", "Lab One", True, ["t_max:Max", "t_high:High"]], ["mix", "Mix", False, ["solo:S"]], ["empty", "Empty", False, []]],
+        {"m1": "Model One", "m2": "My Two"},                                   # the person's own name for a model wins
+        [["Lab One", ["Max - Model One", "Max - My Two", "High - Model One", "High - My Two"]],
+         ["Mix", ["S - Model One", "S - My Two"]]],
+        ["tri", "steal", "mix", "empty"], 1, {"groups": [], "modelNames": {}},
+    ]
+
+
+def test_team_policy_carries_aliases_to_the_member():
+    """Spec 033: provider_groups is cleaned like the personal preference, stored with the team policy and is part
+    of the member's effective policy (which /api/me hands to the page); an administrator's policy carries none."""
+    from goose_web import policy as pol
+    cleaned = api._clean_policy_fields({
+        "allowed_providers": ["*"],
+        "provider_groups": {"groups": [{"id": "tri", "name": " Lab One ", "members": [
+            {"provider": "t_max", "prefix": " Max "}, {"provider": "t_high", "prefix": "High"},
+            {"provider": "t_max", "prefix": "again"}]},
+            {"id": "bad id!", "name": "", "members": "nope"}], "modelNames": {"m1": " One ", "": "x"}, "junk": 1}})
+    want = {"groups": [{"id": "tri", "name": "Lab One", "members": [{"provider": "t_max", "prefix": "Max"},
+                                                                  {"provider": "t_high", "prefix": "High"}]},
+                       {"id": "g2", "name": "Group", "members": []}], "modelNames": {"m1": "One"}}
+    assert cleaned["provider_groups"] == want
+    team = [{"id": 1, "name": "Lab", "policy": cleaned}]
+    assert pol.effective_policy({"role": "user"}, team)["provider_groups"] == want
+    assert "provider_groups" not in pol.effective_policy({"role": "admin"}, team)
+    assert "provider_groups" not in pol.effective_policy({"role": "user"}, [{"id": 2, "name": "Plain", "policy": {}}])
+    # nothing in it = not stored; not a mapping = ignored
+    assert "provider_groups" not in api._clean_policy_fields({"provider_groups": {"groups": [], "modelNames": {}}})
+    assert "provider_groups" not in api._clean_policy_fields({"provider_groups": "tri"})
+    assert "provider_groups" in pol.TEAM_EXTRA_KEYS

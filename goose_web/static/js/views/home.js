@@ -42,7 +42,7 @@ export async function createSession({ cwd, recipeId = null, recipeDeeplink = nul
   } catch (e) {
     // Fresh profiles have no provider yet: point the user at the place to fix it.
     if (/GOOSE_PROVIDER/.test(String((e && (e.data || e.message)) || ''))) {
-      const err = new Error('No model provider is set up for your profile yet. Open Settings > Models & Providers (or ask your admin to assign one to your team).');
+      const err = new Error('Your profile has no default model yet, and Goose needs one to start a chat - also when you pick another provider here. Open Settings > Models & Providers and save a default (or ask your administrator to give your team a provider).');
       err.code = e.code;
       throw err;
     }

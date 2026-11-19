@@ -30,7 +30,6 @@ export function renderLogin(root, { authConfig, onLoggedIn }) {
   const user = input({ autocomplete: 'username', name: 'username', placeholder: 'Username', autofocus: true, 'aria-label': 'Username' });
   const pass = input({ type: 'password', autocomplete: 'current-password', name: 'password', placeholder: 'Password', 'aria-label': 'Password' });
   const totp = input({ inputmode: 'numeric', autocomplete: 'one-time-code', placeholder: '123 456', maxlength: 8, 'aria-label': 'Authentication code', class: 'inp totp-inp' });
-  const remember = h('input', { type: 'checkbox', checked: true });
   const err = h('div', { class: 'auth-err', role: 'alert' });
   const submit = btn('Sign in', null, { variant: 'primary', type: 'submit', class: 'auth-submit' });
   let step = 'password';
@@ -38,8 +37,8 @@ export function renderLogin(root, { authConfig, onLoggedIn }) {
   totpField.hidden = true;
   const credFields = h('div', { class: 'stack' }, field(cfg.ldap && cfg.ldap.enabled ? (cfg.ldap.label || 'Directory') + ' username' : 'Username', user), field('Password', pass));
 
-  const form = h('form', { class: 'auth-form', autocomplete: 'on' }, credFields, totpField,
-    h('label', { class: 'chk' }, remember, h('span', null, 'Keep me signed in')), err, submit);
+  // spec 032: no "Keep me signed in" - a sign-in lasts eight hours at most and is not kept by the browser
+  const form = h('form', { class: 'auth-form', autocomplete: 'on' }, credFields, totpField, err, submit);
 
   if (r.query && r.query.error) err.textContent = loginErrorText(r.query.error);
 
@@ -49,7 +48,7 @@ export function renderLogin(root, { authConfig, onLoggedIn }) {
     if (!user.value || !pass.value) { err.textContent = 'Enter your username and password.'; return; }
     submit.disabled = true; submit.classList.add('is-busy');
     try {
-      const body = { username: user.value.trim(), password: pass.value, remember: remember.checked };
+      const body = { username: user.value.trim(), password: pass.value };
       if (step === 'totp') body.totp = totp.value.replace(/\s+/g, '');
       const res = await POST('/api/auth/login', body, { quiet: true });
       setCsrf(res.csrf);

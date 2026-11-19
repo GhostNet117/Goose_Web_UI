@@ -45,6 +45,8 @@ export const PUT = (p, b = {}, o) => api('PUT', p, b, o);
 export const PATCH = (p, b = {}, o) => api('PATCH', p, b, o);
 export const DEL = (p, o) => api('DELETE', p, undefined, o);
 
+// Attach files to a chat: `dir` is the chat's folder; the server writes them to <dir>\Web_Uploads (spec 031) and
+// answers 403 read_only_folder when this person may not write there.
 export async function upload(dir, files) {
   const fd = new FormData();
   for (const f of files) fd.append('file', f, f.name);

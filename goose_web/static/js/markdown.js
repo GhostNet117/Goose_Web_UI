@@ -46,8 +46,11 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => {
 // No inline style, no id/name (DOM clobbering of the app's ids), no hidden text (D-1, D-2, D-7).
 const PURIFY_OPTS = {
   USE_PROFILES: { html: true },
-  FORBID_TAGS: ['style', 'form', 'input', 'button', 'textarea', 'select', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'dialog'],
-  FORBID_ATTR: ['style', 'id', 'name', 'hidden', 'srcset', 'popover', 'inert'],
+  // F-2: no media elements and no poster/background - their addresses were fetched like an image's, and only the
+  // Content-Security-Policy stood between a model's or a tool's text and a request to an address of its choosing
+  FORBID_TAGS: ['style', 'form', 'input', 'button', 'textarea', 'select', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'dialog',
+    'video', 'audio', 'source', 'track', 'picture'],
+  FORBID_ATTR: ['style', 'id', 'name', 'hidden', 'srcset', 'popover', 'inert', 'poster', 'background', 'ping'],
 };
 
 export function sanitize(html) { return DOMPurify.sanitize(html, PURIFY_OPTS); }

@@ -674,9 +674,12 @@ def test_upgrade_ps1_asks_the_package_where_the_data_is_and_never_skips_the_data
     assert "GOOSE=" in r.stdout                                 # where uv may sit next to the goose binary
     # found in use, 2026-11-16: an account that upgrades but has no Goose of its own (a service account) had no uv
     # on PATH and none in its own Goose folder; the virtualenv, made by uv, has no pip; the upgrade stopped
-    for needle in ("'.venv\\Scripts\\uv.exe'", "(Split-Path $gooseBin) 'uv.exe'", "@('-m', 'uv', '--version')",
+    for needle in ("'.venv\\Scripts\\uv.exe'", "@('-m', 'uv', '--version')",
                    "@('-m', 'ensurepip', '--upgrade')", "register-devices-task.ps1"):
         assert needle in text, needle
+    # review 20261119_6, S-3: not next to the goose binary - that folder can be writable by accounts with fewer
+    # rights than whoever runs the upgrade, and a uv.exe put there would have been run by it
+    assert "(Split-Path $gooseBin) 'uv.exe'" not in text and "Split-Path $gooseBin" not in text
     r = subprocess.run([sys.executable, "-c", line, str(cfg)], capture_output=True, text=True, timeout=60,
                        env={**env, "GOOSE_WEB__PATHS__SYSTEM_DIR": str(tmp_path / "from-env")})
     assert Path(r.stdout.split("SYS=")[1].splitlines()[0]) == tmp_path / "from-env", r.stdout + r.stderr
