@@ -116,7 +116,7 @@ host_tasks:
 | `sandbox.relays` | `[]` | Local services (`host:port` on this machine, for example a model proxy on `127.0.0.1:4000`) sandboxed workers may reach; a relay forwards everything the service exposes on that port (every path, every virtual host). MXC: through the member's egress proxy, at their real address. AppContainer: through a per-user forwarder and a named pipe, with provider URLs rewritten to the forwarder. Everything else on loopback stays closed. A relay to the gateway's own port is ignored. An entry that is not `host:port` (an IPv4 address or a name, port 1 to 65535; no IPv6) is left out and named by `goose-web check`, `sandbox status` and the gateway log; the other relays and members' agents are not affected. AppContainer: two services on the same port each get a forward address of their own. |
 | `sandbox.mxc_dir` | `""` | Where `goose-web sandbox install-mxc` puts the pinned `wxc-exec.exe` (`<dir>\1.0.1\`). Default `<install folder>\vendor\mxc`. Must not be (in or above) the system folder or the profiles root. |
 | `sandbox.proxy_max_connections`, `sandbox.proxy_idle_seconds` | `64`, `900` | MXC egress proxy limits per member: open connections (more get HTTP 503) and seconds without traffic before a connection is closed. The first also limits each AppContainer relay (connections at once per member and service; more are closed at once). |
-| `sandbox.read_dirs` | `[]` | Extra folders sandboxed workers may read and run (Python, node, uv, git installs outside `C:\Program Files`). The goose CLI folder is always included. An entry naming the system folder, the profiles root, a member's profile or the native profile (in any spelling), or a network/device path, is left out and reported by `goose-web sandbox status` / `check`. |
+| `sandbox.read_dirs` | `[]` | Extra folders sandboxed workers may read and run (Python, node, uv, git installs outside `C:\Program Files`). The goose CLI folder is always included. An entry naming the system folder, the profiles root, a member's profile or the native profile (in any spelling), or a network/device path, is left out and reported by `goose-web sandbox status` / `check`. Since 1.26.0 the goose CLI folder and these folders come first on a sandboxed member's `PATH`, and uv there never downloads a Python (`UV_PYTHON_DOWNLOADS=never`, `UV_LINK_MODE=copy`; `goose.extra_env` can override both): give members a Python here and uvx-based extensions and skills work (ADMINISTRATION 11.6). `check` lists the Python and Node it finds here, with versions. |
 | `goose.binary` | `""` | Path to `goose`. When empty: `goose` on `PATH`, then `%LOCALAPPDATA%\Programs\Goose\resources\bin\goose.exe`, `%ProgramFiles%\Goose\resources\bin\goose.exe`, `%USERPROFILE%\.local\bin\goose.exe`. Set it for any other location (for example `C:\AI\Goose\resources\bin\goose.exe`); `install.ps1 -GooseBinary` writes it. |
 | `goose.idle_minutes` | `30` | A worker is stopped after this long with no browser clients, no active runs and no scheduler duty. |
 | `goose.start_timeout_seconds` | `45` | How long `goose serve` may take to answer `/status`. |
@@ -175,6 +175,42 @@ Classification endpoint (since 1.20.0, ADMINISTRATION 9.11). Goose's own prompt 
 | `guard.classifier_max_pieces` | `4` | A text longer than `guard.max_input_chars` is scored in this many consecutive pieces at most. A text that needs more is refused (`413`) and never reported safe; Goose then uses its patterns for that call. |
 | `guard.classifier_max_body_kb` | `256` | Larger request bodies get `413`. |
 | `guard.classifier_rate_per_minute` | `600` | Requests per profile per minute; beyond it `429`. |
+
+### `host_tools` keys (host tools, since 1.26.0)
+
+Servers the gateway runs for sandboxed members, outside their sandbox, lent to the teams that have them, tool by tool
+(ADMINISTRATION 11.9). Defined only here - never from the web page; Admin > Teams gives a defined host tool to a team.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `host_tools.idle_minutes` | `10` | A member's host-tool process stops after this long without a call (it starts again at the next one). |
+| `host_tools.max_calls_per_minute` | `60` | Tool calls per member and host tool per minute; more are refused. A definition may set its own. |
+| `host_tools.max_concurrent` | `4` | Tool calls at once per member and host tool. A definition may set its own. |
+| `host_tools.servers` | `{}` | `<name>: {...}` per host tool. The name: 1-40 lower-case letters, digits or `-`; not the name of a Goose extension Goose Web manages. |
+
+Each definition:
+
+| Key | Meaning |
+|---|---|
+| `from_extension` | The key of one of the gateway administrator's own Goose extensions (a command extension of the native profile): its command, arguments and variables (`envs`; not `env_keys`) are used. The host tool follows that extension: a change there applies at the next start of a member's process. |
+| `command` | Instead of `from_extension`: `[program, arguments...]`, the program with its full path. |
+| `tools` | Required: the tools members may use. Every other tool of the server is hidden and refused. |
+| `env` | Extra variables for the server; `{service_dir}` = `<system_dir>\host-tools\<name>\<member>` (its working folder). |
+| `timeout` | Seconds per call (default: the extension's timeout, else 300). |
+| `description` | What members see (default: the extension's description). |
+| `max_calls_per_minute`, `max_concurrent` | Limits of this host tool. |
+
+```yaml
+host_tools:
+  servers:
+    docs:                                  # members see an extension "docs" with two tools
+      from_extension: docs                 # your own Goose extension of that key
+      tools: [docs_search, docs_page]
+```
+
+A host tool is not started (and the team page says why) when a folder of its program, scripts, interpreter or a path
+in its variables can be changed by Everyone, Authenticated Users, Users or Interactive, or lies below a folder those
+groups may rename or re-permission.
 
 ### `elsewhere` keys (Working elsewhere, since 1.16.0)
 

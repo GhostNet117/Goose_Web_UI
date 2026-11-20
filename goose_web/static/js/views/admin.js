@@ -489,9 +489,35 @@ function teamsTab(body) {
     const hp = multiPick(hints.map((x) => ({ value: x.id, label: x.name, sub: x.description || '' })), t.hints || [], { empty: 'Hints library is empty' });
     const ge = teamGuardEditor(pol.guard, guardSets);
     const itemBoxes = {};
+    const hostBox = h('div', null, spinner(14));   // spec 035: host tools, one switch each
     const secEls = {};
     const meName = (store.get('me').user || {}).username || '';
     const itemsUrl = '/api/admin/teams/' + encodeURIComponent(t.id) + '/items';
+    const drawHostTools = (defs, reach) => {
+      const rows = defs.map((d) => {
+        const have = teamItems.find((i) => i.kind === 'hosttool' && i.name === d.name);
+        const lent = (d.serverTools || []).filter((x) => x.lent);
+        const risky = lent.filter((x) => (x.risky || []).length);
+        return { d, have, risky, lentText: d.tools.join(', ') };
+      });
+      hostBox.replaceChildren(h('div', { class: 'stack-sm' },
+        h('div', { class: 'muted small' }, 'Servers this gateway runs outside the members\' sandbox, as its own account, lending only the tools listed for them in config.yaml (host_tools). Members need no Shell for them; nothing secret is put into their profiles.'),
+        reach ? null : banner('warn', 'Host tools reach members only in the MXC sandbox; on this gateway the sandbox is off or uses the AppContainer backend.'),
+        rows.length ? table([
+          { label: 'Host tool', render: (r) => h('div', null, h('div', { class: 'strong' }, r.d.name), h('div', { class: 'muted small' }, r.d.description || '')) },
+          { label: 'Tools lent to members', render: (r) => h('div', null, h('div', { class: 'small mono' }, r.lentText),
+            ...r.d.problems.map((p) => h('div', { class: 'small', style: 'color:var(--danger)' }, 'Not available: ' + p)),
+            ...r.risky.map((x) => h('div', { class: 'small', style: 'color:var(--warn)' }, x.name + ' takes ' + x.risky.join(', ') + ': it would act on this machine for the member. Lend it only if that is safe.'))) },
+          { label: 'In ' + t.name, class: 'right', render: (r) => toggle(!!r.have, async (v) => {
+            try {
+              if (v) await POST(itemsUrl, { kind: 'hosttool', name: r.d.name });
+              else if (r.have) await DEL(itemsUrl + '/' + encodeURIComponent(r.have.id));
+              toast((v ? 'Lent to ' : 'Taken away from ') + t.name + ': ' + r.d.name, { kind: 'info' });
+            } catch (e) { toastError(e); }
+            loadItems();
+          }, { disabled: !!r.d.problems.length && !r.have }) },
+        ], rows) : h('div', { class: 'muted small' }, 'None defined. Whoever administers this machine defines host tools in config.yaml (host_tools.servers).')));
+    };
     // What the page holds, as the server takes it. Saved whenever it differs from what was saved last.
     const collect = () => {
       const sel = pm.get(); const fl = folders.get();
@@ -578,6 +604,7 @@ function teamsTab(body) {
       if (g.id === 'models') parts.unshift(pm.el);
       if (g.id === 'modes') parts.push(modes.el);
       if (g.id === 'folders') parts.push(h('div', { class: 'stack-sm' }, h('div', { class: 'muted small' }, 'Members can always reach their own workspace and the team folder. Nothing else unless listed here.'), field('Team folder', share, 'Shared by all members. Leave empty for the default: ' + (t.teamFolder || '')), field('Extra folders', folders.el, 'Absolute paths. "Members may write here" on: the members and their agents can change the folder. Off = read only: they can open it, start a chat there and let the agent read it; nothing is created or changed in it, and files cannot be attached to a chat that works there. A read-only folder cannot lie inside a folder this team can write.'), field('Max concurrent runs', maxRuns, 'Per user. Empty = the default (3). 0 = unlimited.')));
+      if (g.id === 'ext') parts.push(field('Host tools', hostBox));
       if (g.kinds) {
         itemBoxes[g.id] = h('div', null, spinner(14));
         parts.push(h('div', { class: 'row' }, h('span', { class: 'muted small grow' }, 'Library items: ' + g.kinds.join(', ') + 's copied into members\' profiles.'), btn('Add from library', () => libraryPicker(t, loadItems, g.kinds[0], () => teamItems), { icon: 'plus', size: 'sm' })), itemBoxes[g.id]);
@@ -602,9 +629,11 @@ function teamsTab(body) {
     for (const ev of ['change', 'input', 'click']) pane.addEventListener(ev, later);
     const loadItems = async () => {
       try {
-        const [items, mine] = await Promise.all([GET(itemsUrl).then((r) => arr(r, 'items')),
-          GET('/api/admin/library' + qs({ profile: meName, kind: 'provider' })).then((r) => arr(r, 'items')).catch(() => [])]);
+        const [items, mine, hostDefs] = await Promise.all([GET(itemsUrl).then((r) => arr(r, 'items')),
+          GET('/api/admin/library' + qs({ profile: meName, kind: 'provider' })).then((r) => arr(r, 'items')).catch(() => []),
+          GET('/api/admin/host-tools').catch(() => ({ items: [], reachesMembers: true }))]);
         teamItems = items; myProviders = mine; pm.refresh();
+        drawHostTools(arr(hostDefs, 'items'), hostDefs.reachesMembers !== false);
         for (const g of EXPERIENCE.filter((x) => x.kinds)) {
           const mine = items.filter((i) => g.kinds.includes(i.kind));
           itemBoxes[g.id].replaceChildren(mine.length ? table([

@@ -568,9 +568,14 @@ def test_guarded_extensions_pinned_off_never_removed(tmp_path, monkeypatch):
     ex = _exts(pr, alice)
     assert ex["developer"]["enabled"] is True and ex["extensionmanager"]["enabled"] is True
     assert ex["summon"]["enabled"] is True
-    for k in ("scheduler", "code_execution", "orchestrator", "computercontroller"):
+    for k in ("code_execution", "orchestrator", "computercontroller"):
         assert k not in ex, k                     # not in the admin's config: Goose's default applies again
+    # FIX scheduler-needs-schedules (1.26.0): Shell alone no longer gives the scheduler; it needs Schedules too
+    assert ex["scheduler"]["enabled"] is False
     assert any("restored" in c for c in changes)
+    _set_policy(db, tid, extensions_edit=True, allow_shell=True, schedules=True)
+    pr.provision(alice)
+    assert "scheduler" not in _exts(pr, alice)
     _set_policy(db, tid)
     pr.provision(alice)
     ex = _exts(pr, alice)
@@ -591,6 +596,9 @@ def test_other_bundled_extensions_denied_by_default(tmp_path, monkeypatch):
     assert ex["newthing"]["enabled"] is False and ex["autovisualiser"]["enabled"] is False
     assert ex["scheduler"]["enabled"] is False and "wiki" not in ex
     _set_policy(db, tid, allow_shell=True)
+    pr.provision(alice)
+    assert _exts(pr, alice)["scheduler"]["enabled"] is False  # 1.26.0: Shell alone is not enough for the scheduler
+    _set_policy(db, tid, allow_shell=True, schedules=True)
     pr.provision(alice)
     ex = _exts(pr, alice)
     assert ex["scheduler"]["enabled"] is True                 # restored as in the admin's config

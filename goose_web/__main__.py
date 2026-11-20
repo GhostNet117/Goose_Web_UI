@@ -436,6 +436,11 @@ def _print_sandbox_summary(settings, refresh: bool = True) -> bool:
     print(f"Extra program folders (sandbox.read_dirs): {settings.get('sandbox', 'read_dirs') or '-'}")
     for p in sm.get("readDirProblems") or []:
         print(f"[!!] sandbox.read_dirs entry {p['path']!r} is never granted to members: {p['why']}")
+    for text, good in mxc.runtime_lines(settings):       # spec 036
+        print(f"[{'OK' if good else '!!'}] runtimes: {text}")
+    from . import hosttools
+    for text, good in hosttools.check_lines(settings):   # spec 035
+        print(f"[{'OK' if good else '!!'}] host tool {text}")
     for p in sm.get("relayProblems") or []:
         print(f"[!!] {p}")
     for p in sm.get("folderProblems") or []:
@@ -1170,6 +1175,11 @@ def cmd_check(args, settings) -> int:
         m = sm.get("mxc") or {}
         for p in sm.get("readDirProblems") or []:
             line("sandbox.read_dirs", f"{p['path']} is never granted to members: {p['why']}", False)
+        for text, good in mxc.runtime_lines(settings):    # spec 036: said, not counted
+            print(f"[{'OK' if good else '!!'}] sandbox runtimes: {text}")
+        from . import hosttools
+        for text, good in hosttools.check_lines(settings):   # spec 035: a definition that cannot run is a problem
+            line("host tool", text, good)
         for p in sm.get("relayProblems") or []:
             line("sandbox.relays", p.split(" ", 1)[1] if p.startswith("sandbox.relays ") else p, False)
         for p in sm.get("folderProblems") or []:

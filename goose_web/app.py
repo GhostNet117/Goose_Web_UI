@@ -749,6 +749,14 @@ def create_app(settings: Settings) -> Starlette:
         profiles.security_endpoint = lambda: c.classify.endpoint
         await c.classify.start()
 
+        # Spec 035: host tools - servers the gateway runs for sandboxed members, outside their sandbox, lent tool by
+        # tool; reached only through each member's egress proxy (no port of their own). Before any worker starts.
+        from .hosttools import HostTools
+        c.host_tools = HostTools(settings, db, profiles, [workers.job])
+        profiles.host_tools = c.host_tools
+        workers.proxies.host_tools = c.host_tools
+        c.host_tools.start()
+
         def sandbox_event(action: str, w, detail: dict) -> None:
             # spec 025: MXC fallbacks and fail-closed refusals of members' workers are audited (admin-visible)
             db.audit(action, user=db.user_by_name(w.username), target=w.username, detail=detail, ok=False)
@@ -845,6 +853,7 @@ def create_app(settings: Settings) -> Starlette:
                 hub.flush_state_now()   # queued messages changed in the last half second
             except Exception:
                 log.exception("saving chat state at shutdown")
+            await c.host_tools.close()
             await workers.shutdown()
             db.audit("system.stop")
             db.close()

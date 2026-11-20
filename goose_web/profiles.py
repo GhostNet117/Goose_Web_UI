@@ -356,6 +356,8 @@ class Profiles:
         # spec 026: the classification endpoint's URL while the gateway holds its port (set by the app); None =
         # Goose-native detection uses patterns only
         self.security_endpoint: Any = None
+        # spec 035: hosttools.HostTools (set by the app); None = definitions are read from the settings when needed
+        self.host_tools: Any = None
 
     # ------------------------------------------------------------ paths
     def is_native(self, user: dict) -> bool:
@@ -862,6 +864,17 @@ class Profiles:
         default_model = tp.get("default_model") or None
         if team is not None:
             self.ensure_team_folder(team)
+        # Spec 035: host tools reach a member only through the egress proxy of an MXC sandbox
+        host_defs: dict = {}
+        if any(it["kind"] == "hosttool" for it in items):
+            from .config import sandbox_backend, sandbox_on
+            if sandbox_on(self.s) and sandbox_backend(self.s) == "mxc" and user.get("role") != "admin":
+                if self.host_tools is not None:
+                    host_defs = self.host_tools.servers
+                else:
+                    from .hosttools import load_servers
+                    host_defs = load_servers(self.s, admin_cfg.get("extensions") if isinstance(admin_cfg, dict)
+                                             else {})
 
         for it in items:
             kind, name, payload = it["kind"], it["name"], it.get("payload") or {}
@@ -889,6 +902,18 @@ class Profiles:
                 exts[key] = e
                 new_manifest["extensions"].append(key)
                 secrets_from(payload.get("secretsFrom"), _names(entry.get("env_keys")))
+            elif kind == "hosttool":
+                # spec 035: a server the gateway runs outside the sandbox, lent tool by tool. The member gets an HTTP
+                # extension and nothing else: no command, no secret, no program folder.
+                sd = host_defs.get(name)
+                if sd is None or sd.problems:
+                    continue
+                from .hosttools import member_entry
+                e = member_entry(sd)
+                if exts.get(name) != e:
+                    changes.append(f"extension {name} (host tool)")
+                exts[name] = e
+                new_manifest["extensions"].append(name)
             elif kind == "provider":
                 pj = payload.get("json")
                 pid = payload.get("providerId") or name

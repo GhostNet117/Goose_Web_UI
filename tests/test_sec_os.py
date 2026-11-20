@@ -183,7 +183,8 @@ def test_sandboxed_worker_env_is_an_allow_list(settings, tmp_path, monkeypatch):
         assert "sentinel-value-123" not in json.dumps(env)
         gateway_set = {"GOOSE_PATH_ROOT", "GOOSE_DISABLE_KEYRING", "GOOSE_RECIPE_PATH", "CONTEXT_FILE_NAMES",
                        "GOOSE_TELEMETRY_ENABLED", "TEMP", "TMP", "UV_CACHE_DIR", "PIP_CACHE_DIR", "npm_config_cache",
-                       "XDG_CACHE_HOME", "APPDATA", "USERPROFILE", "HOME", "ADMIN_CHOSEN"}
+                       "XDG_CACHE_HOME", "APPDATA", "USERPROFILE", "HOME", "ADMIN_CHOSEN",
+                       "UV_PYTHON_DOWNLOADS", "UV_LINK_MODE"}    # spec 036: settings for uv, not secrets
         assert set(env) <= set(SANDBOX_ENV_ALLOW) | gateway_set, set(env) - set(SANDBOX_ENV_ALLOW) - gateway_set
         assert env["ADMIN_CHOSEN"] == "yes" and env["GOOSE_PATH_ROOT"] == str(prof)
         assert env["PATH"] == os.environ["PATH"]

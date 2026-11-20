@@ -7,6 +7,8 @@ and everything it starts (MCP servers, npm, uv, pip, git, curl). The proxy then 
 - `sandbox.relays` targets (for example the local model proxy 127.0.0.1:4000): allowed, connected to the configured
   target (localhost, 127.0.0.1 and ::1 are the same host). A relay forwards everything the relayed service exposes on
   that port (every path, every virtual host behind a local reverse proxy);
+- `<name>.goose-web.invalid` (spec 035): the gateway's host tools - plain http:// only, never looked up or forwarded,
+  answered by hosttools.HostTools for the member of this proxy's credential;
 - public internet addresses: allowed when the member's network is `internet` or `internet+lan`;
 - private, CGNAT and unique-local addresses: only for `internet+lan`;
 - everything else is refused: other loopback ports, this machine's own addresses (the gateway, other local
@@ -332,6 +334,7 @@ class EgressProxy:
         self.counts = {"allowed": 0, "refused": 0, "unauthorized": 0, "auditSummarised": 0}
         self.network = "none"
         self.relays: dict[tuple[str, int], tuple[str, int]] = {}
+        self.broker: Any = None          # hosttools.HostTools (spec 035), set by ProxyRegistry
         self.update(network, relays or [])
 
     # ---------------------------------------------------------- configuration
@@ -589,6 +592,23 @@ class EgressProxy:
             await _reply(writer, reader, 400, f"Goose Web sandbox: bad host name: {bad}")
             return
         shown = clean_text(f"{host}:{port}", 300)
+        # Spec 035: http://<name>.goose-web.invalid/... is one of the gateway's host tools. Never looked up, never
+        # forwarded: answered by HostTools for the member this proxy's credential belongs to (no port of its own).
+        from .hosttools import host_name
+        tool = host_name(host)
+        if tool is not None:
+            broker = self.broker
+            if method == "CONNECT" or not tool or broker is None:
+                # not 401/403 for plain http: Goose answers those with an OAuth sign-in attempt (review HT-13)
+                why, status = (("host tools are reached with plain http:// (the gateway answers them itself)", 403)
+                               if method == "CONNECT" else ("not a host tool name", 400) if not tool
+                               else ("this gateway has no host tools", 502))
+                self._note_refused(shown, why, method=method)
+                await _reply(writer, reader, status, f"Goose Web sandbox: {shown} is not allowed: {why}")
+                return
+            self.counts["hostTools"] = self.counts.get("hostTools", 0) + 1
+            await broker.handle(self.username, tool, method, target, headers, reader, writer)
+            return
         d = await self.decide(host, port)
         if not d.allowed:
             self._note_refused(shown, d.reason, method=method)
@@ -751,6 +771,7 @@ class ProxyRegistry:
         self.audit = audit
         self.proxies: dict[str, EgressProxy] = {}
         self._lock = asyncio.Lock()
+        self.host_tools: Any = None      # hosttools.HostTools (spec 035), set by the app
 
     def protected_ports(self) -> set[int]:
         out = {p.port for p in self.proxies.values() if p.port}
@@ -772,20 +793,26 @@ class ProxyRegistry:
                 self.proxies[key] = p
             else:
                 p.update(network, relays)
+            p.broker = self.host_tools
             p.rotate()
             return p
 
     def revoke(self, key: str) -> None:
-        """MX-10: the member's worker stopped - its credential stops working now (a new one at the next start)."""
+        """MX-10: the member's worker stopped - its credential stops working now (a new one at the next start), and
+        its host-tool processes end (spec 035). May be called from a thread (WorkerManager._kill)."""
         p = self.proxies.get(key)
         if p is not None:
             p.revoke()
+            if self.host_tools is not None:
+                self.host_tools.member_stopped(p.username)
 
     async def drop(self, key: str) -> None:
         async with self._lock:
             p = self.proxies.pop(key, None)
         if p is not None:
             await p.close()
+            if self.host_tools is not None:
+                self.host_tools.member_stopped(p.username)
             log.info("sandbox mxc proxy: %s closed", p.username)
 
     async def close_all(self) -> None:

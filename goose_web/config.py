@@ -217,6 +217,16 @@ DEFAULTS: dict[str, Any] = {
         "proxy_max_connections": 64,      # MXC egress proxy: concurrent connections per member
         "proxy_idle_seconds": 900,        # MXC egress proxy: a connection without traffic this long is closed
     },
+    # Host tools (hosttools.py, spec 035): servers the gateway runs for sandboxed (MXC) members, outside their sandbox,
+    # lent to the teams that have them, tool by tool. Defined only here, never from the web page:
+    #   servers: {<name>: {from_extension: <your Goose extension> | command: [program, args...],
+    #                      tools: [<tools members may use>], env: {NAME: value}, timeout: 300, description: ...}}
+    "host_tools": {
+        "idle_minutes": 10,               # a member's host-tool process stops after this long without a call
+        "max_calls_per_minute": 60,       # per member and host tool (a definition may set its own)
+        "max_concurrent": 4,              # calls at once, per member and host tool
+        "servers": {},
+    },
     # Prompt guard (guard.py, spec 018): the local Prompt Guard 2 22M classifier. Teams switch the guard on in
     # Admin > Teams; these are the classifier's knobs. Nothing loads while no team (and not the admins) uses it.
     "guard": {

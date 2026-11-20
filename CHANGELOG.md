@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.26.0 - 2026-11-20
+
+**Host tools: servers the gateway runs for sandboxed members, lent tool by tool.** A member's sandboxed agent could not
+use an extension that needs something outside its sandbox - a credential in your password store, a service on your
+network, an index or a program on this machine - except by copying the credential into the member's profile, where
+the agent can read it. Now you define a host tool in `config.yaml` (`host_tools.servers`: "the same as my extension X",
+or a command line, and the tools members may use) and give it to a team with a switch (Extensions & tools > Host
+tools). The gateway runs the server itself, outside every sandbox, as its own account, and lends members only those
+tools; the server keeps using your credential store, so a changed key reaches members by itself and nothing is
+copied anywhere. ADMINISTRATION 11.9; SECURITY-ASSESSMENT 22.
+- Members see an ordinary extension; their profile gets an HTTP entry (`http://<name>.goose-web.invalid/mcp`) - no
+  command, no key, no program folder, and no Shell permission needed. Only members on the MXC sandbox get host tools.
+- Reached only through each member's own egress proxy; no port is opened. Every request is checked against the
+  member's team at that moment; one server process per member and host tool; only `initialize`, the filtered tool
+  list, calls of lent tools, `ping` and cancellations reach it; limits per member; `sandbox.hosttool` activity lines
+  without arguments.
+- A host tool whose program, scripts or interpreter lie in a folder other accounts can change (or own, or could
+  replace) does not start; `goose-web check` says why. For a Node program that includes `C:\node_modules`, which
+  every account may create by default: create it empty for administrators only. Never lend a tool that takes a file
+  path, a URL or a command: the team page flags them.
+
+**Programs and Python for sandboxed members.** The goose CLI's folder (uv, uvx, npx) and `sandbox.read_dirs` now come
+first on a sandboxed member's `PATH`, and uv there never downloads a Python - inside an MXC container it cannot install
+one ("Failed to create Python minor version link directory: Access is denied"). Give members a Python in
+`sandbox.read_dirs` and uvx-based extensions and Goose's built-in web-search skill work. `goose-web check` lists the
+members' Python and Node and warns about a Node older than 22.21, whose `fetch` ignores the sandbox's proxy.
+
+**"Schedules: off" also holds for the agents.** With Shell on, a team's members' agents still had Goose's `scheduler`
+tool, and every member's worker ran Goose's scheduler - also for a job an agent wrote into its own profile. Now the
+scheduler needs Schedules **and** Shell, and a member's worker runs Goose's scheduler only when the team allows
+schedules. **A team with Shell and without Schedules loses the agents' scheduler with this upgrade, and the scheduled
+jobs of its members stop running** - switch Schedules on for teams that should keep them.
+
 ## 1.25.0 - 2026-11-19
 
 **Folders a team may only read.** A team's extra folders were all-or-nothing: whoever could open one could change

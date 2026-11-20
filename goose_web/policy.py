@@ -48,7 +48,8 @@ ADMIN_POLICY: dict[str, Any] = {**{k: True for k in BOOL_KEYS}, **{k: [ANY] for 
 
 NO_TEAM_REASON = "You are not in a team yet, so you cannot chat. Ask your administrator to add you to a team."
 _LIST_LABELS = {"allowed_providers": "providers", "allowed_models": "models", "allowed_modes": "approval modes"}
-_PERMISSION_LABELS = {"allow_shell": "the Shell permission", "extensions_edit": "the permission to edit extensions"}
+_PERMISSION_LABELS = {"allow_shell": "the Shell permission", "extensions_edit": "the permission to edit extensions",
+                      "schedules": "the Schedules permission"}
 
 # Extensions that give the model a shell or arbitrary code execution, or that start other extensions / run recipes
 # (a recipe's extensions and retry checks are commands). Measured on Goose 1.57 (security assessment 2026-11-09):
@@ -73,11 +74,18 @@ def ext_key(name: Any) -> str:
 _GUARDED_KEYS = {ext_key(n): n for n in GUARDED_EXTENSIONS}
 
 
+SCHEDULER = "scheduler"
+
+
 def extension_needs(name: Any) -> list[str]:
-    """The permissions a non-admin needs to turn the named extension on (beyond extensions_edit for adding it)."""
+    """The permissions a non-admin needs to turn the named extension on (beyond extensions_edit for adding it).
+    1.26.0 (FIX scheduler-needs-schedules): Goose's `scheduler` creates scheduled recipe runs, so it needs the team's
+    Schedules permission as well as Shell - "Schedules off" left it on for every team with Shell (seen 2026-11-20)."""
     k = ext_key(name)
     if k == ext_key(EXTENSION_MANAGER):
         return ["extensions_edit", "allow_shell"]
+    if k == ext_key(SCHEDULER):
+        return ["allow_shell", "schedules"]
     if k in _GUARDED_KEYS:
         return ["allow_shell"]
     return []
@@ -253,7 +261,8 @@ def check_session_choice(policy: dict, load_result: dict | None) -> None:
 
 def team_warnings(policy: dict, *, hints: int, members: int, provider_items: set | None = None,
                   extension_items: set | None = None, command_items: set | None = None,
-                  sandbox: bool | None = None) -> list[dict]:
+                  sandbox: bool | None = None, host_tool_items: dict | None = None,
+                  host_tools_reach: bool | None = None) -> list[dict]:
     """What the admin should know about a team's experience (Experience page). level: err | warn | info.
     `provider_items`: the ids of the providers this team has as library items (None = not looked at);
     `extension_items`: the names of its extension items; `command_items`: those of them that start a program
@@ -278,6 +287,14 @@ def team_warnings(policy: dict, *, hints: int, members: int, provider_items: set
             out.append({"level": "warn", "text": (
                 f"Members do not get the extension '{name}' although it is a library item of this team: it needs "
                 f"{' and '.join(_PERMISSION_LABELS.get(x, x) for x in lack)}, which this team does not give.")})
+    # Spec 035: a host tool reaches members only when it is defined and valid, and only in the MXC sandbox
+    for name, problem in sorted((host_tool_items or {}).items()):
+        if problem:
+            out.append({"level": "warn", "text": f"Members do not get the host tool '{name}': {problem}."})
+    if host_tool_items and host_tools_reach is False:
+        out.append({"level": "warn", "text": "Members do not get this team's host tools: host tools reach members only "
+                                             "in the MXC sandbox, and the sandbox is off or uses the AppContainer "
+                                             "backend."})
     # Allowing a provider, or making it the team's default, does not put it into the members' profiles. A custom
     # provider is defined in ONE profile - its address, its models, its key. Found in use, 2026-11-13: a team with
     # a default provider whose members could not reach a model, and nothing said why.
@@ -315,6 +332,14 @@ def team_warnings(policy: dict, *, hints: int, members: int, provider_items: set
     if p.get("allow_shell"):
         out.append({"level": "warn", "text": "Shell is on: members' agents can run commands as the gateway's "
                                              "Windows account and read other profiles (known risk)."})
+    # FIX scheduler-needs-schedules (1.26.0): what the Schedules switch means for the agents
+    if p.get("schedules") and not p.get("allow_shell"):
+        out.append({"level": "info", "text": "Schedules is on and Shell is off: members manage schedules on the "
+                                             "Schedules page, but their agents have no scheduler tool (it needs "
+                                             "both)."})
+    elif p.get("allow_shell") and not p.get("schedules"):
+        out.append({"level": "info", "text": "Schedules is off: members' agents have no scheduler, and no scheduled "
+                                             "job in a member's profile runs."})
     if p.get("config_edit"):
         out.append({"level": "warn", "text": "Raw config editing is on: members can change their Goose settings."})
     if p.get("providers_edit"):

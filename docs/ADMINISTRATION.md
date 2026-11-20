@@ -794,13 +794,13 @@ A new team starts with every switch off and every list empty.
 | `skills_edit` | Edit skills | off | create, update, delete and import skills, agents and project sources |
 | `extensions_edit` | Edit extensions | off | add, remove, enable and disable extensions, and choose extensions for a new session |
 | `providers_edit` | Edit providers & models | off | manage custom providers, provider configuration and secrets, default provider/model, local model downloads, onboarding import |
-| `schedules` | Manage schedules | off | create, update, delete, pause, resume and run schedules |
+| `schedules` | Manage schedules | off | create, update, delete, pause, resume and run schedules. Since 1.26.0 it also decides what their agents get: Goose's `scheduler` tool needs Schedules **and** Shell, and a member's worker runs Goose's scheduler only with Schedules - off, the member's agent cannot schedule anything and no scheduled job in the member's profile runs (also one an agent with Shell wrote into the profile itself). Before 1.26.0 Shell alone gave the agent the scheduler. |
 | `apps` | Manage apps | off | import and delete MCP Apps, and call tools directly from an app (`tools/call`) |
 | `prompts_edit` | Edit system prompts | off | change system prompts |
 | `hints_edit` | Members may add personal hints | off | write personal goose hints, which are then included before the team hints (section 10) |
 | `tools_permissions` | Set tool permissions | off | change per-tool permission settings |
 | `config_edit` | Edit raw config | off | read and write the raw Goose configuration (treat like `allow_shell`) |
-| `allow_shell` | Allow shell / stdio extensions | off | use command-running extensions (`developer`, `computercontroller`, `code_execution`, `orchestrator`), stdio MCP extensions, per-session MCP servers and direct shell tool calls. See the known risk in section 11.3. |
+| `allow_shell` | Allow shell / stdio extensions | off | use command-running extensions (`developer`, `computercontroller`, `code_execution`, `orchestrator`; `scheduler` also needs Schedules), stdio MCP extensions, per-session MCP servers and direct shell tool calls. See the known risk in section 11.3. Host tools (11.9) do not need it. |
 | `notify_webhook` | Notification webhooks | off | set a personal notification webhook |
 | `allowed_modes` | Allowed approval modes | nothing | only these Goose modes (`auto`, `approve`, `smart_approve`, `chat`); `*` = any. Empty = members cannot chat. |
 | `allowed_providers` | Allowed providers | nothing | only these provider ids; `*` = any. Empty = members cannot chat. |
@@ -923,6 +923,12 @@ it. Deleting the original from your profile does not take the item away from the
 team for that. Removing an item, or taking a member out of the team, removes it from the member's profile at once -
 the provider file and its key, the extension entry, the skill folder, the recipe; a chat that is running at that
 moment keeps what it has loaded until its agent restarts, which happens as soon as it is idle.
+
+**An extension item copies its keys into every member's profile.** An extension taken from a profile brings the values
+of its `env_keys` along, into each member's `secrets.yaml` - where a member's agent that may run commands can read
+them. For an extension that needs a credential, an index or a service on your network, give the team a **host tool**
+instead (1.26.0, section 11.9): Extensions & tools > Host tools, one switch per host tool this gateway's configuration
+defines. Nothing is copied: the server runs on this machine and members get only the tools you lend.
 
 #### 9.9a Provider aliases for a team (1.25.0)
 
@@ -1692,6 +1698,18 @@ from a policy Goose Web builds at every start:
 - **HTTP/HTTPS only:** programs that do not use `HTTP(S)_PROXY` have no network in an MXC container: ssh and git over
   ssh, database clients, raw TCP, and Node 22's built-in `fetch` (Node 24+ uses it with `NODE_USE_ENV_PROXY=1`,
   which Goose Web sets). Goose itself, npm/npx, uv/uvx, pip, git over https, curl and Python honour it.
+- **Programs members can run (1.26.0):** the goose CLI's folder (with `uv`, `uvx` and `npx`) and the
+  `sandbox.read_dirs` come first on a member's `PATH`. uv cannot install a Python inside an MXC container (it cannot
+  create the link it makes for one: "Failed to create Python minor version link directory: Access is denied"), so it
+  never tries there (`UV_PYTHON_DOWNLOADS=never`, `UV_LINK_MODE=copy`) and uses the Python it finds on `PATH`.
+  **Give members a Python** - a standard CPython in a folder only administrators can change - and list that folder in
+  `sandbox.read_dirs`: then uvx-based extensions (`uvx <package>@<version>`) and Goose's built-in `web-search` skill
+  work (measured: `uvx duckduckgo-mcp-server` and `uvx ddgs` in an MXC container). The first start of a uvx extension
+  downloads its packages into the member's profile (about half a minute); later starts use that cache. For a Node
+  program use Node 22.21 or later (or 24+): older Node ignores the sandbox's proxy in its built-in `fetch`.
+  `goose-web check` lists the Python and Node of `read_dirs` with their versions and warns about an old Node; it does
+  not run one that other accounts can change. List only runtime folders: a folder of command-line tools placed first
+  on `PATH` also replaces Windows tools of the same name for members' agents.
 - **Process:** `wxc-exec.exe` starts suspended, joins the gateway's and the worker's kill-on-close job objects, and
   only then runs; stdin/stdout carry ACP, stderr goes to `worker-<user>.log`. A stop first closes stdin (Goose exits
   cleanly, MXC removes the container), then ends the job. No ACL is changed, no container profile stays behind. The
@@ -1940,6 +1958,81 @@ Goose sends no effort at all for non-OpenAI models on an OpenAI-compatible provi
 a LiteLLM-based gateway); Goose Web says so in the New chat picker. Give those models a fixed effort with a per-model
 `request_params` entry in the custom provider file: [CONFIGURATION.md, "Thinking effort"](CONFIGURATION.md#thinking-effort-since-1161).
 
+### 11.9 Host tools: servers the gateway runs for sandboxed members (since 1.26.0)
+
+A member's agent in the sandbox cannot use an extension that needs something outside it: a credential in your
+password store, a service on your network, an index or a program on this machine. Copying the credential into the
+member's profile would put it where the agent can read it. A **host tool** works the other way round: the gateway runs
+the server itself, on this machine, outside every sandbox, as the gateway's own Windows account (the way your own
+Goose runs it), and lends members **only the tools you list**.
+
+**Define it** in `config.yaml` - only there: whoever administers the machine decides what runs on it; the web page can
+only give a defined host tool to a team (CONFIGURATION.md, `host_tools`):
+
+```yaml
+host_tools:
+  servers:
+    docs:
+      from_extension: docs              # one of your own Goose extensions: the same command, the same credential store
+      tools: [docs_search, docs_page]   # what members may use; the server's other tools are hidden and refused
+    budget:
+      command: ["C:\\Program Files\\nodejs\\node.exe", "D:\\mcp\\budget\\dist\\index.js"]
+      tools: [list_transactions, get_summary]
+      env: {BUDGET_AUDIT_DIR: "{service_dir}\\audit"}   # {service_dir}: a folder of the gateway, per member
+```
+
+Restart the gateway. `goose-web check` prints one line per host tool: the tools it lends, or why it is not available.
+
+**Give it to a team**: Admin > Teams & policy > the team > Extensions & tools > **Host tools**: one switch per host
+tool. Each row shows the lent tools and, once the server has run, warns about a lent tool that takes a path, a file,
+a URL or a command.
+
+**What members get**: an extension of that name with exactly the lent tools. Their profile gets an HTTP extension entry
+(`http://<name>.goose-web.invalid/mcp`) - no command, no key, no program folder - so a team without Shell can have it.
+
+**How it works, and what holds:**
+
+- The address exists only behind the member's egress proxy (MXC): the proxy never looks the name up or forwards it; it
+  hands the request to the gateway with the member whose per-start proxy credential it carries. No port is opened.
+- Every request is checked against the member's team at that moment: taking the host tool from the team, moving the
+  member or disabling the account refuses the next call, and the member's server stops within a minute.
+- Deny by default: members get `initialize`, the tool list filtered to the lent tools, calls of lent tools (name and
+  arguments only), `ping` and cancellations. Resources, prompts, completions and every other request are refused; what
+  the server would ask the member (sampling, roots, elicitation) gets an error from the gateway.
+- One server process per member and host tool: started at first use, stopped after `host_tools.idle_minutes` without a
+  call, when the member loses it and when the member's agent stops. Working folder and `TEMP`:
+  `<system_dir>\host-tools\<name>\<member>`. Environment: the gateway's, without Goose Web's own variables and without
+  variables whose names look like secrets, plus the definition's.
+- Limits per member and host tool: calls per minute and at once, requests per minute, a request of 1 MB, a reply of
+  8 MB, the call time-out. A server that takes no input for 30 s is stopped.
+- Not started when its program, scripts, interpreter or a folder in its variables can be changed by Everyone,
+  Authenticated Users, Users or Interactive, belongs to another account, or lies below a folder they may rename or
+  re-permission: the gateway would run their code as its own account. Checked at start-up, every minute and right
+  before every start; permissions that cannot be read count as a reason. **A Node program** looks for a module it does
+  not find in every `node_modules` folder up to the root of the drive - and every account may create `C:\node_modules`
+  by default: create that folder (empty) and let only administrators change it, or the gateway says so and does not
+  start the server. A Python's folder and the folder above it (`pyvenv.cfg`) are checked too.
+- The server's `PATH` keeps only folders no other account can change or replace, and variables that steer an
+  interpreter to other code (`NODE_OPTIONS`, `PYTHONPATH`, `PYTHONHOME` and the like) are not passed on from the
+  gateway's environment; the server is started suspended and resumed only once it is in its kill-on-close jobs.
+- In the activity log as `sandbox.hosttool`: member, host tool, tool, decision and duration - never the arguments or
+  the result; per member the first 30 records of a minute one by one, the rest as one summary. The server's own error
+  output goes to `logs\host-tool-<name>-<member>.log`.
+- Members on the AppContainer backend, members without the sandbox and administrators do not get host tools (the team
+  page says so; administrators use their own extensions).
+
+**What to lend - and what not.** A lent tool acts outside the sandbox, with the rights of the gateway's Windows
+account, for the member. Lend a tool only if nothing a member can put into its arguments reaches this machine's files,
+programs or network beyond what the tool is for: a search in an index, a record by its id, calls to one fixed web
+service. **Never lend a tool that takes a file path** (it could read or upload any file the gateway's account can
+read), **a URL** (it could reach this machine's and your network's services) **or a command**. Keep servers that fetch
+web pages, run code or work on files inside the sandbox as ordinary extensions (Shell, and a Python or Node in
+`sandbox.read_dirs`, 11.6). A server that keeps state in the gateway account's user profile shares it between members.
+
+**Credentials**: a host tool uses the credential its server already uses for you (its own password-store lookup or
+configuration). Change it there and members get the new one with the server's next use - nothing is copied anywhere.
+The server's own audit, if it keeps one, shows the gateway's account; who asked is in the activity log.
+
 ## 12. Workers
 
 Admin > System lists every worker with its state (`stopped`, `starting`, `ready`, `crashed`), PID and port, uptime,
@@ -1969,7 +2062,7 @@ scheduler inside the worker. A worker runs the scheduler when it is started with
 
 | Profile | `goose.native_scheduler` | Scheduler runs in the gateway's worker |
 |---|---|---|
-| isolated | ignored | always |
+| isolated | ignored | when the member's team allows schedules (1.26.0; before: always); an administrator's isolated profile always |
 | native | `on` | always |
 | native | `off` | never (schedules run in Goose Desktop, or not at all) |
 | native | `auto` (default) | only while Goose Desktop is not running |

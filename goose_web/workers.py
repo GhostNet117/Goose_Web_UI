@@ -303,6 +303,9 @@ class Worker:
     # hook. Applied last: Goose ranks the environment above config.yaml and the secret store, so a member or an
     # agent editing the profile cannot switch the detection off. Never set for the native profile.
     security_env: dict = field(default_factory=dict)
+    # FIX scheduler-needs-schedules (1.26.0): an isolated profile runs Goose's scheduler only when its policy allows
+    # schedules (set by register from the member's policy; administrators' isolated profiles always may)
+    scheduler_allowed: bool = True
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
@@ -379,6 +382,10 @@ class WorkerManager:
 
     def wants_scheduler(self, w: Worker) -> tuple[bool, str]:
         if not w.native:
+            if not w.scheduler_allowed:
+                # FIX scheduler-needs-schedules: no `--enable-scheduler`, so no job in the profile runs - also not one
+                # an agent with Shell wrote into data/schedule.json itself
+                return False, "this member's team does not allow schedules"
             return True, "this profile's own scheduler"
         mode = str(self.s.get("goose", "native_scheduler") or "auto").lower()
         if mode == "on":
@@ -394,16 +401,25 @@ class WorkerManager:
         return self.workers.get(key)
 
     def register(self, key: str, username: str, path_root: str | None, native: bool,
-                 recipe_dirs: list[str], sandbox: dict | None = None) -> Worker:
+                 recipe_dirs: list[str], sandbox: dict | None = None,
+                 scheduler_allowed: bool | None = None) -> Worker:
+        """`scheduler_allowed` (FIX scheduler-needs-schedules): None keeps what the worker has (review SC-1: a caller
+        that does not know the member's policy must not switch the scheduler back on); a NEW isolated worker without
+        it gets no scheduler (second review R2-15: fail safe; every caller of the product passes it)."""
         w = self.workers.get(key)
         if w is None:
             w = Worker(key=key, username=username, path_root=path_root, native=native, recipe_dirs=recipe_dirs,
-                       sandbox=sandbox)
+                       sandbox=sandbox,
+                       scheduler_allowed=bool(native) if scheduler_allowed is None else bool(scheduler_allowed))
             self.workers[key] = w
         else:
+            # a change of the scheduler permission is applied by the monitor (scheduler != wants_scheduler: restart
+            # when no run is active), so it does not need restart_pending
             if (w.path_root, w.recipe_dirs, w.sandbox) != (path_root, recipe_dirs, sandbox) and w.state == "ready":
                 w.restart_pending = True
             w.path_root, w.native, w.recipe_dirs, w.sandbox = path_root, native, recipe_dirs, sandbox
+            if scheduler_allowed is not None:
+                w.scheduler_allowed = bool(scheduler_allowed)
         return w
 
     def _sandbox_env(self, w: Worker, backend: str | None = None) -> dict:
@@ -413,7 +429,8 @@ class WorkerManager:
         Kept from the gateway: SANDBOX_ENV_ALLOW (system locations, processor facts, LOCALAPPDATA - see there) and
         the non-secret GOOSE_TELEMETRY_ENABLED switch. Set by the gateway: GOOSE_PATH_ROOT, GOOSE_DISABLE_KEYRING,
         GOOSE_RECIPE_PATH, CONTEXT_FILE_NAMES, and the home (USERPROFILE, HOME, APPDATA), temp and cache folders,
-        all inside the user's profile.
+        all inside the user's profile; PATH begins with the goose folder and sandbox.read_dirs, and uv neither
+        downloads a Python nor links (spec 036: UV_PYTHON_DOWNLOADS, UV_LINK_MODE).
         Then goose.extra_env (admin-controlled) on top."""
         env: dict[str, str] = {}
         for k in SANDBOX_ENV_ALLOW:
@@ -427,6 +444,17 @@ class WorkerManager:
         env["GOOSE_DISABLE_KEYRING"] = "1"   # secrets stay in the profile's own secrets.yaml
         env["GOOSE_RECIPE_PATH"] = os.pathsep.join(w.recipe_dirs)
         env["GOOSE_PATH_ROOT"] = w.path_root or root
+        # Spec 036: the programs the sandbox may run (the goose folder, sandbox.read_dirs) come first on its PATH, and
+        # uv uses them: it never downloads a Python (an MXC container cannot create the link uv makes for a Python it
+        # installs - measured 2026-11-20) and copies instead of linking. goose.extra_env may override both.
+        first = [str(d) for d in (w.sandbox or {}).get("path_dirs") or [] if d]
+        if first:
+            seen = {os.path.normcase(os.path.normpath(d)) for d in first}
+            rest = [p for p in str(env.get("PATH") or "").split(os.pathsep)
+                    if p and os.path.normcase(os.path.normpath(p)) not in seen]
+            env["PATH"] = os.pathsep.join(first + rest)
+        env["UV_PYTHON_DOWNLOADS"] = "never"
+        env["UV_LINK_MODE"] = "copy"
         for k, v in (self.s.get("goose", "extra_env") or {}).items():
             env[str(k)] = str(v)
         env["CONTEXT_FILE_NAMES"] = json.dumps([ISOLATED_HINTS_FILENAME])

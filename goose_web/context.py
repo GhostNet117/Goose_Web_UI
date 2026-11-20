@@ -53,6 +53,7 @@ class Ctx:
     started_at: float = field(default_factory=time.time)
     guard: Any = None                 # guard.GuardService (spec 018)
     classify: Any = None              # classifyapi.ClassifyService (spec 026): Goose's classification endpoint
+    host_tools: Any = None            # hosttools.HostTools (spec 035): servers lent to sandboxed members
 
     # ---------------------------------------------------------- cookies / origin
     @property
@@ -209,8 +210,15 @@ class Ctx:
                     log.exception("provisioning %s failed", user["username"])
         self.workers.register(key, user["username"], self.profiles.path_root_env(user), native,
                               self.profiles.team_recipe_dirs(user) if not native else [],
-                              sandbox=self.sandbox_spec(user))
+                              sandbox=self.sandbox_spec(user), scheduler_allowed=self.scheduler_allowed(user))
         return self.hub.upstream(key, user["username"])
+
+    def scheduler_allowed(self, user: dict, policy: dict | None = None) -> bool:
+        """FIX scheduler-needs-schedules (1.26.0): an isolated member's worker runs Goose's scheduler only when the
+        member's team allows schedules. Administrators and the native profile are not affected."""
+        if user.get("role") == "admin" or self.profiles.is_native(user):
+            return True
+        return bool((policy or self.policy_for(user)).get("schedules"))
 
     def rights_fingerprint(self, user: dict, target: dict | None = None) -> str:
         """What a WebSocket is allowed to do, as one comparable string: the caller's role and effective policy and
@@ -262,6 +270,10 @@ class Ctx:
             if t not in targets:
                 targets.append(t)
         relays = rl.relay_specs(name, int(user["id"]), targets) if targets else []
+        # Spec 036: the programs the sandbox may run are found first on its PATH - the goose folder (uv, uvx, npx)
+        # and the administrator's read_dirs, in that order (not the gateway's own Python added below for relays)
+        goose_dir = os.path.dirname(str(self.settings.goose_binary or ""))
+        path_dirs = list(dict.fromkeys([d for d in [goose_dir, *read_dirs] if d and os.path.isabs(d)]))
         policy = self.policy_for(user)
         roots = self.write_roots_for(user, policy)          # Modify
         ro_roots = self.read_roots_for(user, policy)        # spec 031: Read & execute only
@@ -275,6 +287,7 @@ class Ctx:
                 "caps": sb.NETWORK_CAPS.get(net, sb.NETWORK_CAPS["internet"]),
                 "backend": sandbox_backend(self.settings), "config_problems": sandbox_config_problems(self.settings),
                 "network": net, "relay_targets": [r["target"] for r in relays], "mxc_grants": mxc_grants,
+                "path_dirs": path_dirs,
                 "profiles_root": str(self.settings.profiles_root), "system_dir": str(self.settings.system_dir),
                 "protected_write": mxc.protected_write_paths(self.settings),
                 "protected_any": sorted({p for p in native if p})}

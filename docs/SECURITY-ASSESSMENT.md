@@ -1647,3 +1647,110 @@ Not verified by anybody: the new registration on a Windows Server (the CI job of
 it as SYSTEM and reports the owners and access lists Windows gives the task folder, the task and the copy's
 folder); what Task Scheduler lets an account do with a task folder it created itself; a real restart; a machine
 that allows only signed scripts.
+
+## 22. Addendum: 1.26.0 (2026-11-20) - host tools, runtimes for sandboxed members, the Schedules switch
+
+Requested by the owner: members whose agents run in the sandbox should use house extensions that need something
+outside it - a credential from the owner's password store, a service on the LAN, a program on the host - with the
+same credential the owner uses, nothing per member to maintain, and the sandbox as strict as before. Assessed before
+building (options, threat model, decision), built as specs 035 and 036 and one fix record, measured with the real
+Goose 1.57 and real MXC containers, and reviewed independently before release (22.4).
+
+### 22.1 Host tools (spec 035)
+
+**What is new.** A host tool is a stdio MCP server that the gateway runs outside every sandbox, as its own account,
+and lends to the members of teams that have it - only the tools the administrator lists. Defined in `config.yaml`
+only; a team gets it with a switch. A member's Goose reaches it as an HTTP extension at
+`http://<name>.goose-web.invalid/mcp` through the member's egress proxy.
+
+**Why not the alternatives.** Putting the credential into the member's environment or profile at each start was
+rejected: with Shell, the member's agent reads its own environment and profile. Copying a per-member key (what a
+library item does with `env_keys`) adds keys to maintain and puts them where the agent reads them. Opening the LAN
+(`internet+lan`) or relaying a whole service is broader than one extension needs.
+
+| Threat | Control | Verified by |
+|---|---|---|
+| A credential readable by the member's agent | None enters the sandbox: the server uses the owner's own credential store on the host; the member's profile gets an HTTP entry without command, key or folder | `test_provisioning_delivers_an_http_extension_only_on_mxc` |
+| Spoofed member, another member's session | Identity only from the per-start proxy credential (407 otherwise, also after revocation); sessions bound to member and host tool; one process per member and host tool | `test_through_the_members_egress_proxy`, `test_who_may_use_it_is_checked_at_every_request` |
+| Revoked access still working | Every request re-checks the team's items, the account and the definition; the sweep stops withdrawn servers | same |
+| The protocol beyond tools (resources, prompts, sampling, roots) | Deny by default; `initialize` from the gateway's own handshake (tools capability only); server requests answered with an error; `_meta` and progress tokens not forwarded | `test_member_gets_only_the_lent_tools` |
+| A lent tool steered to the host (confused deputy) | Only listed tools are listed or callable; the team page flags lent tools whose parameters name a path, file, URL or command; ADMINISTRATION 11.9 says never to lend those | `test_member_gets_only_the_lent_tools` (a `read_file` tool offered by the server is refused) |
+| Code of other accounts run as the gateway | A server whose program, scripts, interpreter or path variables lie in a folder broad groups can change, or below one they can rename or re-permission, does not start; checked at load, every minute and before each start | `test_program_folder_checks_reach_ancestors_arguments_and_path_variables`, `test_the_folder_check_is_repeated_at_every_start` |
+| A new listening port | None: the name exists only inside the members' proxies | by construction (egress.py) |
+| The gateway frozen or starved by a server | Own reader and writer threads per server, bounded queue, write deadline, kill-first stop; JSON parsed and encoded off the event loop; limits per member and host tool | `test_a_server_that_stops_reading_never_blocks_the_gateway` |
+| Floods of requests or log lines | Requests per minute per member and host tool; per-member audit limiter (summaries) | `test_requests_are_limited_and_refusals_summarised` |
+| Goose's own behaviour with such a server | Real goose 1.57 through a real egress proxy: `server/discover` -> "method not found" -> `initialize` -> `tools/list` | `test_real_goose_through_the_egress_proxy` |
+
+### 22.2 Runtimes for sandboxed members (spec 036)
+
+The goose CLI folder and `sandbox.read_dirs` come first on a sandboxed member's `PATH`; uv there never downloads a
+Python and copies instead of linking. No new rights: those folders were already granted read and execute. Measured
+in an MXC container: with a Python granted read-only, `uvx duckduckgo-mcp-server` installs and runs and `uvx ddgs`
+searches through the proxy; Goose's Node 22.14 `fetch` ignores the proxy (Node 22.21+ and 24+ honour
+`NODE_USE_ENV_PROXY`, which Goose Web sets). `goose-web check` reports the runtimes and does not run one that broad
+groups can change.
+
+### 22.3 The Schedules switch (FIX `scheduler-needs-schedules`, Medium)
+
+A team with Shell on and Schedules off still gave its members' agents Goose's `scheduler` tool (seen live), and every
+isolated worker ran Goose's scheduler, which also runs a job an agent with Shell writes into `data/schedule.json` of
+its own profile. Now `scheduler` needs Shell and Schedules (pinned off, direct calls refused, recipes and session
+extensions checked), and a member's worker starts Goose's scheduler only with Schedules. Tests:
+`tests/test_scheduler_permission.py`.
+
+### 22.4 Independent review of the working tree (2026-11-20, read-only, before release)
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| HT-1 | High | Writes to a server's stdin ran in the gateway's default thread pool and `stop()` closed stdin on the event loop: a server that stops reading could freeze the gateway and exhaust the pool | Fixed: one writer thread per server with a bounded queue, a write deadline (the sweep stops the server), a stop that kills first and never waits on a pipe |
+| HT-2 | Medium | Large server messages parsed and answers encoded on the event loop; process start on the loop | Fixed: parsed and encoded in the reader thread; messages above 8 MB dropped; start in a thread |
+| HT-3 | Medium | Refusals audited without a limit; no request limit beyond tool calls | Fixed: per-member audit limiter with summaries; requests per minute per member and host tool |
+| HT-4 | Low | Limits reset when a server restarted; crashes did not count toward the start back-off | Fixed: counters kept per member and host tool; a crash counts as a failure |
+| HT-5 | Low | The member's `_meta` was passed to the server | Fixed: name and arguments only |
+| HT-6 | Low | The folder check missed ancestors, `--x=<path>` arguments, path variables, `node_modules`; ran only at load | Fixed, except: a `node_modules` folder another account creates later above the program, what a `.cmd` wrapper calls, and modules a server imports from its working folder (gateway-owned) |
+| HT-7 | Low | A lent tool that writes files could plant programs in the server's working folder | Mitigated: `NoDefaultCurrentDirectoryInExePath=1`, own `TEMP`; a tool that writes files is not to be lent (11.9) |
+| HT-8 | Low | A cancellation skipped the authorisation and the host tool of the session | Fixed |
+| HT-9 | Low | No overall deadline for a request body; no lingering close for early answers | Fixed |
+| HT-10 | Low | A server could start just after the member's agent stopped and live until the idle sweep | Fixed: a per-member generation checked after the start |
+| HT-11 | Note | Servers share the gateway account's user profile between members | `TEMP` per member; the profile is kept (servers find their credential stores there); stated in 11.9 |
+| HT-12 | Note | One error log per host tool for all members; notification parameters logged at debug level | Fixed: a log per member; nothing of a notification logged |
+| HT-13 | Note | 403 for a host-tool name the gateway cannot serve would start Goose's OAuth attempt | Fixed: 400 (invalid name) and 502 (no host tools) |
+| RT-1 | Low | Refused `read_dirs` put first on PATH | Not the case: `path_dirs` is built from the accepted folders only (tested) |
+| RT-2 | Low | `check` ran `python --version` / `node --version` from `read_dirs` | Fixed: not run when broad groups can change the folder or file |
+| RT-3 | Note | A tool folder first on PATH replaces Windows tools of the same name for members | Stated in 11.6 |
+| SC-1 | Medium (if confirmed) | A `register` call without the permission would switch the scheduler back on | Not the case today (all callers pass it); hardened: no value keeps the current one |
+| SC-2 | Note | A running worker keeps its scheduler until it restarts, which happens when no run is active | Accepted |
+
+### 22.4b Second independent review: the fixes of 22.4 (2026-11-20, read-only, before release)
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| R2-1 | Medium | Node looks for a module it does not find in every `node_modules` up to the root of the drive, and every account may create `C:\node_modules`; a Python reads `pyvenv.cfg` next to it and one folder up | Fixed: the check goes up to the root; for a Node program every folder above it where broad groups may create a sub-folder must already hold a `node_modules` only administrators can change (the gateway refuses to start the server and says so); for a Python the folder above its folder is checked as well |
+| R2-2 | Medium | The server inherited the gateway's `PATH` and interpreter variables (`NODE_OPTIONS`, `PYTHONPATH`, ...) unchecked | Fixed: those variables are not passed on (a definition that sets one has it checked); `PATH` keeps only existing folders no broad group can change, own or replace |
+| R2-3 | Low-Medium | Owners, links, conditional entries and unreadable permissions were not considered | Fixed: a folder owned by an account other than SYSTEM, Administrators, TrustedInstaller or the gateway's own refuses; paths are checked as written and resolved; conditional allow entries count; permissions that cannot be read refuse (fail closed); `{service_dir}` no longer hides the rest of a value |
+| R2-4 | Low | A stop could run in two threads at once | Fixed: once, behind a lock; the reader thread asks the event loop to stop |
+| R2-5 | Low | A writer thread that died left calls waiting until their time-out | Fixed: the server counts as ended |
+| R2-6 | Low | A server could start a process before it was put into its jobs | Fixed: created suspended, put into both kill-on-close jobs (or not started at all), then resumed |
+| R2-7 | Low | A start cancelled while running left the server behind | Fixed |
+| R2-8 | Low | The generation of HT-10 was read late | Fixed: read when the request arrives |
+| R2-9 | Low | Names nobody defined created counters | Fixed: refused before any counter, session or database lookup |
+| R2-10 | Low | Very large or deeply nested messages | Messages above 4 MB dropped; an unreadable message no longer ends the reader |
+| R2-11 | Low | A start could hold its lock for a long time | Fixed: 120 s for a whole start, 150 s for waiting on another one |
+| R2-12 | Low | The error log grows while the server runs | Covered by the log budget of 15 (`logs\**`) |
+| R2-13 | Note | Two members on one service folder if their names mapped to one | Not the case: user names are already valid folder names (`safe_name` validates, it does not change) |
+| R2-14 | Note | Server-side ids restarted with every process | Fixed: unique in the gateway |
+| R2-15 | Low | A new member worker registered without the permission got the scheduler | Fixed: it gets none unless told (all callers tell) |
+| R2-16 | Note | Tool names from the server shown on the admin page | Names that are not plain tool names are not shown; the page puts all text in as text (`ui.h`) |
+
+Measured on the owner's machine before release, with the code of this release outside the live gateway: the owner's
+own index-search server and budget server, lent as host tools (2 and 39 tools), answered their read tools through
+the real broker - the budget server with the owner's own credential from his password store, nothing copied - while
+the write tools that were not lent and the attachment tool (a file path) were refused.
+
+### 22.5 Residual risks
+
+- A lent tool acts outside the sandbox with the gateway account's rights. The control is the administrator's choice
+  of tools; the page flags suspicious parameters, the guide says what never to lend.
+- Host tools reach members on the MXC backend only.
+- A server's own audit records the gateway's account; who asked is in the activity log (`sandbox.hosttool`).
+- The registry exposure of 16.3 is unchanged.

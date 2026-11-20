@@ -1062,7 +1062,8 @@ async def _reprovision(c: Ctx, users: list[dict]) -> dict:
             # recipe folders and (spec 012) the sandbox's folder grants follow team/folder changes; a changed
             # sandbox spec marks the worker for a restart when it is quiet
             c.workers.register(w.key, u["username"], c.profiles.path_root_env(u), False,
-                               c.profiles.team_recipe_dirs(u), sandbox=c.sandbox_spec(u))
+                               c.profiles.team_recipe_dirs(u), sandbox=c.sandbox_spec(u),
+                               scheduler_allowed=c.scheduler_allowed(u))
     if c.hub is not None:
         # A-1: a team, policy or membership change takes effect on open sockets now, not at the next 30 s check:
         # a socket whose role, policy or folders changed is closed and the browser reconnects with the new ones
@@ -1325,7 +1326,8 @@ async def admin_user(request: Request):
     changes = await _reprovision(c, [u2]) if {"team", "teams", "hints", "policyOverrides"} & b.keys() else {}
     if "role" in b and c.workers.get(u2["username"].lower()) and not c.profiles.is_native(u2):
         c.workers.register(u2["username"].lower(), u2["username"], c.profiles.path_root_env(u2), False,
-                           c.profiles.team_recipe_dirs(u2), sandbox=c.sandbox_spec(u2))
+                           c.profiles.team_recipe_dirs(u2), sandbox=c.sandbox_spec(u2),
+                           scheduler_allowed=c.scheduler_allowed(u2))
         if not c.sandboxed(u2):
             await _drop_sandbox(c, u2)
     c.audit(request, "user.update", admin, target=u["username"], detail={"fields": sorted(b.keys() - {"password"})})
@@ -1521,7 +1523,25 @@ def _team_view(c: Ctx, t: dict) -> dict:
                     if isinstance(e, dict) and e.get("type") in ("builtin", "platform") and e.get("name")},
                 command_items={r["name"] for r in ext_rows
                                if acp_policy.is_command_extension((r.get("payload") or {}).get("entry"))},
-                sandbox=_sandbox_on(c))}
+                sandbox=_sandbox_on(c), **_host_tool_view(c, t))}
+
+
+def _host_tool_view(c: Ctx, t: dict) -> dict:
+    """Spec 035: the team's host tools with the problem that keeps each from its members ("" = none), and whether
+    host tools can reach members at all (the MXC sandbox)."""
+    from .config import sandbox_backend
+    names = [r["name"] for r in c.db.query("SELECT name FROM team_items WHERE team_id=? AND kind='hosttool'",
+                                           (t["id"],))]
+    if not names:
+        return {}
+    servers = c.host_tools.servers if c.host_tools is not None else {}
+    items = {}
+    for n in names:
+        sd = servers.get(n)
+        items[n] = ("it is not defined in this gateway's configuration (host_tools.servers)" if sd is None
+                    else sd.problems[0] if sd.problems else "")
+    return {"host_tool_items": items,
+            "host_tools_reach": _sandbox_on(c) and sandbox_backend(c.settings) == "mxc"}
 
 
 def _team_members(c: Ctx, team_id: int) -> list[dict]:
@@ -1630,9 +1650,19 @@ async def admin_team_items(request: Request):
                    for r in rows])
     b = await body_json(request, 8 * 1024 * 1024)
     kind = b.get("kind")
-    if kind not in ("recipe", "skill", "extension", "provider"):
-        raise HTTPError(400, "bad_kind", "kind must be recipe, skill, extension or provider")
-    if b.get("fromProfile"):
+    if kind not in ("recipe", "skill", "extension", "provider", "hosttool"):
+        raise HTTPError(400, "bad_kind", "kind must be recipe, skill, extension, provider or hosttool")
+    if kind == "hosttool":
+        # spec 035: a host tool this gateway's configuration defines and can start; nothing is copied anywhere
+        hname = str(b.get("name") or "")
+        sd = c.host_tools.servers.get(hname) if c.host_tools is not None else None
+        if sd is None:
+            raise HTTPError(400, "bad_ref", f"there is no host tool '{hname[:80]}' in this gateway's configuration "
+                                            "(host_tools.servers in config.yaml)")
+        if sd.problems:
+            raise HTTPError(400, "bad_ref", f"the host tool '{hname}' cannot be given to a team: {sd.problems[0]}")
+        name, payload, source = hname, {"server": hname}, "manual"
+    elif b.get("fromProfile"):
         src = c.db.user_by_name(str(b["fromProfile"]))
         if not src:
             raise HTTPError(404, "not_found", "Profile not found")
@@ -1682,6 +1712,16 @@ async def refresh_library(c: Ctx) -> dict:
         await _reprovision(c, _team_members(c, tid))
         c.db.audit("team.item.refresh", target=str(tid), detail={"items": names[:20]})
     return {str(tid): names for tid, names in changed.items()}
+
+
+async def admin_host_tools(request: Request):
+    """Spec 035: the host tools config.yaml defines - problems, lent tools, the server's whole tool list once it has
+    run (with the parameters that name a path, URL or command), and the members it runs for now."""
+    c = ctx(request)
+    c.require(request, admin=True)
+    from .config import sandbox_backend, sandbox_on
+    reach = sandbox_on(c.settings) and sandbox_backend(c.settings) == "mxc"
+    return ok({"items": c.host_tools.describe() if c.host_tools is not None else [], "reachesMembers": reach})
 
 
 async def admin_library_refresh(request: Request):
@@ -2316,6 +2356,7 @@ routes = [
     Route("/api/admin/teams/{tid:int}/items/{iid:int}", admin_team_item_delete, methods=["DELETE"]),
     Route("/api/admin/library", admin_library),
     Route("/api/admin/library/refresh", admin_library_refresh, methods=["POST"]),
+    Route("/api/admin/host-tools", admin_host_tools),
     Route("/api/admin/hints", admin_hints, methods=["GET", "POST"]),
     Route("/api/admin/hints/{hid:int}", admin_hint, methods=["GET", "PUT", "DELETE"]),
     Route("/api/admin/goose-security", admin_goose_security, methods=["GET", "PUT"]),

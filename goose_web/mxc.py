@@ -814,6 +814,73 @@ def read_dir_problems(settings, native_roots: list[str] | None = None) -> list[t
     return out
 
 
+def _runtime_version(exe: str) -> str:
+    """`python --version` -> '3.13.11', `node --version` -> 'v22.14.0'; '' when it does not answer in 5 s."""
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=5,
+                           creationflags=0x08000000 if IS_WINDOWS else 0)
+        words = (r.stdout or r.stderr or "").strip().split()
+        return words[-1] if words else ""
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+
+
+def _broad_writers(path: str) -> list[str]:
+    try:
+        from .__main__ import broad_writers
+        return broad_writers(path)
+    except (OSError, ValueError):
+        return ["(permissions that cannot be read)"]     # fail closed: such a program is not run either
+
+
+def node_ignores_proxy(version: str) -> bool:
+    """True for a Node whose built-in fetch does not use HTTP(S)_PROXY even with NODE_USE_ENV_PROXY=1, which an MXC
+    member's agent depends on: support came with Node 22.21 and 24.0 (Node 23 never had it)."""
+    import re
+    m = re.match(r"v?(\d+)\.(\d+)", str(version or ""))
+    if not m:
+        return False
+    major, minor = int(m.group(1)), int(m.group(2))
+    return major < 22 or (major == 22 and minor < 21) or major == 23
+
+
+def runtime_report(settings, native_roots: list[str] | None = None) -> list[dict]:
+    """Spec 036: the runtimes sandboxed members can run - python.exe and node.exe directly in a granted
+    `sandbox.read_dirs` folder - with their versions ({kind, path, version, warning})."""
+    refused = {d for d, _ in read_dir_problems(settings, native_roots)}
+    out = []
+    for d in [str(x) for x in (settings.get("sandbox", "read_dirs") or []) if x and str(x) not in refused]:
+        for exe, kind in (("python.exe" if IS_WINDOWS else "python3", "python"),
+                          ("node.exe" if IS_WINDOWS else "node", "node")):
+            p = os.path.join(d, exe)
+            if not os.path.isfile(p):
+                continue
+            who = _broad_writers(p) or _broad_writers(d)
+            if who:     # review RT-2: never run (as whoever runs `check`) what other accounts can replace
+                out.append({"kind": kind, "path": p, "version": "", "warning": (
+                    f"{d} can be changed by {', '.join(who)}: not run here, and every member's sandbox runs what is "
+                    "there - restrict the folder to administrators")})
+                continue
+            v = _runtime_version(p)
+            warning = ""
+            if kind == "node" and node_ignores_proxy(v):
+                warning = (f"Node {v} ignores the sandbox's proxy in its built-in fetch (needs 22.21+ or 24+): "
+                           "extensions that use it have no network in an MXC sandbox")
+            out.append({"kind": kind, "path": p, "version": v, "warning": warning})
+    return out
+
+
+def runtime_lines(settings, native_roots: list[str] | None = None) -> list[tuple[str, bool]]:
+    """(text, good) lines about members' runtimes for `check` and `sandbox status`."""
+    rep = runtime_report(settings, native_roots)
+    lines = [(f"members' {r['kind']}: {r['version'] or '?'} ({r['path']})" + (f" - {r['warning']}" if r["warning"]
+                                                                              else ""), not r["warning"]) for r in rep]
+    if not any(r["kind"] == "python" for r in rep):
+        lines.append(("no Python in sandbox.read_dirs: uv-based extensions and skills (uvx) cannot run in members' "
+                      "sandboxes - uv may not download one there (ADMINISTRATION 11.6)", True))
+    return lines
+
+
 def filter_grants(grants: dict[str, str], **ctx) -> tuple[dict[str, str], list[tuple[str, str]]]:
     """(kept {resolved path: mode}, refused [(path, why)]). Modify wins over read for one (resolved) path."""
     kept: dict[str, str] = {}
