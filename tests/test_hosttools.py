@@ -98,9 +98,13 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("GOOSE_WEB__PATHS__PROFILES_ROOT", str(tmp_path / "profiles"))
     (tmp_path / "none.yaml").write_text("", encoding="utf-8")
     monkeypatch.setenv("GOOSE_WEB_CONFIG", str(tmp_path / "none.yaml"))
-    # the test's server runs on this repository's venv, which a developer's C:\ often lets every account change
+    # the test's server runs on this repository's venv, which a developer's C:\ often lets every account change; on
+    # GitHub's Windows runner the checkout's drive (D:\) belongs to NT AUTHORITY\NETWORK SERVICE: switch off all four
+    # program-folder checks here (as _no_findings does), the checks themselves have tests of their own
     monkeypatch.setattr(ht, "writable_by_others", lambda p: [])
     monkeypatch.setattr(ht, "ancestor_writers", lambda p: [])
+    monkeypatch.setattr(ht, "subfolder_creators", lambda p: [])
+    monkeypatch.setattr(ht, "foreign_owner", lambda p: "")
     monkeypatch.setenv("HT_TEST_API_KEY", "must-not-reach-the-server")
     monkeypatch.setenv("GOOSE_HT_TEST", "must-not-reach-the-server")
     s = load_settings()
@@ -149,6 +153,8 @@ def text_of(res):
 def test_definitions_and_their_problems(tmp_path, monkeypatch):
     monkeypatch.setattr(ht, "writable_by_others", lambda p: ["Users"] if "shared" in p else [])
     monkeypatch.setattr(ht, "ancestor_writers", lambda p: [])
+    monkeypatch.setattr(ht, "subfolder_creators", lambda p: [])     # not what this test is about (CI runner's D:\)
+    monkeypatch.setattr(ht, "foreign_owner", lambda p: "")
     prog = tmp_path / "prog.exe"
     prog.write_bytes(b"")
     shared = tmp_path / "shared"
