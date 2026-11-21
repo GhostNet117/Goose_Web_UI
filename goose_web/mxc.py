@@ -881,6 +881,18 @@ def runtime_lines(settings, native_roots: list[str] | None = None) -> list[tuple
     return lines
 
 
+def members_python(settings, native_roots: list[str] | None = None) -> str:
+    """FIX member-stdio-start-hang (1.26.1): the interpreter the stdio start-up guard runs on - the first python.exe
+    directly in an accepted `sandbox.read_dirs` folder that only administrators can change - or '' (no guard).
+    Nothing is run (provisioning calls it)."""
+    refused = {d for d, _ in read_dir_problems(settings, native_roots)}
+    for d in [str(x) for x in (settings.get("sandbox", "read_dirs") or []) if x and str(x) not in refused]:
+        p = os.path.join(d, "python.exe" if IS_WINDOWS else "python3")
+        if os.path.isfile(p) and not (_broad_writers(p) or _broad_writers(d)):
+            return p
+    return ""
+
+
 def filter_grants(grants: dict[str, str], **ctx) -> tuple[dict[str, str], list[tuple[str, str]]]:
     """(kept {resolved path: mode}, refused [(path, why)]). Modify wins over read for one (resolved) path."""
     kept: dict[str, str] = {}

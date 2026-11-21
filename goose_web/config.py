@@ -124,6 +124,25 @@ def sandbox_config_problems(settings: "Settings") -> list[str]:
     return out
 
 
+def extension_start_seconds(settings: "Settings") -> tuple[int, str]:
+    """(seconds, problem) for the stdio start-up guard (FIX member-stdio-start-hang). 0 = off. A value that is not
+    a whole number from 0 to 3600 is reported (`check`) and the default, 120, is used: a wrong value must not keep
+    members' agents from starting."""
+    raw = settings.get("sandbox", "extension_start_seconds")
+    if raw is None or raw == "":
+        return 120, ""
+    try:
+        if isinstance(raw, bool):
+            raise ValueError
+        n = int(raw)
+        if float(raw) != n or not 0 <= n <= 3600:
+            raise ValueError
+        return n, ""
+    except (TypeError, ValueError):
+        return 120, (f"sandbox.extension_start_seconds is {raw!r}; use a whole number of seconds from 0 to 3600 "
+                     "(0 = no start-up guard) - 120 is used")
+
+
 def sandbox_relay_problems(settings: "Settings") -> list[str]:
     """`sandbox.relays` entries that are left out (AC-6). Not among sandbox_config_problems: a relay that is not
     there can only mean less access, so members' agents still start; `check`, `sandbox status` and the gateway log
@@ -210,6 +229,10 @@ DEFAULTS: dict[str, Any] = {
         # gateway's own (no view of that account's screen or clipboard) | shared = on that account's desktop
         "desktop": "private",
         "read_dirs": [],                  # extra program folders the workers may read and run (Python, node, uv, git)
+        # FIX member-stdio-start-hang (1.26.1): a team's stdio extensions start through Goose Web's start-up guard
+        # (stdio_guard.py, on the members' Python from read_dirs); the server gets this many seconds to answer
+        # initialize. 0 = no guard.
+        "extension_start_seconds": 120,
         # local services sandboxed workers may reach, e.g. ["127.0.0.1:4000"]: AppContainer through relay.py, MXC
         # through the member's egress proxy (egress.py)
         "relays": [],

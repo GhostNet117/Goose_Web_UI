@@ -998,7 +998,7 @@ Shell permission; the page says when a team's item is therefore not delivered (1
 |---|---|
 | recipe | a file in `<system_dir>/library/teams/<team id>/recipes/`, which is on the members' `GOOSE_RECIPE_PATH`. Members cannot delete it. |
 | skill | a folder in the member's `config/skills/<name>/`, marked as managed. A skill the user created with the same name is never overwritten. Up to 2 MB of text files per skill; binary files are not shared. Since 1.18.3 every skill in the profile (team or the member's own) also gets a bridge `config/agents/<name>.md`, so an agent can load it with `load` as well as `load_skill` (only members whose team has the Summon tool, i.e. allow_shell, have `load`). |
-| extension | an entry in the member's `config.yaml`. Shell and stdio extensions stay disabled for members without `allow_shell`. |
+| extension | an entry in the member's `config.yaml`. Shell and stdio extensions stay disabled for members without `allow_shell`. Since 1.26.1 a stdio extension starts through the start-up guard on the members' Python (11.6). |
 | provider | a custom provider file in `config/custom_providers/` |
 
 For extensions and providers added from a profile library, the secrets named by the item (the extension's
@@ -1710,6 +1710,22 @@ from a policy Goose Web builds at every start:
   `goose-web check` lists the Python and Node of `read_dirs` with their versions and warns about an old Node; it does
   not run one that other accounts can change. List only runtime folders: a folder of command-line tools placed first
   on `PATH` also replaces Windows tools of the same name for members' agents.
+- **Start-up guard for a team's stdio extensions (1.26.1):** Goose 1.57 starts a stdio extension by sending
+  `server/discover` and waiting 10 seconds; a server that needs longer (a uvx extension's first start downloads its
+  packages, a Python start in a sandbox is slower) then also gets the legacy `initialize` on the same connection, and
+  a server that speaks the 2026-07-28 protocol answers the late `discover` and rejects `initialize` (error -32022). The
+  extension never starts, and every chat that waits for it stays on "Loading conversation...". So a team's stdio
+  extension (a library item, 9.9) reaches a member's profile as `<members' python> -I <profile>\.goose-web\
+  stdio_guard.py --limit N --name <key> -- <command> <args>`. The guard answers `server/discover` itself, at once, with
+  "method not found" - Goose then takes the legacy `initialize` path, which has no 10-second window, and the server
+  never sees `discover` - and passes everything else on unchanged. The server gets `sandbox.extension_start_seconds`
+  (default 120) to answer `initialize`; if it does not, Goose gets an error naming the extension and the limit, the
+  server's process tree is ended (a job object) and Goose reports the extension as failed, so the chat opens without
+  it. The guard needs a members' Python (the first `python.exe` in `sandbox.read_dirs` that only administrators can
+  change); without one, or with `extension_start_seconds: 0`, entries start directly as before. `goose-web check` has
+  a "stdio start-up guard" line. The guard runs inside the member's sandbox with the member's rights; it is rewritten
+  in the profile whenever it differs. Not guarded: a member's own stdio extensions and per-session MCP servers. Its
+  messages go to `worker-<user>.log` (`[goose-web start-up guard]`).
 - **Process:** `wxc-exec.exe` starts suspended, joins the gateway's and the worker's kill-on-close job objects, and
   only then runs; stdin/stdout carry ACP, stderr goes to `worker-<user>.log`. A stop first closes stdin (Goose exits
   cleanly, MXC removes the container), then ends the job. No ACL is changed, no container profile stays behind. The

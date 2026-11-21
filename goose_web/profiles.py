@@ -165,6 +165,39 @@ def _safe_id(value: Any) -> str | None:
 _REPARSE = 0x400   # FILE_ATTRIBUTE_REPARSE_POINT (junctions, symlinks, mount points)
 
 
+# FIX member-stdio-start-hang (1.26.1): a team's stdio extensions start through stdio_guard.py, written into each
+# isolated member's profile (<profile>/.goose-web/stdio_guard.py) and run on the members' Python.
+GUARD_FILE = "stdio_guard.py"
+_GUARD_SOURCE: list[str] = []
+
+
+def _guard_source() -> str:
+    if not _GUARD_SOURCE:
+        _GUARD_SOURCE.append((Path(__file__).with_name(GUARD_FILE)).read_text(encoding="utf-8"))
+    return _GUARD_SOURCE[0]
+
+
+def guard_entry(entry: dict, python: str, guard: str, limit: int, name: str) -> dict:
+    """The stdio extension entry started through the start-up guard instead of directly; every other field is kept
+    (env, env_keys, timeout, available_tools ...)."""
+    args = [str(a) for a in (entry.get("args") or [])]
+    return {**entry, "cmd": python, "args": ["-I", guard, "--limit", str(int(limit)), "--name", str(name), "--",
+                                             str(entry.get("cmd") or ""), *args]}
+
+
+def unguard_entry(entry: Any) -> Any:
+    """The original of an entry guard_entry made; any other entry unchanged. A member's profile must never hand its
+    guard path to a team library (export_item)."""
+    if not isinstance(entry, dict) or entry.get("type") != "stdio":
+        return entry
+    args = entry.get("args")
+    if not (isinstance(args, list) and len(args) >= 4 and args[0] == "-I"
+            and str(args[1]).replace("\\", "/").lower().endswith("/.goose-web/" + GUARD_FILE) and "--" in args):
+        return entry
+    rest = args[args.index("--") + 1:]
+    return {**entry, "cmd": rest[0], "args": rest[1:]} if rest else entry
+
+
 def _is_reparse(p: Path) -> bool:
     try:
         st = os.lstat(p)
@@ -414,6 +447,35 @@ class Profiles:
         for sub in ("config", "data", "state", "workspace", ".goose-web"):
             (r / sub).mkdir(parents=True, exist_ok=True)
         return r
+
+    def stdio_guard(self, user: dict) -> tuple[str, str, int] | None:
+        """(members' Python, guard file in the profile, limit) to start a team's stdio extensions through
+        stdio_guard.py (FIX member-stdio-start-hang), or None: the guard is off (sandbox.extension_start_seconds 0),
+        there is no members' Python, or the file cannot be written safely. The file is rewritten when it differs:
+        it is in the member's own folder and only ever runs inside that member's sandbox, with that member's rights."""
+        from .config import extension_start_seconds
+        limit, _ = extension_start_seconds(self.s)
+        if limit <= 0:
+            return None
+        from . import mxc
+        py = mxc.members_python(self.s, [str(self.db.get_setting("native_root") or "")])
+        if not py:
+            return None
+        root = self.root_for(user)
+        target = root / ".goose-web" / GUARD_FILE
+        if _is_reparse(target.parent) or _is_reparse(target) or not _inside_profile(target, root):
+            log.warning("profile %s: .goose-web\\%s is a link or outside the profile; a team's stdio extensions "
+                        "start without the start-up guard", user.get("username"), GUARD_FILE)
+            return None
+        try:
+            text = _guard_source()
+            if not target.is_file() or target.read_text(encoding="utf-8", errors="replace") != text:
+                _atomic_write(target, text)
+        except OSError as e:
+            log.warning("profile %s: start-up guard not written (%s); a team's stdio extensions start without it",
+                        user.get("username"), e)
+            return None
+        return py, str(target), limit
 
     # ------------------------------------------------------------ hints
     def assigned_hints(self, user: dict) -> list[dict]:
@@ -876,6 +938,7 @@ class Profiles:
                     host_defs = load_servers(self.s, admin_cfg.get("extensions") if isinstance(admin_cfg, dict)
                                              else {})
 
+        guard: tuple | None = None      # the stdio start-up guard, looked up at the first stdio item
         for it in items:
             kind, name, payload = it["kind"], it["name"], it.get("payload") or {}
             if kind == "extension":
@@ -897,6 +960,13 @@ class Profiles:
                 if is_command_extension(e) and not pol.get("allow_shell"):
                     # not even dormant: a disabled entry can be switched on (B-2). Removed below if it was there.
                     continue
+                if e.get("type") == "stdio" and e.get("cmd"):
+                    # FIX member-stdio-start-hang: through the start-up guard - no Goose 1.57 discover race, and a
+                    # server that does not start in time is ended instead of keeping every new chat from opening
+                    if guard is None:
+                        guard = self.stdio_guard(user) or ()
+                    if guard:
+                        e = guard_entry(e, *guard, key)
                 if exts.get(key) != e:
                     changes.append(f"extension {key}")
                 exts[key] = e
@@ -1515,6 +1585,7 @@ class Profiles:
             if entry.get("env_keys") is not None and _names(entry["env_keys"]) != entry["env_keys"]:
                 raise ValueError("the extension's env_keys is not a list of names; it is not shared")
             entry = json.loads(json.dumps(entry))   # a plain copy: no shared parts, nothing but JSON types
+            entry = unguard_entry(entry)            # a team item carries the server's command, never a guard path
             entry["enabled"] = True
             return ref, {"key": ref, "entry": entry, "secretsFrom": user["username"]}
         if kind == "provider":

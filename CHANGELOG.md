@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.26.1 - 2026-11-21
+
+**A team's stdio extension that starts slowly no longer keeps members' chats from opening.** Goose 1.57 starts a
+stdio extension by sending `server/discover` and waiting 10 seconds; a slower server (a uvx extension's first start,
+a Python start in a sandbox) then also gets the legacy `initialize` on the same connection, and a server that speaks
+the 2026-07-28 protocol answers the late `discover` and rejects `initialize` (-32022). The extension never started and
+every new chat that waited for it stayed on "Loading conversation...".
+- A team's stdio extensions now start through a **start-up guard** (`goose_web/stdio_guard.py`, written into each
+  member's profile, run on the members' Python from `sandbox.read_dirs`). It answers `server/discover` itself with
+  "method not found", so Goose takes the `initialize` path and the server never sees `discover`; everything else
+  passes through unchanged.
+- **Start-up limit:** `sandbox.extension_start_seconds` (default 120; 0 = no guard). A server that has not answered
+  `initialize` by then is ended with its process tree, Goose reports the extension as failed and the chat opens.
+- No members' Python, or the setting 0: entries start directly as before. `goose-web check` has a "stdio start-up
+  guard" line; the guard's messages are in `worker-<user>.log`.
+- Copying an extension from a member's profile into a team library removes the guard, so a member's path never
+  reaches a team item.
+- Docs: ADMINISTRATION 11.6 and 9.9, CONFIGURATION, TROUBLESHOOTING 11.2, SECURITY-ASSESSMENT 22.6.
+
 ## 1.26.0 - 2026-11-20
 
 **Host tools: servers the gateway runs for sandboxed members, lent tool by tool.** A member's sandboxed agent could not

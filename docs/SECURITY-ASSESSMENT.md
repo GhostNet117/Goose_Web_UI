@@ -1754,3 +1754,23 @@ the write tools that were not lent and the attachment tool (a file path) were re
 - Host tools reach members on the MXC backend only.
 - A server's own audit records the gateway's account; who asked is in the activity log (`sandbox.hosttool`).
 - The registry exposure of 16.3 is unchanged.
+
+### 22.6 The stdio start-up guard (1.26.1, FIX `member-stdio-start-hang`)
+
+What it is: `goose_web/stdio_guard.py`, written into each isolated member's profile (`.goose-web/stdio_guard.py`) and
+run on the members' Python (`sandbox.read_dirs`) in front of every stdio extension a team gives its members. It
+answers Goose's `server/discover` with "method not found" and passes every other message on unchanged; a server that
+does not answer `initialize` within `sandbox.extension_start_seconds` is ended (job object) and Goose gets an error.
+
+- **No new reach.** It runs inside the member's sandbox, as part of the member's own agent, with the member's rights;
+  no grant, relay, port or network path is added. Stdio extensions already need `allow_shell`, which is unchanged.
+- **In the member's writable profile.** A member (or the member's agent) can change the file; that only changes what
+  runs in that member's own sandbox, which Shell allows anyway. Provisioning rewrites it whenever it differs. A link
+  (junction, symbolic link) at `.goose-web` or at the file makes provisioning skip the guard rather than write
+  through it.
+- **Nothing leaves the profile.** `export_item` removes the guard from an entry before it becomes a team item, so a
+  member's path never reaches a team library or another member.
+- **Falls back to the old behaviour, never closed:** without a members' Python, with the setting 0, or when the file
+  cannot be written, entries start directly as before 1.26.1 (`check` says so).
+- **Residual:** a member's own stdio extensions and per-session MCP servers are not guarded; a server that accepts
+  only the 2026-07-28 handshake fails at once instead of hanging.

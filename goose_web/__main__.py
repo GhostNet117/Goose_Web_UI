@@ -1177,6 +1177,21 @@ def cmd_check(args, settings) -> int:
             line("sandbox.read_dirs", f"{p['path']} is never granted to members: {p['why']}", False)
         for text, good in mxc.runtime_lines(settings):    # spec 036: said, not counted
             print(f"[{'OK' if good else '!!'}] sandbox runtimes: {text}")
+        from .config import extension_start_seconds     # FIX member-stdio-start-hang (1.26.1)
+        lim, prob = extension_start_seconds(settings)
+        gpy = mxc.members_python(settings)
+        if prob:
+            line("stdio start-up guard", prob, False)
+        elif lim <= 0:
+            print("[--] stdio start-up guard: off (sandbox.extension_start_seconds = 0) - a team's stdio extensions "
+                  "start directly, and one that starts slowly can keep members' chats from opening (ADMINISTRATION "
+                  "11.6)")
+        elif not gpy:
+            print("[--] stdio start-up guard: off - no members' Python in sandbox.read_dirs, so a team's stdio "
+                  "extensions start directly (ADMINISTRATION 11.6)")
+        else:
+            print(f"[OK] stdio start-up guard: a team's stdio extensions start through it on {gpy}; their server "
+                  f"gets {lim} s to answer initialize")
         from . import hosttools
         for text, good in hosttools.check_lines(settings):   # spec 035: a definition that cannot run is a problem
             line("host tool", text, good)
