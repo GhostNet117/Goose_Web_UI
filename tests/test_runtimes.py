@@ -80,6 +80,9 @@ def test_runtime_lines(tmp_path, monkeypatch):
     (node / f"node{exe}").write_bytes(b"")
     versions = {str(py): "3.13.11", str(node): "v22.14.0"}
     monkeypatch.setattr(mxc, "_runtime_version", lambda p: versions[os.path.dirname(p)])
+    # the folders' permissions come last (RT-2): GitHub's Python 3.11 for Windows (3.11.9) ignores mkdir's mode, so
+    # there pytest's folders keep the runner's permissions, which let Users write
+    monkeypatch.setattr(mxc, "_broad_writers", lambda p: [])
     s = _settings(tmp_path, monkeypatch, read_dirs=[str(py), str(node), str(empty)])
     lines = mxc.runtime_lines(s)
     assert (f"members' python: 3.13.11 ({os.path.join(str(py), 'python.exe' if os.name == 'nt' else 'python3')})",

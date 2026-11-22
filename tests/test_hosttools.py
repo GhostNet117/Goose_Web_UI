@@ -502,6 +502,8 @@ def test_program_folder_checks_reach_ancestors_arguments_and_path_variables(tmp_
     lib.mkdir()
     monkeypatch.setattr(ht, "writable_by_others", lambda p: [])
     monkeypatch.setattr(ht, "ancestor_writers", lambda p: [])
+    monkeypatch.setattr(ht, "subfolder_creators", lambda p: [])     # not what this test is about (CI runner's D:\)
+    monkeypatch.setattr(ht, "foreign_owner", lambda p: "")
     assert ht.program_problems([str(prog)]) == []
     monkeypatch.setattr(ht, "ancestor_writers", lambda p: ["Users"] if os.path.normcase(p) ==
                         os.path.normcase(str(tmp_path)) else [])
