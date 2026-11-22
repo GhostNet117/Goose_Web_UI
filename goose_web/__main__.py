@@ -1192,6 +1192,14 @@ def cmd_check(args, settings) -> int:
         else:
             print(f"[OK] stdio start-up guard: a team's stdio extensions start through it on {gpy}; their server "
                   f"gets {lim} s to answer initialize")
+        from .config import python_socketpair_on       # FIX mxc-asyncio-socketpair (1.26.2)
+        if python_socketpair_on(settings):
+            print("[OK] python socket pairs: Python programs in members' MXC sandboxes get socket.socketpair() "
+                  "(asyncio's wake-up channel) through their egress proxy - Goose Web's sitecustomize.py in "
+                  "<profile>\\.goose-web\\python, first on PYTHONPATH (not for python -I/-E/-S)")
+        else:
+            print("[--] python socket pairs: off (sandbox.python_socketpair: false) - a Python program that uses "
+                  "asyncio, such as any Python MCP server, hangs in a member's MXC sandbox (ADMINISTRATION 11.6)")
         from . import hosttools
         for text, good in hosttools.check_lines(settings):   # spec 035: a definition that cannot run is a problem
             line("host tool", text, good)

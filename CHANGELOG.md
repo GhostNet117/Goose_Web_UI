@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.26.2 - 2026-11-22
+
+**Python MCP servers now run in members' MXC sandboxes, and the start-up guard always ends what it stops.** Both
+found by the live checks of 1.26.1.
+- **Python's event loop in an MXC sandbox.** On Windows `socket.socketpair()` is a connection to a listener on
+  127.0.0.1, and asyncio (every event loop), anyio and trio make their wake-up channel with it. An MXC sandbox may
+  connect to no loopback address but the member's egress proxy, so every asyncio program - every Python MCP server -
+  hung at its start (measured: `socket.socketpair()` and `asyncio.new_event_loop()` block in a member's sandbox; MXC
+  refuses loopback allow rules next to a runtime proxy, and AF_UNIX sockets are denied). Now the egress proxy joins
+  two `CONNECT <token>.pair.goose-web.invalid` requests of the same member into a socket pair, and Goose Web's
+  `sitecustomize.py` (written into the member's profile, first on `PYTHONPATH`, with `GOOSE_WEB_SOCKETPAIR=proxy`)
+  makes `socket.socketpair()` ask for pairs that way; if that is impossible it fails at once with an explanation
+  instead of hanging. No new reach: a pair only joins two connections of the same member's proxy credential, nothing
+  is looked up or forwarded, the host's loopback stays closed. Pair connections do not count toward
+  `sandbox.proxy_max_connections` and have no idle time-out; their own limits are per member (64 unmatched, 256 open,
+  64 KiB/s per direction). `sandbox.python_socketpair` (default true) turns it off; `goose-web check` has a "python
+  socket pairs" line. Not for programs started with `python -I`, `-E` or `-S`. An independent review before release
+  found no Critical or High issue; its Medium (pair traffic could load the gateway) and Low findings are fixed
+  (SECURITY-ASSESSMENT 22.7).
+- **Start-up guard (FIX stdio-guard-orphans).** A server started through a launcher such as `uvx` could survive the
+  guard's time-out: the guard put it into its kill-on-close job only after it had started, and `uvx` starts its own
+  child within milliseconds, outside the job. The survivors held the stderr the server had inherited from Goose, and
+  Goose - which reads an extension's stderr to the end before it reports the failure - kept the member's chat on
+  "Starting session...". Now the server starts suspended and joins the job before it runs; it has its own stderr pipe,
+  which the guard forwards; and the guard ends the server's whole tree (process snapshot, then the job, then
+  `taskkill /T`), also descendants whose parent has already ended.
+- Docs: ADMINISTRATION 11.6, CONFIGURATION, TROUBLESHOOTING 11.2, SECURITY-ASSESSMENT 22.6 and 22.7.
+
 ## 1.26.1 - 2026-11-21
 
 **A team's stdio extension that starts slowly no longer keeps members' chats from opening.** Goose 1.57 starts a

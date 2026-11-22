@@ -143,6 +143,15 @@ def extension_start_seconds(settings: "Settings") -> tuple[int, str]:
                      "(0 = no start-up guard) - 120 is used")
 
 
+def python_socketpair_on(settings: "Settings") -> bool:
+    """FIX mxc-asyncio-socketpair (1.26.2): sandbox.python_socketpair, default on. Only `false` (or no, off, 0)
+    turns it off; anything else keeps it on (it gives members' Python programs nothing they could not do anyway)."""
+    raw = settings.get("sandbox", "python_socketpair")
+    if isinstance(raw, str):
+        return raw.strip().lower() not in ("false", "no", "off", "0")
+    return raw is None or bool(raw)
+
+
 def sandbox_relay_problems(settings: "Settings") -> list[str]:
     """`sandbox.relays` entries that are left out (AC-6). Not among sandbox_config_problems: a relay that is not
     there can only mean less access, so members' agents still start; `check`, `sandbox status` and the gateway log
@@ -233,6 +242,10 @@ DEFAULTS: dict[str, Any] = {
         # (stdio_guard.py, on the members' Python from read_dirs); the server gets this many seconds to answer
         # initialize. 0 = no guard.
         "extension_start_seconds": 120,
+        # FIX mxc-asyncio-socketpair (1.26.2): Python programs in an MXC member's sandbox get socket.socketpair() -
+        # asyncio's wake-up channel, otherwise a loopback connection the sandbox may not make - through the member's
+        # egress proxy (Goose Web's sitecustomize.py in <profile>/.goose-web/python, first on PYTHONPATH). false = off
+        "python_socketpair": True,
         # local services sandboxed workers may reach, e.g. ["127.0.0.1:4000"]: AppContainer through relay.py, MXC
         # through the member's egress proxy (egress.py)
         "relays": [],

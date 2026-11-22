@@ -9,6 +9,16 @@ and everything it starts (MCP servers, npm, uv, pip, git, curl). The proxy then 
   that port (every path, every virtual host behind a local reverse proxy);
 - `<name>.goose-web.invalid` (spec 035): the gateway's host tools - plain http:// only, never looked up or forwarded,
   answered by hosttools.HostTools for the member of this proxy's credential;
+- `CONNECT <32 hex digits>.pair.goose-web.invalid:<port>` (FIX mxc-asyncio-socketpair, 1.26.2): a socket pair. The
+  container may connect to no loopback address but this proxy, so Python's `socket.socketpair()` (a connection to a
+  loopback listener: asyncio's, anyio's and trio's wake-up channel) cannot work there; Goose Web's sitecustomize
+  (sandbox_sitecustomize.py) asks here instead. Two requests with the same token are answered "200" and joined to
+  each other; nothing is looked up, connected or audited (it is not egress), and only this member's own connections
+  can meet (one proxy per member, 128-bit tokens). An unmatched request is answered 504 after PAIR_WAIT. Pair
+  connections do not count toward the connection limit (also when it is reached) and have no idle time-out (a
+  wake-up channel lives as long as its process); their own limits are PAIR_PENDING_MAX and PAIR_CONNECTIONS_MAX, and
+  each direction of a pair carries at most PAIR_RATE bytes a second (burst PAIR_BURST), so a pair cannot be used to
+  load the gateway. Refusals are counted and logged, not audited;
 - public internet addresses: allowed when the member's network is `internet` or `internet+lan`;
 - private, CGNAT and unique-local addresses: only for `internet+lan`;
 - everything else is refused: other loopback ports, this machine's own addresses (the gateway, other local
@@ -68,6 +78,13 @@ LOCAL_REFRESH = 60.0
 AUDIT_WINDOW = 60.0
 AUDIT_VERBATIM_PER_MINUTE = 30     # per member; the rest of the minute goes into one summary line
 AUDIT_SUMMARY_TARGETS = 50
+PAIR_WAIT = 10.0                   # socket pairs: how long the first half waits for the second
+PAIR_PENDING_MAX = 64              # unmatched halves per member
+PAIR_CONNECTIONS_MAX = 256         # open pair connections per member (two per Python event loop)
+PAIR_RATE = 64 * 1024              # bytes per second and direction through one pair (a wake-up channel needs few)
+PAIR_BURST = 256 * 1024
+_PAIR_HOST = re.compile(r"([0-9a-f]{32})\.pair\.goose-web\.invalid", re.I)
+_PAIR_REQUEST = re.compile(rb"CONNECT [0-9a-fA-F]{32}\.pair\.goose-web\.invalid:[0-9]{1,5} HTTP/1\.[01]\r\n")
 METADATA = {ipaddress.ip_address(a) for a in (
     "169.254.169.254",             # AWS / GCP / Azure / OpenStack instance metadata
     "169.254.170.2",               # AWS ECS task metadata
@@ -331,7 +348,12 @@ class EgressProxy:
         self.server: asyncio.base_events.Server | None = None
         self.port = 0
         self.active = 0
-        self.counts = {"allowed": 0, "refused": 0, "unauthorized": 0, "auditSummarised": 0}
+        self.counts = {"allowed": 0, "refused": 0, "unauthorized": 0, "auditSummarised": 0, "pairs": 0,
+                       "pairBytes": 0, "pairRefused": 0}
+        self._pairs: dict[str, tuple] = {}     # token -> (reader, writer, joined, ended) of a waiting first half
+        self._pair_writers: set = set()        # every open pair connection (aborted at close)
+        self._pair_logged = 0.0
+        self.pair_connections = 0
         self.network = "none"
         self.relays: dict[tuple[str, int], tuple[str, int]] = {}
         self.broker: Any = None          # hosttools.HostTools (spec 035), set by ProxyRegistry
@@ -382,6 +404,11 @@ class EgressProxy:
     async def close(self) -> None:
         self._limiter.flush()
         s, self.server = self.server, None
+        for w in list(self._pair_writers):      # socket pairs have no idle time-out: end them with the proxy
+            try:
+                w.transport.abort()
+            except Exception:
+                pass
         if s is not None:
             s.close()
             try:
@@ -391,6 +418,7 @@ class EgressProxy:
 
     def describe(self) -> dict:
         return {"port": self.port, "network": self.network, "connections": self.active, "revoked": self.revoked,
+                "pairConnections": self.pair_connections,
                 "relays": sorted(f"{h}:{p}" for h, p in self.relays.values()), **self.counts}
 
     # ---------------------------------------------------------- name resolution
@@ -521,10 +549,20 @@ class EgressProxy:
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         if self.active >= self.max_connections:
+            head = b""
             try:   # read the request first: answering unread input would reset the connection (see _reply)
-                await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
+                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)
             except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError, ConnectionError):
                 pass
+            if head and _PAIR_REQUEST.match(head):
+                # a socket pair is not egress: the egress limit does not apply to it (it has limits of its own)
+                try:
+                    await self._serve(reader, writer, head=head, counted=False)
+                except Exception as e:
+                    log.debug("sandbox mxc proxy %s: connection error %r", self.username, e)
+                finally:
+                    _close(writer)
+                return
             await _reply(writer, reader, 503, "Goose Web sandbox proxy: too many connections for this member")
             self._note_refused("-", "too many connections", audit=False)
             return
@@ -537,14 +575,18 @@ class EgressProxy:
             self.active -= 1
             _close(writer)
 
-    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), HEADER_TIMEOUT)
-        except asyncio.LimitOverrunError:
-            await _reply(writer, reader, 431, "request header too large")
-            return
-        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError):
-            return
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, head: bytes | None = None,
+                     counted: bool = True) -> None:
+        """One request. `head`: already read (a socket pair request over the egress limit); `counted`: this
+        connection is counted in `active` (a socket pair takes itself out while it lasts)."""
+        if head is None:
+            try:
+                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), HEADER_TIMEOUT)
+            except asyncio.LimitOverrunError:
+                await _reply(writer, reader, 431, "request header too large")
+                return
+            except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError):
+                return
         if len(head) > MAX_HEADER:
             await _reply(writer, reader, 431, "request header too large")
             return
@@ -592,6 +634,15 @@ class EgressProxy:
             await _reply(writer, reader, 400, f"Goose Web sandbox: bad host name: {bad}")
             return
         shown = clean_text(f"{host}:{port}", 300)
+        # FIX mxc-asyncio-socketpair (1.26.2): a socket pair for this member's own processes - joined here, never
+        # looked up or forwarded
+        pm = _PAIR_HOST.fullmatch(host)
+        if pm is not None:
+            if method != "CONNECT":
+                await _reply(writer, reader, 400, "Goose Web sandbox: socket pairs are made with CONNECT")
+                return
+            await self._pair(pm.group(1).lower(), reader, writer, counted)
+            return
         # Spec 035: http://<name>.goose-web.invalid/... is one of the gateway's host tools. Never looked up, never
         # forwarded: answered by HostTools for the member this proxy's credential belongs to (no port of its own).
         from .hosttools import host_name
@@ -646,6 +697,121 @@ class EgressProxy:
             await self._pipe(reader, writer, up_r, up_w)
         finally:
             _close(up_w)
+
+    # ---------------------------------------------------------- socket pairs (FIX mxc-asyncio-socketpair)
+    def _pair_refused(self, reason: str) -> None:
+        """Counted, and logged at most once a minute per member; not egress, so never in the activity log."""
+        self.counts["pairRefused"] += 1
+        now = time.monotonic()
+        if now - self._pair_logged > 60:
+            self._pair_logged = now
+            log.info("sandbox mxc proxy: %s: socket pair refused: %s", self.username, reason)
+
+    async def _pair(self, token: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                    counted: bool = True) -> None:
+        """One half of a socket pair. Not an egress connection: while it lasts it is not counted toward
+        max_connections (an event loop's wake-up channel lives as long as its process); it has limits of its own."""
+        if self.pair_connections >= PAIR_CONNECTIONS_MAX:
+            self._pair_refused(f"more than {PAIR_CONNECTIONS_MAX} open pair connections")
+            await _reply(writer, None, 503, "Goose Web sandbox proxy: too many socket pairs for this member "
+                                            f"({PAIR_CONNECTIONS_MAX} connections)")
+            return
+        self.pair_connections += 1
+        if counted:
+            self.active -= 1
+        self._pair_writers.add(writer)
+        try:
+            first = self._pairs.pop(token, None)
+            if first is None:
+                await self._pair_wait(token, reader, writer)
+            else:
+                await self._pair_join(first, reader, writer)
+        finally:
+            self._pair_writers.discard(writer)
+            self.pair_connections -= 1
+            if counted:
+                self.active += 1
+
+    async def _pair_wait(self, token: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if len(self._pairs) >= PAIR_PENDING_MAX:
+            self._pair_refused(f"more than {PAIR_PENDING_MAX} unmatched requests")
+            await _reply(writer, None, 503, "Goose Web sandbox proxy: too many unmatched socket pair requests "
+                                            f"({PAIR_PENDING_MAX})")
+            return
+        loop = asyncio.get_running_loop()
+        joined, ended = loop.create_future(), loop.create_future()
+        entry = (reader, writer, joined, ended)
+        self._pairs[token] = entry
+        try:
+            try:
+                await asyncio.wait_for(asyncio.shield(joined), PAIR_WAIT)
+            except asyncio.TimeoutError:
+                if self._pairs.get(token) is entry:
+                    del self._pairs[token]
+                    self._pair_refused("the other half did not come")
+                    await _reply(writer, None, 504, "Goose Web sandbox proxy: the other half of the socket pair "
+                                                    "did not come")
+                    return
+            await ended                  # the second half's handler joins both; this one stays open until the end
+        finally:
+            if self._pairs.get(token) is entry:
+                del self._pairs[token]
+
+    async def _pair_join(self, first: tuple, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        r1, w1, joined, ended = first
+        if not joined.done():
+            joined.set_result(None)
+        ok = b"HTTP/1.1 200 Connection established\r\n\r\n"
+        try:
+            w1.write(ok)
+            writer.write(ok)
+            await w1.drain()
+            await writer.drain()
+            self.counts["pairs"] += 1
+            await self._splice(r1, w1, reader, writer)
+        except (ConnectionError, OSError, RuntimeError):
+            pass
+        finally:
+            _close(w1)
+            _close(writer)
+            if not ended.done():
+                ended.set_result(None)
+
+    async def _splice(self, r1: asyncio.StreamReader, w1: asyncio.StreamWriter, r2: asyncio.StreamReader,
+                      w2: asyncio.StreamWriter) -> None:
+        """Both directions, like a socket pair: an end of stream is passed on (half-close) and the other direction
+        goes on until it ends too. No idle time-out; each direction at most PAIR_RATE bytes a second (burst
+        PAIR_BURST) - a wake-up channel needs a few bytes, so a member cannot use a pair to load the gateway."""
+        async def copy(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+            tokens, last = float(PAIR_BURST), time.monotonic()
+            try:
+                while True:
+                    data = await src.read(65536)
+                    if not data:
+                        break
+                    now = time.monotonic()
+                    tokens = min(float(PAIR_BURST), tokens + (now - last) * PAIR_RATE) - len(data)
+                    last = now
+                    if tokens < 0:
+                        await asyncio.sleep(-tokens / PAIR_RATE)
+                    self.counts["pairBytes"] += len(data)
+                    dst.write(data)
+                    await dst.drain()
+            except (ConnectionError, OSError, RuntimeError):
+                return
+            try:
+                if dst.can_write_eof():
+                    dst.write_eof()
+            except (OSError, RuntimeError):
+                pass
+        a = asyncio.create_task(copy(r1, w2))
+        b = asyncio.create_task(copy(r2, w1))
+        try:
+            await asyncio.gather(a, b)
+        finally:
+            for t in (a, b):
+                t.cancel()
+            await asyncio.gather(a, b, return_exceptions=True)
 
     async def _pipe(self, cr, cw, ur, uw) -> None:
         last = [time.monotonic()]

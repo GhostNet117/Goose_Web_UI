@@ -288,6 +288,8 @@ class Ctx:
                 "backend": sandbox_backend(self.settings), "config_problems": sandbox_config_problems(self.settings),
                 "network": net, "relay_targets": [r["target"] for r in relays], "mxc_grants": mxc_grants,
                 "path_dirs": path_dirs,
+                # FIX mxc-asyncio-socketpair (1.26.2): the folder of Goose Web's sitecustomize.py ('' = off)
+                "python_shim": self.profiles.python_shim(user),
                 "profiles_root": str(self.settings.profiles_root), "system_dir": str(self.settings.system_dir),
                 "protected_write": mxc.protected_write_paths(self.settings),
                 "protected_any": sorted({p for p in native if p})}

@@ -1644,6 +1644,8 @@ sandbox:
   mxc_dir: ""                # default: <install folder>\vendor\mxc
   proxy_max_connections: 64  # MXC egress proxy, per member; also each AppContainer relay
   proxy_idle_seconds: 900
+  extension_start_seconds: 120  # a team's stdio extensions: start-up guard limit (0 = no guard)
+  python_socketpair: true    # MXC: Python's socket pairs through the member's egress proxy (1.26.2)
 ```
 
 Administrators and the native profile are never sandboxed. Two backends exist; **MXC is the default** since 1.19.0,
@@ -1688,7 +1690,13 @@ from a policy Goose Web builds at every start:
   names that resolve to any of these. Host names without a dot and `.local` names are not looked up (LLMNR, NetBIOS
   and mDNS are slow and local); use the full name or a relay. Name lookups run in the proxies' own small thread pool
   (never the one sign-in uses), at most two per member at a time (more: `503`), 5 s each, and a failed name is not
-  looked up again for 30 s. A malformed or over-long host name gets `400`. Every destination asked for is recorded in
+  looked up again for 30 s. A malformed or over-long host name gets `400`. Since 1.26.2 it also makes **socket pairs**
+  for the member's own Python programs (`CONNECT <token>.pair.goose-web.invalid`; see "Python's event loop" below):
+  never looked up, forwarded or recorded in the activity log; not counted toward `proxy_max_connections` (also made
+  when that limit is reached) and without idle time-out; at most 64 unmatched requests (answered `504` after 10 s)
+  and 256 pair connections per member, and each direction of a pair carries at most 64 KiB/s (a wake-up channel
+  needs a few bytes). Admin > System shows `pairs`, `pairConnections`, `pairBytes` and `pairRefused` per proxy.
+  Every destination asked for is recorded in
   the activity log as `sandbox.egress` (host:port and the decision; never a path or content): per member the first 30
   of a minute one by one, the rest as one summary line per minute with counts per destination
   (`decision: summary`). The proxy's credential is new at every worker start and stops working when the worker stops.
@@ -1704,7 +1712,8 @@ from a policy Goose Web builds at every start:
   never tries there (`UV_PYTHON_DOWNLOADS=never`, `UV_LINK_MODE=copy`) and uses the Python it finds on `PATH`.
   **Give members a Python** - a standard CPython in a folder only administrators can change - and list that folder in
   `sandbox.read_dirs`: then uvx-based extensions (`uvx <package>@<version>`) and Goose's built-in `web-search` skill
-  work (measured: `uvx duckduckgo-mcp-server` and `uvx ddgs` in an MXC container). The first start of a uvx extension
+  work (measured: `uvx ddgs` in an MXC container; Python MCP servers such as `uvx duckduckgo-mcp-server` since
+  1.26.2, see "Python's event loop" below). The first start of a uvx extension
   downloads its packages into the member's profile (about half a minute); later starts use that cache. For a Node
   program use Node 22.21 or later (or 24+): older Node ignores the sandbox's proxy in its built-in `fetch`.
   `goose-web check` lists the Python and Node of `read_dirs` with their versions and warns about an old Node; it does
@@ -1719,13 +1728,32 @@ from a policy Goose Web builds at every start:
   stdio_guard.py --limit N --name <key> -- <command> <args>`. The guard answers `server/discover` itself, at once, with
   "method not found" - Goose then takes the legacy `initialize` path, which has no 10-second window, and the server
   never sees `discover` - and passes everything else on unchanged. The server gets `sandbox.extension_start_seconds`
-  (default 120) to answer `initialize`; if it does not, Goose gets an error naming the extension and the limit, the
-  server's process tree is ended (a job object) and Goose reports the extension as failed, so the chat opens without
-  it. The guard needs a members' Python (the first `python.exe` in `sandbox.read_dirs` that only administrators can
+  (default 120) to answer `initialize`; if it does not, its process tree is ended, Goose gets an error naming the
+  extension and the limit and reports the extension as failed, so the chat opens without it. Since 1.26.2 the server
+  starts suspended and joins the guard's kill-on-close job before it runs (a launcher such as `uvx` starts its own
+  child within milliseconds; in 1.26.1 that child could stay outside the job and survive), the guard ends the whole
+  tree (process snapshot, also descendants whose parent has ended; then the job; then `taskkill /T`), and the server
+  has its own stderr pipe, which the guard forwards - so nothing the server leaves behind can keep Goose, which reads
+  an extension's stderr to the end before reporting a failure, waiting. The guard needs a members' Python (the first `python.exe` in `sandbox.read_dirs` that only administrators can
   change); without one, or with `extension_start_seconds: 0`, entries start directly as before. `goose-web check` has
   a "stdio start-up guard" line. The guard runs inside the member's sandbox with the member's rights; it is rewritten
   in the profile whenever it differs. Not guarded: a member's own stdio extensions and per-session MCP servers. Its
   messages go to `worker-<user>.log` (`[goose-web start-up guard]`).
+- **Python's event loop (1.26.2):** on Windows `socket.socketpair()` is a connection to a listener on 127.0.0.1, and
+  asyncio (every event loop), anyio and trio make their wake-up channel with it. An MXC container may connect to no
+  loopback address but the member's egress proxy, so without help every asyncio program - every Python MCP server -
+  hangs as its event loop starts (it prints its start-up banner and never answers). Goose Web therefore writes a
+  `sitecustomize.py` into each member's profile (`<profile>\.goose-web\python`), puts that folder first on the
+  member's `PYTHONPATH` (before anything `goose.extra_env` sets) and sets `GOOSE_WEB_SOCKETPAIR=proxy`; Python imports
+  it at start-up and `socket.socketpair()` then asks the member's egress proxy for the pair: two
+  `CONNECT <random token>.pair.goose-web.invalid:1` requests with the proxy credential, which the proxy joins to each
+  other. If that is impossible it fails at once with an explanation instead of hanging; the credential is only ever
+  sent to a proxy on loopback. A `sitecustomize` found further along the path still runs (once). The folder holds
+  nothing else: Goose Web removes anything placed next to the file (it is first on the member's `PYTHONPATH`, ahead
+  of the standard library). `sandbox.python_socketpair: false` turns it off; `goose-web check` has a "python socket
+  pairs" line. Not for programs started with `python -I`, `-E` or `-S`, and not for members without an egress proxy
+  (network `none` and no relays). MXC itself refuses loopback allow rules next to a runtime proxy, and AF_UNIX sockets
+  are denied in its containers (measured 2026-11-22), so this is the way in.
 - **Process:** `wxc-exec.exe` starts suspended, joins the gateway's and the worker's kill-on-close job objects, and
   only then runs; stdin/stdout carry ACP, stderr goes to `worker-<user>.log`. A stop first closes stdin (Goose exits
   cleanly, MXC removes the container), then ends the job. No ACL is changed, no container profile stays behind. The

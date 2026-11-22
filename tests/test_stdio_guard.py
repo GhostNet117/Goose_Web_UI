@@ -321,3 +321,218 @@ def test_no_guard_without_shell(env):
     db.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps(ANYCHAT), tid))
     pr.provision(db.user_by_id(alice["id"]))
     assert "websearch" not in _exts(pr, alice)
+
+
+
+# ------------------------------------------------------------------------- FIX stdio-guard-orphans (1.26.2)
+STDERR_SERVER = r"""
+import json, sys
+sys.stderr.write("hello from the server's stderr\n")
+sys.stderr.flush()
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get("method") == "initialize":
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {"protocolVersion": "x"}}) + "\n")
+        sys.stdout.flush()
+"""
+
+# A launcher like uvx: starts its own child at once and never answers; both ids go to a file.
+LAUNCHER = r"""
+import subprocess, sys, time
+kid = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+with open(sys.argv[1], "w") as fh:
+    fh.write(f"{kid.pid} {__import__('os').getpid()}")
+time.sleep(120)
+"""
+
+
+def _pids(p: Path, secs=15):
+    _wait_file(p, secs)
+    return [int(x) for x in p.read_text().split()]
+
+
+def _gone_pid(pid, secs=15):
+    end = time.time() + secs
+    while time.time() < end:
+        if not _alive(pid):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def test_the_server_s_stderr_reaches_goose_through_the_guard(tmp_path):
+    srv = tmp_path / "srv.py"
+    srv.write_text(STDERR_SERVER, encoding="utf-8")
+    pr = Proc([sys.executable, "-I", GUARD, "--limit", "30", "--", sys.executable, "-u", str(srv)])
+    try:
+        pr.send(DISCOVER)
+        pr.get(10)
+        pr.send(INITIALIZE)
+        assert pr.get(20)["result"]["protocolVersion"] == "x"
+    finally:
+        pr.close()
+    assert pr.p.wait(20) == 0
+    assert b"hello from the server's stderr" in pr.p.stderr.read()      # forwarded by the guard, line by line
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows job objects and process snapshots")
+def test_a_launcher_s_whole_tree_ends_at_the_time_out(tmp_path):
+    """1.26.1 put the server into its job only after it had started, so a launcher's child created in that moment
+    (uvx starting uv) stayed outside and survived the time-out, holding Goose's stderr; Goose kept waiting."""
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(LAUNCHER, encoding="utf-8")
+    ids = tmp_path / "ids.txt"
+    pr = Proc([sys.executable, "-I", GUARD, "--limit", "3", "--name", "slow", "--",
+               sys.executable, "-u", str(launcher), str(ids)])
+    try:
+        pr.send(DISCOVER)
+        pr.get(10)
+        pr.send(INITIALIZE)
+        kid, launcher_pid = _pids(ids)
+        r = pr.get(30)
+        assert r["error"]["code"] == -32000
+        box = []
+        t = threading.Thread(target=lambda: box.append(pr.p.stderr.read()), daemon=True)
+        t.start()
+        t.join(15)                                   # EOF: nothing of the server holds the guard's stderr any more
+        assert box, "the guard's stderr stayed open"
+        assert box[0].rstrip().endswith(b"stopped its server")           # the guard's message comes last
+        assert pr.p.wait(20) == 1
+    finally:
+        pr.close()
+    assert _gone_pid(kid) and _gone_pid(launcher_pid)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process snapshots")
+def test_descendants_are_found_after_their_parent_ended(tmp_path):
+    from goose_web.stdio_guard import _created, _terminate, descendants
+    ids = tmp_path / "ids.txt"
+    # the base interpreter, also inside (a venv's python.exe is a launcher with a child of its own)
+    py = getattr(sys, "_base_executable", sys.executable)
+    env = {k: v for k, v in os.environ.items() if k.upper() != "__PYVENV_LAUNCHER__"}
+    parent = subprocess.Popen([py, "-c",
+                               "import subprocess, sys; k = subprocess.Popen([sys.argv[2], '-c', "
+                               "'import time; time.sleep(120)']); open(sys.argv[1], 'w').write(str(k.pid))",
+                               str(ids), py], env=env)
+    born = _created(parent._handle)
+    kid = _pids(ids)[0]
+    parent.wait(20)                                  # the parent is gone; its child is an orphan now
+    found = {}
+    try:
+        found = descendants({parent.pid: born})
+        assert kid in found
+        assert kid not in descendants({parent.pid: found[kid] + 1})   # a "child" older than its parent: never
+        assert not _terminate(kid, found[kid] + 1)                     # not the process created then: not ended
+        assert _terminate(kid, found[kid])
+        assert _gone_pid(kid)
+    finally:
+        for pid in {kid, *found}:
+            if _alive(pid):
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process snapshots")
+def test_a_reused_process_id_is_not_taken_for_a_parent():
+    from goose_web.stdio_guard import _created_pid, descendants
+    kid = subprocess.Popen([getattr(sys, "_base_executable", sys.executable), "-c", "import time; time.sleep(60)"])
+    try:
+        me = os.getpid()
+        born = _created_pid(me)
+        assert kid.pid in descendants({me: born})
+        assert kid.pid not in descendants({me: born + 1})            # "me" is now a different process: not followed
+        assert kid.pid not in descendants({me: None})                 # cannot be compared: not followed either
+    finally:
+        kid.kill()
+        kid.wait(10)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows job objects")
+def test_the_server_starts_suspended_and_joins_the_job_before_it_runs(monkeypatch):
+    """The 1.26.1 race (a launcher's child created before the job assignment) cannot happen: Popen creates the
+    server suspended, it joins the job, and only then is it resumed."""
+    import io
+    from goose_web import stdio_guard as sg
+    order = []
+
+    class FakeProc:
+        pid, _handle = 4242, 0
+
+        def __init__(self):
+            self.stdin, self.stdout, self.stderr = io.BytesIO(), io.BytesIO(b""), io.BytesIO(b"")
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(sg.subprocess, "Popen", lambda cmd, **kw: order.append(("popen", kw.get("creationflags")))
+                        or FakeProc())
+    monkeypatch.setattr(sg.Job, "add", lambda self, p: order.append("join") or True)
+    monkeypatch.setattr(sg, "_resume", lambda p: order.append("resume") or True)
+    monkeypatch.setattr(sg, "_created", lambda h: 1)
+    g = sg.Guard(["server"], 0, "x", io.BytesIO(b""), io.BytesIO(), io.BytesIO())
+    assert g.run() == 0
+    assert order == [("popen", sg.CREATE_SUSPENDED), "join", "resume"]
+
+
+def test_exit_codes_that_os_exit_takes():
+    from goose_web.stdio_guard import _exit_code
+    assert [_exit_code(x) for x in (0, 1, 0xC0000005, -5, 2 ** 32, True, None)] == \
+        [0, 1, 0xC0000005 - 2 ** 32, -5, 1, 1, 1]
+
+
+SLEEPER_PYPROJECT = """[project]
+name = "gw-sleeper"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[project.scripts]
+gw-sleeper = "gw_sleeper:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["gw_sleeper"]
+"""
+
+
+@pytest.mark.skipif(os.name != "nt" or not os.environ.get("GOOSE_WEB_TEST_UVX"),
+                    reason="the real uvx chain: set GOOSE_WEB_TEST_UVX=1 (needs uvx on PATH and PyPI)")
+def test_a_uvx_started_server_leaves_nothing_behind(tmp_path):
+    """The live case of 2026-11-22: uvx -> uv -> uv's launcher -> python -> python."""
+    import shutil
+    uvx = shutil.which("uvx")
+    assert uvx, "uvx not on PATH"
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "pyproject.toml").write_text(SLEEPER_PYPROJECT, encoding="utf-8")
+    (pkg / "gw_sleeper.py").write_text("import time\n\ndef main():\n    time.sleep(300)\n", encoding="utf-8")
+    env = {**os.environ, "UV_CACHE_DIR": str(tmp_path / "uvcache")}
+    subprocess.run([uvx, "--from", str(pkg), "python", "-c", "print(1)"], env=env, capture_output=True, timeout=300)
+    p = subprocess.Popen([sys.executable, "-I", GUARD, "--limit", "6", "--", uvx, "--from", str(pkg), "gw-sleeper"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    p.stdin.write((json.dumps(INITIALIZE) + "\n").encode())
+    p.stdin.flush()                                  # Goose's input stays open, as in a chat that waits
+    box = []
+    t = threading.Thread(target=lambda: box.append(p.stderr.read()), daemon=True)
+    t.start()
+    threading.Thread(target=p.stdout.read, daemon=True).start()
+    rc = p.wait(60)
+    t.join(15)
+    p.stdin.close()
+    assert rc == 1 and box and b"did not start within 6 s" in box[0]
+    time.sleep(1)
+    left = subprocess.run(["powershell", "-NoProfile", "-Command",
+                           "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine "
+                           "-like '*" + str(tmp_path / "uvcache").replace("'", "''") + "*' } | "
+                           "ForEach-Object { $_.ProcessId }"],
+                          capture_output=True, text=True).stdout.split()
+    for pid in left:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", pid], capture_output=True)
+    assert left == []

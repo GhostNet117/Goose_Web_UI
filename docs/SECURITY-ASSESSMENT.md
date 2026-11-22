@@ -1774,3 +1774,64 @@ does not answer `initialize` within `sandbox.extension_start_seconds` is ended (
   cannot be written, entries start directly as before 1.26.1 (`check` says so).
 - **Residual:** a member's own stdio extensions and per-session MCP servers are not guarded; a server that accepts
   only the 2026-07-28 handshake fails at once instead of hanging.
+- **1.26.2 (FIX `stdio-guard-orphans`):** the live check of 1.26.1 found a server started through `uvx` surviving the
+  guard's time-out (its child had started before the guard put it into the job) and keeping the member's chat
+  waiting through the stderr it had inherited. The server now starts suspended and joins the kill-on-close job before
+  it runs (the job allows no breakaway, so ending it ends the whole tree), and has its own stderr pipe (forwarded by
+  the guard, at most 64 KiB per line). Only when the job cannot be used does the guard look for the server's
+  descendants by process snapshot: by parent link, each created after its parent, a process id that is now alive as
+  another process (or cannot be examined) not followed, each one checked again through the handle that ends it.
+  Residual of that fallback: a parent that has ended and whose id was reused by a process that has also ended could
+  have that process's children taken for its own - possible only without the job, and only within the guard's
+  member's sandbox. The guard still runs with the member's rights inside the member's sandbox; nothing else changes.
+
+### 22.7 Socket pairs through the egress proxy (1.26.2, FIX `mxc-asyncio-socketpair`)
+
+Why: on Windows `socket.socketpair()` is a TCP connection to a listener on 127.0.0.1 - the wake-up channel of every
+asyncio, anyio and trio event loop. An MXC member's container may connect to no loopback address but its egress proxy
+(the policy is "egress deny" with `runtimeConfig.networkProxy`; MXC refuses allow rules next to a runtime proxy, and
+AF_UNIX sockets are denied in the container - measured), so every asyncio program, every Python MCP server, hung.
+
+What it is: the member's egress proxy answers `CONNECT <32 hex digits>.pair.goose-web.invalid:<port>`: two requests
+with the same token are both answered `200` and joined to each other. Goose Web writes `sitecustomize.py`
+(`goose_web/sandbox_sitecustomize.py`) into the member's profile (`.goose-web/python`), puts that folder first on the
+member's `PYTHONPATH` and sets `GOOSE_WEB_SOCKETPAIR=proxy`; `socket.socketpair()` for stream sockets then asks the
+proxy, with the proxy credential MXC already gives the container (`HTTP_PROXY`).
+
+- **No new reach.** A pair joins two connections that both carry this member's proxy credential; each member has
+  its own proxy, so no other member's connection can be joined; tokens are 128-bit random and live at most 10 s
+  unmatched. Nothing is looked up, connected or forwarded - the host's loopback services (other ports on 127.0.0.1,
+  the native worker, a browser's DevTools port) stay unreachable, and the MXC policy is unchanged. Bytes between the
+  two halves never leave the gateway process.
+- **Not egress, so not audited** as `sandbox.egress` (nothing leaves the machine); the proxy counts pairs
+  (Admin > System, proxy `pairs` / `pairConnections`).
+- **Resources:** pair connections are exempt from `proxy_max_connections` (also accepted when it is reached) and from
+  the idle time-out (an event loop's channel lives as long as its process), and limited on their own: at most 64
+  unmatched requests (`504` after 10 s) and 256 open pair connections per member (`503` beyond, answered without
+  lingering), and each direction of a pair carries at most 64 KiB/s (burst 256 KiB) - a wake-up channel needs a few
+  bytes, so pairs cannot be used to load the gateway's event loop, which serves every member. Pairs end with their
+  proxy (closed connections are aborted); refusals are counted (`pairRefused`) and logged at most once a minute per
+  member, not audited.
+- **The sitecustomize** is in the member's writable profile, like the start-up guard (22.6): changing it only changes
+  the member's own processes. It is rewritten when it differs, and anything else placed in its folder - which is first
+  on the member's `PYTHONPATH`, ahead of the standard library - is removed (a link itself, never what it points to).
+  A link at the folder or the file makes Goose Web skip it; that the gateway never writes through a link also rests on
+  members being unable to create links there (MXC and AppContainer processes cannot create junctions to places they
+  may not write - measured, 11.6). The proxy credential is only sent to a proxy on loopback. A `sitecustomize` further
+  along the path still runs, once. Without the switch, or with `sandbox.python_socketpair: false`, Python keeps its
+  own `socketpair()`; without a proxy it fails at once instead of hanging.
+- **Residual:** programs started with `python -I`, `-E` or `-S` (and embedded Pythons with a `._pth` file) do not load
+  it; members with network `none` and no relays have no proxy, so asyncio still cannot start there; an `AF_INET6`
+  request gets IPv4 sockets (asyncio does not care).
+- **Independent review (2026-11-22, read-only, before release):** no Critical or High finding. Medium M1 (pair
+  traffic unlimited, could load the gateway's loop) - fixed: per-direction rate cap and byte count. Low L1 (pair
+  refusals lingered uncounted; pairs refused at the egress limit) - fixed; L2 (no half-close, cancelled tasks not
+  awaited) - fixed; L3 (pairs outlived the proxy) - fixed: aborted at close; L4 (folder ahead of the standard
+  library) - fixed: nothing else stays in it; L5 (process-id reuse in the tree walk) - the job ends the tree, the walk
+  only without a job, unexaminable ids not followed (residual above); L6 (unbounded stderr lines) - fixed; L7 (crash
+  exit codes made `os._exit` fail) - fixed; L8 (one pair budget per member) - limits raised and named in the refusal.
+  Also fixed: every spelling of `PYTHONPATH` merged, the credential only to loopback, the next `sitecustomize` found
+  like Python finds it (package or compiled file too) and run as `sitecustomize`, the job handle closed when it cannot
+  be set up, a failed job assignment logged, the resume guarded. Tests: fixed sleeps replaced by conditions, timing
+  bounds widened, vacuous assertions replaced, a unit test that the server starts suspended and joins the job before
+  it runs, link refusal and folder clean-up, exact tokens only, rate cap, half-close, end with the proxy.

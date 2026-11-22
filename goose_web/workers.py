@@ -133,6 +133,24 @@ def appcontainer_grants(spec: dict, settings) -> tuple[dict[str, str], list[tupl
     return grants, refused, required
 
 
+def with_python_shim(env: dict, shim_dir: str) -> dict:
+    """FIX mxc-asyncio-socketpair (1.26.2): the environment of an MXC worker that has an egress proxy, with Goose
+    Web's sitecustomize.py folder first on PYTHONPATH (after it whatever the administrator set) and
+    GOOSE_WEB_SOCKETPAIR=proxy, so the member's Python programs get socket.socketpair() through the proxy."""
+    if not shim_dir:
+        return env
+    out = dict(env)
+    mine = os.path.normcase(os.path.normpath(shim_dir))
+    rest: list[str] = []
+    for key in [k for k in out if k.upper() == "PYTHONPATH"]:     # every spelling (Windows names ignore case)
+        for p in str(out.pop(key) or "").split(os.pathsep):
+            if p and os.path.normcase(os.path.normpath(p)) != mine and p not in rest:
+                rest.append(p)
+    out["PYTHONPATH"] = os.pathsep.join([shim_dir, *rest])
+    out["GOOSE_WEB_SOCKETPAIR"] = "proxy"
+    return out
+
+
 def _first_line(proc, seconds: float) -> str:
     """The first line a started process prints, or '' when it prints none within `seconds` (the caller then ends
     the process, which ends the reader)."""
@@ -778,7 +796,10 @@ class WorkerManager:
         cwd = os.path.join(spec["profile_root"], "workspace")
         if not os.path.isdir(cwd):
             cwd = spec["profile_root"]
-        policy = mxc.build_policy(command=args, cwd=cwd, env=self._sandbox_env(w, "mxc"), grants=grants, proxy_url=proxy_url,
+        env = self._sandbox_env(w, "mxc")
+        if proxy_url:     # FIX mxc-asyncio-socketpair: Python's socket pairs through the proxy ('' = off)
+            env = with_python_shim(env, str(spec.get("python_shim") or ""))
+        policy = mxc.build_policy(command=args, cwd=cwd, env=env, grants=grants, proxy_url=proxy_url,
                                   system_drive=os.environ.get("SystemDrive", "C:"))
         pfile = state_dir / "mxc" / f"{spec['name']}.json"
         await asyncio.to_thread(mxc.write_policy, pfile, policy)

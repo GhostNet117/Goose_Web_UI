@@ -177,6 +177,19 @@ def _guard_source() -> str:
     return _GUARD_SOURCE[0]
 
 
+# FIX mxc-asyncio-socketpair (1.26.2): Goose Web's sitecustomize for the Python programs of an MXC member's sandbox,
+# written into the profile as <profile>/.goose-web/python/sitecustomize.py (the folder goes first on PYTHONPATH).
+SHIM_DIR = "python"
+SHIM_FILE = "sitecustomize.py"
+_SHIM_SOURCE: list[str] = []
+
+
+def _shim_source() -> str:
+    if not _SHIM_SOURCE:
+        _SHIM_SOURCE.append((Path(__file__).with_name("sandbox_sitecustomize.py")).read_text(encoding="utf-8"))
+    return _SHIM_SOURCE[0]
+
+
 def guard_entry(entry: dict, python: str, guard: str, limit: int, name: str) -> dict:
     """The stdio extension entry started through the start-up guard instead of directly; every other field is kept
     (env, env_keys, timeout, available_tools ...)."""
@@ -476,6 +489,62 @@ class Profiles:
                         user.get("username"), e)
             return None
         return py, str(target), limit
+
+    def python_shim(self, user: dict) -> str:
+        """FIX mxc-asyncio-socketpair (1.26.2): the folder holding Goose Web's sitecustomize.py in the member's profile
+        (<profile>/.goose-web/python), written when it differs, or '' - off (sandbox.python_socketpair false), or not
+        writable safely (a link, outside the profile). Like the start-up guard it is in the member's own folder and
+        only ever runs in that member's sandbox, with that member's rights."""
+        from .config import python_socketpair_on
+        if not python_socketpair_on(self.s):
+            return ""
+        root = self.root_for(user)
+        folder = root / ".goose-web" / SHIM_DIR
+        target = folder / SHIM_FILE
+        if _is_reparse(folder.parent) or _is_reparse(folder) or _is_reparse(target) or \
+                not _inside_profile(target, root):
+            log.warning("profile %s: .goose-web\\%s is a link or outside the profile; Python programs in the member's "
+                        "sandbox get no socket pairs", user.get("username"), SHIM_DIR)
+            return ""
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            if _is_reparse(folder):
+                return ""
+            text = _shim_source()
+            if not target.is_file() or target.read_text(encoding="utf-8", errors="replace") != text:
+                _atomic_write(target, text)
+        except OSError as e:
+            log.warning("profile %s: %s not written (%s); Python programs in the member's sandbox get no socket pairs",
+                        user.get("username"), SHIM_FILE, e)
+            return ""
+        self._only_shim_in(folder, user.get("username"))
+        return str(folder)
+
+    @staticmethod
+    def _only_shim_in(folder: Path, who: Any = None) -> None:
+        """Nothing but sitecustomize.py stays in the shim folder: it is first on the member's PYTHONPATH, so anything
+        placed there (a json.py, say) would shadow the standard library for all of the member's Python programs. A
+        link is removed itself, never followed."""
+        import shutil
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            return
+        for e in entries:
+            if e.name == SHIM_FILE:
+                continue
+            try:
+                if e.is_symlink() or _is_reparse(Path(e.path)):
+                    try:
+                        os.unlink(e.path)
+                    except OSError:
+                        os.rmdir(e.path)
+                elif e.is_dir(follow_symlinks=False):
+                    shutil.rmtree(e.path)
+                else:
+                    os.unlink(e.path)
+            except OSError as ex:
+                log.warning("profile %s: could not remove %s from .goose-web\\%s (%s)", who, e.name, SHIM_DIR, ex)
 
     # ------------------------------------------------------------ hints
     def assigned_hints(self, user: dict) -> list[dict]:
