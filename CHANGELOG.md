@@ -1,5 +1,161 @@
 # Changelog
 
+## 1.27.0 - 2026-11-24
+
+**Chats with a long run open again, idle chats stop holding their MCP servers, and four new things: "Keep me signed
+in" for 24 hours at most, a provider for one person, uploads up to 5 GB with images the model can take, and a
+retention period for chats.** About one chat open in ten failed after a long run ("Could not open this session"), and
+a worker that had opened many chats kept one set of MCP servers running for each of them; both are fixed, and a chat
+Goose cannot open can now be read as a read-only copy. An independent assessment of the release candidate found one
+Medium and four lower findings, all fixed in this release (SECURITY-ASSESSMENT 23).
+
+**Upgrade notes - read these before you upgrade.**
+- **Chat retention is new, and it deletes nothing until an administrator confirms it.** Admin > Settings > Files and
+  chats > "Delete chats and their attachments after (days without use)": default 180 days (`retention.chat_days`;
+  0 = never, at most 3650), counted from a chat's last use in Goose Web, Goose Desktop or the goose CLI. It covers
+  every profile - **in the native profile your own Goose Desktop and CLI chats unused that long go too**, with the
+  files uploaded to them, for good. After the upgrade the page says "Not in force yet" and `goose-web check` prints a
+  `!!` line: nothing is deleted automatically until an administrator confirms the period, with **Start automatic
+  deletion** (it shows the Preview numbers and asks once) or by saving a period on that page. Look at the **Preview**
+  first (chats, files and bytes per user that would go now), or set 0 to keep everything. The first automatic sweep
+  runs a day after the confirmation, then hourly; changing the period starts that day again. Deleted chats come back
+  only from a backup.
+- **"Keep me signed in" is back, for 24 hours at most.** The sign-in page shows the box again, unchecked. Admin >
+  Settings > "Keep me signed in lasts (hours)" (`auth.remember_hours`): default 24, 1 to 24, 0 = off (no box). Set 0
+  where devices are shared. Nobody is signed out by the upgrade: sign-ins made before it count as normal ones (8 hours
+  at most).
+- **Scripts that use `/ws` with an API token:** when a chat is opened (`session/load`), the replayed frames now arrive
+  as JSON arrays of notifications (at most 256 KB each), followed by the load result - split the arrays. A socket that
+  reads too slowly gets `_gw/resync {sessionId}` (load the chat again) instead of being disconnected.
+- **The largest upload is still 25 MB** (`server.max_upload_mb`) until an administrator raises it, up to 5120 MB
+  (5 GB), in Admin > Settings > Files and chats. An upload needs its size plus 1 GB of free disk space.
+- **A model sees images only when Goose knows it supports vision.** For an OpenAI-compatible custom provider, add
+  `"supports_vision": true` to the model's entry in the provider file (`config/custom_providers/<id>.json`, under
+  `"models"`) and let Goose restart (Goose Web's workers restart when idle). Otherwise Goose sends
+  "[image omitted: model does not support vision]" instead of the image. ADMINISTRATION 9.9c.
+- At the first start the database gets four tables (`uploads`, `upload_links`, `chat_access`, `user_items`) and a
+  column (`auth_sessions.remember`); nothing to do. Teams created from now on let their members add personal hints;
+  existing teams keep their setting.
+
+**"Keep me signed in", for 24 hours at most (spec 037).** Ticked, the browser keeps the sign-in cookie, so closing the
+browser does not sign you out; the sign-in lasts `auth.remember_hours`, counted from signing in and never extended.
+Two-factor is still asked at sign-in and the idle limit (`auth.idle_minutes`) applies. Each stored sign-in knows its
+kind, so the start-up cut holds each to its own limit, lowering either setting shortens the sign-ins of that kind at
+once, and 0 ends the kept ones. Settings > Account > Active sign-ins marks kept sign-ins; single sign-on sign-ins are
+never kept. `goose-web check` reports both lifetimes and a value above 24; `auth.remember_days` is still reported as
+removed and now points to `auth.remember_hours`. The settings API refuses a `rememberHours` that is not a number
+(400) instead of storing it as 24.
+
+**A provider for one person (spec 038).** Admin > Users > Edit > "Providers for this user only": give one person a
+provider of your own profile and the models they may use with it, without giving the rest of their team access. Only
+that person's profile gets the provider file and its key; taking it away removes both; your later edits of the
+provider reach them by themselves. The grant is added to what the team allows (a team's Any stays Any), and its
+models count with that provider only. The person's agent can read the key, as with a team's provider: give only
+providers whose key you would hand to that person, and rotate a key after taking it away from someone who should no
+longer have it. New API: `GET/POST /api/admin/users/{id}/items`, `DELETE /api/admin/users/{id}/items/{itemId}`;
+audit `user.item.add`, `user.item.remove`, `user.item.refresh`.
+
+**Personal hints are on for new teams.** A team created from now on lets its members add personal Goose hints
+("Members may add personal hints", `hints_edit`): Admin > Teams > New team, `init`'s Everyone, `native-hints enable
+--team`. Team hints still come last and take precedence. Existing teams keep their setting; someone without a team
+still gets none.
+
+**Uploads up to 5 GB, in resumable pieces (spec 039).** The message box sends files in pieces of 16 MB and shows per
+file the percent and the bytes; the X cancels (the server deletes what it had); a failed piece is tried again by
+itself (3 times, after 1, 2 and 4 s) from where the server stopped; two files go up at a time. The gateway writes each
+piece straight into a hidden partial file in `<chat folder>\Web_Uploads` and names it at the last byte without
+replacing another file; its memory stays small (measured: a 600 MB file, server working set about 50 MB). Every check
+of 1.25.0 holds for each piece (write access to the resolved folder, `Web_Uploads` links, names, hint files,
+`.agents`); new: the declared size against the limit, at most 20 unfinished uploads and 4 pieces at once per person,
+upload ids bound to whoever started them, free disk space (size + 1 GB), a piece that brings no byte for 120 s ends
+(the page tries it again), partial files idle for 24 hours are removed. The limit in Admin > Settings > Files and
+chats (1 to 5120 MB) overrides `server.max_upload_mb` (default 25, unchanged; above 5120 counts as 5120,
+`goose-web check` says so). API: `/api/fs/uploads` (API.md). `POST /api/fs/upload` stays for older pages and scripts,
+never above `server.max_upload_mb`.
+
+**Images the model can take (spec 039).** The original is saved unchanged; the model gets a copy made in the browser
+(at most 1600 px, about 1 MB, JPEG or PNG), at most 10 MB of images per message; more images, and formats the browser
+cannot read (HEIC, TIFF), go as file links only, marked "link only". Reason: OpenAI-compatible endpoints that refuse
+bodies above about 5 MB, Goose sending the whole conversation again at every turn, and `goose serve` dropping
+WebSocket messages above 16 MiB. A message with that much image data can also be queued and steered (the gateway's
+limit for one queued or steered message is now 15 MiB, was 9 MiB).
+
+**A retention period for chats (spec 040).** Chats and their attachments are deleted after a period without use, once
+an administrator has confirmed it (upgrade notes). Last use is the later of Goose Web's record (opened, prompted,
+steered, stopped, forked, mode changed) and Goose's own time of the session, so Goose Desktop and CLI use counts.
+Hourly, at most 200 chats per sweep, oldest first, through the profile's Goose worker (`session/delete`, with its
+sub-agent sessions); then the chat's uploaded files - only inside `Web_Uploads`, in folders the profile may write, the
+same file that was uploaded, not shared with a chat that is kept (a fork shares the files of the chat it came from;
+files attached on the New chat page go with the new chat); uploads never sent in a chat count from their upload.
+Never a chat that is running, being opened, open in a tab, with queued messages or a question waiting, or running in
+Goose Desktop or a scheduled job. Admin > Settings > Files and chats has a Preview per user and Run now (after a
+confirmation); every deletion is audited (`retention.chat_deleted`, `retention.files_deleted`, `retention.run`). Not
+covered: disabled accounts, Goose's hidden sessions, files attached before this version (no record: they stay on
+disk), forks made in Goose Desktop. Backups keep what retention deleted.
+
+**Fixed.**
+- **Chats with a long run open again (FIX chat-open-replay-overflow).** About one chat open in ten failed with "Could
+  not open this session" / "Connection lost", over and over: when a run had streamed more than 20,000 chunks, opening
+  the chat replayed them all at once into the tab's send queue, the full queue made the gateway end the tab's socket,
+  and the tab reconnected, loaded the chat again and looped. Now the buffer merges the streamed text chunks of one
+  message into one frame and keeps at most 5,000 frames per chat (beyond that an idle chat is loaded from Goose
+  again); a tab's send queue is limited by bytes (64 MiB) instead of 20,000 frames, and a tab that cannot keep up
+  loses that chat's frames and gets `_gw/resync` instead of being disconnected (only a tab that never reads its
+  responses is, at 128 MiB: `ws.disconnect` reason `queue-full`); replays go out in batches of at most 256 KB at the
+  pace the tab reads; there is one `session/load` per chat, and tabs that open a chat while it loads wait for that
+  load (two tabs no longer empty or duplicate each other's transcript); a chat Goose does not open within
+  `goose.session_load_timeout_seconds` (180) fails with "Goose did not answer within 180 s" instead of a spinner that
+  never ends. A worker whose process has exited is noticed before the next call ("the Goose worker is restarting"
+  instead of an internal error). `ws.disconnect` records why the socket ended (`client`, `queue-full`, `kick`,
+  `error`, `shutdown`). In the browser the reconnect backoff resets only after a connection stayed up 10 s, and
+  opening a chat retries a dropped connection, a restarting worker or a time-out (after 0.5, 1, 2 and 4 s) but not
+  "chat gone", "folder gone" or a refusal; the error card says which and shows the code.
+- **Idle chats no longer keep their MCP servers running (FIX idle-sessions-keep-mcp-servers).** Goose keeps one
+  agent, with a full set of the profile's stdio MCP servers, for every chat opened on a connection until the chat is
+  closed, and Goose Web never closed one: a worker that owns schedules or always has a tab open collected one set per
+  chat ever opened (measured: 12 sets, 282 processes, about 11 GB). Every minute the gateway now closes
+  (`session/close`) chats idle for `goose.session_unload_minutes` (30), and while a worker holds more than
+  `goose.max_loaded_sessions` (12) the least recently used idle ones at once (never one used in the last 2 minutes).
+  Never a chat that runs, waits for an answer, has a prompt, request, queued message or steer, is being loaded, or is
+  shown in a tab; only with a Goose that offers `session/close` (1.57 does). The chat keeps its queue, title, herd
+  status and marks; opening it, or a message, mode or folder change sent to it, loads it again silently through the
+  chat's one upstream load (its extensions start again). Admin > System > Workers shows each worker's **Loaded
+  chats**; `goose-web check` has an "idle chats" line; `0` minutes = never.
+- **Orphaned MCP servers on Windows (same fix).** Goose ends only a released server's direct child, so a launcher's
+  child (`uvx`, `npx` chains) kept running in the worker's job object. Every minute the gateway now ends a process of
+  a configured stdio extension's tree once the tree's root has ended and the process has been cut off from the
+  worker's goose.exe for `goose.orphan_grace_seconds` (120) - nothing outside the worker's job, nothing it did not
+  recognise, never the worker or a reused process id. Audited as `worker.orphan_ended` (command line masked);
+  `goose.orphan_reaper: false` turns it off; `check` has an "orphan reaper" line. Unloading and the reaper were tested
+  against the real Goose 1.57.0 (opt-in tests, `GOOSE_WEB_TEST_GOOSE=1`).
+- **A read-only copy of a chat Goose cannot open (FIX chat-open-readonly-fallback).** The "Could not open this
+  session" card offers **Show a read-only copy**: the conversation read straight from the profile's Goose session
+  database - without Goose, the worker or the WebSocket - under the banner "Read-only copy - Goose could not load
+  this chat" and the reason: your messages and Goose's replies, each tool call and result shortened, images as a
+  note; 200 messages per page with **Load more**; **Try again** opens the chat normally. The access rules are those
+  of opening the chat; an administrator's look into another profile is audited as `transcript.view`. New route
+  `GET /api/sessions/{id}/transcript`; the database is opened read-only and never written.
+- Admin > System: a worker without a connection says so.
+
+**Security.** An independent assessment of the release candidate (code review, the full test suite, live checks on a
+throwaway gateway; SECURITY-ASSESSMENT 23) found no Critical or High issue. Its findings, all fixed in this release:
+- **M-1 (Medium):** the prompt-time check of a chat's provider, model and approval mode - since spec 038 also where a
+  model given to one person is held to its provider - was skipped once for every chat the idle unloader had closed.
+  A member's prompt to a chat with no load result (unloaded, or never loaded on this connection) now loads the chat
+  first and is checked against its provider, model and mode; a chat that cannot be loaded is refused ("open it
+  again").
+- **M-2 (Low):** the candidate still called itself 1.26.2, had no changelog entry, and SECURITY-ASSESSMENT 21.3 still
+  said there is no persistent sign-in. Fixed by these release documents; 21.3 now points to 23.3.
+- **M-3 (Low):** the upgrade would have started deleting chats unused for 180 days a week later - the Goose Desktop
+  and CLI history of the native profile included - with a log line as the only notice. Automatic deletion is now in
+  force only after an administrator confirms the period (upgrade notes).
+- **M-4 (Info):** a `rememberHours` that is not a number is refused (400) instead of being stored as 24.
+- **M-5 (Info):** `POST /api/fs/uploads/link` records a chat's use only when it linked something; any well-formed id
+  used to leave a row.
+
+Docs: USER-GUIDE, ADMINISTRATION (6.4, 7.7, 9.9c, 9.9d, "Providers for one person", 12, 16, 19), CONFIGURATION, API,
+ARCHITECTURE, TROUBLESHOOTING (8, 11.3, 16), SECURITY-ASSESSMENT 23.
+
 ## 1.26.2 - 2026-11-22
 
 **Python MCP servers now run in members' MXC sandboxes, and the start-up guard always ends what it stops.** Both

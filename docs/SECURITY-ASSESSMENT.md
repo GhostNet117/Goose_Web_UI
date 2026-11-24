@@ -1527,6 +1527,8 @@ attached to a chat exists as a file in the chat folder.
 
 ### 21.3 Sign-ins: eight hours, no persistent sign-in
 
+> Superseded in 1.27.0 by 23.3: "Keep me signed in" is back, capped at 24 hours.
+
 **Threat.** A copied sign-in cookie is a working sign-in for as long as it lives, and this product starts
 programs for whoever is signed in. Before: 30 days when "Keep me signed in" was ticked (it was, by default), kept
 on disk by the browser; 12 hours otherwise, up to 720 by an administrator's setting. An installation in use
@@ -1835,3 +1837,357 @@ proxy, with the proxy credential MXC already gives the container (`HTTP_PROXY`).
   be set up, a failed job assignment logged, the resume guarded. Tests: fixed sleeps replaced by conditions, timing
   bounds widened, vacuous assertions replaced, a unit test that the server starts suspended and joins the job before
   it runs, link refusal and folder clean-up, exact tokens only, rate cap, half-close, end with the proxy.
+
+## 23. Release 1.27.0 (2026-11-24)
+
+Four features - "Keep me signed in" again, capped at 24 hours (spec 037); a provider for one person (spec 038);
+uploads up to 5 GB with images the model can take (spec 039); a retention period for chats (spec 040) - plus personal
+hints on for new teams, and three fixes of faults found in use (`chat-open-replay-overflow`,
+`idle-sessions-keep-mcp-servers`, `chat-open-readonly-fallback`). Built on separate branches, merged into one release
+candidate, assessed independently before release (23.1, 23.2) and corrected after that assessment (commit
+`1499ab7`). Sections 23.3 to 23.11 describe the changes as released, including what the assessment changed.
+
+### 23.1 Independent assessment: scope and method (2026-11-24, before release)
+
+- **Who.** An independent AI reviewer, model recorded as Claude Mythos 5.2; read-only on all code; production not
+  touched; no secrets recorded.
+- **What.** The release candidate, commit `8f87cc8`, against 1.26.2 (`e9c41c4`): 55 files, +8,884 / -318 lines.
+- **How.** (A) A code review of the diff and of what it touches. (B) The full test suite: 1,202 passed, 14 skipped,
+  0 failed. (C) Live checks on a throwaway gateway on loopback with its own system folder and profiles root (plain
+  HTTP, sandbox off; one administrator, two members): cookie attributes and lifetimes; CSRF, Origin and role checks
+  on every new route; the WebSocket handshake and the gateway methods; upload isolation between members, offsets,
+  limits, never-overwrite, read-only folders and junctions (also one swapped in mid-upload); the transcript's access
+  rules and rate limit; a per-user grant reaching only the grantee and leaving on withdrawal; retention failing safe
+  when Goose cannot confirm a deletion. (D) A short spot check of the rest: the firewall's always-allowed set, the
+  CSRF model, the gateway-method dispatcher, an identity check on every new route; no new outbound HTTP call,
+  subprocess call or deserialisation in the diff.
+- **Not exercised.** Anything that needs a running Goose: no Goose binary was installed where it ran, so real
+  retention deletion (`session/delete`), idle unloading (`session/close`), the orphan reaper on real process trees
+  and WebSocket chat traffic (replay, resync, waiters, watchdog) were judged from the code, the project's tests
+  against stand-ins and one in-process reproduction (M-1); the opt-in real-Goose tests were skipped. No browser: the
+  front end was reviewed by reading (no XSS sink found). `hub.py`'s diff was read in part - the prompt path, the
+  unloader hooks, the gateway-method dispatcher, the response hooks and the open-chat, waiter and watchdog code; the
+  coalescing buffer and the byte-bounded tab queue were checked against the fix record and the tests, not line by
+  line. `Secure` and the `__Host-` prefix (plain HTTP) and the disk-margin refusal (`disk_full`) were not checked
+  live. The sandbox, the egress proxy, OIDC / LDAP and the prompt guard, unchanged since 1.26.2, were not audited
+  again.
+- **Verdict.** Ship after fixes: no Critical or High finding; fix M-1 and close M-2 and M-3 before the release.
+
+### 23.2 Findings
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| M-1 | Medium | The prompt-time check of a chat's provider, model and approval mode was skipped once for every chat the idle unloader had closed (`hub.py` `_from_client`, `unload.py`, `policy.check_session_choice`) | Fixed in `1499ab7` |
+| M-2 | Low | The candidate still identified as 1.26.2, had no CHANGELOG entry, and this document contradicted the shipped behaviour (21.3) | Fixed by the release documents: version, CHANGELOG, this section |
+| M-3 | Low | An upgrade switched on irreversible chat deletion (180 days, Goose Desktop and CLI history included) with a log line and one settings line as the only notice | Fixed in `1499ab7` |
+| M-4 | Info | A `rememberHours` that is not a number was stored as the maximum (24 hours) instead of being refused | Fixed in `1499ab7` |
+| M-5 | Info | `POST /api/fs/uploads/link` recorded a "last use" row for any well-formed chat id | Fixed in `1499ab7` |
+
+**M-1 (Medium).** For a member, `session/prompt` is refused when the chat's current provider, model or approval mode
+is not allowed (`policy.check_session_choice`); since spec 038 it is also the only place where a model given to one
+person is held to the provider it was given with (`session/set_config_option` checks the model without its
+provider). The check reads the chat's last `session/new` / `session/load` result. The idle unloader clears that
+result when it closes a chat, the check returned at once when there was none, and the silent re-load came only after
+it - so one prompt per unload ran unchecked (reproduced against the real hub with a fake Goose: a model given with
+one provider was used with another), and a member could repeat that at will: a chat is unloaded after 30 idle
+minutes, or after 2 once more than 12 are held. The same "no load result, no check" shape existed in 1.26.2 after a
+worker restart or a buffer eviction, but nothing reloaded the chat on the prompt's behalf there. Fix: a member's
+prompt to a chat with no load result - unloaded, or never loaded on this connection - first loads the chat
+(`Unloader.ensure_loaded`, the same silent load) and is then checked on the fresh load result; when the chat cannot
+be loaded, or is running without a load result, the prompt is refused ("this chat could not be loaded to check its
+settings: open it again"). Three tests with a member client in `tests/test_unload.py` (unloaded and not allowed:
+refused before Goose sees a prompt; unloaded and allowed: load, then prompt; never loaded here: loaded and checked
+first) fail on the candidate and pass with the fix.
+
+**M-2 (Low).** Operators could not tell the candidate from 1.26.2 (start-up log, `/api/auth/config`, package
+metadata), and 21.3 still said there is no persistent sign-in. Fixed by the release documents: version 1.27.0, the
+CHANGELOG entry with the retention notice first, this section, and 21.3 marked as superseded by 23.3. A sentence of a
+draft for this section that M-1 disproved - that the silent re-load runs after the triggering method passed every
+policy and guard check - is corrected in 23.10. The database schema number stays 6: the new tables and the column
+are created at every start whatever the number.
+
+**M-3 (Low).** Spec 040's default applied to an existing installation by itself: the first maintenance pass armed
+retention, and seven days later the hourly sweep began deleting every chat unused for 180 days - for chats older
+than the upgrade, counted from when Goose last wrote them - including a native profile's Goose Desktop and CLI
+history. The only notice was a log line and one line on the settings page. Fix: retention never arms itself.
+Automatic deletion is in force only once an administrator confirms the period - by saving it in Admin > Settings, or
+with **Start automatic deletion**, which shows the Preview numbers and asks once (`retention.confirm`:
+`retention_armed_at`, `retention_confirmed_by`). The first sweep runs a day later; a changed period starts that day
+again; saving another setting confirms nothing (the page sends the period only when it was stored before or
+changed). Until then the page says "Not in force yet", the gateway log warns once, and `goose-web check` prints a
+`!!` line. Test: `tests/test_retention.py::test_automatic_deletion_waits_for_an_administrator_to_confirm`.
+
+**M-4 (Info).** `PUT /api/admin/settings` stored a `rememberHours` that is not a number (`"abc"`, `null`) as 24, so a
+script that meant "off" switched kept sign-ins on at their maximum for everybody. Now 400, and nothing of that
+request is written; numbers keep the clamp (above 24 is stored as 24).
+
+**M-5 (Info).** The link call recorded a use for any well-formed chat id, also when it linked nothing; such rows were
+removed only by a real sweep of that profile, never while retention is off. Always under the caller's own profile -
+no other person's chat or file was affected; slow growth of the gateway database only. Now a use is recorded only
+when files were really linked to the chat.
+
+### 23.3 "Keep me signed in", 24 hours at most (spec 037)
+
+This reverses part of 21.3: a persistent sign-in exists again, chosen per sign-in and capped.
+
+- **What changes for an attacker.** A kept sign-in's cookie is stored by the browser on disk. Someone who takes an
+  unlocked device, or copies the cookie (malware on the client, a backup of the browser profile), holds a working
+  sign-in for up to 24 hours instead of until the browser closes (a session cookie, 8 hours at most) - with
+  everything the person can do, including starting agents.
+- **Mitigations.** A hard cap of 24 hours in code (`auth.REMEMBER_HOURS_MAX`; the configuration, the database and
+  the admin page clamp; `check` names a higher value; the settings API refuses a value that is not a number, M-4);
+  a fixed lifetime counted from signing in, never extended; unchecked by default, a deliberate choice per sign-in
+  (only JSON `true` counts); the cookie is HttpOnly, SameSite=Strict, path /, and Secure with the `__Host-` prefix
+  over HTTPS; only the SHA-256 of the token is stored; two-factor at sign-in and the idle limit (`auth.idle_minutes`)
+  apply; the person sees kept sign-ins (Settings > Account > Active sign-ins) and can end them; a password change or
+  reset and disabling the account end them; an administrator can lower the lifetime or set 0, which shortens or ends
+  the kept sign-ins that exist, at once and at start-up (each stored sign-in knows its kind,
+  `auth_sessions.remember`). Single sign-on sign-ins are never kept.
+- **Checked live (23.1).** Without `remember`: a session cookie, 8 hours. `remember: true`: `Max-Age=86400`,
+  24 hours. `"true"` or `1`: not kept. Lowering the setting to 1 cut an existing kept sign-in to an hour at once; 0
+  ended it while a normal sign-in of the same person went on.
+- **Mistakes.** Ticking the box on a shared or public computer leaves a 24-hour sign-in there (the box's tooltip and
+  the user guide warn; end it from another device). A lifetime below the normal one makes kept sign-ins shorter than
+  normal ones (harmless).
+- **Residual.** Up to 24 hours of exposure for a kept sign-in on a stolen or infected device. Recommended: 0 where
+  devices are shared, and an idle limit. Not done, as in 21.3: tying a sign-in to an address or a browser name.
+
+### 23.4 A provider for one person (spec 038)
+
+- **Who can do it.** Administrators only (403 otherwise), with CSRF and Origin checks; audited (`user.item.add`,
+  `user.item.remove`, `user.item.refresh`, with the source and the models). The source must be an enabled
+  administrator's own profile (`400 bad_source`): a member's provider - its address and key - can never be copied
+  into another person's profile this way. A grant to the account on the native profile is refused.
+- **The key goes to the grantee only.** As with a team's provider item, the grantee gets the provider definition and
+  its key value in their own `secrets.yaml`, readable by their own agent (with Shell or a file tool) - give only
+  providers whose key you would hand to that person. Nobody else gets the file or the key: teammates' profiles are
+  provisioned from their own rows, and the key value is never stored in the database. Tested, and checked live: the
+  grantee's profile got the provider file and exactly the one key the provider names (a second key of the
+  administrator's was not copied), a teammate got neither, and no API answer contains the value.
+- **Provider and model as a pair.** The grant only adds, after the team's lists and the person's overrides (a team's
+  Any stays Any); the team stays the base (no team, no chat). A given model counts only with the provider it was
+  given with, at every check that knows the provider (prompt, defaults and save, recipes, provisioning).
+  `session/set_config_option` and `config/upsert` accept a given model for its providers, so the pair is held at the
+  prompt - since M-1 also for a chat the gateway unloaded or never loaded on this connection, which is loaded and
+  checked first (refused if that fails); on the release candidate the first prompt after an unload was not checked
+  (23.2). Ids that are not text are refused, not crashed on.
+- **Withdrawal.** The file and the key leave the profile at once; a chat running at that moment keeps what its agent
+  loaded until the agent restarts (it is marked and restarts when idle), as for team items; open sockets reconnect
+  with the new rights. A grant is a copy of the key: withdrawing it does not make a key that was used or read
+  elsewhere safe again - rotate it after taking it from someone who should no longer have it.
+- **Following the source.** Only administrators' profiles are followed (a demoted or disabled source stops
+  counting); a source that is gone keeps the copy without delivering the key.
+- **Residual.** A team's `allowed_models` stays provider-agnostic (unchanged). The grantee holds the key value while
+  the grant lasts.
+
+### 23.5 Personal hints on for new teams
+
+Members of teams created from now on may write personal hints, which their own agent loads before assigned and team
+hints. They could already instruct their own agent in every prompt; hints make that persistent. Team hints stay
+last, with the "final: these take precedence" note - an instruction to the model, not an enforcement (unchanged).
+Hint file names stay refused in uploads. Existing teams are not changed. An administrator who expects a new team to
+start fully locked down finds the switch on the team's Experience page (Hints; the team page shows it as an info
+line), or sends `policy.hints_edit: false` when creating a team by API. Residual: a personal hint that contradicts a
+team hint relies on the model following the stated precedence, as before for teams that had personal hints on.
+
+### 23.6 Uploads up to 5 GB in pieces (spec 039)
+
+New surface: a person can write up to the administrator's limit (25 MB by default, at most 5 GB) per file through
+four routes (`/api/fs/uploads`), over several requests.
+
+- **Who and where.** Sign-in, CSRF token and Origin on every write. The folder is checked as written and as resolved
+  at the start, before every piece and before the final name (a read-only folder, or a `Web_Uploads` that links
+  elsewhere: refused, nothing written); names are cleaned; hint file names and `.agents` are refused for members. An
+  upload id is 32 random bytes, stored as its SHA-256 and usable only by the account that started it (anyone else,
+  an administrator included, gets the 404 of an unknown id). An administrator's `profile` argument only labels whose
+  chat a file belongs to; a member cannot use it.
+- **Partial files and junctions.** The gateway is not sandboxed and writes into folders a member's agent can change.
+  The partial file has a random name (not the id), is created exclusively, and its volume:file index is stored. A
+  piece opens it only when `lstat` shows a plain file (no link) and the opened handle has the stored identity, so a
+  partial file replaced by a link or another file, or a `Web_Uploads` swapped for a junction, is never written
+  through (tested; live, a junction swapped in between two pieces made the next piece 403 and nothing was written
+  outside). After creating the file and after the final rename the gateway checks it is still the same file in the
+  folder resolved at the start, else removes it (`409 upload_moved`, audited). The rename never replaces a file.
+  Residual: a junction swapped in inside the rename call itself could move the finished file - with the person's own
+  content - to where it points; Windows does not let a sandboxed process create a junction to a folder it cannot
+  write, and without a sandbox the agent has the gateway account's rights anyway.
+- **Limits and the disk.** The declared size is the most the server accepts (a piece beyond it, or above 32 MiB, is
+  refused); pieces are written as they arrive with at most 1 MiB held (measured: 600 MB through a live gateway,
+  working set about 50 MB); a piece that brings no byte for 120 s ends (408) and frees its slot; 4 pieces at once
+  and 20 unfinished uploads per person; at the start the disk must have the size, plus what other open uploads still
+  need, plus 1 GB free (507 otherwise); partial files idle for 24 hours are deleted. Residual: no per-person quota -
+  with a raised limit a member can fill the drive of a writable folder with finished files down to the 1 GB margin
+  (as with the old endpoint, faster); retention (23.8) removes unused files eventually.
+- **The old endpoint** (`POST /api/fs/upload`) keeps its ceiling, never above `server.max_upload_mb`: its multipart
+  body is spooled to the system's temporary folder, outside the disk check.
+
+### 23.7 Images sent to the model (spec 039)
+
+The browser makes the copy shown to the model (decoding happens in the browser, not on the gateway); the gateway
+stores the original unchanged. Nothing new reaches the model: images were sent inline before (up to 8 MB an image;
+now at most 10 MB of images per message, and the gateway's limit for one queued or steered message rose from 9 to
+15 MiB with it). As before, the prompt guard reads text only - text written inside an image reaches a vision model
+unchecked. A model sees images only when Goose treats it as vision-capable (`supports_vision`); turning that on for
+a model is the administrator's decision.
+
+### 23.8 Chat retention (spec 040)
+
+New: the gateway deletes chats and files on its own, and what it deletes comes back only from a backup - so the
+safeguards are about data loss.
+
+- **Only after an administrator confirms it (M-3).** Retention never arms itself: nothing is deleted automatically
+  until an administrator confirms the period in Admin > Settings > Files and chats (saving it, or **Start automatic
+  deletion** after the Preview numbers). The first automatic sweep runs a day later and a changed period starts that
+  day again; until then the page says so, the log warns once and `goose-web check` prints `!!`. 0 = never.
+- **What can be deleted.** Only top-level chats of the types Goose lists (`user`, `scheduled`, `acp`), through Goose
+  (`session/delete`), with their sub-agent sessions; never a file by a path the profile chose - file paths come from
+  the gateway's own upload records. A chat's files go only after Goose confirmed the chat's deletion, and a file only
+  when it is still in a folder named `Web_Uploads` (as written and resolved), in a folder the profile may write
+  (`path_ok(write=True)`), a regular file and no link, with the volume:file index recorded at upload (a file put in
+  its place is kept), and not linked to a chat that is kept. Upload rows older than the account are ignored (a
+  deleted account of the same name).
+- **What is never deleted.** A chat that is running, being opened (or whose load Goose never answered), open in a
+  tab, with queued messages, steers, questions or open requests, or running in Goose Desktop or a scheduled job; any
+  chat of a profile whose `sessions.db` cannot be read; a chat when the hub's state cannot be read (kept, logged);
+  anything when retention is 0 or not confirmed; chats of disabled accounts. At most 200 chats per sweep, oldest
+  first; a profile stops at the first chat Goose does not delete.
+- **Mistakes.** The default is 180 days and the native profile (Goose Desktop and CLI history) is included. The page
+  shows the Preview per user (also for a number typed but not saved), Run now asks for a confirmation, and every
+  deletion is audited with the chat id, file count and bytes (`retention.chat_deleted`, `retention.files_deleted`,
+  `retention.run`).
+- **Checked.** Live, without Goose (23.1): the Preview lists only chats past the cut-off and keeps a file shared with
+  a kept chat; Run now deleted nothing (one error per profile, every file still on disk). Tests: files outside
+  `Web_Uploads`, outside writable folders, replaced since the upload or behind a junction are kept. A harness of the
+  assessment that swapped `Web_Uploads` for a junction 2,963 times during 58,802 deletions deleted no outside file.
+- **Last-use records** (`chat_access`) come from the hub's audit hook and the upload link call (ids of at most 128
+  safe characters). Rows for ids Goose does not have are removed at the end of a real sweep of that profile; since
+  M-5 the link call records a use only when it linked something.
+- **Admin API.** Administrators only (403 otherwise; CSRF on Run now).
+- **Residual.** Backups keep what retention deleted (ADMINISTRATION 19.1). A fork made in Goose Desktop does not
+  share the files of its chat; when the original expires, its files go. Files attached before 1.27.0 have no record
+  and are never deleted by retention. A file is checked and then deleted by its path: the window between needs
+  someone who can already write the member's folder (deleting through the opened handle would close it). Last use is
+  under the member's control (opening a chat counts), so a member can keep their own chats.
+
+### 23.9 Opening chats: tab queues, replays, the load watchdog (FIX `chat-open-replay-overflow`)
+
+**Change.** The per-tab send queue was bounded by count (20,000 frames of any size); it is now bounded by bytes:
+64 MiB (`CLIENT_QUEUE_BYTES`) of queued and held frames, of which session notifications may be dropped - the tab then
+gets `_gw/resync` and loads the chat again - and 128 MiB (`CLIENT_QUEUE_HARD_BYTES`) of frames that are never
+dropped (responses, agent requests, gateway notices), past which the socket is closed (`queue-full`). A chat's
+buffer merges the text chunks of one message and keeps at most 5,000 frames. Replays run as tasks, one per tab and
+chat (a newer load of the same chat by the same tab ends the older one), sending JSON arrays of at most 256 KB while
+the tab has at most 4 MiB queued. One upstream `session/load` per chat; tabs of the same profile wait for it. A
+watchdog (`goose.session_load_timeout_seconds`, 180 s) ends a load Goose does not answer.
+
+- **Memory per tab** is bounded in bytes (before: 20,000 entries of up to 64 MiB each). A replay holds references to
+  the chat's buffered strings (at most 12 MB and 5,000 frames per chat) plus the rendered last chunk; frames held
+  back for a tab during its replay count toward its 64 MiB.
+- **No cross-tab exposure.** A waiting tab passed the same `pol.check` (folder roots, policy) for its own
+  `session/load` before it waits, and gets the frames of the chat it asked for from its profile's own upstream, as it
+  would from its own load. `_gw/resync` carries only a session id, to the tab whose frames were dropped; a tab that
+  sends `_gw/resync` or `_gw/unload` itself gets "unknown gateway method" (checked live).
+- **Denial of service.** A tab cannot make the gateway hold unbounded data (byte caps), cannot pin a Goose load
+  forever (watchdog), and cannot force repeated loads of a chat Goose is stuck on (refused at once until Goose's late
+  answer or a worker restart). The browser's retries are bounded (4) and paced (0.5 to 4 s), and its reconnect
+  backoff no longer resets after a socket that dies at once.
+- **Logging.** The overflow warning names profile, user, session id, frame and byte counts - no content.
+  `ws.disconnect` records a reason.
+- **Compatibility.** Scripts on `/ws` get replayed frames as JSON arrays of notifications (CHANGELOG 1.27.0).
+- **Residual.** A chat whose upstream load Goose never answers stays refused until the worker restarts (by design: a
+  second load would hang the same way). A tab that drops frames reloads the chat, which costs a replay; a tab that
+  keeps falling behind repeats that, bounded by the browser's retries.
+
+### 23.10 Idle-chat unloading and the orphan reaper (FIX `idle-sessions-keep-mcp-servers`)
+
+Why: Goose 1.57 keeps a chat's agent and all its stdio MCP servers until the chat is closed; Goose Web never closed
+one, so long-lived workers accumulated processes and memory without bound - a resource-exhaustion path any member
+could drive by opening chats. On Windows Goose also ends only a released server's direct child.
+
+- **Unloading never ends work.** `session/close` cancels a running turn in Goose, so the gateway closes only a chat
+  with no turn, prompt, question, request, queued message or steer, not being loaded, not shown in a connected tab,
+  and idle for the configured time. The decision is checked again under a per-chat lock right before the close, and
+  a prompt or load arriving meanwhile waits for the close and then loads the chat. The close is an internal request
+  (pseudo-method `_gw/unload` in the pending table), never a client action; the client-facing close and delete paths
+  are unchanged.
+- **The silent re-load (corrected after M-1).** A method that needs the agent of a chat the gateway unloaded first
+  loads the chat again, through the chat's one upstream load (23.9) with no tab waiting; the replay goes into the
+  gateway's buffer, to no tab. It runs after the method passed the firewall and the checks that do not depend on the
+  chat's settings. For a member's prompt it runs before the check of the chat's provider, model and approval mode,
+  which is then made on the fresh load result; a member's prompt to a chat never loaded on this connection is loaded
+  the same way first, and a prompt without a load result is refused (M-1). The draft of this section said the
+  re-load ran after every policy and guard check; on the release candidate that order was the gap - the check ran
+  first, on nothing (23.2). The re-load uses the folder recorded at the chat's earlier load or, for a chat not loaded
+  on this connection, the folder Goose stored for it; that folder is not checked against the member's current folder
+  rules again (opening a chat in a tab is), and with the sandbox the agent is held to the member's folders whatever
+  the chat's folder (21.1). Members reach only their own profile's worker, so it opens no other profile's chats.
+- **`current` in `_gw/watch` / `_gw/seen`** lets a socket keep one chat of its own profile loaded (at most 200
+  characters, per socket). A member could pin as many chats as sockets they open - the same as keeping tabs open; no
+  effect on other profiles. Accepted.
+- **What the reaper can end.** Only members of the worker's own job object (a member's processes cannot leave it);
+  only processes it classified while they were part of a configured stdio extension's tree - a direct child of the
+  worker's goose.exe whose command line matches an entry of the profile's `config.yaml`, plus descendants by parent
+  link and creation time; only once the tree's root has ended and the process's ancestor chain no longer reaches
+  goose.exe, after a grace (`goose.orphan_grace_seconds`, 120 s); every end through a handle whose creation time is
+  checked (`stdio_guard._terminate`), so a reused process id is never hit.
+- **What it cannot end.** The worker, the gateway, anything outside the worker's job (another profile's worker and
+  its servers included) and anything it did not classify. A member who can edit their own extensions can at most get
+  processes in their own worker's job ended - for example a developer-shell command whose command line is exactly a
+  configured extension's.
+- **Audit content.** Each end is audited (`worker.orphan_ended`, administrators only) with the command line; values
+  of key, token, secret, password and auth options, URL credentials and long opaque strings are masked. A secret
+  passed as a short positional argument could remain visible to administrators (residual).
+- **Windows calls.** `QueryInformationJobObject` (JobObjectBasicProcessIdList) on the gateway's own job handles,
+  `CreateToolhelp32Snapshot`, `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` and `NtQueryInformationProcess`
+  (ProcessCommandLineInformation, at most 1 MiB), `TerminateProcess` - all within the gateway account's own
+  processes.
+- **Tested** against the real Goose 1.57.0 with the opt-in tests (`GOOSE_WEB_TEST_GOOSE=1`): unloading leaves no
+  server process, a re-loaded chat starts its servers again, and the reaper ends a launcher's orphaned child after
+  the grace. The independent assessment could not run them (23.1).
+
+### 23.11 Read-only copy of a chat (FIX `chat-open-readonly-fallback`)
+
+Why: a chat Goose cannot load was unreadable, although its messages are in the profile's Goose session database all
+the time. `GET /api/sessions/{id}/transcript` (`transcript.py`) reads that database and returns the chat's
+user-visible messages in pages; `readonly.js` shows them behind a button on the chat's error card.
+
+- **The access rules of `session/load`, no wider.** The caller's own profile; `?profile=` with another name only for
+  administrators (403 otherwise, with one message for existing and unknown names) - the `/ws` rule - audited as
+  `transcript.view`, the counterpart of `ws.impersonate`. For a member the firewall's `session/load` check runs with
+  the chat's folder from the database and the member's policy and folders: a chat in a folder the member may no
+  longer use is refused with the same `403 forbidden: <reason>` and audited as `acp.denied` (via the transcript).
+  Another member's chat is not in the caller's database (404). Sign-in as for every route (a pending password change
+  or two-factor enrolment first); GET only.
+- **Never writes Goose's data.** Opened with `mode=ro` and `PRAGMA query_only=1`; a missing database is not created;
+  2 s busy timeout, closed at once. Tested: INSERT, UPDATE, DELETE and CREATE are refused and the file's hash is
+  unchanged. A WAL database nobody has open may get SQLite's `-wal` / `-shm` companions when it is opened (as with
+  `elsewhere.py`); the database file itself is not written.
+- **Input.** The session id must match `^[A-Za-z0-9_.:-]{1,128}$` (400) and is only a bound SQL parameter; `after`
+  and `limit` are whole numbers (400 for text, inf, nan); the SQL text is built from constants only.
+- **Bounded.** 200 messages per page by default, 1,000 at most; per message 200 KB of text and 500 blocks; tool
+  arguments and results 2,000 characters; a page at most 4 MB of JSON and 64 MB of stored content read (rows one at
+  a time); a stored message over 16 MB is not read (a notice instead); 60 requests per person and minute (429).
+  Image data is never returned (its type only).
+- **Rendering.** Goose's text and thinking go through the Markdown sanitiser (marked, then DOMPurify with the
+  existing options); user text, tool text, names and notices are text nodes; `readonly.js` uses no `innerHTML`
+  (tested). The server re-checks an administrator's `?profile=`.
+- **Disclosure.** The copy shows what opening the chat would show, minus live-only parts; messages Goose marks
+  `userVisible: false` (agent-only context) are filtered in SQL and never leave the server.
+- **Checked live (23.1).** Own chat 200; another member's chat 404; `?profile=` as a member 403; a chat in the
+  member's own database whose folder is another member's workspace or a system folder 403; malformed ids 400; 64
+  quick requests gave 60 answers and four 429s, another user unaffected. No browser test of the copy was made.
+
+### 23.12 Residual risks
+
+- A kept sign-in on a stolen or infected device works for up to 24 hours (23.3).
+- A grant copies a provider's key into the grantee's profile; withdrawing it does not make a key already read
+  elsewhere safe again - rotate it (23.4).
+- No per-person upload quota: with a raised limit one member can fill a disk down to the 1 GB margin (23.6; the same
+  class as GW-22).
+- Retention deletes for good; backups keep what it deleted (23.8).
+- A chat whose load Goose never answers stays refused until its worker restarts (23.9).
+- A member's prompt can load the member's own chat again in the folder recorded for it, without the folder check
+  that opening it in a tab makes (23.10); the sandbox still holds the agent to the member's folders.
+- Not run against a real Goose by the independent assessment: retention deletion, unloading, the reaper and chat
+  traffic (23.1). Not tested in a browser by anybody independent: the new front end (uploads, images, the read-only
+  copy).
