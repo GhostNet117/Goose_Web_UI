@@ -104,6 +104,17 @@ def limit_bytes(c) -> int:
     return (clamp_mb(v) if v else config_mb(c.settings)) * MB
 
 
+def single_request_mb(settings) -> int:
+    """The single-request upload (api.fs_upload, multipart) keeps its old ceiling: the smaller of the limit and
+    server.max_upload_mb. Starlette spools multipart files to the system's temp folder, which the disk check of the
+    chunked upload does not cover; larger files go up in pieces (/api/fs/uploads)."""
+    return min(limit_mb(settings), config_mb(settings))
+
+
+def single_request_bytes(c) -> int:
+    return min(limit_bytes(c), config_mb(c.settings) * MB)
+
+
 def limit_text(mb: int) -> str:
     return f"{mb} MB" + (f" ({round(mb / 1024, 2):g} GB)" if mb >= 1024 else "")
 
@@ -476,7 +487,10 @@ async def _start(c, u: dict, request: Request):
     if not raw_dir:
         raise HTTPError(400, "bad_request", "dir (the chat's folder) is required")
     size = b.get("size")
-    if isinstance(size, bool) or not isinstance(size, (int, float)) or size != int(size) or size < 0:
+    try:
+        if isinstance(size, bool) or not isinstance(size, (int, float)) or size != int(size) or size < 0:
+            raise ValueError
+    except (ValueError, OverflowError):     # NaN, Infinity
         raise HTTPError(400, "bad_request", "size must be the file's size in bytes")
     size = int(size)
     lim = limit_bytes(c)

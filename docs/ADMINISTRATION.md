@@ -459,8 +459,10 @@ Behind a reverse proxy:
 
 **Largest file upload** (spec 039): **Admin > Settings > Files and chats > Largest file upload (MB)**, 1 to 5120
 (5 GB). Until it is saved there, `server.max_upload_mb` (default 25) applies; a configured value above 5120 counts
-as 5120 and `goose-web check` says so. The limit is per file, for the chunked upload and the single-request
-`POST /api/fs/upload` alike; people see it in the paper-clip button's tooltip and in the refusal.
+as 5120 and `goose-web check` says so. The limit is per file; people see it in the paper-clip button's tooltip and
+in the refusal. The single-request `POST /api/fs/upload` (older pages, scripts) keeps its ceiling: the smaller of
+this limit and `server.max_upload_mb`, because its multipart body is spooled to the system's temp folder first;
+larger files go up in pieces (`/api/fs/uploads`, API.md).
 
 How a file goes up: the message box declares the file (name, size, chat folder), then sends it in pieces of 16 MB
 (at most 32 MB per request) and the gateway writes each piece straight to a hidden partial file

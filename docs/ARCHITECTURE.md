@@ -1734,8 +1734,9 @@ The REST file endpoints (`/api/fs/*`) use the same check through
 - the directory must pass the path check;
 - non-admins cannot upload a file named `AGENTS.md`, `.goosehints` or
   `.goose-web-hints.md` (`403 hint_file_refused`);
-- size is limited to the upload limit (spec 039: the `max_upload_mb` setting of
-  Admin > Settings over `server.max_upload_mb`, 25 by default, 1..5120), checked
+- size is limited to `server.max_upload_mb` (25), or the administrator's lower
+  upload limit (spec 039: `uploads.single_request_mb`; a higher one is for the
+  chunked upload only - this body is spooled to the temp folder), checked
   against `Content-Length` first and again while streaming in 1 MB chunks;
 - at most 20 files and 20 fields per request.
 
@@ -1776,7 +1777,7 @@ are audited.
   `POST /api/fs/uploads/link {session, ids?, from?, profile?}` (spec 040).
 - `uploads.cleanup` (maintenance loop): `open` rows idle 24 h -> partial file deleted (only if still ours),
   `abandoned`; ended rows dropped after 30 days. `fs_upload` records its files too (`record_saved`, `id` in its
-  answer) and uses the same limit.
+  answer); its limit never exceeds `server.max_upload_mb`.
 
 **Downloads** (`/api/fs/download`):
 

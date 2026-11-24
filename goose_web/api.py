@@ -824,7 +824,7 @@ async def fs_upload(request: Request):
         raise
     if os.path.lexists(d) and not d.is_dir():
         raise HTTPError(409, "name_taken", f"{UPLOAD_FOLDER} exists in this folder and is not a folder")
-    limit = uploads.limit_bytes(c)   # spec 039: Admin > Settings over server.max_upload_mb
+    limit = uploads.single_request_bytes(c)   # spec 039: never above server.max_upload_mb (larger: /api/fs/uploads)
     # app.BodyLimit caps the whole body while it streams in (chunked bodies too), so request.form() never
     # spools more than max_upload_mb to disk (A-2); this early check only gives the same 413 without the middleware.
     try:

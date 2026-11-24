@@ -139,6 +139,10 @@ def test_wrong_offset_and_over_size_are_refused(env, monkeypatch):
         assert r.status_code == 413 and r.json()["message"] == "Uploads are limited to 25 MB"
         for bad in (-1, "12", 1.5, True, None):
             assert start(tc, h, ws, "a", bad).status_code == 400
+        for raw in (b'{"dir": "%s", "name": "a", "size": Infinity}', b'{"dir": "%s", "name": "a", "size": NaN}'):
+            body = raw.replace(b"%s", json.dumps(str(ws))[1:-1].encode())
+            r = tc.post("/api/fs/uploads", content=body, headers={**h, "content-type": "application/json"})
+            assert r.status_code == 400, r.text
         assert tc.post("/api/fs/uploads", json={"name": "a", "size": 1}, headers=h).status_code == 400   # no dir
 
 
@@ -488,13 +492,14 @@ def test_limit_setting_range_and_clamp(env):
         for sent, stored in ((9000, 5120), (0, 1), (300.7, 300), ("2048", 2048), (5120, 5120)):
             assert tc.put("/api/admin/settings", json={"maxUploadMb": sent}, headers=h).status_code == 200
             assert db.get_setting("max_upload_mb") == stored and tc.get("/api/admin/settings").json()["maxUploadMb"] == stored
-            assert gw_app.upload_limit_mb(s) == stored                # app.BodyLimit follows at once
+            assert uploads.limit_mb(s) == stored                      # app.BodyLimit's copy follows at once
+            assert gw_app.upload_limit_mb(s) == min(stored, 25)       # the single-request route keeps its ceiling
         for bad in ("abc", True, [1]):
             r = tc.put("/api/admin/settings", json={"maxUploadMb": bad, "brand": {"name": "X"}}, headers=h)
             assert r.status_code == 400 and db.get_setting("max_upload_mb") == 5120
         assert (db.get_setting("brand") or {}).get("name") != "X"    # nothing written when a value is refused
         assert tc.put("/api/admin/settings", json={"maxUploadMb": None}, headers=h).status_code == 200
-        assert tc.get("/api/admin/settings").json()["maxUploadMb"] == 25 and gw_app.upload_limit_mb(s) == 25
+        assert tc.get("/api/admin/settings").json()["maxUploadMb"] == 25 and uploads.limit_mb(s) == 25
         assert tc.put("/api/admin/settings", json={"maxUploadMb": 1}, headers=h).status_code == 200
     with client_for(c) as tc:
         h = sign_in(tc, c, dee)
@@ -522,6 +527,17 @@ def test_old_endpoint_uses_the_admin_limit_and_records_files(env):
     row = row_of(db, f["id"])
     assert row["state"] == "done" and row["path"] == f["path"] and row["size"] == MB + MB // 2 and row["profile"] == "dee"
     assert row["file_id"]
+    # a higher limit is for the chunked upload: the single request (multipart, spooled to the temp folder) keeps the
+    # configuration's ceiling
+    s.data["server"]["max_upload_mb"] = 1
+    db.set_setting("max_upload_mb", 100)
+    uploads.load_admin_limit(s, db)
+    assert gw_app.upload_limit_mb(s) == 1 and uploads.limit_mb(s) == 100
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        r = tc.post("/api/fs/upload", params={"dir": str(ws)}, headers=h, files=[("f", ("b.bin", b"x" * (MB + MB // 2)))])
+        assert r.status_code == 413 and r.json()["message"] == "Uploads are limited to 1 MB"
+        assert start(tc, h, ws, "b.bin", MB + MB // 2).status_code == 200
 
 
 def test_check_reports_the_upload_limit(tmp_path):

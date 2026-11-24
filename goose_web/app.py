@@ -90,7 +90,7 @@ _MULTIPART_SLACK = 64 * 1024   # multipart boundaries and part headers on top of
 
 
 def upload_limit_mb(settings: Settings) -> int:
-    return uploads.limit_mb(settings)   # spec 039: Admin > Settings over server.max_upload_mb, 1..5120
+    return uploads.single_request_mb(settings)   # spec 039: never above server.max_upload_mb (multipart spools)
 
 
 class BodyLimit:
