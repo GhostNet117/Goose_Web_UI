@@ -777,6 +777,21 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .term.live { border-color: color-mix(in srgb, var(--accent-2) 30%, var(--border)); }
 .term.stderr { color: color-mix(in srgb, var(--err) 75%, var(--term-fg)); }
 .json { color: var(--fg-2); }
+/* Read-only copy of a chat (readonly.js, FIX chat-open-readonly-fallback) */
+.readonly { display: flex; flex-direction: column; gap: 6px; }
+.readonly > .banner { position: sticky; top: 0; z-index: 2; }
+.ro-head { margin: 6px 0 2px; }
+.ro-title { font-weight: 600; font-size: 1.05em; overflow-wrap: anywhere; }
+.ro-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.ro-tool > summary { list-style: none; }
+.ro-tool > summary::-webkit-details-marker { display: none; }
+.ro-tool.is-error { border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
+.ro-pre {
+  margin: 0; padding: 8px 10px; border-radius: var(--r-sm); background: var(--term-bg); color: var(--term-fg); border: 1px solid var(--border);
+  font: 400 12.5px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; overflow: auto; max-height: 320px;
+}
+.ro-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 14px 0 6px; }
+.ro-error { color: var(--err); }
 .diff { border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden; background: var(--term-bg); }
 .diff-head { display: flex; align-items: center; gap: 6px; padding: 5px 10px; font: 500 12px var(--mono); color: var(--fg-2); border-bottom: 1px solid var(--border); background: var(--bg-3); }
 .diff-body { max-height: 420px; overflow: auto; padding: 4px 0; }

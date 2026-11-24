@@ -15,6 +15,7 @@ import { visibilityContext, pickerHidden, HIDDEN_LABEL, knownDefaultProvider } f
 import { groupsConfig, groupPicker, groupOfProvider, headerPickers, groupDefault, isGroupValue, splitValue, inventory, loadInventoryOnce, GROUP_PREFIX } from '../providergroups.js';
 import { setBaseTitle, agentFor } from '../herd.js';
 import { mdElement } from '../markdown.js';
+import { offerReadOnly } from '../readonly.js';
 
 export function renderChat(ctx, sessionId) {
   const chat = getChat(sessionId);
@@ -228,6 +229,7 @@ export function renderChat(ctx, sessionId) {
     if (chat.error && !chat.loaded) {
       errorEl.hidden = false;
       errorEl.replaceChildren(empty('alert', 'Could not open this session', errMsg(chat.error), btn('Retry', () => chat.reload(), { icon: 'refresh' }), btn('Back to herd', () => router.go('/herd'))));
+      offerReadOnly(errorEl, chat.id, chat.error, () => chat.reload());   // "Show a read-only copy" (FIX chat-open-readonly-fallback)
     } else errorEl.hidden = true;
   };
 
