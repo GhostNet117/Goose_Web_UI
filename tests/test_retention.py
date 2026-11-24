@@ -364,6 +364,15 @@ def test_running_loading_and_open_chats_are_skipped(rt):
     assert chats_left(rt, dee) == ["ASK", "ELSE", "JOB", "LOAD", "QUEUE", "REQ", "RUN", "TAB"]
 
 
+def test_a_hub_that_cannot_be_asked_keeps_the_chats(rt):
+    s, db, pr, c, hub = rt
+    dee = member(rt)
+    chat(rt, dee, "OLD", 400)
+    del hub.upstreams["dee"].asks          # e.g. the hub's state looks different after a refactoring
+    r = sweep(c)
+    assert r["chats"] == 0 and r["busy"] == 1 and chats_left(rt, dee) == ["OLD"]
+
+
 def test_at_most_200_chats_per_sweep(rt):
     s, db, pr, c, hub = rt
     dee = member(rt)

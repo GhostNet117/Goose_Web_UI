@@ -236,15 +236,17 @@ def sessions_in_use(hub: Any, key: str) -> set[str]:
 
 
 def _in_use(c, keys: list[str], sid: str, jobs: set[tuple[str, str]]) -> bool:
+    """True when the chat must not be deleted now - also when the hub cannot be asked (keep it)."""
     hub = c.hub
     for k in keys:
-        if sid in sessions_in_use(hub, k) or (k, sid) in jobs:
-            return True
         try:
+            if sid in sessions_in_use(hub, k) or (k, sid) in jobs:
+                return True
             if hub is not None and hub.elsewhere_running(k, sid):
                 return True
         except Exception:
-            return True   # cannot tell: keep it
+            log.exception("retention: cannot tell whether chat %s is in use; it is kept", sid)
+            return True
     return False
 
 
