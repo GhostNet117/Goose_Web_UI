@@ -85,7 +85,8 @@ class Sink:
         self.event = asyncio.Event()
 
     async def send(self, raw):
-        self.msgs.append(json.loads(raw))
+        m = json.loads(raw)
+        self.msgs.extend(m if isinstance(m, list) else [m])   # replays come in JSON-array batches
         self.event.set()
 
     async def wait_for(self, pred, timeout=5):

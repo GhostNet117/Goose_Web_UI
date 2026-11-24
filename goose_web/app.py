@@ -438,10 +438,14 @@ async def ws_endpoint(websocket: WebSocket):
     c.hub.attach(up, client)
     opened = time.time()
     activity.record("ws.connect", user=user, ip=ip, target=target["username"])
+    # FIX chat-open-replay-overflow: why the socket ended - client (the browser closed it), queue-full (a tab that never
+    # reads), kick (SC-3), error (a send or receive failed, an oversized frame) or shutdown (the gateway stops)
+    reason = "client"
     try:
         while True:
             raw = await websocket.receive_text()
             if len(raw) > 64 * 1024 * 1024:
+                reason = "error"
                 break
             try:
                 msg = json.loads(raw)
@@ -459,15 +463,19 @@ async def ws_endpoint(websocket: WebSocket):
                                  "error": {"code": -32603, "message": f"Internal error ({e.__class__.__name__}, "
                                                                      "see the gateway log)"}})
             if client.closed:
+                reason = client.reason or "error"
                 break
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as e:
+        reason = client.reason or ("shutdown" if e.code == 1012 else "client")
     except RuntimeError:
-        pass
+        reason = client.reason or "error"
+    except asyncio.CancelledError:
+        reason = "shutdown"
+        raise
     finally:
         c.hub.detach(up, client)
         activity.record("ws.disconnect", user=user, ip=ip, target=target["username"],
-                        detail={"seconds": round(time.time() - opened)})
+                        detail={"seconds": round(time.time() - opened), "reason": reason})
 
 
 # ---------------------------------------------------------------------- notifications (webhooks)

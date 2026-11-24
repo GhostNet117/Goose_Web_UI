@@ -37,6 +37,23 @@ log = logging.getLogger("goose_web.hub")
 
 SESSION_BUFFER_BYTES = 12 * 1024 * 1024
 TOTAL_BUFFER_BYTES = 256 * 1024 * 1024
+# FIX chat-open-replay-overflow: a long run streams one frame per text chunk (tens of thousands). Consecutive chunks of
+# one message are merged in the buffer (ChunkTail), which also keeps at most this many frames: beyond it the buffer is
+# truncated like at SESSION_BUFFER_BYTES, so an idle chat is loaded from Goose again.
+SESSION_BUFFER_FRAMES = 5000
+COALESCED_UPDATES = ("agent_message_chunk", "agent_thought_chunk")
+# A tab's send queue is bounded by bytes, not frames. Beyond CLIENT_QUEUE_BYTES its session frames are dropped and the
+# tab is told to load those chats again (_gw/resync); only frames that must not be dropped (responses, agent requests,
+# gateway notices) beyond CLIENT_QUEUE_HARD_BYTES end the socket (a tab that never reads).
+CLIENT_QUEUE_BYTES = 64 * 1024 * 1024
+CLIENT_QUEUE_HARD_BYTES = 2 * CLIENT_QUEUE_BYTES
+REPLAY_BATCH_BYTES = 256 * 1024        # replayed frames go out as JSON arrays of at most this size
+REPLAY_QUEUE_BYTES = 4 * 1024 * 1024   # a replay waits while the tab still has more than this to receive
+SESSION_LOAD_TIMEOUT = 180             # default of goose.session_load_timeout_seconds (0 = no watchdog)
+RESYNC = "_gw/resync"
+WORKER_RESTARTING = "the Goose worker is restarting"
+RESYNC_ERROR = {"code": -32000, "message": "this tab could not receive the chat as fast as it was sent: open it again",
+                "data": {"resync": True}}
 AGENT_REQUESTS = {"session/request_permission", "elicitation/create", "_goose/unstable/session/recipe/request-params"}
 SESSION_NOTIFICATIONS = {"session/update", "_goose/unstable/session/update"}
 RPC_FORBIDDEN = -32003
@@ -286,6 +303,97 @@ class RpcError(Exception):
         return e
 
 
+def chunk_key(msg: Any) -> tuple | None:
+    """(sessionId, update kind, messageId) of a text chunk that may be merged with the chunk before it, else None.
+    Only agent message / thought text chunks: the browser appends consecutive ones of one message to one item."""
+    if not isinstance(msg, dict) or msg.get("method") != "session/update":
+        return None
+    p = msg.get("params")
+    u = p.get("update") if isinstance(p, dict) else None
+    if not isinstance(u, dict) or u.get("sessionUpdate") not in COALESCED_UPDATES:
+        return None
+    c = u.get("content")
+    if not isinstance(c, dict) or c.get("type") != "text" or not isinstance(c.get("text"), str):
+        return None
+    meta = u.get("_meta")
+    goose = meta.get("goose") if isinstance(meta, dict) else None
+    mid = u.get("messageId") or (goose.get("messageId") if isinstance(goose, dict) else None)
+    return (str(p.get("sessionId") or ""), u["sessionUpdate"], None if mid is None else str(mid))
+
+
+class ChunkTail:
+    """The last buffered frame while later chunks of the same message may still extend it (FIX
+    chat-open-replay-overflow). Kept unserialized - the message and its text pieces - so a merge costs only the new
+    piece (re-serializing on every merge would be quadratic); serialized when a replay reads it (cached) and for good
+    when the next frame does not belong to it."""
+    __slots__ = ("key", "msg", "content", "pieces", "size", "_raw")
+
+    def __init__(self, msg: dict, key: tuple, raw: str):
+        params = dict(msg["params"])
+        update = dict(params["update"])
+        self.content = dict(update["content"])   # own copies along the path: the text is replaced when rendering
+        update["content"] = self.content
+        params["update"] = update
+        self.msg = {**msg, "params": params}
+        self.key = key
+        self.pieces = [self.content["text"]]
+        self.size = len(raw)
+        self._raw: str | None = raw
+
+    def add(self, text: str) -> int:
+        self.pieces.append(text)
+        self._raw = None
+        self.size += len(text)
+        return len(text)
+
+    def render(self) -> str:
+        if self._raw is None:
+            text = "".join(self.pieces)
+            self.pieces = [text]
+            self.content["text"] = text
+            self._raw = json.dumps(self.msg, separators=(",", ":"), ensure_ascii=False)
+        return self._raw
+
+
+def replay_batches(frames: list[str], limit: int | None = None):
+    """Serialized frames as JSON arrays of at most `limit` characters (a larger frame goes alone, unwrapped)."""
+    limit = limit or REPLAY_BATCH_BYTES
+    out: list[str] = []
+    size = 2
+    for f in frames:
+        if out and size + len(f) + 1 > limit:
+            yield out[0] if len(out) == 1 else "[" + ",".join(out) + "]"
+            out, size = [], 2
+        out.append(f)
+        size += len(f) + 1
+    if out:
+        yield out[0] if len(out) == 1 else "[" + ",".join(out) + "]"
+
+
+@dataclass(eq=False)
+class LoadWaiter:
+    """A tab opening a chat (FIX chat-open-replay-overflow). It is sent what the hub has of the chat so far (the
+    catch-up, in batches at the pace the tab reads), then the frames that arrived meanwhile (held), and the answer."""
+    client: Any
+    sid: str
+    mid: Any
+    gen: int                       # client.dropped[sid] when it asked: a different value later = frames were dropped
+    final: dict | None = None      # the answer once known (a replay knows it at once, a load when Goose answers)
+    final_at: int = 0              # held frames that go before the answer
+    task: asyncio.Task | None = None   # the catch-up while it runs
+    load: Any = None               # the UpstreamLoad it waits for; None = a replay from the buffer
+
+
+@dataclass(eq=False)
+class UpstreamLoad:
+    """The one session/load of a chat sent to Goose (its pending entry has no client); every tab that opens the chat
+    meanwhile waits for it."""
+    up_id: int
+    started: float = field(default_factory=time.time)
+    waiters: list = field(default_factory=list)
+    timer: Any = None              # the watchdog (goose.session_load_timeout_seconds)
+
+
 SESSION_STATES_MAX = 2000       # session states kept per worker before idle ones are dropped (B-7)
 
 
@@ -304,7 +412,8 @@ class SessionState:
     truncated: bool = False
     loaded: bool = False
     load_result: dict | None = None
-    loading_client: Any = None
+    loading: Any = None            # UpstreamLoad in flight (one per chat, FIX chat-open-replay-overflow)
+    abandoned: int | None = None   # upstream id of a load the watchdog gave up on, until Goose's late answer
     prompts: int = 0
     last_touch: float = field(default_factory=time.time)
     wrote_at: float = 0.0   # spec 020: when Goose Web last changed this session (prompt, turn end, edit) - not a load
@@ -378,7 +487,20 @@ class Client:
         self.herd_all = False
         self.elsewhere = False   # spec 020: an administrator's tab that asked for the "running elsewhere" list
         self.closed = False
-        self.queue: asyncio.Queue[str] = asyncio.Queue(maxsize=20000)
+        self.reason = ""         # why the gateway ended this socket: queue-full | kick (app.py: ws.disconnect detail)
+        self.key = ""            # profile key of the upstream it is attached to (log lines)
+        # FIX chat-open-replay-overflow: the send queue is bounded by bytes. Entries are (text, sid): sid = a session
+        # notification the gateway may drop (the tab is then told to load that chat again), None = kept.
+        self._q: deque[tuple[str, str | None]] = deque()
+        self.qbytes = 0          # queued, all entries
+        self.kept_bytes = 0      # queued, kept entries
+        self.hold_bytes = 0      # held (below)
+        self._wake = asyncio.Event()
+        self._room = asyncio.Event()
+        self.holds: dict[str, list] = {}       # sid -> live frames held back while this tab is sent that chat
+        self.replays: dict[str, Any] = {}      # sid -> the LoadWaiter of a session/load of this tab
+        self.stale: set[str] = set()           # chats whose frames were dropped: no more until the tab loads them
+        self.dropped: dict[str, int] = {}      # sid -> how often frames of that chat were dropped
         self.task: asyncio.Task | None = None
         # SC-3, wired by the app: close the socket itself (the read loop is waiting on it), and re-check that the
         # session / API token this socket signed in with is still valid
@@ -391,31 +513,123 @@ class Client:
     async def _pump(self) -> None:
         try:
             while True:
-                msg = await self.queue.get()
-                await self._send(msg)
+                if not self._q:
+                    self._wake.clear()
+                    await self._wake.wait()
+                    continue
+                raw, sid = self._q.popleft()
+                self.qbytes -= len(raw)
+                if sid is None:
+                    self.kept_bytes -= len(raw)
+                if self.qbytes <= REPLAY_QUEUE_BYTES:
+                    self._room.set()
+                await self._send(raw)
         except Exception:
             self.closed = True
+            self._room.set()
 
     def send(self, obj: dict | str) -> None:
+        """A frame the tab must get: a response, an agent request, a gateway notice."""
         if self.closed:
             return
-        try:
-            self.queue.put_nowait(obj if isinstance(obj, str) else json.dumps(obj, separators=(",", ":")))
-        except asyncio.QueueFull:  # a stuck tab must not stall the agent; drop it
-            self.closed = True
-            if self.task:
-                self.task.cancel()
+        self._put(obj if isinstance(obj, str) else json.dumps(obj, separators=(",", ":")), None)
 
-    def close(self) -> None:
+    def push(self, sid: str, raw: str) -> None:
+        """A notification of the chat `sid`: held while that chat is being sent to this tab, dropped while it is stale."""
+        if self.closed or sid in self.stale:
+            return
+        held = self.holds.get(sid)
+        if held is None:
+            self._put(raw, sid)
+            return
+        held.append((raw, sid))
+        self.hold_bytes += len(raw)
+        if self.qbytes + self.hold_bytes > CLIENT_QUEUE_BYTES:
+            self._overflow()
+
+    def put_frames(self, sid: str, raw: str) -> None:
+        """Replayed frames of `sid` (one JSON array): queued now, never held."""
+        if not self.closed and sid not in self.stale:
+            self._put(raw, sid)
+
+    def unhold(self, sid: str) -> list:
+        held = self.holds.pop(sid, None) or []
+        self.hold_bytes -= sum(len(r) for r, _ in held)
+        return held
+
+    def put_held(self, entries: list) -> None:
+        for raw, sid in entries:
+            if self.closed:
+                return
+            if sid is None or sid not in self.stale:
+                self._put(raw, sid)
+
+    def _put(self, raw: str, sid: str | None) -> None:
+        self._q.append((raw, sid))
+        self.qbytes += len(raw)
+        if sid is None:
+            self.kept_bytes += len(raw)
+        self._wake.set()
+        if self.qbytes + self.hold_bytes > CLIENT_QUEUE_BYTES:
+            self._overflow()
+
+    def _overflow(self) -> None:
+        """More than CLIENT_QUEUE_BYTES waits for this tab (it reads slower than its chats stream, or not at all). Its
+        session frames are dropped - never responses or agent requests - and it is told to load those chats again;
+        until it does, their frames are not queued. A replay of such a chat answers -32000 {resync: true}."""
+        if self.qbytes - self.kept_bytes + self.hold_bytes > 0:
+            lost: dict[str, list[int]] = {}
+            kept: deque[tuple[str, str | None]] = deque()
+            for raw, sid in self._q:
+                if sid is None:
+                    kept.append((raw, sid))
+                else:
+                    x = lost.setdefault(sid, [0, 0])
+                    x[0] += 1
+                    x[1] += len(raw)
+            for sid, held in self.holds.items():
+                if held:
+                    x = lost.setdefault(sid, [0, 0])
+                    x[0] += len(held)
+                    x[1] += sum(len(r) for r, _ in held)
+                    held.clear()
+            self._q, self.qbytes, self.hold_bytes = kept, self.kept_bytes, 0
+            for sid, (frames, nbytes) in lost.items():
+                self.stale.add(sid)
+                self.dropped[sid] = self.dropped.get(sid, 0) + 1
+                log.warning("tab queue overflow (profile %s, user %s, session %s): dropped %d frame(s), %d bytes; the "
+                            "tab is told to load the chat again", self.key, self.user.get("username"), sid, frames,
+                            nbytes)
+                raw = json.dumps({"jsonrpc": "2.0", "method": RESYNC, "params": {"sessionId": sid}},
+                                 separators=(",", ":"))
+                self._q.append((raw, None))
+                self.qbytes += len(raw)
+                self.kept_bytes += len(raw)
+        if self.kept_bytes > CLIENT_QUEUE_HARD_BYTES:
+            log.warning("tab queue full (profile %s, user %s): %d bytes of responses and requests unread; closing the "
+                        "socket", self.key, self.user.get("username"), self.kept_bytes)
+            self.disconnect("queue full", kind="queue-full")
+
+    async def wait_room(self) -> None:
+        """Until the tab has at most REPLAY_QUEUE_BYTES left to receive (or the socket is gone)."""
+        while self.qbytes > REPLAY_QUEUE_BYTES and not self.closed:
+            self._room.clear()
+            await self._room.wait()
+
+    def close(self, reason: str = "") -> None:
+        if reason and not self.reason:
+            self.reason = reason
         self.closed = True
+        self._room.set()
         if self.task:
             self.task.cancel()
 
-    def disconnect(self, reason: str = "") -> None:
-        """SC-3: end this socket now (user deleted / disabled / signed out elsewhere): nothing it sends is handled."""
+    def disconnect(self, reason: str = "", kind: str = "kick") -> None:
+        """SC-3: end this socket now (user deleted / disabled / signed out elsewhere): nothing it sends is handled.
+        Also a tab that never reads (kind queue-full)."""
         if self.closed and self.kick is None:
             return
-        self.close()
+        self.close(kind)
         kick, self.kick = self.kick, None
         if kick is not None:
             try:
@@ -457,9 +671,21 @@ class Upstream:
     def worker(self) -> Worker:
         return self.hub.workers.workers[self.key]
 
+    def _channel_gone(self) -> bool:
+        """A stdio worker whose process has exited while its connection still looks ready (RC5 of
+        chat-open-replay-overflow): nothing sent to it is ever answered."""
+        proc = getattr(self.ws, "proc", None)
+        try:
+            return proc is not None and proc.poll() is not None
+        except Exception:
+            return False
+
     async def ensure(self) -> None:
         if self.state == "ready" and self.ws is not None:
-            return
+            if not self._channel_gone():
+                return
+            log.warning("the Goose worker of %s has exited but its connection looked ready: reconnecting", self.key)
+            await self.reset(WORKER_RESTARTING)
         async with self._connect_lock:
             if self.state == "ready" and self.ws is not None:
                 return
@@ -514,6 +740,18 @@ class Upstream:
                 fut.set_exception(RpcError(-32000, reason))
             elif client is not None:
                 client.send({"jsonrpc": "2.0", "id": cid, "error": {"code": -32000, "message": reason}})
+        # tabs opening a chat: from Goose (the load's pending entry has no client) or from the buffer cleared below
+        err = {"code": -32000, "message": reason}
+        for s in self.sessions.values():
+            ld, s.loading, s.abandoned = s.loading, None, None
+            if ld is not None:
+                if ld.timer is not None:
+                    ld.timer.cancel()
+                for w in list(ld.waiters):
+                    self._fail_waiter(w, err)
+        for c in list(self.clients):
+            for w in list(c.replays.values()):
+                self._fail_waiter(w, err)
         for aid, ask in list(self.asks.items()):
             self.broadcast({"jsonrpc": "2.0", "method": "_gw/ask_resolved",
                             "params": {"id": ask["msg"]["id"], "sessionId": ask["sessionId"], "by": "worker-restart"}})
@@ -556,9 +794,15 @@ class Upstream:
             self._fail_all("the Goose worker connection closed")
 
     async def _send(self, obj: dict) -> None:
-        if self.ws is None:
+        ws = self.ws
+        if ws is None:
             raise RpcError(-32000, "Goose is not connected")
-        await self.ws.send(json.dumps(obj, separators=(",", ":")))
+        try:
+            await ws.send(json.dumps(obj, separators=(",", ":")))
+        except (OSError, websockets.ConnectionClosed) as e:   # OSError: also a stdio channel's ConnectionError
+            # RC5: the caller answers the tab and drops the pending entry, as for any RpcError
+            log.warning("sending to the Goose worker of %s failed: %s", self.key, e.__class__.__name__)
+            raise RpcError(-32000, WORKER_RESTARTING) from e
 
     # ------------------------------------------------------------ requests
     def _new_id(self) -> int:
@@ -598,8 +842,9 @@ class Upstream:
         asked |= {str(e[4].get("sessionId") or "") for e in self.pending.values()
                   if len(e) > 4 and isinstance(e[4], dict)}
         idle = sorted((s for s in self.sessions.values()
-                       if not s.running() and not s.queue and not s.steers and s.loading_client is None
-                       and s.sid not in watched and s.sid not in asked), key=lambda s: s.last_touch)
+                       if not s.running() and not s.queue and not s.steers and s.loading is None
+                       and s.abandoned is None and s.sid not in watched and s.sid not in asked),
+                      key=lambda s: s.last_touch)
         for s in idle[:max(1, len(self.sessions) - SESSION_STATES_MAX * 9 // 10)]:
             if self.sessions.pop(s.sid, None) is not None:
                 # what it had buffered leaves the gateway-wide count with it (as when a chat is closed)
@@ -691,6 +936,7 @@ class Upstream:
         params = msg.get("params")
         if params is None:
             params = {}
+        load: UpstreamLoad | None = None
         try:
             pol.check(method, params, is_admin=client.is_admin, policy=client.policy, roots=client.roots)
             if method == "session/new" and client.is_admin:
@@ -747,25 +993,9 @@ class Upstream:
                 self.hub.audit_activity(client, self, method, params)   # SA-10: only what passed the guard
             await self.ensure()
             if method == "session/load":
-                sid = str(params.get("sessionId") or "")
-                s = self.sess(sid)
-                # Live in this worker: replay from the buffer (never reload a running session upstream).
-                if s.loaded and s.running():
-                    self._replay(client, s, mid)
-                    return
-                # Idle: the buffer is only good while nobody else (Goose Desktop, the CLI, a schedule) has
-                # written the session since. Compare the stored fingerprint with Goose's current one.
-                if s.loaded and s.load_result is not None and not s.truncated and s.fp is not None \
-                        and not s.fp_pending:
-                    fp = await self._fingerprint(sid)
-                    if fp is not None and same_content(fp, s.fp) and not s.running():
-                        self._replay(client, s, mid)
-                        return
-                self.hub.total_buffer -= s.buffer_bytes
-                s.buffer.clear()
-                s.buffer_bytes, s.truncated, s.fp = 0, False, None
-                s.loading_client = client
-                s.cwd = str(params.get("cwd") or s.cwd)
+                load = await self._open_chat(client, mid, params)
+                if load is None:
+                    return   # answered from the buffer, or waiting for the load of this chat already in flight
         except pol.Denied as e:
             self.hub.audit_denied(client, method, str(e))
             if mid is not None:
@@ -810,11 +1040,17 @@ class Upstream:
                                   separators=(",", ":"))
                 self._buffer(s, echo)
                 for c in list(self.clients):
-                    if c is not client and s.sid in c.watch:
-                        c.send(echo)
+                    if c is not client and (s.sid in c.watch or s.sid in c.holds):
+                        c.push(s.sid, echo)
         self.hub.audit_call(client, self, method, params)
         if mid is None:  # notification (e.g. session/cancel)
-            await self._send({"jsonrpc": "2.0", "method": method, "params": params})
+            try:
+                await self._send({"jsonrpc": "2.0", "method": method, "params": params})
+            except RpcError:
+                pass   # nobody to answer; the worker's restart is announced to every tab
+            return
+        if load is not None:
+            await self._send_load(load, params)
             return
         up_id = self._new_id()
         self.pending[up_id] = (client, mid, None, method, params)
@@ -1369,7 +1605,7 @@ class Upstream:
         fps = await asyncio.gather(*[self._fingerprint(s.sid) for s in cands])
         changed = []
         for s, fp in zip(cands, fps):
-            if fp is None or s.running() or s.fp_pending or s.loading_client is not None:
+            if fp is None or s.running() or s.fp_pending or s.loading is not None or s.abandoned is not None:
                 continue
             if fp[2] and fp[2] != s.title:   # renamed (auto-naming, or elsewhere): metadata only
                 s.title = fp[2]
@@ -1385,15 +1621,215 @@ class Upstream:
                                        "title": fp[2]}})
         return changed
 
+    # ------------------------------------------------------------ opening a chat (FIX chat-open-replay-overflow)
+    def _load_timeout(self) -> float:
+        s = getattr(self.hub.workers, "s", None)
+        v = s.get("goose", "session_load_timeout_seconds", SESSION_LOAD_TIMEOUT) if s is not None else None
+        try:
+            return max(0.0, float(SESSION_LOAD_TIMEOUT if v is None else v))
+        except (TypeError, ValueError):
+            return float(SESSION_LOAD_TIMEOUT)
+
+    async def _open_chat(self, client: Client, mid: Any, params: dict) -> UpstreamLoad | None:
+        """session/load. A chat live in this worker, or idle and unchanged elsewhere, is replayed from the buffer; a
+        load of it already in flight gets this tab as one more waiter (one upstream load per chat); otherwise a new
+        upstream load is set up and returned for the caller to send."""
+        sid = str(params.get("sessionId") or "")
+        s = self.sess(sid)
+        if mid is None:
+            return None   # a load nobody waits for
+        client.stale.discard(sid)   # the tab loads it again: its frames flow again
+        self._drop_waiter(client, sid, "superseded by a newer load of this chat")
+        # Idle: the buffer is only good while nobody else (Goose Desktop, the CLI, a schedule) has written the session
+        # since. Compare the stored fingerprint with Goose's current one.
+        if s.loading is None and s.abandoned is None and not s.running() and s.loaded and \
+                s.load_result is not None and not s.truncated and s.fp is not None and not s.fp_pending:
+            fp = await self._fingerprint(sid)
+            if client.closed:
+                return None
+            if fp is not None and same_content(fp, s.fp) and s.loading is None and s.abandoned is None and \
+                    not s.running() and s.loaded and s.load_result is not None and not s.truncated:
+                self._replay(client, s, mid)
+                return None
+        if s.abandoned is not None:
+            raise RpcError(-32000, f"Goose has not answered an earlier load of this chat (it did not answer within "
+                                   f"{self._load_timeout():g} s): try again later")
+        if s.loading is not None:
+            self._open_waiter(s, client, mid, self._frames(s), load=s.loading)
+            return None
+        # Live in this worker: replay from the buffer (never reload a running session upstream).
+        if s.loaded and s.running():
+            self._replay(client, s, mid)
+            return None
+        self.hub.total_buffer -= s.buffer_bytes
+        s.buffer.clear()
+        s.buffer_bytes, s.truncated, s.fp = 0, False, None
+        s.cwd = str(params.get("cwd") or s.cwd)
+        ld = s.loading = UpstreamLoad(self._new_id())
+        self._open_waiter(s, client, mid, [], load=ld)
+        return ld
+
+    @staticmethod
+    def _frames(s: SessionState) -> list[str]:
+        return [x.render() if isinstance(x, ChunkTail) else x for x in s.buffer]
+
     def _replay(self, client: Client, s: SessionState, mid: Any) -> None:
-        for raw in list(s.buffer):
-            client.send(raw)
+        """Send a chat from the hub buffer: its frames in batches at the tab's pace, then the load result as it was when
+        the frames were taken. Frames arriving meanwhile are held and follow the result."""
         result = dict(s.load_result or {})
         meta = dict(result.get("_meta") or {})
         meta["gw"] = {"replayed": True, "running": s.running(), "truncated": s.truncated}
         result["_meta"] = meta
-        self._reply(client, mid, result)
         client.watch.add(s.sid)
+        self._open_waiter(s, client, mid, self._frames(s), final={"jsonrpc": "2.0", "id": mid, "result": result})
+
+    def _open_waiter(self, s: SessionState, client: Client, mid: Any, frames: list[str], final: dict | None = None,
+                     load: UpstreamLoad | None = None) -> LoadWaiter:
+        w = LoadWaiter(client, s.sid, mid, client.dropped.get(s.sid, 0), final=final, load=load)
+        client.replays[s.sid] = w
+        if load is not None:
+            load.waiters.append(w)
+        if frames:
+            client.holds[s.sid] = []   # taken together with the snapshot: nothing is lost or sent twice
+            w.task = asyncio.create_task(self._catch_up(w, frames))
+        elif final is not None:
+            self._waiter_done(w)
+        return w
+
+    @staticmethod
+    def _dropped(w: LoadWaiter) -> bool:
+        return w.client.dropped.get(w.sid, 0) != w.gen
+
+    async def _catch_up(self, w: LoadWaiter, frames: list[str]) -> None:
+        c = w.client
+        for batch in replay_batches(frames):
+            await c.wait_room()
+            if c.closed or self._dropped(w):
+                break
+            c.put_frames(w.sid, batch)
+        # no await from here on: the held frames, the answer and later frames keep their order
+        w.task = None
+        held = c.unhold(w.sid)
+        if c.closed:
+            return
+        if self._dropped(w):
+            self._fail_waiter(w, RESYNC_ERROR)
+            return
+        if w.final is None:   # Goose has not answered yet: from now on this tab gets the load's frames as they come
+            c.put_held(held)
+            return
+        c.put_held(held[:w.final_at])
+        self._waiter_done(w)
+        c.put_held(held[w.final_at:])
+
+    def _waiter_done(self, w: LoadWaiter) -> None:
+        c = w.client
+        if c.replays.get(w.sid) is w:
+            del c.replays[w.sid]
+        if w.load is not None and w in w.load.waiters:
+            w.load.waiters.remove(w)
+        out = w.final
+        if out is None or c.closed:
+            return
+        if "result" in out:
+            if self._dropped(w):
+                out = {"jsonrpc": "2.0", "id": w.mid, "error": RESYNC_ERROR}
+            else:
+                c.watch.add(w.sid)
+        c.send(out)
+
+    def _fail_waiter(self, w: LoadWaiter, err: dict) -> None:
+        c = w.client
+        if w.task is not None:
+            w.task.cancel()
+            w.task = None
+            c.unhold(w.sid)
+        if c.replays.get(w.sid) is w:
+            del c.replays[w.sid]
+        if w.load is not None and w in w.load.waiters:
+            w.load.waiters.remove(w)
+        if not c.closed:
+            c.send({"jsonrpc": "2.0", "id": w.mid, "error": err})
+
+    def _drop_waiter(self, client: Client, sid: str, why: str) -> None:
+        w = client.replays.get(sid)
+        if w is not None:
+            self._fail_waiter(w, {"code": -32000, "message": why})
+
+    def forget_client(self, client: Client) -> None:
+        """The socket is gone: its loads stop waiting (an upstream load goes on and fills the buffer)."""
+        for w in list(client.replays.values()):
+            if w.task is not None:
+                w.task.cancel()
+                w.task = None
+            if w.load is not None and w in w.load.waiters:
+                w.load.waiters.remove(w)
+        client.replays.clear()
+        client.holds.clear()
+        client.hold_bytes = 0
+
+    async def _send_load(self, ld: UpstreamLoad, params: dict) -> None:
+        """Send the chat's one upstream session/load (internal pending entry: the waiters are answered from it)."""
+        sid = str(params.get("sessionId") or "")
+        self.pending[ld.up_id] = (None, None, None, "session/load", params)
+        t = self._load_timeout()
+        if t > 0:
+            ld.timer = asyncio.get_running_loop().call_later(t, self._load_watchdog, sid, ld)
+        try:
+            await self._send({"jsonrpc": "2.0", "id": ld.up_id, "method": "session/load", "params": params})
+        except RpcError as e:
+            self.pending.pop(ld.up_id, None)
+            s = self.sessions.get(sid)
+            if s is not None and s.loading is ld:
+                s.loading = None
+                if ld.timer is not None:
+                    ld.timer.cancel()
+                for w in list(ld.waiters):
+                    self._fail_waiter(w, e.to_json())
+
+    def _load_answered(self, up_id: int, params: dict, msg: dict) -> None:
+        sid = str(params.get("sessionId") or "")
+        s = self.sessions.get(sid)
+        if s is None:
+            return
+        if s.abandoned == up_id:
+            # the watchdog gave up on this load and its frames were dropped: the buffer does not hold the chat
+            s.abandoned = None
+            log.info("Goose answered the abandoned load of %s (profile %s) late", sid, self.key)
+            return
+        ld = s.loading
+        if ld is None or ld.up_id != up_id:
+            return
+        s.loading = None
+        if ld.timer is not None:
+            ld.timer.cancel()
+        self._post_response("session/load", params, msg, None)
+        if "error" in msg and not s.running():
+            self._invalidate(s)   # what Goose sent before the error is not the chat
+        for w in list(ld.waiters):
+            w.final = {"jsonrpc": "2.0", "id": w.mid, **({"error": msg["error"]} if "error" in msg
+                                                         else {"result": msg.get("result")})}
+            if w.task is not None:   # still catching up: the answer goes after the frames held so far
+                w.final_at = len(w.client.holds.get(sid) or ())
+            else:
+                self._waiter_done(w)
+
+    def _load_watchdog(self, sid: str, ld: UpstreamLoad) -> None:
+        """Goose did not answer a session/load in goose.session_load_timeout_seconds: every waiting tab is answered,
+        and Goose's late frames for it are dropped until its late answer arrives (a new load is refused meanwhile)."""
+        s = self.sessions.get(sid)
+        if s is None or s.loading is not ld:
+            return
+        t = self._load_timeout()
+        s.loading = None
+        s.abandoned = ld.up_id   # its pending entry stays: Goose's late answer ends this (_load_answered)
+        log.warning("Goose did not answer session/load of %s within %g s (profile %s, %d tab(s) waiting)", sid, t,
+                    self.key, len(ld.waiters))
+        err = {"code": -32000, "message": f"Goose did not answer within {t:g} s"}
+        for w in list(ld.waiters):
+            self._fail_waiter(w, err)
+        if not s.running():
+            self._invalidate(s)
 
     async def _answer_ask(self, client: Client, msg: dict) -> None:
         key = json.dumps(msg.get("id"))
@@ -1432,6 +1868,9 @@ class Upstream:
             if entry is None:
                 return
             client, cid, fut, method, params = entry
+            if method == "session/load" and client is None and fut is None:
+                self._load_answered(msg["id"], params, msg)   # the chat's one upstream load: answer its waiters
+                return
             self._post_response(method, params, msg, client)
             if fut is not None:
                 if not fut.done():
@@ -1470,33 +1909,55 @@ class Upstream:
         if method in SESSION_NOTIFICATIONS:
             sid = str(params.get("sessionId") or "")
             s = self.sess(sid)
-            replaying = s.loading_client is not None
+            ld = s.loading
+            if ld is None and s.abandoned is not None:
+                return   # the late history of a load the watchdog gave up on: neither buffered nor sent
+            replaying = ld is not None
             u0 = params.get("update") if isinstance(params.get("update"), dict) else {}
             self._herd_from_update(s, method, u0, replaying)
             if not replaying and u0.get("sessionUpdate") in ("tool_call", "tool_call_update") \
                     and u0.get("status") in ("in_progress", "completed") and self.hub.guard_active():
                 self._check_bypass(s, u0)
             if s.loaded or replaying:
-                self._buffer(s, raw)
-            if replaying:
-                s.loading_client.send(raw)
+                self._buffer(s, raw, msg)
+            if replaying:   # Goose's history goes only to the tabs waiting for this load
+                for w in list(ld.waiters):
+                    w.client.push(sid, raw)
             else:
                 for c in list(self.clients):
-                    if sid in c.watch:
-                        c.send(raw)
+                    if sid in c.watch or sid in c.holds:
+                        c.push(sid, raw)
             return
         # other notifications (device-code, etc.)
         self.broadcast(raw)
 
-    def _buffer(self, s: SessionState, raw: str) -> None:
+    def _buffer(self, s: SessionState, raw: str, msg: dict | None = None) -> None:
+        """Append one frame (msg: its parsed form). A text chunk of the same message as the chunk before it is merged
+        into that one (FIX chat-open-replay-overflow: about one frame per message, as in Goose's own replay)."""
+        key = chunk_key(msg) if msg is not None else None
+        last = s.buffer[-1] if s.buffer else None
+        if isinstance(last, ChunkTail):
+            if key is not None and key == last.key:
+                n = last.add(msg["params"]["update"]["content"]["text"])
+                s.buffer_bytes += n
+                self.hub.total_buffer += n
+                self._trim(s)
+                return
+            text = s.buffer[-1] = last.render()   # the message's text is complete: serialize it once
+            s.buffer_bytes += len(text) - last.size
+            self.hub.total_buffer += len(text) - last.size
         n = len(raw)
-        s.buffer.append(raw)
+        s.buffer.append(ChunkTail(msg, key, raw) if key is not None else raw)
         s.buffer_bytes += n
         self.hub.total_buffer += n
-        while s.buffer_bytes > SESSION_BUFFER_BYTES and len(s.buffer) > 1:
+        self._trim(s)
+
+    def _trim(self, s: SessionState) -> None:
+        while (s.buffer_bytes > SESSION_BUFFER_BYTES or len(s.buffer) > SESSION_BUFFER_FRAMES) and len(s.buffer) > 1:
             old = s.buffer.popleft()
-            s.buffer_bytes -= len(old)
-            self.hub.total_buffer -= len(old)
+            n = old.size if isinstance(old, ChunkTail) else len(old)
+            s.buffer_bytes -= n
+            self.hub.total_buffer -= n
             s.truncated = True
         if self.hub.total_buffer > TOTAL_BUFFER_BYTES:
             self.hub.evict_buffers()
@@ -1537,7 +1998,6 @@ class Upstream:
                 s.sys_prompts.pop(slot, None)
         elif method == "session/load":
             s = self.sess(str(params.get("sessionId") or ""))
-            s.loading_client = None
             if ok:
                 s.loaded, s.load_result = True, result
                 if client is not None:
@@ -2332,14 +2792,13 @@ class Hub:
             self.flush_state_now()
 
     def attach(self, up: Upstream, client: Client) -> None:
+        client.key = up.key
         up.clients.add(client)
 
     def detach(self, up: Upstream, client: Client) -> None:
         up.clients.discard(client)
         self.herd_watchers.discard(client)
-        for s in up.sessions.values():
-            if s.loading_client is client:
-                s.loading_client = None
+        up.forget_client(client)
         client.close()
 
     def herd_out(self, up: Upstream, msg: dict) -> None:
@@ -2357,7 +2816,8 @@ class Hub:
         # key=: two sessions touched at the same instant must not make sorted() compare Upstream objects (TypeError,
         # which lost the chunk being buffered - B-1)
         cands = sorted(((s.last_touch, up, s) for up in self.upstreams.values() for s in up.sessions.values()
-                        if not s.running() and s.buffer_bytes and not any(s.sid in c.watch for c in up.clients)),
+                        if not s.running() and s.buffer_bytes and s.loading is None
+                        and not any(s.sid in c.watch for c in up.clients)),
                        key=lambda t: t[0])
         for _, up, s in cands:
             if self.total_buffer <= TOTAL_BUFFER_BYTES * 0.7:
