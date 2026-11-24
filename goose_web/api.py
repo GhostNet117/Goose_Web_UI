@@ -25,6 +25,7 @@ from starlette.routing import Route
 from . import auth as auth_mod
 from . import guard as guardmod
 from . import guardmodel, hosttasks, logjanitor, prefsync, security, tls, winsec
+from . import retention, uploads   # specs 039 (chunked uploads) and 040 (chat retention)
 from . import policy as acp_policy
 from .auth import AuthError
 from .context import Ctx, HTTPError, body_json, read_body
@@ -823,7 +824,7 @@ async def fs_upload(request: Request):
         raise
     if os.path.lexists(d) and not d.is_dir():
         raise HTTPError(409, "name_taken", f"{UPLOAD_FOLDER} exists in this folder and is not a folder")
-    limit = int(c.settings.get("server", "max_upload_mb") or 25) * 1024 * 1024
+    limit = uploads.limit_bytes(c)   # spec 039: Admin > Settings over server.max_upload_mb
     # app.BodyLimit caps the whole body while it streams in (chunked bodies too), so request.form() never
     # spools more than max_upload_mb to disk (A-2); this early check only gives the same 413 without the middleware.
     try:
@@ -865,8 +866,10 @@ async def fs_upload(request: Request):
                         target.unlink(missing_ok=True)
                         raise HTTPError(413, "too_large", f"Uploads are limited to {limit // 1048576} MB")
                     out.write(chunk)
-            saved.append({"name": target.name, "path": str(target), "size": size,
-                          "mime": f.content_type or mimetypes.guess_type(target.name)[0] or "application/octet-stream"})
+            mime = f.content_type or mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+            # spec 040: recorded like a chunked upload, so retention deletes it with its chat (id: for the link call)
+            saved.append({"name": target.name, "path": str(target), "size": size, "mime": mime,
+                          "id": uploads.record_saved(c, u, target, size, mime, d)})
     finally:
         await form.close()
     c.audit(request, "fs.upload", u, target=str(d), detail={"files": [s["name"] for s in saved]})
@@ -2054,7 +2057,8 @@ async def admin_settings(request: Request):
                    "idleMinutes": c.auth.idle_seconds() / 60,
                    "allowSelfTotp": c.db.get_setting("allow_self_totp", True),
                    "requireTotpForAdmins": bool(c.db.get_setting("require_totp_admins")),
-                   "requireTotpForAll": bool(c.db.get_setting("require_totp_all")), "peers": peers})
+                   "requireTotpForAll": bool(c.db.get_setting("require_totp_all")), "peers": peers,
+                   **uploads.settings_view(c), **retention.settings_view(c)})   # specs 039, 040
     b = await body_json(request)
     # Validate before writing anything (the UI saves every field in one request).
     if b.get("requireTotpForAdmins") and not c.db.get_setting("require_totp_admins") and not admin["totp_enabled"]:
@@ -2064,6 +2068,9 @@ async def admin_settings(request: Request):
     if b.get("requireTotpForAll") and not c.db.get_setting("require_totp_all") and not admin["totp_enabled"]:
         raise HTTPError(409, "totp_needed_first",
                         "Turn on two-factor for your own account before requiring it for everyone")
+    storage = {**uploads.clean_settings(b), **retention.clean_settings(b)}   # specs 039, 040: both checked first
+    uploads.store_settings(c, storage)
+    retention.store_settings(c, storage)
     if "brand" in b and isinstance(b["brand"], dict):
         c.db.set_setting("brand", {k: str(v)[:120] for k, v in b["brand"].items() if k in ("name", "tagline", "machine")})
     if "defaultTeamId" in b:
@@ -2337,6 +2344,7 @@ routes = [
     Route("/api/fs/list", fs_list),
     Route("/api/fs/mkdir", fs_mkdir, methods=["POST"]),
     Route("/api/fs/upload", fs_upload, methods=["POST"]),
+    *uploads.routes,     # spec 039: /api/fs/uploads (chunked, resumable) and /api/fs/uploads/link (spec 040)
     Route("/api/fs/download", fs_download),
     Route("/api/fs/read", fs_read),
     Route("/api/apps/frame", apps_frame),
@@ -2371,6 +2379,7 @@ routes = [
     Route("/api/admin/guard/rulesets/{rid:int}/reset", admin_guard_ruleset_reset, methods=["POST"]),
     Route("/api/admin/auth", admin_auth, methods=["GET", "PUT"]),
     Route("/api/admin/settings", admin_settings, methods=["GET", "PUT"]),
+    *retention.routes,   # spec 040: /api/admin/retention, /preview, /run
     Route("/api/admin/audit", admin_audit),
     Route("/api/admin/system", admin_system),
     Route("/api/admin/system/workers/{key}/{action}", admin_worker_action, methods=["POST"]),

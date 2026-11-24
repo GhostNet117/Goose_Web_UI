@@ -186,7 +186,7 @@ DEFAULTS: dict[str, Any] = {
         # 127.0.0.1, ::1 and the bind address (server.host unless 0.0.0.0 / ::). Add other names users type
         # in the address bar here (no ports, no wildcards). Other Host values get "400 invalid host".
         "allowed_hosts": [],
-        "max_upload_mb": 25,
+        "max_upload_mb": 25,              # spec 039: 1..5120 (above counts as 5120); Admin > Settings overrides it
         "allow_elevated": False,          # Windows: refuse to run with an admin token (ownership guarantee)
         # normal | inherit. Task Scheduler starts a task below normal (CPU, I/O, memory) unless the task says
         # otherwise; a gateway left like that is starved whenever the computer is busy. normal = the gateway raises
@@ -211,6 +211,11 @@ DEFAULTS: dict[str, Any] = {
         "include_native_goose_logs": False,   # also trim the native profile's Goose logs (shared with Desktop)
         "audit_days": 365,                # audit table in the database
         "audit_max_rows": 500000,
+    },
+    # Spec 040: chats (and the files uploaded to them) are deleted after this many days without use; 0 = keep
+    # forever; 1..3650. Admin > Settings overrides it (retention.py).
+    "retention": {
+        "chat_days": 180,
     },
     "paths": {
         "profiles_root": _default_profiles_root(),
