@@ -1849,7 +1849,7 @@ candidate, assessed independently before release (23.1, 23.2) and corrected afte
 
 ### 23.1 Independent assessment: scope and method (2026-11-24, before release)
 
-- **Who.** An independent AI reviewer, model recorded as Claude Mythos 5.2; read-only on all code; production not
+- **Who.** An independent AI reviewer (a separate frontier-model agent, not the one that wrote the changes); read-only on all code; production not
   touched; no secrets recorded.
 - **What.** The release candidate, commit `8f87cc8`, against 1.26.2 (`e9c41c4`): 55 files, +8,884 / -318 lines.
 - **How.** (A) A code review of the diff and of what it touches. (B) The full test suite: 1,202 passed, 14 skipped,
