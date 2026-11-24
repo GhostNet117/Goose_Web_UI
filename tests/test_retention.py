@@ -6,8 +6,6 @@ profile's worker (ACP session/delete), then its files - only inside Web_Uploads,
 write, the same file that was uploaded, not shared with a kept chat; unlinked files older than the period too. Never a
 chat that is running, being opened, open in a tab, queued, asked about or running elsewhere; at most 200 per sweep."""
 import asyncio
-import json
-import os
 import sqlite3
 import subprocess
 import sys
