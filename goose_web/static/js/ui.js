@@ -240,6 +240,22 @@ export function errMsg(e) {
   else if (e.data && e.data.problems) m += ': ' + e.data.problems.join(', ');
   return m;
 }
+// FIX chat-open-replay-overflow: why a chat could not be opened, in words (views/chat.js error card). Always ends with
+// the code and any object data, so a report says exactly what Goose or the gateway answered.
+export function openErrMsg(e, { cwd = '' } = {}) {
+  if (!e || typeof e === 'string') return errMsg(e);
+  const raw = errMsg(e);
+  const code = e.code;
+  let text = raw;
+  if (code === -32002) text = 'This chat no longer exists';
+  else if (code === -32602 && /director/i.test(raw)) text = "This chat's folder no longer exists: " + (cwd || '(unknown folder)');
+  else if (code === -32003) text = raw.replace(/^forbidden:\s*/i, '');
+  else if (e.disconnected || code === 'disconnected') text = 'The connection dropped while opening (attempt ' + (e.attempt || 1) + '/' + (e.attempts || 4) + ')';
+  const bits = [];
+  if (code !== undefined && code !== null && code !== '') bits.push('code ' + code);
+  if (e.data && typeof e.data === 'object') { try { bits.push(JSON.stringify(e.data)); } catch { /* cyclic */ } }
+  return bits.length ? text + ' [' + bits.join(', ') + ']' : text;
+}
 
 // ---------- popover menu ----------
 let openMenu = null;

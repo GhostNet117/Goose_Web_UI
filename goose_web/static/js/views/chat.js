@@ -1,5 +1,5 @@
 // Chat view: header (title, folder, mode/provider/model, usage, menu), transcript, composer.
-import { h, btn, iconBtn, menu, toast, toastError, confirmDialog, promptDialog, modal, downloadBlob, prettyJson, fmtNum, fmtCost, shortPath, spinner, empty, errMsg, select, table, textarea, field, tabs, input, debounce, toggle, banner } from '../ui.js';
+import { h, btn, iconBtn, menu, toast, toastError, confirmDialog, promptDialog, modal, downloadBlob, prettyJson, fmtNum, fmtCost, shortPath, spinner, empty, errMsg, openErrMsg, select, table, textarea, field, tabs, input, debounce, toggle, banner } from '../ui.js';
 import { icon } from '../icons.js';
 import { rpc, G } from '../rpc.js';
 import { router } from '../router.js';
@@ -228,7 +228,7 @@ export function renderChat(ctx, sessionId) {
     renderHeader(); renderQueue();
     if (chat.error && !chat.loaded) {
       errorEl.hidden = false;
-      errorEl.replaceChildren(empty('alert', 'Could not open this session', errMsg(chat.error), btn('Retry', () => chat.reload(), { icon: 'refresh' }), btn('Back to herd', () => router.go('/herd'))));
+      errorEl.replaceChildren(empty('alert', 'Could not open this session', openErrMsg(chat.error, { cwd: chat.cwd }), btn('Retry', () => chat.reload(), { icon: 'refresh' }), btn('Back to herd', () => router.go('/herd'))));
     } else errorEl.hidden = true;
   };
 

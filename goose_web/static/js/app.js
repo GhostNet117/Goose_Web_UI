@@ -10,7 +10,7 @@ import { addAsk, resetAsks, resolvedElsewhere, ASK_METHODS, gotoAsk, noteToolCal
 import { setHerd, upsertAgent, setMyProfile, refreshBadges, browserNotify, chime, setBaseTitle } from './herd.js';
 import { setElsewhere, elsewhereDoneFor } from './elsewhere.js';
 import { loadSessions, sessionsState, sessionTitle, activityTime, isArchived, refreshSessionsSoon } from './sessions.js';
-import { routeNotification, allChats, currentChat, sessionChangedElsewhere, promptCreated, applyHelloState, queueUpdated, steerUpdated, hasLocalQueue, clearDrafts } from './chatsession.js';
+import { routeNotification, allChats, currentChat, sessionChangedElsewhere, promptCreated, applyHelloState, queueUpdated, steerUpdated, hasLocalQueue, clearDrafts, resyncChat } from './chatsession.js';
 import { renderLogin, renderChangePassword } from './views/login.js';
 import { renderSidebar, NAV } from './views/sidebar.js';
 import { renderHome } from './views/home.js';
@@ -291,6 +291,8 @@ rpc.on('hello', (hello) => {
   if (hello.draining) toast('Goose Web restarts for an update in a moment. New messages wait until it is back.', { kind: 'warn', timeout: 8000 });
   if (!firstHello) {
     refreshPrefs();   // 1.18.2: a reconnect re-reads the prefs (saves made while this tab was offline)
+    // The open chat is loaded again: the gateway keeps no record of what this tab already got. A socket that dies at
+    // once no longer loops here - rpc.js resets its backoff only after STABLE_MS, and reload() shares a load in flight.
     const cur = currentChat();
     for (const c of allChats()) {
       if (c === cur) c.reload().catch(() => {});
@@ -315,6 +317,7 @@ rpc.on('session/update', (p) => { noteToolCallSource(p); routeNotification('sess
 rpc.on(G('session/update'), (p) => routeNotification(G('session/update'), p));
 rpc.on('_gw/ask_resolved', (p) => resolvedElsewhere(p || {}));
 rpc.on('_gw/session_changed', (p) => sessionChangedElsewhere(p || {}));
+rpc.on('_gw/resync', (p) => resyncChat(p || {}));   // FIX chat-open-replay-overflow: frames of a chat were dropped
 rpc.on('_gw/prompt_created', (p) => promptCreated(p || {}));
 rpc.on('_gw/queue_update', (p) => queueUpdated(p || {}));
 rpc.on('_gw/steer_update', (p) => steerUpdated(p || {}));

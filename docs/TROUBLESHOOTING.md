@@ -528,20 +528,27 @@ the user's Goose Web settings.
 ## 8. A chat will not open ("Could not open this session")
 
 When opening a chat fails, the chat page shows `Could not open this session` with the error text, a **Retry**
-button and **Back to herd**.
+button and **Back to herd**. The text ends with the error code and any data, for example `[code -32000]`. A dropped
+connection, a restarting worker (`-32000`) or a time-out is retried by the tab itself first (after 0.5, 1, 2 and
+4 s); the error shows only when that fails too. `-32002`, `-32602` and `-32003` are never retried.
 
 | Error text | Cause | Fix |
 | --- | --- | --- |
-| Goose's own "session not found" style error | The session was deleted (in Goose Web, Goose Desktop or the CLI), or the link points at a session in another profile. Sessions belong to one profile. | Go back to the herd and pick an existing chat. Administrators open other users' chats through the herd or with `?profile=<user>`. |
-| `forbidden: folder not allowed: <folder>` | The session's working folder is outside the user's allowed folders (the policy changed after the chat was created). | An administrator adds the folder to the team's extra folders, or the user starts a new chat in an allowed folder. |
+| `This chat no longer exists [code -32002]` | The session was deleted (in Goose Web, Goose Desktop or the CLI), or the link points at a session in another profile. Sessions belong to one profile. | Go back to the herd and pick an existing chat. Administrators open other users' chats through the herd or with `?profile=<user>`. |
+| `This chat's folder no longer exists: <folder> [code -32602]` | Goose refuses to open a chat whose working folder was deleted or moved. | Recreate the folder, or start a new chat. |
+| `folder not allowed: <folder> [code -32003]` | The session's working folder is outside the user's allowed folders (the policy changed after the chat was created). | An administrator adds the folder to the team's extra folders, or the user starts a new chat in an allowed folder. |
 | `Goose is not available: <error>` | The worker cannot start (section 7.2). | Section 7.2. |
-| `the Goose worker restarted` / `the Goose worker connection closed` | The worker restarted while the chat was loading. | Click Retry. |
+| `the Goose worker restarted` / `the Goose worker connection closed` / `the Goose worker is restarting` | The worker restarted (or its process had exited) while the chat was loading. | Click Retry. |
+| `Goose did not answer within 180 s` | Goose did not finish loading the chat in `goose.session_load_timeout_seconds` (a slow session database, an extension that hangs at start). | Retry later. Until Goose's late answer arrives, a new attempt is refused at once with `Goose has not answered an earlier load of this chat`. Check the worker log; restarting the worker ends the wait. |
+| `The connection dropped while opening (attempt 4/4)` | The browser's connection to Goose Web ended four times while the chat was being sent. Before the FIX chat-open-replay-overflow the gateway itself ended it when a long run had buffered more than 20,000 frames (`ws.disconnect` 0-15 ms after `chat.open`, repeating about every 0.7 s). | Check the network or proxy. The activity log's `ws.disconnect` entries say why each socket ended (`reason`: `client`, `queue-full`, `kick`, `error`, `shutdown`). |
 | `Goose is not connected` | The worker connection is down. | Wait for the yellow bar to clear, then Retry. |
 | Chat opens but is empty or stale | The transcript is reloaded from Goose after reconnecting; a change made outside Goose Web (Goose Desktop on a native profile) is picked up within a few seconds. | Reload the page. |
 
-Goose Web keeps a replay buffer per chat in memory (12 MiB per session, 256 MiB in total; idle chats that nobody
-watches are dropped first). A dropped buffer is rebuilt from Goose when the chat is opened again, so this does not
-lose history.
+Goose Web keeps a replay buffer per chat in memory (12 MiB and 5,000 frames per session, 256 MiB in total; idle chats
+that nobody watches are dropped first; streamed text chunks of one message count as one frame). A dropped buffer is
+rebuilt from Goose when the chat is opened again, so this does not lose history. A tab that cannot keep up with what
+its chats stream gets `_gw/resync` and reloads the chat instead of being disconnected; the gateway log then has a
+WARNING `tab queue overflow (profile ..., user ..., session ...)`.
 
 ---
 

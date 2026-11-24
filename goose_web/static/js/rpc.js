@@ -1,7 +1,14 @@
 // WebSocket JSON-RPC 2.0 client for /ws with auto-reconnect, _gw/hello resync, pending map and timeouts.
 import { Emitter, store } from './store.js';
 
-const LONG_METHODS = new Set(['session/prompt', 'session/new', 'session/load', '_goose/unstable/schedules/run-now', '_goose/unstable/providers/config/authenticate', '_goose/unstable/session/steer']);
+const LONG_METHODS = new Set(['session/prompt', 'session/new', '_goose/unstable/schedules/run-now', '_goose/unstable/providers/config/authenticate', '_goose/unstable/session/steer']);
+// FIX chat-open-replay-overflow: opening a chat gives up after this long (the gateway's own watchdog,
+// goose.session_load_timeout_seconds, answers by then); it used to wait forever.
+export const LOAD_TIMEOUT_MS = 180000;
+const METHOD_TIMEOUTS = { 'session/load': LOAD_TIMEOUT_MS };
+// A socket counts as working only once it stayed up this long: one that dies right after hello keeps backing off
+// instead of reconnecting every 0.7 s.
+export const STABLE_MS = 10000;
 
 export class RpcError extends Error {
   constructor(err) {
@@ -56,7 +63,7 @@ class Rpc extends Emitter {
       const hello = await this._send('_gw/hello', {}, 20000, true);
       this.hello = hello;
       this.ready = true;
-      this.attempt = 0;
+      this.readyAt = Date.now();   // the backoff (attempt) is reset in onClose, once the socket stayed up STABLE_MS
       store.set('conn', 'open');
       if (hello && hello.upstream) store.set('upstream', hello.upstream.state || 'ready');
       if (hello && hello.agent) store.set('agentInfo', hello.agent);
@@ -82,6 +89,7 @@ class Rpc extends Emitter {
     }
     if (wasReady) this.emit('disconnected', ev);
     else this.emit('handshake_failed', ev);
+    if (wasReady && Date.now() - (this.readyAt || 0) >= STABLE_MS) this.attempt = 0;
     if (this.stopped) return;
     this.scheduleReconnect(ev);
   }
@@ -148,7 +156,7 @@ class Rpc extends Emitter {
 
   async call(method, params = {}, { timeout } = {}) {
     if (!this.ready) await this.waitReady();
-    const to = timeout !== undefined ? timeout : (LONG_METHODS.has(method) ? 0 : 60000);
+    const to = timeout !== undefined ? timeout : (method in METHOD_TIMEOUTS ? METHOD_TIMEOUTS[method] : (LONG_METHODS.has(method) ? 0 : 60000));
     return this._send(method, params, to);
   }
 

@@ -225,6 +225,7 @@ DEFAULTS: dict[str, Any] = {
         "binary": "",                     # default: auto-detect
         "idle_minutes": 30,               # stop a profile's worker after this long without clients or runs
         "start_timeout_seconds": 45,
+        "session_load_timeout_seconds": 180,   # a chat Goose has not opened by then fails with -32000 (0 = wait forever)
         "native_scheduler": "auto",       # auto | on | off  (auto = off while Goose Desktop runs on the same profile)
         "extra_env": {},
         "default_workdir_native": "",     # admin native profile: default folder for new chats (default: home)
