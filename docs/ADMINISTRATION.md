@@ -2169,7 +2169,8 @@ running after a tab is closed.
   may see.
 - **Open their Herd / chats** (Admin > Users > actions menu) opens a new tab connected to that user's profile
   (`/?profile=<username>`). Only admins can do this. It is recorded as `ws.impersonate`, and calls made on another
-  user's profile are recorded as `acp.*` entries in the audit log.
+  user's profile are recorded as `acp.*` entries in the audit log. Reading the read-only copy of one of their chats
+  (when Goose cannot open it) is recorded as `transcript.view`.
 
 ### 15.1 Working elsewhere (since 1.16.0)
 
@@ -2234,7 +2235,7 @@ Recorded actions:
 | Settings | `settings.auth`, `settings.update` |
 | Operations | `worker.restart`, `worker.stop`, `hosttask.<action>`, `fs.upload` |
 | Agent calls | `acp.denied` (policy denials, with the reason), `acp.<method>` for sensitive methods (configuration, providers and secrets, recipes save/delete, schedules create/delete, apps import/delete, sources, tool permissions, direct tool calls, adding session extensions, defaults, session delete) and for every call on another user's profile, `acp.answer` (answers to permission prompts and forms, with the choice) |
-| Admin access | `ws.impersonate` |
+| Admin access | `ws.impersonate`, `transcript.view` (an administrator read the read-only copy of a chat in another profile, with the session id) |
 | Everyday use (1.11) | `chat.new` (with the folder), `chat.open`, `chat.prompt` (length and number of attachments - never the text), `chat.steer` (1.15, the same), `chat.cancel`, `chat.fork`, `chat.mode`; `settings.tls`, `tls.renewed` |
 
 Retention: entries older than `logs.audit_days` (365) are deleted, and the table is kept to `logs.audit_max_rows`

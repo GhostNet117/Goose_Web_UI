@@ -779,7 +779,6 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .json { color: var(--fg-2); }
 /* Read-only copy of a chat (readonly.js, FIX chat-open-readonly-fallback) */
 .readonly { display: flex; flex-direction: column; gap: 6px; }
-.readonly > .banner { position: sticky; top: 0; z-index: 2; }
 .ro-head { margin: 6px 0 2px; }
 .ro-title { font-weight: 600; font-size: 1.05em; overflow-wrap: anywhere; }
 .ro-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
