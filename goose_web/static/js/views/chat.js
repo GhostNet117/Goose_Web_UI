@@ -16,6 +16,7 @@ import { groupsConfig, groupPicker, groupOfProvider, headerPickers, groupDefault
 import { setBaseTitle, agentFor } from '../herd.js';
 import { mdElement } from '../markdown.js';
 import { linkUploads } from '../api.js';
+import { offerReadOnly } from '../readonly.js';
 
 export function renderChat(ctx, sessionId) {
   const chat = getChat(sessionId);
@@ -229,6 +230,7 @@ export function renderChat(ctx, sessionId) {
     if (chat.error && !chat.loaded) {
       errorEl.hidden = false;
       errorEl.replaceChildren(empty('alert', 'Could not open this session', openErrMsg(chat.error, { cwd: chat.cwd }), btn('Retry', () => chat.reload(), { icon: 'refresh' }), btn('Back to herd', () => router.go('/herd'))));
+      offerReadOnly(errorEl, chat.id, chat.error, () => chat.reload());   // "Show a read-only copy" (FIX chat-open-readonly-fallback)
     } else errorEl.hidden = true;
   };
 

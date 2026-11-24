@@ -27,6 +27,7 @@ from . import guard as guardmod
 from . import guardmodel, hosttasks, logjanitor, prefsync, security, tls, useritems, winsec
 from . import retention, uploads   # specs 039 (chunked uploads) and 040 (chat retention)
 from . import policy as acp_policy
+from . import transcript as transcript_mod
 from .auth import AuthError
 from .context import Ctx, HTTPError, body_json, read_body
 from .hub import RpcError
@@ -1025,6 +1026,59 @@ async def herd(request: Request):
     import socket
     name = (c.db.get_setting("brand") or {}).get("machine") or os.environ.get("COMPUTERNAME") or socket.gethostname()
     return ok({"machine": {"name": name, "url": c.settings.public_url}, "agents": agents, "peers": list(peers)})
+
+
+# ====================================================================== read-only copy of a chat
+_TRANSCRIPT_LIMIT = security.RateLimiter(60, 60.0)    # pages per person and minute
+
+
+async def session_transcript(request: Request):
+    """FIX chat-open-readonly-fallback: a read-only copy of a chat, read straight from the profile's Goose session
+    database (transcript.py), for when Goose cannot load it. Access is that of opening the chat and never wider: the
+    caller's own profile; `?profile=` for administrators only (the /ws rule, audited as `transcript.view` like
+    `ws.impersonate`); for a member the policy check session/load gets, with the chat's folder (the folder rules),
+    refused with the same reason. `after` / `limit`: paging by message id."""
+    c = ctx(request)
+    user = c.require(request).user
+    sid = request.path_params["sid"]
+    if not transcript_mod.valid_sid(sid):
+        raise HTTPError(400, "bad_request", "Invalid session id")
+    target = user
+    want = request.query_params.get("profile")
+    if want and want.lower() != user["username"].lower():
+        if user["role"] != "admin":
+            raise HTTPError(403, "forbidden", "Only administrators can open another person's chats")
+        target = c.db.user_by_name(want)
+        if not target:
+            raise HTTPError(404, "not_found", "No such user")
+    after = int_param(request.query_params.get("after"), "after", 0, lo=0)
+    limit = int_param(request.query_params.get("limit"), "limit", transcript_mod.DEFAULT_LIMIT, lo=1,
+                      hi=transcript_mod.MAX_LIMIT)
+    if not _TRANSCRIPT_LIMIT.hit(str(user["id"])):
+        raise HTTPError(429, "rate_limited", "Too many requests for read-only copies. Wait a minute and try again.")
+    db_file = transcript_mod.db_path(c.profiles.root_for(target))
+    gone = HTTPError(404, "not_found", "This chat does not exist in Goose's session database")
+    try:
+        info = await asyncio.to_thread(transcript_mod.session_info, db_file, sid)
+        if info is None:
+            raise gone
+        policy = c.policy_for(user)
+        try:
+            acp_policy.check("session/load", {"sessionId": sid, "cwd": info["workingDir"]},
+                             is_admin=user["role"] == "admin", policy=policy, roots=c.roots_for(target, policy))
+        except acp_policy.Denied as e:
+            c.audit(request, "acp.denied", user, target="session/load",
+                    detail={"reason": str(e), "via": "transcript"}, ok=False)
+            raise HTTPError(403, "forbidden", f"forbidden: {e}")
+        page = await asyncio.to_thread(transcript_mod.read, db_file, sid, after, limit)
+    except transcript_mod.Unavailable as e:
+        log.warning("read-only copy of %s (profile %s): %s", sid, target["username"], e)
+        raise HTTPError(503, "unavailable", "Goose's session database cannot be read right now. Try again shortly.")
+    if page is None:
+        raise gone
+    if target is not user:
+        c.audit(request, "transcript.view", user, target=target["username"], detail={"sessionId": sid, "after": after})
+    return ok(page)
 
 
 # ====================================================================== admin: users
@@ -2452,6 +2506,7 @@ routes = [
     Route("/api/fs/read", fs_read),
     Route("/api/apps/frame", apps_frame),
     Route("/api/herd", herd),
+    Route("/api/sessions/{sid}/transcript", session_transcript),
     Route("/api/admin/users", admin_users, methods=["GET", "POST"]),
     Route("/api/admin/users/{uid:int}", admin_user, methods=["GET", "PATCH", "DELETE"]),
     Route("/api/admin/users/{uid:int}/reset-password", admin_user_reset, methods=["POST"]),
