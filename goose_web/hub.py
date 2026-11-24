@@ -605,6 +605,7 @@ class Client:
                 self._q.append((raw, None))
                 self.qbytes += len(raw)
                 self.kept_bytes += len(raw)
+            self._room.set()   # a replay waiting for this tab stops now (it answers {resync: true})
         if self.kept_bytes > CLIENT_QUEUE_HARD_BYTES:
             log.warning("tab queue full (profile %s, user %s): %d bytes of responses and requests unread; closing the "
                         "socket", self.key, self.user.get("username"), self.kept_bytes)
