@@ -108,7 +108,7 @@ def settings_view(c) -> dict:
 
 def confirm(db, by: str, now: float | None = None) -> None:
     """Automatic deletion is in force from now on (the first sweep FIRST_RUN_DELAY later). Called when an
-    administrator saves the period in Admin > Settings, and by `init` for a new installation. M-3 (assessment
+    administrator saves the period in Admin > Settings (also on a new installation: nothing confirms it by itself). M-3 (assessment
     2026-11-24): an upgrade never starts deleting chats by itself - the default only applies once confirmed."""
     db.set_setting("retention_armed_at", time.time() if now is None else float(now))
     db.set_setting("retention_confirmed_by", str(by or "")[:100])

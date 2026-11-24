@@ -2118,9 +2118,13 @@ could drive by opening chats. On Windows Goose also ends only a released server'
   the same way first, and a prompt without a load result is refused (M-1). The draft of this section said the
   re-load ran after every policy and guard check; on the release candidate that order was the gap - the check ran
   first, on nothing (23.2). The re-load uses the folder recorded at the chat's earlier load or, for a chat not loaded
-  on this connection, the folder Goose stored for it; that folder is not checked against the member's current folder
-  rules again (opening a chat in a tab is), and with the sandbox the agent is held to the member's folders whatever
-  the chat's folder (21.1). Members reach only their own profile's worker, so it opens no other profile's chats.
+  on this connection, the folder Goose stored for it; before a member's prompt makes Goose load a chat, that folder
+  is checked against the member's current folder rules exactly as opening the chat in a tab is (`policy.check` of
+  `session/load`; an unknown folder is refused), so a chat in a folder the member may no longer use is never loaded
+  for them (found by the release documentation review, fixed before release; test
+  `test_a_members_prompt_never_loads_a_chat_in_a_folder_they_may_not_use`). With the sandbox the agent is held to the
+  member's folders in any case (21.1). Members reach only their own profile's worker, so it opens no other profile's
+  chats.
 - **`current` in `_gw/watch` / `_gw/seen`** lets a socket keep one chat of its own profile loaded (at most 200
   characters, per socket). A member could pin as many chats as sockets they open - the same as keeping tabs open; no
   effect on other profiles. Accepted.
@@ -2186,8 +2190,6 @@ user-visible messages in pages; `readonly.js` shows them behind a button on the 
   class as GW-22).
 - Retention deletes for good; backups keep what it deleted (23.8).
 - A chat whose load Goose never answers stays refused until its worker restarts (23.9).
-- A member's prompt can load the member's own chat again in the folder recorded for it, without the folder check
-  that opening it in a tab makes (23.10); the sandbox still holds the agent to the member's folders.
 - Not run against a real Goose by the independent assessment: retention deletion, unloading, the reaper and chat
   traffic (23.1). Not tested in a browser by anybody independent: the new front end (uploads, images, the read-only
   copy).

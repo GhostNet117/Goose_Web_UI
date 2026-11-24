@@ -227,6 +227,20 @@ class Unloader:
             if method != "session/load" and sid in self.unloaded and self.up.ws is not None:
                 await self._silent_load(sid, method)
 
+    async def chat_folder(self, sid: str) -> str:
+        """The chat's working folder: the gateway's record, else what Goose stored (session/info, read-only)."""
+        from .hub import SESSION_INFO, RpcError
+        s = self.up.sess(sid)
+        if s.cwd:
+            return s.cwd
+        try:
+            info = await self.up.request(SESSION_INFO, {"sessionId": sid}, timeout=30)
+        except asyncio.TimeoutError:
+            raise RpcError(-32000, "Goose did not say where this chat works in time; try once more") from None
+        cwd = str((((info or {}).get("session") or {}) if isinstance(info, dict) else {}).get("cwd") or "")
+        s.cwd = s.cwd or cwd
+        return s.cwd or cwd
+
     async def ensure_loaded(self, sid: str, method: str) -> None:
         """M-1 (assessment 2026-11-24): a member's prompt is checked against the chat's CURRENT provider, model and
         mode (policy.check_session_choice), which the gateway knows only from a load. A chat it unloaded - or never
@@ -368,21 +382,14 @@ class Unloader:
         (hub.UpstreamLoad, FIX chat-open-replay-overflow) with no tab waiting: Goose's history fills only the hub
         buffer, so a tab that opens the chat later gets it replayed, and a tab that opens it meanwhile joins the same
         load. A load already in flight (a tab's) is waited for instead of sending a second one."""
-        from .hub import SESSION_INFO, RpcError, UpstreamLoad
+        from .hub import RpcError, UpstreamLoad
         up = self.up
         s = up.sess(sid)
         if s.abandoned is not None:
             raise RpcError(-32000, "Goose has not answered an earlier load of this chat: try again later")
         ld = s.loading
         if ld is None:
-            cwd = s.cwd
-            if not cwd:
-                try:
-                    info = await up.request(SESSION_INFO, {"sessionId": sid}, timeout=30)
-                except asyncio.TimeoutError:
-                    raise RpcError(-32000, "Goose did not say where this chat works in time; try once more") from None
-                cwd = str((((info or {}).get("session") or {}) if isinstance(info, dict) else {}).get("cwd") or "")
-                s.cwd = s.cwd or cwd
+            cwd = await self.chat_folder(sid)
             ld = s.loading
             if ld is None:   # nobody started a load while Goose was asked for the folder
                 up.hub.total_buffer -= s.buffer_bytes

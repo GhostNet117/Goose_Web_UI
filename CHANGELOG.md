@@ -153,7 +153,7 @@ throwaway gateway; SECURITY-ASSESSMENT 23) found no Critical or High issue. Its 
 - **M-5 (Info):** `POST /api/fs/uploads/link` records a chat's use only when it linked something; any well-formed id
   used to leave a row.
 
-Docs: USER-GUIDE, ADMINISTRATION (6.4, 7.7, 9.9c, 9.9d, "Providers for one person", 12, 16, 19), CONFIGURATION, API,
+Docs: USER-GUIDE, ADMINISTRATION (6.4, 7.7, 9.9c, 9.9d, 9.9e, 12, 16, 19), CONFIGURATION, API,
 ARCHITECTURE, TROUBLESHOOTING (8, 11.3, 16), SECURITY-ASSESSMENT 23.
 
 ## 1.26.2 - 2026-11-22

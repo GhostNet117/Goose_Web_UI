@@ -859,7 +859,7 @@ names, and `session/new` is always tagged with the client name `goose-web`.
 | user without a team | nothing allowed, and chatting is blocked |
 | user in a team | the team's policy laid over the least-privilege base (every switch off, every list empty, 3 runs) |
 | per-user overrides | applied after the team; each key in the override replaces the team's value |
-| providers for this user only (1.27.0) | applied last and only ADDED: each provider given to this person joins `allowed_providers` (a team's Any stays Any), and its models are allowed with that provider only (section 9.9d) |
+| providers for this user only (1.27.0) | applied last and only ADDED: each provider given to this person joins `allowed_providers` (a team's Any stays Any), and its models are allowed with that provider only (section 9.9e) |
 
 There is no merging of several teams any more: a user has one team, and that team's policy applies.
 
@@ -1107,7 +1107,7 @@ content to the team. To share a skill that uses links, make it real files first.
 **You are sharing text.** Read a skill before you offer it. Whatever its files say (paths, host names, a key someone
 pasted into an example) is copied into every member's profile, where the member's agent reads it.
 
-#### 9.9d Providers for one person (1.27.0)
+#### 9.9e Providers for one person (1.27.0)
 
 To give ONE person a provider of your own profile - without giving the rest of their team access - open Admin >
 Users > the person > Edit > **Providers for this user only**. Each provider of your own profile has a switch:
@@ -2327,7 +2327,7 @@ Recorded actions:
 | Sign-in | `auth.login` (success and failure), `auth.logout`, `auth.totp` (wrong code), `auth.ldap` (insecure LDAP refused), `auth.oidc` (OIDC failure), `user.oidc.bind`, `auth.password.weak` (existing password below the policy, change forced), `auth.ip.blocked`, `auth.ip.unblocked` (`"via": "cli"` from the console) |
 | Own account | `user.password`, `user.totp.enable`, `user.totp.disable`, `user.token.create`, `user.token.delete`, `hints.personal.save`, `hints.native.save`, `prefs.update` (1.18.2: the changed, deleted and skipped preference NAMES - never values - the tab's client id and the new revision; a refused save is `ok=false` with `error`, for example `prefs_conflict`) |
 | User admin | `user.create`, `user.update` (changed field names, never the password), `user.delete`, `user.reset_password`, `user.totp.reset` (two-factor reset, `"via": "cli"` from the console), `user.unlock`, `user.provision`, `user.team.directory` (directory sign-in matched several teams; the first was used) |
-| Teams and hints | `team.create`, `team.update` (with `moved`: users moved here from another team), `team.delete`, `team.migrate.membership` (1.5.0 upgrade: a second team membership was dropped), `team.item.add`, `team.item.remove`, `user.item.add`, `user.item.remove`, `user.item.refresh` (1.27.0: providers for one person, section 9.9d), `hints.create`, `hints.update`, `hints.delete` |
+| Teams and hints | `team.create`, `team.update` (with `moved`: users moved here from another team), `team.delete`, `team.migrate.membership` (1.5.0 upgrade: a second team membership was dropped), `team.item.add`, `team.item.remove`, `user.item.add`, `user.item.remove`, `user.item.refresh` (1.27.0: providers for one person, section 9.9e), `hints.create`, `hints.update`, `hints.delete` |
 | Settings | `settings.auth`, `settings.update` |
 | Operations | `worker.restart`, `worker.stop`, `worker.orphan_ended` (the orphan reaper ended an MCP server process Goose had let go: profile, pid, extension, masked command line, seconds cut off; section 12), `hosttask.<action>`, `fs.upload` |
 | Agent calls | `acp.denied` (policy denials, with the reason), `acp.<method>` for sensitive methods (configuration, providers and secrets, recipes save/delete, schedules create/delete, apps import/delete, sources, tool permissions, direct tool calls, adding session extensions, defaults, session delete) and for every call on another user's profile, `acp.answer` (answers to permission prompts and forms, with the choice) |

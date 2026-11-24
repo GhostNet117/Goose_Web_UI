@@ -993,6 +993,11 @@ class Upstream:
                         # load. A chat the gateway unloaded, or never loaded on this connection, is loaded first;
                         # without its values the prompt is refused (fail closed), never passed unchecked.
                         await self.ensure()
+                        # the same folder rule as opening the chat in a tab (policy.check of session/load), before
+                        # Goose is asked to load it: a chat in a folder the member may no longer use stays closed
+                        cwd0 = await self.unloader.chat_folder(sid0)
+                        pol.check("session/load", {"sessionId": sid0, "cwd": cwd0}, is_admin=False,   # "" = refused
+                                  policy=client.policy, roots=client.roots)
                         await self.unloader.ensure_loaded(sid0, method)
                         s0 = self.sessions.get(sid0)
                     if s0 is None or s0.load_result is None:

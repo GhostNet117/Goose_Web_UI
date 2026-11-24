@@ -358,6 +358,20 @@ async def test_a_members_prompt_to_a_chat_never_loaded_here_is_loaded_and_checke
     assert "session/load" in calls and "session/prompt" not in calls   # loaded to learn its settings; no prompt
 
 
+async def test_a_members_prompt_never_loads_a_chat_in_a_folder_they_may_not_use(mk):
+    """The silent load for a member's prompt applies the folder rule of opening the chat in a tab (policy.check of
+    session/load) BEFORE Goose is asked to load it."""
+    agent, hub, up, c, sink = await mk()
+    agent.load_result = uses("good-provider")
+    m, msink = member(roots=(os.path.abspath("/elsewhere"),))   # the chat works in CWD, outside these roots
+    hub.attach(up, m)
+    await up.from_client(m, prompt(12, "old-chat-2"))
+    r = await msink.wait_for(lambda x: x.get("id") == 12)
+    assert "error" in r and "folder not allowed" in r["error"]["message"], r
+    calls = agent.methods("old-chat-2")
+    assert "session/load" not in calls and "session/prompt" not in calls
+
+
 async def test_a_prompt_during_a_close_waits_then_loads_the_chat(mk):
     agent, hub, up, c, sink = await mk()
     sid = await new_chat(up, c, sink)

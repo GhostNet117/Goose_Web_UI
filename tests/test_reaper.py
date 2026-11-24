@@ -71,8 +71,8 @@ def world(tmp_path):
     p.add(1, 0, "services.exe", 1, job=False)
     p.add(10, 1, "python.exe", 50, "python -m goose_web serve", job=False)                     # the gateway
     p.add(100, 10, "goose.exe", 100, "goose serve --port 1")                                    # the worker
-    p.add(200, 100, "uvx.exe", 200, r'"C:\Users\u\.local\bin\uvx.exe" mcp-server-fetch')        # fetch's launcher
-    p.add(300, 200, "python.exe", 300, r"C:\Users\u\AppData\Local\uv\cache\archive-v0\abc\Scripts\python.exe "
+    p.add(200, 100, "uvx.exe", 200, r'"D:\tools\u\.local\bin\uvx.exe" mcp-server-fetch')        # fetch's launcher
+    p.add(300, 200, "python.exe", 300, r"D:\tools\u\AppData\Local\uv\cache\archive-v0\abc\Scripts\python.exe "
                                        r"-m mcp_server_fetch --api-key sk-NOT-A-REAL-KEY-0123456789")   # the server
     p.add(400, 100, "cmd.exe", 400, r"C:\WINDOWS\system32\cmd.exe /c start /b uvicorn app:api")  # a shell command
     p.add(500, 400, "uvicorn.exe", 500, "uvicorn app:api")                                      # ... left running
@@ -176,7 +176,7 @@ def test_command_lines_match_configured_stdio_extensions():
             ("files", "npx", ["-y", "@modelcontextprotocol/server-filesystem", "C:/w"]),
             ("guarded", r"C:\Py\python.exe", ["-I", r"C:\P\m\.goose-web\stdio_guard.py", "--limit", "120", "--name",
                                              "x", "--", "uvx", "mcp-x"])]
-    assert rp.match_extension(r'"C:\Users\u\.local\bin\uvx.exe" mcp-server-fetch', exts) == "fetch"
+    assert rp.match_extension(r'"D:\tools\u\.local\bin\uvx.exe" mcp-server-fetch', exts) == "fetch"
     assert rp.match_extension(r'C:\WINDOWS\system32\cmd.exe /e:ON /v:OFF /d /c "C:\nodejs\npx.cmd -y '
                               r'@modelcontextprotocol/server-filesystem C:/w"', exts) == "files"
     assert rp.match_extension(r'"C:\Py\python.exe" -I C:\P\m\.goose-web\stdio_guard.py --limit 120 --name x -- '
