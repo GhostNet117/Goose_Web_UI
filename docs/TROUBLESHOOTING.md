@@ -611,6 +611,14 @@ the page** (or reconnect) before it applies to chats.
 | A sandboxed user's chats cannot reach a model proxy or service on this machine (connection refused) | The sandbox closes loopback. | Add the service to `sandbox.relays` (ADMINISTRATION 11.6) and restart the user's worker. Check `goose-web sandbox status` and the user's `worker-<user>.log`. |
 | Any other failure | | Read `worker-<user>.log` and `<profile>/data/logs`. Goose prints the extension's start-up error there. |
 
+### 11.3 Many MCP server processes, memory growing
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| A worker that stays up (it owns schedules, or a tab is always open) holds one set of stdio MCP server processes per chat ever opened in it; memory grows over days | Goose keeps a chat's agent, with all its extensions, until the chat is closed, and has no idle time-out. Before the idle-chat unloading the gateway never closed a chat. | Admin > System > Workers shows the loaded chats per worker. Idle chats are closed after `goose.session_unload_minutes` (30), and beyond `goose.max_loaded_sessions` (12) the least recently used idle ones go at once (CONFIGURATION). Check that the tooltip does not say "Not unloaded" (`0` minutes, or a Goose without `session/close`). The chat a tab shows, a running chat and a chat with queued messages stay loaded. Right now: stop the worker when it is quiet (its job ends the whole tree). |
+| A chat takes a few seconds to open after a pause, or its extensions show as starting again | It was unloaded while idle: opening it starts its extensions again. | Expected. Raise `goose.session_unload_minutes` if this happens too often. |
+| (Windows) `python.exe` or `node.exe` processes without a parent stay in a worker's job after their chat was closed | Goose ends only a released server's direct child (uvx, npx, a venv launcher); the launcher's child survives. | The orphan reaper ends them `goose.orphan_grace_seconds` (120) after they were cut off, if it saw them as part of a configured stdio extension (audit: `worker.orphan_ended`). Processes it never classified (started before the reaper saw the tree, or by a shell command) are left alone: stop the worker when it is quiet. Do not end single servers by hand: a killed server stays dead inside its chat until the chat is loaded again. |
+
 ---
 
 ## 12. Schedules not running

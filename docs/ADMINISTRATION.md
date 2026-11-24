@@ -2080,7 +2080,9 @@ The server's own audit, if it keeps one, shows the gateway's account; who asked 
 ## 12. Workers
 
 Admin > System lists every worker with its state (`stopped`, `starting`, `ready`, `crashed`), PID and port, uptime,
-connected clients, active runs, whether it owns the scheduler, restart count and last error. It refreshes every
+connected clients, active runs, loaded chats (chats whose agent, with all the profile's stdio MCP servers, the worker
+holds; the tooltip says when idle ones are unloaded, or why they are not), whether it owns the scheduler, restart count
+and last error. It refreshes every
 10 seconds and offers **Restart** and **Stop** per worker. The page also shows the gateway and goose versions, the
 goose binary, the OS account and integrity level, the profiles root, the native root and whether Goose Desktop is
 running.
@@ -2095,6 +2097,8 @@ running.
 | Stop by admin | Admin > System > Stop: in-flight calls fail with "stopped by an administrator"; the worker starts again when the user connects |
 | Restart by admin | Admin > System > Restart: active runs are interrupted (the UI asks for confirmation) |
 | Process tree | stopping a worker also stops its MCP server processes (`taskkill /T`) |
+| Idle chats | Goose keeps a chat's agent and MCP servers until the chat is closed. The gateway closes (unloads) a chat idle for `goose.session_unload_minutes` (30), and the least recently used idle ones while a worker holds more than `goose.max_loaded_sessions` (12). Never a running chat, one with a question, queued messages or steers, or the chat a tab shows. Opening an unloaded chat loads it again (its extensions start, a few seconds); a message to it is held until it is loaded. Needs a Goose whose `initialize` offers `session/close` (1.57 does) |
+| Orphaned MCP servers (Windows) | Goose ends only a released server's direct child; a launcher's child (uvx, npx, a venv's python) survives. The orphan reaper ends such a process in the worker's job once it has been cut off from the worker's goose for `goose.orphan_grace_seconds` (120); only processes it saw as part of a configured stdio extension's tree. Audited as `worker.orphan_ended` (command line, secrets masked). `goose.orphan_reaper: false` turns it off |
 | Concurrency | `max_concurrent_runs` per profile for non-admins |
 
 Worker output goes to `<system_dir>/logs/worker-<username>.log` (section 18).
@@ -2232,7 +2236,7 @@ Recorded actions:
 | User admin | `user.create`, `user.update` (changed field names, never the password), `user.delete`, `user.reset_password`, `user.totp.reset` (two-factor reset, `"via": "cli"` from the console), `user.unlock`, `user.provision`, `user.team.directory` (directory sign-in matched several teams; the first was used) |
 | Teams and hints | `team.create`, `team.update` (with `moved`: users moved here from another team), `team.delete`, `team.migrate.membership` (1.5.0 upgrade: a second team membership was dropped), `team.item.add`, `team.item.remove`, `hints.create`, `hints.update`, `hints.delete` |
 | Settings | `settings.auth`, `settings.update` |
-| Operations | `worker.restart`, `worker.stop`, `hosttask.<action>`, `fs.upload` |
+| Operations | `worker.restart`, `worker.stop`, `worker.orphan_ended` (the orphan reaper ended an MCP server process Goose had let go: profile, pid, extension, masked command line, seconds cut off; section 12), `hosttask.<action>`, `fs.upload` |
 | Agent calls | `acp.denied` (policy denials, with the reason), `acp.<method>` for sensitive methods (configuration, providers and secrets, recipes save/delete, schedules create/delete, apps import/delete, sources, tool permissions, direct tool calls, adding session extensions, defaults, session delete) and for every call on another user's profile, `acp.answer` (answers to permission prompts and forms, with the choice) |
 | Admin access | `ws.impersonate` |
 | Everyday use (1.11) | `chat.new` (with the folder), `chat.open`, `chat.prompt` (length and number of attachments - never the text), `chat.steer` (1.15, the same), `chat.cancel`, `chat.fork`, `chat.mode`; `settings.tls`, `tls.renewed` |

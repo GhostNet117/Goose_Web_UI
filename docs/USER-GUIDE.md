@@ -395,6 +395,11 @@ for models that support it, a thinking level picker.
 The chip shows how many extensions are loaded in this chat. If one fails to start, the chip shows a warning
 icon and a message appears with **Details**.
 
+A chat you have not used for a while (30 minutes unless your administrator changed it) is unloaded from your agent,
+so its extensions stop. Nothing in it is lost: opening it again, or sending it a message, loads it again and starts
+its extensions, which can take a few seconds. A chat that is running, waiting for you, has queued messages or is
+open in one of your tabs is never unloaded.
+
 Click the chip (or **Session extensions...** in the session menu) to open the **Session extensions** dialog:
 
 - **Failed to start**: each failed extension with its error. **Retry** starts it again.

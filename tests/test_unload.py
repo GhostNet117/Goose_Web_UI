@@ -215,7 +215,8 @@ BLOCKERS = {
     "pending request": lambda up, c, s: up.pending.__setitem__(
         99999, (None, None, None, "session/set_mode", {"sessionId": s.sid})),
     "queued message": lambda up, c, s: setattr(s, "queue", [queue_item([{"type": "text", "text": "x"}], "alice")]),
-    "steer": lambda up, c, s: setattr(s, "steers", [{"id": "x", "state": "pending", "blocks": []}]),
+    "steer": lambda up, c, s: setattr(s, "steers", [{"id": "x", "messageId": "m1", "runId": "", "blocks": [],
+                                                     "by": "alice", "at": time.time(), "state": "pending"}]),
     "being loaded": lambda up, c, s: setattr(s, "loading_client", c),
     "current chat of a tab": lambda up, c, s: setattr(c, "current", s.sid),
     "prompt being checked": lambda up, c, s: setattr(up, "starting", 1),
