@@ -2138,6 +2138,8 @@ async def admin_system(request: Request):
         d = w.describe()
         up = c.hub.upstreams.get(w.key)
         d["clients"], d["activeRuns"] = up.activity() if up else (0, 0)
+        # FIX idle-sessions-keep-mcp-servers: chats whose agent (with all its MCP servers) the worker holds
+        d.update(up.unloader.describe() if up else {"loadedSessions": 0})
         workers.append(d)
     native = c.db.get_setting("native_root") or ""
     from . import mxc

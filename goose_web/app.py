@@ -764,6 +764,12 @@ def create_app(settings: Settings) -> Starlette:
         app.state.ctx = c
         hub.start()
         workers.start_monitor()
+        # FIX idle-sessions-keep-mcp-servers: MCP server processes Goose let go but did not end (a launcher's child)
+        # are ended once they have been cut off from their worker's goose for goose.orphan_grace_seconds (Windows)
+        from .reaper import OrphanReaper
+        c.reaper = OrphanReaper(settings, workers, audit=lambda username, detail: db.audit(
+            "worker.orphan_ended", user=db.user_by_name(username), target=username, detail=detail, ok=True))
+        c.reaper.start()
         from .config import sandbox_backend, sandbox_on
         if sandbox_on(settings) and sandbox_backend(settings) != "appcontainer":
             # spec 025 R3: probe MXC at start (logged: "sandbox mxc: available ..." / "UNAVAILABLE: <reason>")
@@ -840,6 +846,7 @@ def create_app(settings: Settings) -> Starlette:
             yield
         finally:
             control.stop()
+            c.reaper.stop()
             maintenance.cancel()
             library.cancel()
             native_sec.cancel()

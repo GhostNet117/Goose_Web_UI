@@ -54,6 +54,7 @@ class Ctx:
     guard: Any = None                 # guard.GuardService (spec 018)
     classify: Any = None              # classifyapi.ClassifyService (spec 026): Goose's classification endpoint
     host_tools: Any = None            # hosttools.HostTools (spec 035): servers lent to sandboxed members
+    reaper: Any = None                # reaper.OrphanReaper (FIX idle-sessions-keep-mcp-servers), Windows
 
     # ---------------------------------------------------------- cookies / origin
     @property

@@ -1029,6 +1029,8 @@ function systemTab(body) {
           { label: 'PID / port', render: (w) => h('span', { class: 'mono small' }, (w.pid || '—') + ' / ' + (w.port || '—')) },
           { label: 'Up', render: (w) => w.startedAt ? relTime(w.startedAt) : '—' },
           { label: 'Clients', key: 'clients' }, { label: 'Runs', key: 'activeRuns' },
+          // FIX idle-sessions-keep-mcp-servers: chats whose agent, with all its MCP servers, this worker holds
+          { label: 'Loaded chats', render: (w) => h('span', { title: w.unloading ? 'Chats whose agent and extensions run in this worker. Idle ones are unloaded after ' + w.unloadMinutes + ' min' + (w.maxLoadedSessions ? '; above ' + w.maxLoadedSessions + ' the least recently used go first' : '') + ' (' + (w.unloadedSessions || 0) + ' so far).' : 'Chats whose agent and extensions run in this worker. Not unloaded: ' + (w.unloadOff || 'goose.session_unload_minutes is 0') + '.' }, String(w.loadedSessions || 0), w.unloading || !w.loadedSessions ? null : h('span', { class: 'muted small' }, ' (kept)')) },
           { label: 'Scheduler', render: (w) => w.scheduler ? badge('owner', 'accent') : '' },
           { label: 'Sandbox', render: (w) => w.sandboxed ? (w.sandboxBackend === 'mxc'
             ? h('span', { title: 'MXC process container - talks to the gateway over stdio; network only through its egress proxy' + (w.proxyPort ? ' (127.0.0.1:' + w.proxyPort + ')' : ' (none)') }, badge('MXC', 'ok'))

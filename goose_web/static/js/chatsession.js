@@ -125,7 +125,7 @@ function evict() {
   const victims = [...chats.values()].filter((c) => c.id !== currentId && !c.running && !c.queue.length).sort((a, b) => a.touched - b.touched);
   while (chats.size > MAX_CACHED && victims.length) chats.delete(victims.shift().id);
 }
-function syncWatch() { rpc.setWatched([...chats.keys()]); }
+function syncWatch() { rpc.setWatched([...chats.keys()], currentId || ''); }
 
 export function routeNotification(method, params) {
   const sid = params && params.sessionId;
@@ -154,6 +154,16 @@ export function promptCreated(p) {
 export function sessionChangedElsewhere(p) {
   const sid = p && p.sessionId;
   if (!sid) return;
+  if (p.reason === 'unloaded') {
+    // FIX idle-sessions-keep-mcp-servers: the gateway closed this idle chat in Goose (its extensions stopped). Nothing
+    // changed in it: no "updated elsewhere" notice. A cached chat loads again (from Goose) when it is shown next; the
+    // gateway loads it before anything is sent to it.
+    const c = chats.get(sid);
+    if (!c) return;
+    c.gwUnloaded = true;
+    if (sid !== currentId && !c.running && !c.promptPending && !c.loading) c.loaded = false;
+    return;
+  }
   const patch = {};
   if (p.title) patch.title = p.title;
   if (p.updatedAt) patch.updatedAt = p.updatedAt;
@@ -182,6 +192,7 @@ export class ChatSession extends Emitter {
     this.commands = [];
     this.loaded = false;
     this.loading = false;
+    this.gwUnloaded = false;   // the gateway unloaded this chat from its worker since it was loaded here
     this.error = null;
     this.progress = null;
     this.touched = Date.now();
@@ -271,6 +282,7 @@ export class ChatSession extends Emitter {
         const ag = agentFor(this.id);
         if (ag && (ag.status === 'working' || ag.status === 'needs_you')) this.setRunning(true);
         this.loaded = true;
+        this.gwUnloaded = false;   // Goose holds the chat again
         this.emit('loaded');
       } catch (e) {
         this.error = e;
@@ -284,6 +296,24 @@ export class ChatSession extends Emitter {
   }
 
   reload() { this.loaded = false; return this.load(); }
+
+  // FIX idle-sessions-keep-mcp-servers: the gateway unloads idle chats from their worker and loads one again before
+  // anything is sent to it. Should Goose still answer "not found" (-32002) for a chat the gateway reported unloaded,
+  // load it once more here and send again (onReload: the reload redrew the transcript).
+  async callLoaded(method, params, onReload) {
+    try {
+      const res = await rpc.call(method, params);
+      this.gwUnloaded = false;
+      return res;
+    } catch (e) {
+      if (!(e && e.code === -32002 && this.gwUnloaded)) throw e;
+      this.gwUnloaded = false;
+      await this.reload();
+      if (this.error) throw e;
+      if (onReload) onReload();
+      return rpc.call(method, params);
+    }
+  }
 
   async refreshFromElsewhere() {
     if (this.running || this.promptPending || this.loading) return;
@@ -389,14 +419,17 @@ export class ChatSession extends Emitter {
 
   async send(blocks) {
     if (this.running || this.promptPending) { this.enqueue(blocks); return; }
-    const item = this.transcript.addUser(blocks, { pending: true });
+    let item = this.transcript.addUser(blocks, { pending: true });
     this.lastSent = item;
     this.promptPending = true;
     this.setRunning(true);
     this.emit('sent');
     try {
       if (!this.loaded && !this.loading) await this.load();
-      const p = rpc.call('session/prompt', { sessionId: this.id, prompt: blocks });
+      const p = this.callLoaded('session/prompt', { sessionId: this.id, prompt: blocks }, () => {
+        item = this.transcript.addUser(blocks, { pending: true });
+        this.lastSent = item;
+      });
       this.transcript.markUserSent(item);
       const res = await p;
       const reason = res && res.stopReason;
@@ -555,13 +588,13 @@ export class ChatSession extends Emitter {
   }
 
   async setMode(modeId) {
-    await rpc.call('session/set_mode', { sessionId: this.id, modeId });
+    await this.callLoaded('session/set_mode', { sessionId: this.id, modeId });
     if (this.modes) this.modes = { ...this.modes, currentModeId: modeId };
     this.configOptions = this.configOptions.map((o) => (o.category === 'mode' || o.id === 'mode' ? { ...o, currentValue: modeId } : o));
     this.emit('state');
   }
   async setConfig(configId, value) {
-    const res = await rpc.call('session/set_config_option', { sessionId: this.id, configId, value });
+    const res = await this.callLoaded('session/set_config_option', { sessionId: this.id, configId, value });
     if (res && Array.isArray(res.configOptions)) this.configOptions = res.configOptions;
     else this.configOptions = this.configOptions.map((o) => (o.id === configId ? { ...o, currentValue: value } : o));
     this.emit('state');
@@ -573,7 +606,7 @@ export class ChatSession extends Emitter {
     this.emit('state');
   }
   async setCwd(dir) {
-    await rpc.call(G('session/working-dir/update'), { sessionId: this.id, workingDir: dir });
+    await this.callLoaded(G('session/working-dir/update'), { sessionId: this.id, workingDir: dir });
     this.cwd = dir;
     patchSession(this.id, { cwd: dir });
     this.emit('state');
