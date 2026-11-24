@@ -26,6 +26,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import __version__, activity, api, logjanitor, security, tls
+from . import retention, uploads   # specs 039 (chunked uploads) and 040 (chat retention)
 from .auth import AuthService
 from .config import Settings
 from .context import DEFAULT_BODY_LIMIT, BodyTooLarge, Ctx, HTTPError, _ip_in
@@ -83,12 +84,13 @@ class SecurityHeaders:
 
 # ---------------------------------------------------------------------- request body cap (A-1, A-2)
 # Routes that take more than DEFAULT_BODY_LIMIT: (path pattern, bytes). /api/fs/upload follows server.max_upload_mb.
-_LARGE_BODY_ROUTES = ((re.compile(r"^/api/admin/teams/\d+/items$"), 8 * 1024 * 1024),)
+_LARGE_BODY_ROUTES = ((re.compile(r"^/api/admin/teams/\d+/items$"), 8 * 1024 * 1024),
+                      (uploads.PIECE_ROUTE, uploads.MAX_CHUNK_BYTES))   # spec 039: one piece of a chunked upload
 _MULTIPART_SLACK = 64 * 1024   # multipart boundaries and part headers on top of the file bytes
 
 
 def upload_limit_mb(settings: Settings) -> int:
-    return int(settings.get("server", "max_upload_mb") or 25)
+    return uploads.single_request_mb(settings)   # spec 039: never above server.max_upload_mb (multipart spools)
 
 
 class BodyLimit:
@@ -321,6 +323,13 @@ async def _maintenance_loop(c: Ctx) -> None:
             raise
         except Exception:
             log.exception("maintenance")
+        try:   # spec 039: partial upload files idle for 24 hours; spec 040: chat retention, at most hourly
+            await asyncio.to_thread(uploads.cleanup, c)
+            await retention.maybe_sweep(c)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("maintenance: uploads / retention")
         await asyncio.sleep(minutes * 60)
 
 
@@ -697,6 +706,7 @@ def make_audit_handler(c: Ctx):
             c.db.audit(action, user=client.user, ip=client.ip, target=target, detail=detail, ok=ok)
         except Exception:
             log.exception("audit write failed")
+        retention.note_activity(c, action, target, detail)   # spec 040: a chat's last use (throttled)
     return handler
 
 
@@ -706,6 +716,7 @@ def create_app(settings: Settings) -> Starlette:
     async def lifespan(app: Starlette):
         settings.system_dir.mkdir(parents=True, exist_ok=True)
         db = Database(settings.system_dir / "goose-web.db")
+        uploads.load_admin_limit(settings, db)   # spec 039: app.BodyLimit has no database
         workers = WorkerManager(settings)
         hub = Hub(workers)
         profiles = Profiles(settings, db)

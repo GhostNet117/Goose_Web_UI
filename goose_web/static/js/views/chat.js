@@ -15,6 +15,7 @@ import { visibilityContext, pickerHidden, HIDDEN_LABEL, knownDefaultProvider } f
 import { groupsConfig, groupPicker, groupOfProvider, headerPickers, groupDefault, isGroupValue, splitValue, inventory, loadInventoryOnce, GROUP_PREFIX } from '../providergroups.js';
 import { setBaseTitle, agentFor } from '../herd.js';
 import { mdElement } from '../markdown.js';
+import { linkUploads } from '../api.js';
 
 export function renderChat(ctx, sessionId) {
   const chat = getChat(sessionId);
@@ -316,6 +317,7 @@ export function renderChat(ctx, sessionId) {
     try {
       const res = await rpc.call('session/fork', { sessionId: chat.id, cwd: chat.cwd });
       const id = res.sessionId;
+      linkUploads(id, { from: chat.id, profile: rpc.profileParam || null });   // spec 040: the fork shares the chat's files
       upsertSession({ sessionId: id, cwd: chat.cwd, title: (chat.title || 'Chat') + ' (fork)', updatedAt: new Date().toISOString() });
       toast('Forked conversation', { kind: 'success' });
       router.go('/chat/' + encodeURIComponent(id));

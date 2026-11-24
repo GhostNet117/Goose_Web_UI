@@ -13,6 +13,8 @@ from .policy import ANY, CHAT_LISTS, LEGACY_DEFAULT_POLICY
 SCHEMA_VERSION = 6   # v3 (1.3.0): ip_blocks table; v4 (1.5.0): one team per user, least-privilege policies;
 #                      v5 (1.14.0): guard_rulesets table (prompt guard, spec 018)
 #                      v6 (1.15.0): chat_state table (composer queues and herd marks survive a restart, spec 019)
+#                      (specs 039/040 add the uploads, upload_links and chat_access tables - additive, created on
+#                      every open like all tables; the release that ships them may number them v7)
 POLICY_MODEL = 2     # meta 'policy_model': 2 = spec 009 semantics (empty list = nothing, "*" = any)
 
 # Audit rows older than this are deleted when the database is opened (GW-23).
@@ -188,6 +190,48 @@ CREATE TABLE IF NOT EXISTS chat_state (
   data TEXT NOT NULL DEFAULT '{}',
   updated_at REAL NOT NULL,
   PRIMARY KEY (profile, session_id, kind)
+);
+-- files uploaded through Goose Web (uploads.py, spec 039): id = SHA-256 of the id the browser holds; state open (a
+-- hidden partial file in `dir`), done (`path`), aborted, abandoned (idle 24 h), deleted (retention), gone (missing),
+-- kept (retention found it moved, linked or replaced: `note` says why); file_id = volume:file index of what was written
+CREATE TABLE IF NOT EXISTS uploads (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER,
+  username TEXT NOT NULL DEFAULT '',
+  profile TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  dir TEXT NOT NULL,
+  real_dir TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL,
+  partial TEXT NOT NULL DEFAULT '',
+  path TEXT NOT NULL DEFAULT '',
+  size INTEGER NOT NULL,
+  received INTEGER NOT NULL DEFAULT 0,
+  mime TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL,
+  file_id TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  completed_at REAL
+);
+CREATE INDEX IF NOT EXISTS ix_uploads_user ON uploads(user_id, state);
+CREATE INDEX IF NOT EXISTS ix_uploads_profile ON uploads(profile, state);
+-- the chats an upload belongs to (spec 040: attachments are deleted with their chat)
+CREATE TABLE IF NOT EXISTS upload_links (
+  upload_id TEXT NOT NULL,
+  profile TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  linked_at REAL NOT NULL,
+  PRIMARY KEY (upload_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS ix_upload_links_session ON upload_links(profile, session_id);
+-- when each chat was last used in Goose Web (retention.py, spec 040; written at most once a minute per chat)
+CREATE TABLE IF NOT EXISTS chat_access (
+  profile TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  last_access REAL NOT NULL,
+  PRIMARY KEY (profile, session_id)
 );
 """
 

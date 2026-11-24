@@ -1124,6 +1124,9 @@ def cmd_check(args, settings) -> int:
     line("config file", settings.source or "(defaults)")
     for mark, text in _config_lines(settings) + _signin_lines(settings):
         print(f"[{mark}] {text}")      # shown, not counted: an upgrade must not stop over a leftover line in a file
+    from . import retention, uploads
+    for mark, text in uploads.check_lines(settings) + retention.check_lines(settings):   # specs 039, 040
+        print(f"[{mark}] {text}")
     _startup_failure_line()
     gb = settings.goose_binary
     gv = goose_version(gb)

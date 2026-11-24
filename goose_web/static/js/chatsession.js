@@ -6,6 +6,7 @@ import { asksForSession } from './asks.js';
 import { getSession, upsertSession, patchSession } from './sessions.js';
 import { agentFor } from './herd.js';
 import { errMsg, toast } from './ui.js';
+import { linkUploads } from './api.js';
 
 const chats = new Map();
 const MAX_CACHED = 10;
@@ -444,6 +445,7 @@ export class ChatSession extends Emitter {
       const res = await rpc.call('session/fork', { sessionId: this.id, cwd: this.cwd, _meta: { conversationBefore: created } });
       const id = res && res.sessionId;
       if (!id) throw new Error('Goose did not return the new chat');
+      linkUploads(id, { from: this.id, profile: rpc.profileParam || null });   // spec 040: the branch shares the chat's files
       const title = (this.title || 'Chat') + ' (edited)';
       upsertSession({ sessionId: id, cwd: this.cwd, title, updatedAt: new Date().toISOString() });
       const c = getChat(id, { cwd: this.cwd, title });

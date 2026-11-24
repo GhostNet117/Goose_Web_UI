@@ -14,6 +14,7 @@ import { visibilityContext } from '../providervis.js';
 import { groupsConfig, groupPicker, entryOfProvider, groupDefault, isGroupValue, joinValue, splitValue, labelIn } from '../providergroups.js';
 import { upsertSession, sessionsState, sessionTitle, activityTime } from '../sessions.js';
 import { setBaseTitle, herdList } from '../herd.js';
+import { linkUploads } from '../api.js';
 
 export async function createSession({ cwd, recipeId = null, recipeDeeplink = null }) {
   const _meta = {};
@@ -143,12 +144,13 @@ export function renderHome(ctx, query = {}) {
   const composer = new Composer({
     placeholder: 'What should Goose work on?  (/ for commands, @ to mention)',
     getCwd: () => cwd,
-    onSend: async (blocks) => {
+    onSend: async (blocks, meta = {}) => {
       if (sending) return;
       if (!cwd) { const d = await pickFolder(); if (!d) { composer.value = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n'); return; } cwd = d; renderChips(); }
       sending = true; status.hidden = false;
       try {
         const chat = await createSession({ cwd, recipeId: recipe ? recipe.id : null });
+        linkUploads(chat.id, { ids: meta.uploads || [], profile: rpc.profileParam || null });   // spec 040: files attached before the chat existed
         await applyChoice(chat);
         router.go('/chat/' + encodeURIComponent(chat.id));
         // Goose renders recipe parameters during session/new; swap an untouched template prompt for the rendered one.

@@ -1,11 +1,20 @@
 // Composer: autosizing input with slash commands, @mentions, attachments, send/stop/steer.
-import { h, btn, iconBtn, autosize, toast, toastError, readFileBase64, pickFile, fmtBytes, kbd } from './ui.js';
+import { h, btn, iconBtn, autosize, toast, toastError, pickFile, fmtBytes, kbd } from './ui.js';
 import { icon } from './icons.js';
-import { upload } from './api.js';
+import { uploadFile, uploadLimits } from './api.js';
 import { rpc, G } from './rpc.js';
 import { prefs } from './prefs.js';
+import { prepareInline, planInline, NOTES } from './images.js';
 
-const IMAGE_MAX = 8 * 1024 * 1024;
+// Spec 039: files go up in resumable pieces (api.js uploadFile, 2 at a time) with progress and cancel; images are
+// also shown to the model as a smaller copy (images.js), within a per-message budget. At most MAX_FILES at once.
+const MAX_FILES = 20;
+const cancelled = (e) => !!e && (e.name === 'AbortError' || e.code === 'cancelled');
+function progressText(a) {
+  if (!a.id && !a.sent) return 'waiting…';
+  const pct = a.size ? Math.floor((a.sent || 0) * 100 / a.size) : 100;
+  return pct + '% · ' + fmtBytes(a.sent || 0) + ' of ' + fmtBytes(a.size);
+}
 
 export function fileUri(p) {
   let s = String(p).replace(/\\/g, '/');
@@ -48,6 +57,7 @@ export class Composer {
           h('div', { class: 'composer-right' }, ...(opts.trailing || []), h('span', { class: 'composer-hint' }, kbd(prefs().enterToSend !== false ? '↵' : 'Ctrl ↵'), ' send'), this.steerBtn, this.stopBtn, this.sendBtn))));
     this.bind();
     this.setRunning(false);
+    uploadLimits().then((l) => { this.attachBtn.title = 'Attach files or images (up to ' + fmtBytes(l.maxBytes) + ' each)'; }).catch(() => {});
   }
 
   bind() {
@@ -187,47 +197,87 @@ export class Composer {
   // ----- attachments -----
   async pick() { const files = await pickFile({ multiple: true }); if (files.length) this.addFiles(files); }
   async addFiles(files) {
-    for (const f of files) {
-      const att = { name: f.name, size: f.size, mime: f.type, status: 'loading' };
-      this.attachments.push(att);
-      this.renderAtts();
-      try {
-        // Spec 031: every attached file is written to <chat folder>\Web_Uploads - the server names that folder
-        // and refuses when this person may not write there (a read-only folder): then nothing is attached.
-        const cwd = this.o.getCwd && this.o.getCwd();
-        if (!cwd) throw new Error('Choose a working folder first');
-        const res = await upload(cwd, [f]);
-        const up = (res.files || [])[0];
-        if (!up) throw new Error('Upload returned no file');
-        const link = { type: 'resource_link', uri: fileUri(up.path), name: up.name || f.name, mimeType: up.mime || f.type || undefined, size: up.size ?? f.size };
-        att.path = up.path;
-        if (f.type.startsWith('image/') && f.size <= IMAGE_MAX) {
-          // an image is also shown to the model itself; the link says where the file is for the agent's tools
-          att.blocks = [{ type: 'image', data: await readFileBase64(f), mimeType: f.type }, link];
-          att.preview = URL.createObjectURL(f);
-        } else att.blocks = [link];
-        att.status = 'ready';
-      } catch (e) {
-        att.status = 'error'; toastError(e, 'Attach ' + f.name);
-        this.attachments = this.attachments.filter((x) => x !== att);
+    // Spec 031: every attached file is written to <chat folder>\Web_Uploads - the server names that folder and
+    // refuses when this person may not write there (a read-only folder): then nothing is attached.
+    const cwd = this.o.getCwd && this.o.getCwd();
+    if (!cwd) { toastError(new Error('Choose a working folder first'), 'Attach'); return; }
+    const room = MAX_FILES - this.attachments.length;
+    if (room < files.length) toast('At most ' + MAX_FILES + ' files at once' + (room > 0 ? ': ' + (files.length - room) + ' not added' : ''), { kind: 'warn' });
+    if (room <= 0) return;
+    let limits = null;
+    try { limits = await uploadLimits(); } catch { /* the server refuses at the start with the limit in its message */ }
+    await Promise.all(files.slice(0, room).map((f) => this.addFile(f, cwd, limits)));
+  }
+  async addFile(f, cwd, limits) {
+    if (limits && f.size > limits.maxBytes) { toastError(new Error(f.name + ' (' + fmtBytes(f.size) + ') is larger than the upload limit of ' + fmtBytes(limits.maxBytes)), 'Attach'); return; }
+    const att = { name: f.name, size: f.size, mime: f.type, status: 'loading', sent: 0, id: null, controller: new AbortController(), inline: null, note: '' };
+    this.attachments.push(att);
+    this.renderAtts();
+    // the copy the model sees is made while the original goes up unchanged (images.js)
+    const inline = (f.type || '').startsWith('image/') ? prepareInline(f).catch(() => ({ skip: 'undecodable' })) : null;
+    try {
+      const up = await uploadFile(cwd, f, {
+        session: (this.o.getSessionId && this.o.getSessionId()) || null,   // spec 040: the chat the file belongs to
+        profile: rpc.profileParam || null,
+        signal: att.controller.signal,
+        onStart: (id) => { att.id = id; this.renderProgress(att); },
+        onProgress: (sent) => { att.sent = sent; this.renderProgress(att); },
+      });
+      att.id = up.id || att.id;
+      att.path = up.path;
+      // the link says where the file is, for the agent's tools; an image also goes inline (buildBlocks, budget)
+      att.link = { type: 'resource_link', uri: fileUri(up.path), name: up.name || f.name, mimeType: up.mime || f.type || undefined, size: up.size ?? f.size };
+      if (inline) {
+        const r = await inline;
+        if (r && r.data) { att.inline = { data: r.data, mimeType: r.mimeType, bytes: r.bytes }; att.preview = URL.createObjectURL(f); }
+        else att.note = NOTES[(r && r.skip) || 'undecodable'] || NOTES.undecodable;
       }
-      this.renderAtts();
+      att.status = 'ready';
+    } catch (e) {
+      if (!cancelled(e)) toastError(e, 'Attach ' + f.name);
+      this.attachments = this.attachments.filter((x) => x !== att);
     }
+    this.renderAtts();
+  }
+  removeAtt(a) {
+    if (a.status === 'loading' && a.controller) a.controller.abort();   // stops the upload; the server deletes what it had
+    this.attachments = this.attachments.filter((x) => x !== a);
+    if (a.preview) URL.revokeObjectURL(a.preview);
+    this.renderAtts();
+  }
+  renderProgress(a) {
+    const pct = a.size ? Math.floor((a.sent || 0) * 100 / a.size) : 100;
+    if (a.barEl) a.barEl.style.width = pct + '%';
+    if (a.pctEl) a.pctEl.textContent = progressText(a);
   }
   renderAtts() {
+    const plan = planInline(this.attachments);
     this.attRow.hidden = !this.attachments.length;
-    this.attRow.replaceChildren(...this.attachments.map((a) => h('div', { class: ['att', 'att-' + a.status], title: a.path || a.name },
-      a.preview ? h('img', { src: a.preview, alt: '' }) : icon(a.status === 'loading' ? 'upload' : 'file', 14),
-      h('span', { class: 'att-name' }, a.name), h('span', { class: 'att-size' }, fmtBytes(a.size)),
-      a.status === 'loading' ? h('span', { class: 'spinner', style: { width: '11px', height: '11px' } }) : null,
-      iconBtn('x', 'Remove', () => { this.attachments = this.attachments.filter((x) => x !== a); if (a.preview) URL.revokeObjectURL(a.preview); this.renderAtts(); }, { size: 'sm' }))));
+    this.attRow.replaceChildren(...this.attachments.map((a, i) => {
+      const note = a.inline && !plan[i] ? NOTES.budget : a.note;
+      const loading = a.status === 'loading';
+      a.barEl = loading ? h('span', { class: 'att-bar', style: { width: (a.size ? Math.floor((a.sent || 0) * 100 / a.size) : 0) + '%' } }) : null;
+      a.pctEl = loading ? h('span', { class: 'att-size att-pct' }, progressText(a)) : null;
+      return h('div', { class: ['att', 'att-' + a.status, note ? 'att-link-only' : ''], title: (a.path || a.name) + (note ? '\n' + note : '') },
+        a.preview ? h('img', { src: a.preview, alt: '' }) : icon(loading ? 'upload' : 'file', 14),
+        h('span', { class: 'att-name' }, a.name), loading ? a.pctEl : h('span', { class: 'att-size' }, fmtBytes(a.size)),
+        note ? h('span', { class: 'att-note', title: note }, 'link only') : null,
+        loading ? h('span', { class: 'att-progress', role: 'progressbar', 'aria-label': 'Upload progress' }, a.barEl) : null,
+        iconBtn('x', loading ? 'Cancel upload' : 'Remove', () => this.removeAtt(a), { size: 'sm' }));
+    }));
   }
 
   buildBlocks() {
     const text = this.ta.value.replace(/\s+$/, '');
     const blocks = [];
     if (text.trim()) blocks.push({ type: 'text', text });
-    for (const a of this.attachments) for (const b of a.blocks || []) blocks.push(b);
+    // text, then per file: [image (the smaller copy, within the per-message budget)], resource_link
+    const plan = planInline(this.attachments);
+    this.attachments.forEach((a, i) => {
+      if (a.status !== 'ready' || !a.link) return;
+      if (a.inline && plan[i]) blocks.push({ type: 'image', data: a.inline.data, mimeType: a.inline.mimeType });
+      blocks.push(a.link);
+    });
     return blocks;
   }
 
@@ -236,10 +286,11 @@ export class Composer {
     const blocks = this.buildBlocks();
     if (!blocks.length) return;
     if (this.o.validate && !this.o.validate(blocks)) return;
+    const uploads = this.attachments.map((a) => a.id).filter(Boolean);   // spec 040: New chat links them to the chat
     this.ta.value = ''; this.fit(); this.o.onInput && this.o.onInput('');
     for (const a of this.attachments) if (a.preview) setTimeout(() => URL.revokeObjectURL(a.preview), 60000);
     this.attachments = []; this.renderAtts();
     this.hideMenu();
-    if (steer && this.o.onSteer) this.o.onSteer(blocks); else this.o.onSend(blocks);
+    if (steer && this.o.onSteer) this.o.onSteer(blocks, { uploads }); else this.o.onSend(blocks, { uploads });
   }
 }

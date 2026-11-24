@@ -119,6 +119,8 @@ The main ideas:
 | `app.py` | ASGI app factory `create_app`: middleware (`SecurityHeaders`, `GZipMiddleware`, `HostGuard`, `IPBlockGuard`), static and SPA routes, `/ws` endpoint, lifespan, webhook SSRF guard and sender, event/audit handlers wired into the hub. |
 | `context.py` | `Ctx` (shared services), `HTTPError`, request helpers: identity resolution, `require()` (auth, CSRF, origin, role), allowed origins, client IP, policy and roots for a user, `upstream_for(user)`, `body_json`. |
 | `api.py` | All REST handlers and the `routes` list: auth, current user, preferences, TOTP, API tokens, hints, notifications, file system, MCP App frames, herd, and every `/api/admin/*` endpoint. |
+| `uploads.py` | Spec 039: chunked, resumable uploads (`/api/fs/uploads`, section [12.7](#127-uploads-and-downloads)): the upload limit (Admin > Settings over `server.max_upload_mb`, 1..5120 MB; `limit_mb` for `app.BodyLimit`), start / piece / status / cancel, the hidden partial file and its identity checks, the never-replacing rename, `record_saved` (the single-request upload's files), `cleanup` (partial files idle 24 h), `POST /api/fs/uploads/link` (spec 040). |
+| `retention.py` | Spec 040: chats and their uploads deleted after N days without use (section [10.5](#105-chat-and-attachment-retention-retentionpy-spec-040)): last use (`note_activity` from the audit hook, `chat_access`), Goose's session times (`sessions.db`, read-only), `sessions_in_use` (a read-only look at the hub), the sweep / preview, `/api/admin/retention*`, `check_lines`. |
 | `tls.py` | Spec 015: built-in HTTPS - mode resolution (`auto`/`self-signed`/`files`/`off`, Admin UI override), local CA and server certificate (`cryptography`, EC P-256) with every local name/address, renewal (expiry, new names) and hot reload into the live `SSLContext`. |
 | `activity.py` | Spec 015: user activity log, JSON lines in `<system_dir>/logs/activity.jsonl` (every audit event + connections). |
 | `logjanitor.py` | Spec 015: keeps all logs under `logs.max_disk_percent` of the volume (oldest unused files first, copytruncate for a live worker log), prunes the audit table. |
@@ -161,14 +163,15 @@ The main ideas:
 | `js/store.js` | `Emitter`, `Store`, the global `store` and `bus`, policy helpers. |
 | `js/router.js` | Hash router (`#/view/arg?query`). |
 | `js/rpc.js` | Reconnecting JSON-RPC client over `/ws`. |
-| `js/api.js` | `fetch` wrapper for the REST API (CSRF header, errors, uploads). |
+| `js/api.js` | `fetch` wrapper for the REST API (CSRF header, errors, uploads). Spec 039: `uploadFile` (pieces from `File.slice` with `XMLHttpRequest` for progress; 2 files at a time; a failed piece is tried again 3 times after 1, 2, 4 s from the server's `received`; cancel through an `AbortSignal` + `DELETE`; injectable transport), `uploadLimits`, `linkUploads` (spec 040). |
+| `js/images.js` | Spec 039: the copy of an image the model sees - `prepareInline` (decode with `createImageBitmap`, longest side 1600 px, PNG for small images with transparency, else JPEG 0.85 -> 0.55, then 3/4 size, until about 1 MB of base64; undecodable formats are links only) and `planInline` (10 MiB of inline images per message, in attachment order). |
 | `js/prefs.js` | User preferences (server-stored, cached in `localStorage`, synced live between tabs), themes. |
 | `js/providervis.js` | Spec 023 (1.17.0): which providers the chat pickers offer. The user's hidden list (`prefs.providerVisibility.hidden`, server-stored), applied after the policy; never hides the default provider or (in a chat header) the chat's own provider; leaves out providers Goose lists but that are not configured, and effort variants (`variantOf`, a spec 022 hook). Pure rules `pickerHidden` / `pickerProviders` / `cleanHidden` / `hideAllExcept`; default provider, unconfigured ids and variants remembered in `localStorage` `gw-provider-vis` (ids only, per user) so the chat header needs no request. |
 | `js/providergroups.js` | Spec 024 (1.18.0): provider groups, a display alias for the chat pickers. `prefs.providerGroups = {groups: [{id, name, members: [{provider, prefix}]}], modelNames: {id: name}}` (server-cleaned, `api._clean_provider_groups`; a provider in one group only). Pure rules `groupPicker` (policy-filtered providers -> picker entries: ungrouped providers with display names, one `group:<id>` entry per group with the members that pass spec 023's `pickerHidden` - the chat's own and the default provider always - and models `{value: '<provider>\|<model>', label: '<prefix> - <name>'}` in the order of the group's providers, then by name). `groupsConfig()` = `mergeGroups(teamGroups(), ownGroups())` (1.25.0): the team's aliases (`policy.provider_groups` of `/api/me`) first, then the person's own groups for providers the team left alone, `headerPickers` (collapses Goose's provider option for the chat header), `groupDefault`, `labelIn`, `splitValue`. Picks always resolve to the REAL provider + model (header: `set_config_option provider`, then `model`). The members' model lists come from the `providers/list` New chat and Settings load (`localStorage` `gw-provider-models`, ids and names, per user; `loadInventoryOnce` fetches it at most once per page otherwise). |
 | `js/chatoptions.js` | Per-chat options shared by the chat header and the New chat screen: `pillSelect`, Goose's approval `MODES`, the learned thinking-effort values (`localStorage` `gw-effort-options`), `loadNewChatOptions()` and `applyNewChatOptions()` (spec 008). |
 | `js/chatsession.js` | `ChatSession`: per-session controller. Maps ACP updates to transcript calls. Handles send, queue, steer, cancel and modes. |
 | `js/transcript.js` | `Transcript`: incremental, windowed rendering of messages, thoughts, tool cards, plans, asks and inline MCP Apps. |
-| `js/composer.js` | Message input: slash commands, @mentions, attachments, send/stop/steer/queue. |
+| `js/composer.js` | Message input: slash commands, @mentions, attachments (spec 039: chunked uploads with progress and cancel, at most 20 files, the inline image copy within the per-message budget and a "link only" note), send/stop/steer/queue. |
 | `js/asks.js` | Permission, elicitation and recipe-parameter cards and their answers. |
 | `js/herd.js` | Herd store, status transitions, browser notifications, title and favicon badges. |
 | `js/elsewhere.js` | Spec 020: the "Working elsewhere" list (administrators): `setElsewhere`, `elsewhereFor(sessionId)`, `runningElsewhere`, source labels; the sidebar group, the herd section and the chat's read-only banner read it. 1.18.1: `namePrefix` (the port of `elsewhere.name_prefix`), `jobPrefixes`, `groupJobRows` - the sidebar's folder list shows the sessions of one elsewhere job as one row. |
@@ -177,7 +180,7 @@ The main ideas:
 | `js/cron.js` | Cron presets, validation, description, editor widget. |
 | `js/ui.js` | DOM helpers (`h()`), buttons, modals, toasts, menus, dialogs, tables, tabs, formatting. |
 | `js/icons.js` | Inline SVG icon set. |
-| `js/views/*.js` | One module per screen: `home`, `chat`, `herd`, `recipes`, `skills`, `schedules`, `apps`, `extensions`, `settings`, `admin`, `login`, `sidebar`, `folderpicker`. |
+| `js/views/*.js` | One module per screen: `home`, `chat`, `herd`, `recipes`, `skills`, `schedules`, `apps`, `extensions`, `settings`, `admin`, `login`, `sidebar`, `folderpicker`. `filesettings.js` (specs 039/040): Admin > Settings > Files and chats (largest upload, retention, Preview, Run now). |
 
 ### Packaging, deployment and tests
 
@@ -392,8 +395,10 @@ sessions and configuration.
    audit retention is applied by the maintenance loop, section 10.4.)
 3. Creates `WorkerManager`, `Hub(workers)`, `Profiles` and the `Ctx`, and reads
    the Goose version (`goose --version`, 20 s timeout).
-4. Wires hub callbacks: `on_audit` (writes audit rows), `on_event` (webhook
-   notifications), and `profile_root_for` (used by the external-change watcher).
+4. Wires hub callbacks: `on_audit` (writes audit rows; spec 040: also a chat's
+   last use, `retention.note_activity`), `on_event` (webhook notifications), and
+   `profile_root_for` (used by the external-change watcher). Loads the
+   administrator's upload limit for `BodyLimit` (`uploads.load_admin_limit`).
 5. Starts the hub flush loop (`hub.start()`) and the worker monitor.
 6. Calls `upstream_for(user)` for every user who is not disabled. This
    registers every profile, so profiles with schedules get their workers
@@ -1271,6 +1276,10 @@ secrets, schedules) stays in each profile and is never copied into it.
 | `ip_blocks` | `ip` (address key: IPv4 or IPv6 /64), `failures` (JSON list of timestamps of the current run), `last_username`, `blocked_at` (0 = not blocked), `blocked_until` (0 = until unblocked), `updated_at` (schema version 3) |
 | `chat_state` | Per-chat live state the hub keeps for each profile (spec 019, schema version 6): `(profile, session_id, kind)` primary key, `data` (JSON), `updated_at`. `kind = 'queue'`: the composer queue; `kind = 'mark'`: the herd status not yet seen (`working`, `needs_you`, `done`, `error` with title, folder, last text). Written on queue changes and status changes only; read when the profile's `Upstream` is created (`Upstream.restore_state`). Rows are deleted when the queue empties, the status becomes idle (`_gw/seen`), the chat is deleted, or the user is deleted; marks older than 30 days are dropped. |
 
+| `uploads` | Spec 039: files uploaded through Goose Web. `id` (SHA-256 of the id the browser holds), `user_id`, `username`, `profile` (whose chats it belongs to), `session_id` (the chat named at the start), `dir` (`<chat folder>\Web_Uploads` as written) and `real_dir` (resolved at the start), `name`, `partial` (the hidden partial file while `open`), `path` (the final file), `size` (declared), `received`, `mime`, `state` (`open`, `done`, `aborted`, `abandoned`, `deleted`, `gone`, `kept`), `file_id` (volume:file index of the file written), `note`, `created_at`, `updated_at`, `completed_at`. Ended rows are dropped after 30 days; `done` rows stay for retention. |
+| `upload_links` | Spec 040: `(upload_id, session_id)` primary key, `profile`, `linked_at` - the chats a file belongs to (set at completion, by New chat after `session/new`, copied to a fork or branch). |
+| `chat_access` | Spec 040: `(profile, session_id)` primary key, `last_access` - when Goose Web last saw the chat used (at most one write a minute per chat). |
+
 **JSON columns.** `prefs`, `policy_overrides`, `policy`, `payload`, `detail` and
 `value` are decoded automatically in `_row()`, so callers always get Python
 objects.
@@ -1344,6 +1353,37 @@ and every `logs.check_minutes`). Since 1.20.0 opening the database purges nothin
 deleted rows a longer `logs.audit_days` was meant to keep. Before 1.20.0 `purge_audit()` deleted older rows each time the
 database is opened. Admins read the log through
 `GET /api/admin/audit?before=&user=&action=&limit=` (at most 500 rows per page).
+
+### 10.5 Chat and attachment retention (`retention.py`, spec 040)
+
+A chat and the files uploaded to it are deleted after `retention_days` (Admin > Settings, over
+`retention.chat_days`, default 180; 0 = never) without use.
+
+- **Last use** = max(Goose's `updated_at` / `created_at` of the session in the profile's `sessions.db`, read
+  read-only like `elsewhere.read_activity`; Goose bumps `updated_at` when a chat is opened, in Desktop and the CLI
+  too) and `chat_access.last_access`. The latter is written from the hub's audit hook
+  (`app.make_audit_handler` -> `retention.note_activity`): `chat.open`, `chat.prompt`, `chat.cancel`, `chat.fork`,
+  `chat.mode`, `chat.steer` (session id in `target`, `detail.profile`) and audited `acp.*` calls with
+  `detail.sessionId`; throttled to one write a minute per chat, ids checked (`^[A-Za-z0-9_.:-]{1,128}$`); rows
+  of chats Goose no longer has are removed by the sweep. `chat.new` has no id yet: Goose's own time and the
+  link call that follows cover a new chat. `hub.py` is not involved beyond the existing hook.
+- **Files of a chat**: `uploads` rows in state `done` joined through `upload_links`. Rows older than the account
+  (a deleted account of the same name) are ignored.
+- **Sweep** (`maybe_sweep` from the maintenance loop: retention on, 7 days after `retention_armed_at`, an hour
+  after `retention_last.at`, one at a time): enabled users grouped by Goose profile folder; per profile the
+  top-level sessions of type `user`, `scheduled` or `acp` whose last use is older than the period, oldest first, at
+  most `CHATS_PER_SWEEP` (200) in total. Right before each: `sessions_in_use(hub, key)` (running, `loading_client`,
+  queue, steers, prompts, a tab's `watch`, asks, pending requests naming it), `hub.elsewhere_running`, and the
+  scheduler jobs of `hub.busy_report()` (asked once). Deletion: `ctx.upstream_for(user).request("session/delete")`
+  (starts the worker if needed; the hub's `_post_response` drops the chat's state), then its `sub_agent` sessions,
+  then its files (`file_problem`: parent folder `Web_Uploads` as written and resolved, `path_ok(owner, write=True)`,
+  a regular file and no link, the recorded `file_id`, no link to a chat that is kept). A failed `session/delete`
+  (unless the session is gone from `sessions.db`) stops that profile for this sweep; files go only after their chat.
+  Then files with no link to an existing chat whose upload is older than the period. A `sessions.db` that cannot
+  be read skips the profile; a missing one allows only files linked to no chat. Audit: `retention.chat_deleted`,
+  `retention.files_deleted`, `retention.run`; summary in `retention_last`.
+- **Admin API**: `GET /api/admin/retention`, `GET /api/admin/retention/preview?days=` (the same code with
+  `dry_run`, no cap), `POST /api/admin/retention/run` (409 while one runs).
 
 ---
 
@@ -1724,8 +1764,10 @@ The REST file endpoints (`/api/fs/*`) use the same check through
 - the directory must pass the path check;
 - non-admins cannot upload a file named `AGENTS.md`, `.goosehints` or
   `.goose-web-hints.md` (`403 hint_file_refused`);
-- size is limited to `server.max_upload_mb` (25), checked against
-  `Content-Length` first and again while streaming in 1 MB chunks;
+- size is limited to `server.max_upload_mb` (25), or the administrator's lower
+  upload limit (spec 039: `uploads.single_request_mb`; a higher one is for the
+  chunked upload only - this body is spooled to the temp folder), checked
+  against `Content-Length` first and again while streaming in 1 MB chunks;
 - at most 20 files and 20 fields per request.
 
 `safe_upload_name` sanitises file names:
@@ -1739,6 +1781,34 @@ The REST file endpoints (`/api/fs/*`) use the same check through
 Files are created exclusively (`open(..., 'xb')`). An existing file is never
 overwritten. A collision becomes `name (2).ext`, up to 1000 attempts. Uploads
 are audited.
+
+**Chunked uploads** (`uploads.py`, spec 039; the message box uses them):
+
+- `POST /api/fs/uploads {dir, name, size, mime?, session?, profile?}`: the checks above on the resolved
+  `<dir>\Web_Uploads`, the declared size against the limit (`max_upload_mb` setting over `server.max_upload_mb`,
+  1..5120), at most 20 unfinished uploads per person (idle ones beyond 24 h do not count), free disk space >=
+  size + what other open uploads on that drive still need + 1 GiB (`507 disk_full`). Then `mkdir`, the folder
+  checked again, and a partial file created with `O_CREAT|O_EXCL` and a random name
+  (`.goose-web-upload-<hex>.partial`, hidden on Windows); its volume:file index is stored, and it must be the file
+  in the folder resolved at the start (else removed, `403`). The id (32 random bytes) is returned; the row stores
+  its SHA-256. `profile` is honoured for administrators only (a member's chat they work in).
+- `PUT /api/fs/uploads/{id}?offset=N`: only the owner (others get 404); `offset` must equal `received`; at most
+  `MAX_CHUNK_BYTES` (32 MiB, also `app.BodyLimit` for this route) and never past the declared size; 4 pieces per
+  person at once, one per upload. The folder is checked again; the partial file is opened only if `lstat` shows a
+  regular file and `fstat` of the opened handle has the stored identity; a longer file is cut back, a shorter one
+  ends the upload. The body is written while it arrives (at most 1 MiB gathered, writes in a thread), `fsync`,
+  then `received` stored - a piece is all or nothing (cut back on any error, a disconnect, or 120 s without a byte:
+  `408`; the page stops a piece itself after 90 s without progress and tries again). At the last byte:
+  checked again, renamed without replacing (`MoveFileEx` without replace; `link`+`unlink` elsewhere) to
+  `name`, `name (1).ext`, ...; afterwards it must still be the same file in the same resolved folder (else deleted,
+  `409 upload_moved`, audited); hidden attribute removed, row `done`, link to `session_id`, audit `fs.upload`
+  `{files: [name], size, chunked: true}`.
+- `GET /api/fs/uploads/{id}` -> `{received, size, state, done, file?}` (resume); `DELETE` -> abort (the partial
+  file is deleted at once, or by the piece being received); `GET /api/fs/uploads` -> the limits;
+  `POST /api/fs/uploads/link {session, ids?, from?, profile?}` (spec 040).
+- `uploads.cleanup` (maintenance loop): `open` rows idle 24 h -> partial file deleted (only if still ours),
+  `abandoned`; ended rows dropped after 30 days. `fs_upload` records its files too (`record_saved`, `id` in its
+  answer); its limit never exceeds `server.max_upload_mb`.
 
 **Downloads** (`/api/fs/download`):
 

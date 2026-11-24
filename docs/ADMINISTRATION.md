@@ -352,7 +352,10 @@ Changes to `config.yaml` take effect after a gateway restart.
   rewrite the host, `X-Forwarded-Host`.
 - Do not cut long-lived connections. The gateway pings WebSocket clients every 25 seconds (60-second timeout), but
   agent runs can last much longer than typical proxy timeouts, so disable or raise read/write timeouts.
-- Allow request bodies of at least `server.max_upload_mb` (default 25 MB) for file uploads.
+- Allow request bodies of at least 32 MB (one piece of a chunked upload, `PUT /api/fs/uploads/{id}`; since spec
+  039 the message box sends files in pieces of 16 MB) and, for older pages and scripts that still use the
+  single-request `POST /api/fs/upload`, of the upload limit (6.4). Do not buffer request bodies to disk at the proxy
+  if you can avoid it (nginx: `proxy_request_buffering off;`).
 - Do not cache `/api/`, `/ws`, `/sw.js` or `/` at the proxy.
 
 Caddy (proxies WebSockets and sets `X-Forwarded-*` by default):
@@ -454,9 +457,25 @@ Behind a reverse proxy:
 
 ### 6.4 Uploads and other fixed limits
 
-`server.max_upload_mb` (default 25) limits the size of an upload request; up to 20 files per request. Other limits
-are fixed: 2 MiB JSON bodies, 64 MiB WebSocket frames, a 12 MiB live transcript buffer per session and 256 MiB in
-total (the oldest idle buffers are dropped first).
+**Largest file upload** (spec 039): **Admin > Settings > Files and chats > Largest file upload (MB)**, 1 to 5120
+(5 GB). Until it is saved there, `server.max_upload_mb` (default 25) applies; a configured value above 5120 counts
+as 5120 and `goose-web check` says so. The limit is per file; people see it in the paper-clip button's tooltip and
+in the refusal. The single-request `POST /api/fs/upload` (older pages, scripts) keeps its ceiling: the smaller of
+this limit and `server.max_upload_mb`, because its multipart body is spooled to the system's temp folder first;
+larger files go up in pieces (`/api/fs/uploads`, API.md).
+
+How a file goes up: the message box declares the file (name, size, chat folder), then sends it in pieces of 16 MB
+(at most 32 MB per request) and the gateway writes each piece straight to a hidden partial file
+(`.goose-web-upload-<random>.partial`) in the chat folder's `Web_Uploads`; at the last byte the file gets its name
+(never replacing a file). Checked at the start: the person may write the folder (as it resolves), the name, the
+declared size against the limit, and the free disk space - the file's size plus what other unfinished uploads on
+that drive still need, plus 1 GB, must be free, otherwise "Not enough free disk space for this file ...". Per
+person: at most 20 unfinished uploads and 4 pieces at the same time. A partial file nobody has added to for 24
+hours is deleted by the maintenance loop (`logs.check_minutes`); a cancelled upload's at once. Each finished upload
+is in the audit log (`fs.upload`: name, size, folder).
+
+Other limits are fixed: 2 MiB JSON bodies, 64 MiB WebSocket frames, a 12 MiB live transcript buffer per session and
+256 MiB in total (the oldest idle buffers are dropped first).
 
 ## 7. Users and sign-in
 
@@ -988,6 +1007,45 @@ when needed. The server names it - the page only says which chat folder. An atta
 written, when the person may not write in the chat folder (a read-only folder), when a `Web_Uploads` there is a
 link to somewhere they may not write, or when Windows refuses. Existing files are never overwritten
 (`report (1).pdf`). Earlier versions wrote to `.goose-web-uploads`; those files stay where they are.
+
+Images (spec 039): the original goes to `Web_Uploads` unchanged; the model is shown a copy the browser makes (at
+most 1600 pixels, about 1 MB, JPEG or PNG), and at most 10 MB of images per message - further images and formats
+the browser cannot read (HEIC, TIFF) go as file links only. Reason: some OpenAI-compatible endpoints refuse request
+bodies above about 5 MB, Goose sends the whole conversation again at every turn, and `goose serve` drops WebSocket
+messages above 16 MiB. **A model only sees images when Goose knows it supports them**: Goose looks the model up in
+its model catalog, and for a custom provider's model it uses the model entry's `supports_vision` in the provider's
+JSON (`config/custom_providers/<id>.json`, `"models": [{"name": "...", "supports_vision": true, ...}]`). Without it,
+an OpenAI-type provider's request carries "[image omitted: model does not support vision]" instead of the image
+(Anthropic-type providers pass images on). Add the field in your own profile's provider files; members' profiles
+get it at the next provisioning, and Goose reads provider files when it starts (restart Goose Desktop; Goose Web's
+workers restart when idle, or use Admin > System > Workers). Note: the prompt guard reads text only - text written
+inside an image reaches a vision model unchecked.
+
+#### 9.9d Deleting unused chats and their attachments (retention, spec 040)
+
+**Admin > Settings > Files and chats > Delete chats and their attachments after (days without use)**: default 180
+(`retention.chat_days`), 0 = never, 1 to 3650. Counted from a chat's **last use**: the later of when Goose Web last
+saw it opened or used (prompt, steer, stop, fork, mode, any audited call naming it) and Goose's own "updated" time of
+the session - which Goose also bumps when a chat is opened in Goose Desktop or the CLI. A chat that is used keeps
+restarting its period.
+
+Once an hour (the maintenance loop) Goose Web deletes, per profile, every chat whose last use is older than the
+period - through the profile's Goose worker (`session/delete`, the worker is started when needed), with its
+sub-agent sessions - and then the files uploaded to it. A file is deleted only when it is still in a folder named
+`Web_Uploads`, in a folder the profile may write, the same file that was uploaded (not replaced since), and not used
+by a chat that is kept (a fork shares the files of the chat it came from). Files uploaded but never sent in a chat
+count from their upload time. Never deleted: a chat that is running, being opened, open in a tab, with queued
+messages or a question waiting, or running in Goose Desktop or a scheduled job. At most 200 chats per sweep, oldest
+first. Deletions are audited: `retention.chat_deleted` (chat id, files, bytes), `retention.files_deleted` (per
+profile), `retention.run` (per sweep).
+
+- **Preview** shows per user how many chats, files and bytes would be deleted now - also for a number typed but not
+  saved yet. **Run now** runs a sweep at once (after a confirmation) and shows what was deleted.
+- **The first automatic sweep waits 7 days** after retention first applies (the page shows the date), so you can
+  look at the Preview first. This includes the native profile: Goose Desktop and CLI chats unused for the period go
+  too. Set 0 before upgrading if you are not ready.
+- Not covered: disabled accounts (skipped until enabled again), Goose's hidden sessions, files attached before
+  this version (no record), and forks made in Goose Desktop (they do not share the original's files).
 
 A team can hand recipes, skills, extensions and providers to its members. In the team's "Library items" section,
 choose "Add from library", pick a profile (any user, including your own native profile) and a kind, then add an
@@ -2435,7 +2493,10 @@ JSON, and the gateway log is one line per event plus traceback continuation line
 The database and the profiles contain credentials. Encrypt and restrict backups like the originals. Since 1.15 the
 database also holds messages users queued for a running chat (`chat_state`, plaintext, deleted when sent, removed
 or older than 7 days; `secure_delete` is on since 1.15.1), so a database backup can contain prompt text: keep the
-same retention for it.
+same retention for it. Since specs 039/040 it also lists the files uploaded through Goose Web (path, name, size,
+chat) and when each chat was last used (`uploads`, `upload_links`, `chat_access`) - names, never file contents. A
+retention sweep deletes chats and files, not your backups: keep backups no longer than the retention period if the
+period is meant to bind them too.
 
 ### 19.2 Online backup of the database
 
@@ -2568,7 +2629,8 @@ everything gone (back up first).
    warning marked as an error.
 9. Set the default team, the sign-in lifetime (8 hours at most), how long Keep me signed in lasts (24 hours at
    most, 0 = off) and the branding in Admin > Settings. Consider
-   an idle limit (`auth.idle_minutes`) where devices are shared.
+   an idle limit (`auth.idle_minutes`) where devices are shared. Check **Files and chats**: the largest upload and
+   how long unused chats are kept (look at the Preview).
 10. Add shared providers, extensions, skills and recipes as team items, and shared hints documents.
 11. Create user accounts (or let LDAP/OIDC create them) and check one user's experience with a non-admin account.
 12. Decide who owns the native profile's scheduler (`goose.native_scheduler`) if Goose Desktop is used on the same
