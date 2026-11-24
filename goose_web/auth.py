@@ -28,6 +28,9 @@ API_TOKEN_PREFIX = "gwt_"
 SESSION_HOURS_MAX = 8.0
 IDLE_MINUTES_MAX = 480.0
 IDLE_MINUTES_MIN = 5.0
+# Spec 037: "Keep me signed in" is back with a hard cap - a remembered sign-in survives closing the browser (its cookie
+# is kept on disk) and lasts auth.remember_hours, 24 at most; 0 switches the checkbox off.
+REMEMBER_HOURS_MAX = 24.0
 
 
 def clamp_session_hours(raw: Any) -> float:
@@ -51,6 +54,20 @@ def clamp_idle_minutes(raw: Any) -> float:
     if not (m > 0):
         return 0.0
     return max(IDLE_MINUTES_MIN, min(IDLE_MINUTES_MAX, m))
+
+
+def clamp_remember_hours(raw: Any) -> float:
+    """How long a "keep me signed in" sign-in lasts, in hours (spec 037): 0 or less = the feature is off; above the
+    limit = REMEMBER_HOURS_MAX; empty or not a number = REMEMBER_HOURS_MAX (the default); never below a minute."""
+    try:
+        h = float(raw)
+    except (TypeError, ValueError):
+        return REMEMBER_HOURS_MAX
+    if h != h or h > REMEMBER_HOURS_MAX:          # NaN, or more than the cap
+        return REMEMBER_HOURS_MAX
+    if not (h > 0):
+        return 0.0
+    return max(h, 1 / 60)
 MASK = "********"
 
 DEFAULT_AUTH = {
@@ -621,11 +638,21 @@ class AuthService:
     # ------------------------------------------------------------ sessions
     def session_hours(self) -> float:
         """How long a sign-in lasts (spec 032): the administrator's setting, else `auth.session_hours`, never more
-        than SESSION_HOURS_MAX. Fixed at sign-in, never extended. There is no "keep me signed in"."""
+        than SESSION_HOURS_MAX. Fixed at sign-in, never extended. A "keep me signed in" sign-in: remember_hours."""
         return clamp_session_hours(self.db.get_setting("session_hours") or self.s.get("auth", "session_hours"))
 
     def session_seconds(self) -> float:
         return 3600 * self.session_hours()
+
+    def remember_hours(self) -> float:
+        """How long a "keep me signed in" sign-in lasts (spec 037): the administrator's setting, else
+        `auth.remember_hours` (24), never more than REMEMBER_HOURS_MAX; 0 = the checkbox is off and a sign-in that
+        asks to be remembered is a normal one. Fixed at sign-in, never extended, like every sign-in."""
+        raw = self.db.get_setting("remember_hours")
+        return clamp_remember_hours(self.s.get("auth", "remember_hours") if raw is None else raw)
+
+    def remember_seconds(self) -> float:
+        return 3600 * self.remember_hours()
 
     def idle_seconds(self) -> float:
         """A sign-in no browser has used for this long ends; 0 = no such limit (the default). "Used" is any request
@@ -633,25 +660,36 @@ class AuthService:
         raw = self.db.get_setting("idle_minutes")
         return 60 * clamp_idle_minutes(self.s.get("auth", "idle_minutes") if raw is None else raw)
 
-    def create_session(self, user: dict, ip: str, ua: str, method: str) -> tuple[str, str]:
+    def create_session(self, user: dict, ip: str, ua: str, method: str, remember: bool = False) -> tuple[str, str]:
+        """A new sign-in. `remember` (spec 037, "Keep me signed in"): it lasts remember_hours instead of
+        session_hours and is marked as remembered - unless the administrator switched the feature off (0), then it is
+        a normal one. The caller gives the cookie the same lifetime (api._set_cookie)."""
         token = security.new_token()
         csrf = security.new_token(24)
         now = time.time()
+        life = self.remember_seconds() if remember else 0.0
+        kept = life > 0
         self.db.execute(
             "INSERT INTO auth_sessions(token_hash, user_id, csrf, created_at, expires_at, last_seen, ip, user_agent,"
-            " method) VALUES(?,?,?,?,?,?,?,?,?)",
-            (security.token_hash(token), user["id"], csrf, now, now + self.session_seconds(), now, ip,
-             (ua or "")[:300], method))
+            " method, remember) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (security.token_hash(token), user["id"], csrf, now, now + (life if kept else self.session_seconds()), now,
+             ip, (ua or "")[:300], method, 1 if kept else 0))
         self.db.execute("DELETE FROM auth_sessions WHERE expires_at < ?", (now,))
         return token, csrf
 
     def clamp_sessions(self) -> int:
-        """Start-up (spec 032): no stored sign-in outlives the lifetime counted from when it was made. Sign-ins of
-        an earlier version ("keep me signed in": 30 days; an administrator's setting of up to 720 hours) end here.
-        Returns how many were cut short or removed."""
-        now, limit = time.time(), self.session_seconds()
-        n = self.db.execute_count("UPDATE auth_sessions SET expires_at = created_at + ? WHERE expires_at > created_at + ?",
-                                  (limit, limit))
+        """Start-up (spec 032) and a changed lifetime: no stored sign-in outlives the lifetime of its kind counted
+        from when it was made (spec 037) - a normal one session_hours, a remembered one remember_hours; with "keep me
+        signed in" switched off (0) the remembered ones end. Sign-ins of an earlier version (30 days; up to 720
+        hours) end here. Returns how many were cut short or removed."""
+        now, limit, keep = time.time(), self.session_seconds(), self.remember_seconds()
+        n = self.db.execute_count("UPDATE auth_sessions SET expires_at = created_at + ? WHERE COALESCE(remember, 0) <> 1"
+                                  " AND expires_at > created_at + ?", (limit, limit))
+        if keep:
+            n += self.db.execute_count("UPDATE auth_sessions SET expires_at = created_at + ? WHERE remember = 1"
+                                       " AND expires_at > created_at + ?", (keep, keep))
+        else:
+            n += self.db.execute_count("DELETE FROM auth_sessions WHERE remember = 1")
         self.db.execute("DELETE FROM auth_sessions WHERE expires_at < ?", (now,))
         return n
 

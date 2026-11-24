@@ -282,7 +282,9 @@ def test_api_one_team_move_hints_view_and_upload_refusal(env, tmp_path):
         assert r.json()["warnings"] and r.json()["teamFolder"].endswith(os.path.join("_teams", str(t2)))
         r = tc.post("/api/admin/teams", json={"name": "C"}, headers=h)
         new = r.json()["team"]["policy"]
-        assert not any(new[k] for k in pol.BOOL_KEYS) and new["allowed_models"] == []
+        # personal hints are on for a new team (policy.NEW_TEAM_POLICY, tests/test_new_team_hints.py); nothing else
+        assert not any(new[k] for k in pol.BOOL_KEYS if k != "hints_edit") and new["allowed_models"] == []
+        assert new["hints_edit"] is True
         r = tc.get(f"/api/admin/users/{dee['id']}/hints")
         assert r.status_code == 200 and r.json()["effective"].startswith(HINTS_HEADER)
         assert tc.patch(f"/api/admin/teams/{t2}", json={"policy": {"share_folder": "relative"}},

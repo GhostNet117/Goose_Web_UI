@@ -713,9 +713,10 @@ def create_app(settings: Settings) -> Starlette:
                 hub=hub, version=__version__)
         c.goose_version = await asyncio.to_thread(goose_version, settings.goose_binary)
         try:    # spec 032: sign-ins made by an earlier version (30 days, up to 720 hours) end at today's limit
-            cut = c.auth.clamp_sessions()
+            cut = c.auth.clamp_sessions()       # spec 037: each kind to its own limit ("keep me signed in": 0 = ended)
             if cut:
-                log.info("sign-ins: %d stored sign-in(s) were cut to the %g-hour limit", cut, c.auth.session_hours())
+                log.info("sign-ins: %d stored sign-in(s) were cut to the %g-hour limit (keep me signed in: %g hours)",
+                         cut, c.auth.session_hours(), c.auth.remember_hours())
         except Exception:
             log.exception("cutting stored sign-ins to the lifetime limit")
         hub.on_audit = make_audit_handler(c)

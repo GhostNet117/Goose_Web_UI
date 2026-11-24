@@ -308,6 +308,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "auth": {
         "session_hours": 8,               # how long a sign-in lasts; 8 is also the most (spec 032)
+        "remember_hours": 24,             # "Keep me signed in" lasts this long; 0 = no checkbox; 24 is the most (spec 037)
         "idle_minutes": 0,                # end a sign-in no browser has used for this long; 0 = off (5 to 480)
         "lockout_threshold": 8,
         "lockout_minutes": 15,
@@ -448,8 +449,8 @@ def load_settings(explicit: str | None = None) -> Settings:
 
 # Settings that existed once: named with the reason when a configuration file still has them.
 REMOVED_SETTINGS = {
-    ("auth", "remember_days"): "removed in 1.25.0: there is no \"keep me signed in\" any more; a sign-in lasts "
-                               "auth.session_hours, 8 hours at most",
+    ("auth", "remember_days"): "removed in 1.25.0; \"keep me signed in\" now lasts auth.remember_hours, 24 hours at "
+                               "most (0 = off) - use that setting instead",
 }
 
 

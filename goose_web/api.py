@@ -90,12 +90,20 @@ def _weak(problems: list[str]) -> HTTPError:
 async def auth_config(request: Request):
     c = ctx(request)
     brand = c.db.get_setting("brand") or {"name": "Goose Web", "tagline": "Your Goose, anywhere"}
-    return ok({"brand": brand, "version": c.version, **c.auth.public_auth_config()})
+    # spec 037: rememberHours 0 = the sign-in page shows no "Keep me signed in"
+    return ok({"brand": brand, "version": c.version, "rememberHours": c.auth.remember_hours(),
+               **c.auth.public_auth_config()})
 
 
-def _set_cookie(c: Ctx, resp: Response, token: str) -> None:
-    """The sign-in cookie. A session cookie (no Max-Age: the browser is not asked to keep it on disk); the server
-    ends the sign-in after auth.session_hours whatever the browser does (spec 032)."""
+def _set_cookie(c: Ctx, resp: Response, token: str, max_age: int = 0) -> None:
+    """The sign-in cookie. Normally a session cookie (no Max-Age: the browser is not asked to keep it on disk); the
+    server ends the sign-in after auth.session_hours whatever the browser does (spec 032). `max_age` (spec 037, "Keep
+    me signed in"): kept by the browser for that many seconds - the remembered sign-in's lifetime, which the server
+    holds to as well. HttpOnly, Secure (HTTPS), SameSite=Strict and path / either way."""
+    if max_age > 0:
+        resp.set_cookie(c.cookie_name, token, max_age=max_age, expires=max_age, httponly=True, secure=c.secure,
+                        samesite="strict", path="/")
+        return
     resp.set_cookie(c.cookie_name, token, httponly=True, secure=c.secure, samesite="strict", path="/")
 
 
@@ -111,14 +119,16 @@ async def login(request: Request):
                                        b.get("totp"), ip)
     except AuthError as e:
         return JSONResponse({"error": e.code, "message": e.message}, status_code=e.status)
-    # spec 032: there is no "keep me signed in"; a `remember` an old page still sends changes nothing
-    token, csrf = c.auth.create_session(user, ip, request.headers.get("user-agent", ""), "password")
-    c.audit(request, "auth.login", user)
+    # spec 037: "Keep me signed in" (remember: true) - a sign-in of auth.remember_hours (24 at most) whose cookie the
+    # browser keeps; nothing when the administrator switched it off (0). Two-factor was checked above either way.
+    keep = int(c.auth.remember_seconds()) if b.get("remember") is True else 0
+    token, csrf = c.auth.create_session(user, ip, request.headers.get("user-agent", ""), "password", remember=keep > 0)
+    c.audit(request, "auth.login", user, detail={"remember": True} if keep else None)
     if not c.profiles.is_native(user) and not (c.profiles.root_for(user) / ".goose-web").exists():
         await asyncio.to_thread(c.profiles.provision, user)
     resp = ok({"user": c.public_user(user), "csrf": csrf, "mustChangePassword": bool(user["must_change_pw"]),
                "totpEnrolmentRequired": c.auth.totp_enrolment_required(user)})
-    _set_cookie(c, resp, token)
+    _set_cookie(c, resp, token, keep)
     return resp
 
 
@@ -563,7 +573,8 @@ async def me_logins(request: Request):
                       (ident.user["id"], time.time()))
     cur = ident.session["token_hash"] if ident.session else ""
     return ok([{"id": r["token_hash"][:12], "createdAt": r["created_at"], "lastSeen": r["last_seen"], "ip": r["ip"],
-                "userAgent": r["user_agent"], "method": r["method"], "current": r["token_hash"] == cur} for r in rows])
+                "userAgent": r["user_agent"], "method": r["method"], "current": r["token_hash"] == cur,
+                "remembered": r.get("remember") == 1, "expiresAt": r["expires_at"]} for r in rows])   # spec 037
 
 
 async def me_login_delete(request: Request):
@@ -1560,7 +1571,8 @@ async def admin_teams(request: Request):
     if c.db.one("SELECT id FROM teams WHERE name=?", (name,)):
         raise HTTPError(409, "exists", "A team with that name exists")
     import json as _json
-    cleaned = _clean_policy(b.get("policy") or {}, c)
+    # personal hints are on for a new team unless the request says otherwise (policy.NEW_TEAM_POLICY)
+    cleaned = {**acp_policy.NEW_TEAM_POLICY, **_clean_policy(b.get("policy") or {}, c)}
     tid = c.db.execute("INSERT INTO teams(name, description, policy, created_at) VALUES(?,?,?,?)",
                        (name, str(b.get("description") or "")[:500], _json.dumps(cleaned), time.time()))
     # the team's own folder is known only now (its id): a read-only folder must not lie inside it (R-4)
@@ -2051,6 +2063,7 @@ async def admin_settings(request: Request):
         return ok({"brand": c.db.get_setting("brand") or {"name": "Goose Web", "tagline": ""},
                    "defaultTeamId": c.db.get_setting("default_team_id"),
                    "sessionHours": c.auth.session_hours(), "sessionHoursMax": auth_mod.SESSION_HOURS_MAX,
+                   "rememberHours": c.auth.remember_hours(), "rememberHoursMax": auth_mod.REMEMBER_HOURS_MAX,
                    "idleMinutes": c.auth.idle_seconds() / 60,
                    "allowSelfTotp": c.db.get_setting("allow_self_totp", True),
                    "requireTotpForAdmins": bool(c.db.get_setting("require_totp_admins")),
@@ -2075,6 +2088,11 @@ async def admin_settings(request: Request):
         except (TypeError, ValueError):
             hours = auth_mod.SESSION_HOURS_MAX
         c.db.set_setting("session_hours", max(1.0, auth_mod.clamp_session_hours(hours)))
+    if "rememberHours" in b:
+        # spec 037: "Keep me signed in" lasts 0 (off) or 1 to 24 hours; more is stored as 24, not a number as 24
+        rh = auth_mod.clamp_remember_hours(b["rememberHours"])
+        c.db.set_setting("remember_hours", max(1.0, rh) if rh else 0)
+    if "sessionHours" in b or "rememberHours" in b:
         cut = c.auth.clamp_sessions()      # a shorter lifetime holds for the sign-ins that exist, too
         if cut and c.hub is not None:
             c.hub.revalidate_clients()

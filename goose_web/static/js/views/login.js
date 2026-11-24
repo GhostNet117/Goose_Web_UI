@@ -37,8 +37,13 @@ export function renderLogin(root, { authConfig, onLoggedIn }) {
   totpField.hidden = true;
   const credFields = h('div', { class: 'stack' }, field(cfg.ldap && cfg.ldap.enabled ? (cfg.ldap.label || 'Directory') + ' username' : 'Username', user), field('Password', pass));
 
-  // spec 032: no "Keep me signed in" - a sign-in lasts eight hours at most and is not kept by the browser
-  const form = h('form', { class: 'auth-form', autocomplete: 'on' }, credFields, totpField, err, submit);
+  // spec 037: "Keep me signed in" - off by default; ticked, the sign-in survives closing the browser and lasts
+  // cfg.rememberHours (24 at most, set by the administrator); 0 = the administrator switched it off: no checkbox.
+  const keepHours = Number(cfg.rememberHours) || 0;
+  const remember = h('input', { type: 'checkbox', checked: false, 'data-remember': '1' });
+  const keepField = keepHours > 0 ? h('label', { class: 'chk', title: 'Closing the browser does not sign you out. Leave it off on a shared or public computer.' },
+    remember, h('span', null, 'Keep me signed in (' + keepHours + (keepHours === 1 ? ' hour)' : ' hours)'))) : null;
+  const form = h('form', { class: 'auth-form', autocomplete: 'on' }, credFields, totpField, keepField, err, submit);
 
   if (r.query && r.query.error) err.textContent = loginErrorText(r.query.error);
 
@@ -49,6 +54,7 @@ export function renderLogin(root, { authConfig, onLoggedIn }) {
     submit.disabled = true; submit.classList.add('is-busy');
     try {
       const body = { username: user.value.trim(), password: pass.value };
+      if (keepField && remember.checked) body.remember = true;   // sent again with the two-factor code
       if (step === 'totp') body.totp = totp.value.replace(/\s+/g, '');
       const res = await POST('/api/auth/login', body, { quiet: true });
       setCsrf(res.csrf);

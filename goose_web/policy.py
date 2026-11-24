@@ -33,6 +33,10 @@ GUARDED_MODES = ["approve", "chat"]
 # The base every team starts from (spec 009): everything off, nothing allowed.
 DEFAULT_POLICY: dict[str, Any] = {**{k: False for k in BOOL_KEYS}, **{k: [] for k in LIST_KEYS},
                                   "max_concurrent_runs": 3}
+# What a team CREATED from now on stores on top of that base (Admin > Teams > New team, `init`'s Everyone, native-hints
+# --team): its members may write personal hints - added before the team's hints, which stay last and final. Stored in
+# the new team's policy, so teams that exist keep what they have, and a person without a team keeps DEFAULT_POLICY.
+NEW_TEAM_POLICY: dict[str, Any] = {"hints_edit": True}
 
 # The defaults of Goose Web 1.4 and earlier (empty list = unrestricted). Used only to migrate old teams.
 LEGACY_DEFAULT_POLICY: dict[str, Any] = {
