@@ -151,6 +151,26 @@ export function promptCreated(p) {
   if (c && c.lastSent && !c.lastSent.created && Number.isInteger(p.created)) c.lastSent.created = p.created;
 }
 
+// FIX chat-open-replay-overflow: opening a chat is retried up to 4 times, after 0.5, 1, 2 and 4 s, when the connection
+// dropped, the gateway answered -32000 (worker restarting, Goose not available or too slow, tab could not keep up) or
+// the call timed out. Never when Goose says the chat cannot be opened: -32002 (gone), -32602 (folder), -32003 (refused).
+export const LOAD_RETRY_DELAYS = [500, 1000, 2000, 4000];
+const LOAD_NO_RETRY = new Set([-32002, -32602, -32003]);
+export function retryableLoadError(e) {
+  if (!e || LOAD_NO_RETRY.has(e.code)) return false;
+  return !!e.disconnected || e.code === 'disconnected' || e.code === 'timeout' || e.code === -32000;
+}
+
+// _gw/resync {sessionId}: the gateway dropped frames of this chat for this tab. The open chat is loaded again once
+// (with the same backoff); another cached one when it is opened next.
+export function resyncChat(p) {
+  const c = p && p.sessionId && chats.get(p.sessionId);
+  if (!c) return;
+  if (c.id === currentId) c.resync().catch(() => {});
+  else if (c.loading) c.resyncPending = true;
+  else c.loaded = false;
+}
+
 export function sessionChangedElsewhere(p) {
   const sid = p && p.sessionId;
   if (!sid) return;
@@ -251,25 +271,18 @@ export class ChatSession extends Emitter {
     this.emit('state');
     this.loadPromise = (async () => {
       try {
-        if (!this.cwd) {
-          const r = await rpc.call(G('session/info'), { sessionId: this.id });
-          if (r && r.session) { this.applyInfo(r.session); upsertSession(r.session); }
+        // FIX chat-open-replay-overflow: a dropped connection, a restarting worker (-32000) or a timeout is retried
+        // with backoff; an answer that the chat cannot be opened (-32002, -32602, -32003) is not.
+        for (let retry = 0; ; retry++) {
+          this.resyncPending = false;   // this attempt gets the whole chat
+          try { await this.loadOnce(); break; } catch (e) {
+            if (retry >= LOAD_RETRY_DELAYS.length || !retryableLoadError(e)) {
+              try { e.attempt = retry; e.attempts = LOAD_RETRY_DELAYS.length; } catch { /* frozen */ }
+              throw e;
+            }
+            await new Promise((r) => setTimeout(r, LOAD_RETRY_DELAYS[retry]));
+          }
         }
-        this.transcript.clear();
-        this.transcript.beginBulk();
-        this.replaying = true;
-        let res;
-        try {
-          res = await rpc.call('session/load', { sessionId: this.id, cwd: this.cwd, mcpServers: [] });
-        } finally {
-          this.replaying = false;
-          this.transcript.endBulk();
-        }
-        this.applySessionResult(res);
-        for (const a of asksForSession(this.id)) this.transcript.addAsk(a);
-        for (const st of pendingSteers(this.id)) this.onSteerState(st);   // sent from another tab / before a refresh
-        const ag = agentFor(this.id);
-        if (ag && (ag.status === 'working' || ag.status === 'needs_you')) this.setRunning(true);
         this.loaded = true;
         this.emit('loaded');
       } catch (e) {
@@ -279,11 +292,46 @@ export class ChatSession extends Emitter {
         this.loading = false;
         this.emit('state');
       }
+      // _gw/resync arrived while this load was answered: the gateway dropped frames of it, load once more
+      if (this.loaded && this.resyncPending) { this.resyncPending = false; this.reload().catch(() => {}); }
     })();
     return this.loadPromise;
   }
 
-  reload() { this.loaded = false; return this.load(); }
+  async loadOnce() {
+    if (!this.cwd) {
+      const r = await rpc.call(G('session/info'), { sessionId: this.id });
+      if (r && r.session) { this.applyInfo(r.session); upsertSession(r.session); }
+    }
+    this.transcript.clear();
+    this.transcript.beginBulk();
+    this.replaying = true;
+    let res;
+    try {
+      res = await rpc.call('session/load', { sessionId: this.id, cwd: this.cwd, mcpServers: [] });
+    } finally {
+      this.replaying = false;
+      this.transcript.endBulk();
+    }
+    this.applySessionResult(res);
+    for (const a of asksForSession(this.id)) this.transcript.addAsk(a);
+    for (const st of pendingSteers(this.id)) this.onSteerState(st);   // sent from another tab / before a refresh
+    const ag = agentFor(this.id);
+    if (ag && (ag.status === 'working' || ag.status === 'needs_you')) this.setRunning(true);
+  }
+
+  // One load at a time: a reload while a load is in flight (a reconnect's hello, a click on Retry) shares it.
+  reload() {
+    if (this.loading && this.loadPromise) return this.loadPromise;
+    this.loaded = false; return this.load();
+  }
+
+  // _gw/resync: the gateway dropped frames of this chat for this tab (it could not keep up). Load it once more - after
+  // the load in flight, if there is one (that load's own answer is an error with data.resync and is retried anyway).
+  resync() {
+    if (this.loading) { this.resyncPending = true; return this.loadPromise; }
+    return this.reload();
+  }
 
   async refreshFromElsewhere() {
     if (this.running || this.promptPending || this.loading) return;
