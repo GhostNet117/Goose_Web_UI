@@ -69,6 +69,10 @@ goose:
   native_scheduler: auto                    # auto | on | off
   extra_env: {}
   default_workdir_native: ""                # "" = home folder
+  session_unload_minutes: 30                # close idle chats in Goose (their MCP servers stop); 0 = never
+  max_loaded_sessions: 12                   # per worker; 0 = no limit
+  orphan_reaper: true                       # Windows: end MCP server processes Goose let go but did not end
+  orphan_grace_seconds: 120
 auth:
   session_hours: 8                          # 1 to 8; a sign-in never lasts longer
   remember_hours: 24                        # "Keep me signed in": 1 to 24; 0 = no such box
@@ -131,6 +135,10 @@ host_tasks:
 | `goose.native_scheduler` | `auto` | Who runs the scheduler for the admin's native profile (section 7). |
 | `goose.extra_env` | `{}` | Extra environment variables for **every** worker, isolated ones included. |
 | `goose.default_workdir_native` | `""` | Default folder for new chats of native-profile users (home folder when empty). |
+| `goose.session_unload_minutes` | `30` | Goose keeps a chat's agent, with all of the profile's stdio MCP servers, until the chat is closed, and the gateway's connection to a worker lasts as long as the worker. Every minute the gateway closes (`session/close`) chats idle longer than this, so Goose ends their servers; never a running chat, one with a question, a request in flight, queued messages or steers, one being loaded, or the chat a tab shows. Opening the chat again loads it (its extensions start again); a message or setting sent to it waits until it is loaded. Only for a Goose whose `initialize` result offers `session/close` (1.57 does); a "method not found" answer turns it off for that worker. `0` = never. A value that is not a whole number from 0 to 10080 is reported by `check` and 30 is used. Admin > System shows each worker's loaded chats. |
+| `goose.max_loaded_sessions` | `12` | While a worker holds more chats than this, the least recently used idle ones (used at least 2 minutes ago, same rules as above) are closed at once, without waiting for `session_unload_minutes`. `0` = no limit. Whole number from 0 to 1000. |
+| `goose.orphan_reaper` | `true` | Windows: Goose ends only a released MCP server's direct child process, so a launcher's child (uvx, npx, a virtual environment's python.exe) can survive in the worker's job. Every minute the gateway lists each running worker's job and ends a process it earlier saw as part of a configured stdio extension's tree (a direct child of the worker's goose.exe whose command line matches the extension, and its descendants) once that tree's root has ended and the process has been cut off from goose.exe for `orphan_grace_seconds`. Nothing outside the job and nothing it never classified is touched; each end is audited as `worker.orphan_ended`. `false` = off. No effect elsewhere. |
+| `goose.orphan_grace_seconds` | `120` | How long a classified MCP server process must have been cut off from its worker's goose.exe before the reaper ends it. Whole number from 30 to 86400. |
 | `auth.session_hours` | `8` | How long a sign-in lasts, counted from signing in and never extended. 1 to 8; a value above 8 counts as 8 (`check` says so). Overridden by the DB setting `session_hours` (Admin > Settings). A "Keep me signed in" sign-in lasts `auth.remember_hours` instead. |
 | `auth.remember_hours` | `24` | Since 1.27.0: how long a sign-in made with **Keep me signed in** ticked lasts, counted from signing in and never extended; its cookie is kept by the browser (`Max-Age`), so closing the browser does not sign out. 0 = the sign-in page has no such box. 1 to 24; a value above 24 counts as 24 and `check` says so. Overridden by the DB setting `remember_hours` (Admin > Settings). Lowering it, or 0, shortens or ends the kept sign-ins that exist (at once and at every start). |
 | `auth.idle_minutes` | `0` | 0 = off. 5 to 480: a sign-in that no browser has used for this long ends on the server. "Used" is any request and the 30-second re-check of an open tab's connection, so an open tab counts as use: this ends forgotten sign-ins, not open ones. Overridden by the DB setting `idle_minutes`. Applies to kept sign-ins too. `auth.remember_days` no longer exists (1.25.0); a file that still has it is reported by `check`, which points to `auth.remember_hours`. |

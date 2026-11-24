@@ -31,6 +31,7 @@ from . import __version__
 from . import effort as effortmod
 from . import guard as guardmod
 from . import policy as pol
+from .unload import Unloader   # FIX idle-sessions-keep-mcp-servers: closes idle chats in Goose (unload.py)
 from .workers import Worker, WorkerManager
 
 log = logging.getLogger("goose_web.hub")
@@ -666,6 +667,8 @@ class Upstream:
         self.bypassed: OrderedDict[str, None] = OrderedDict()
         self.closed = False   # SC-3: the user was deleted; this object must not write state any more
         self.starting = 0     # prompts / tool calls between "not draining" and Goose (guard checks, worker start-up)
+        # FIX idle-sessions-keep-mcp-servers: which chats Goose holds an agent (and its MCP servers) for; closes idle ones
+        self.unloader = Unloader(self)
 
     # ------------------------------------------------------------ connection
     @property
@@ -719,6 +722,7 @@ class Upstream:
             self.broadcast({"jsonrpc": "2.0", "method": "_gw/upstream", "params": {"state": "ready"}})
             if self._watcher is None or self._watcher.done():
                 self._watcher = asyncio.create_task(self._watch_loop())
+            self.unloader.start()   # FIX idle-sessions-keep-mcp-servers: its loop (ends when this Upstream is closed)
 
     async def reset(self, reason: str) -> None:
         """Called when the worker restarts: drop the old connection, fail everything in flight."""
@@ -847,6 +851,7 @@ class Upstream:
                        and s.abandoned is None and s.sid not in watched and s.sid not in asked),
                       key=lambda s: s.last_touch)
         for s in idle[:max(1, len(self.sessions) - SESSION_STATES_MAX * 9 // 10)]:
+            self.unloader.before_forget(s)   # FIX idle-sessions-keep-mcp-servers: Goose closes a chat it holds first
             if self.sessions.pop(s.sid, None) is not None:
                 # what it had buffered leaves the gateway-wide count with it (as when a chat is closed)
                 self.hub.total_buffer = max(0, self.hub.total_buffer - s.buffer_bytes)
@@ -993,6 +998,9 @@ class Upstream:
             if method in ("session/prompt", STEER):
                 self.hub.audit_activity(client, self, method, params)   # SA-10: only what passed the guard
             await self.ensure()
+            # FIX idle-sessions-keep-mcp-servers (unload.py): wait while the gateway closes this chat; a chat it unloaded
+            # is loaded again (silently) before a method that needs its agent
+            await self.unloader.before_forward(method, params)
             if method == "session/load":
                 load = await self._open_chat(client, mid, params)
                 if load is None:
@@ -1964,6 +1972,8 @@ class Upstream:
             self.hub.evict_buffers()
 
     def _post_response(self, method: str, params: dict, msg: dict, client: Client | None) -> None:
+        if self.unloader.on_response(method, params, msg):
+            return   # FIX idle-sessions-keep-mcp-servers: the unloader's own close (_gw/unload) - never the close branch
         result = msg.get("result") if isinstance(msg.get("result"), dict) else {}
         ok = "error" not in msg
         # Our own change to a buffered session (rename, mode, truncate, ...): re-baseline its fingerprint so
@@ -2848,6 +2858,8 @@ class Hub:
                 result["guard"] = gh
         elif method == "_gw/watch":
             client.watch = {str(x) for x in (params.get("sessionIds") or [])[:200]}
+            if "current" in params:   # FIX idle-sessions-keep-mcp-servers: the chat this tab shows is never unloaded
+                client.current = str(params.get("current") or "")[:200]
             result = {"ok": True}
         elif method == "_gw/herd":
             if params.get("all") and client.is_admin:
@@ -2881,6 +2893,7 @@ class Hub:
                     self.elsewhere_push(up)
                 result = {"ok": True}
         elif method == "_gw/seen":
+            client.current = str(params.get("sessionId") or "")[:200]   # FIX idle-sessions-keep-mcp-servers
             s = up.sessions.get(str(params.get("sessionId") or ""))
             if s and s.status in ("done", "error"):
                 up._set_status(s, "idle")

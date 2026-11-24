@@ -143,6 +143,41 @@ def extension_start_seconds(settings: "Settings") -> tuple[int, str]:
                      "(0 = no start-up guard) - 120 is used")
 
 
+def _whole_knob(settings: "Settings", section: str, key: str, default: int, lo: int, hi: int,
+                hint: str = "") -> tuple[int, str]:
+    """(value, problem) of a whole-number setting. A value that is not a whole number from lo to hi is reported
+    (`check`) and the default is used."""
+    raw = settings.get(section, key)
+    if raw is None or raw == "":
+        return default, ""
+    try:
+        if isinstance(raw, bool):
+            raise ValueError
+        n = int(raw)
+        if float(raw) != n or not lo <= n <= hi:
+            raise ValueError
+        return n, ""
+    except (TypeError, ValueError):
+        return default, f"{section}.{key} is {raw!r}; use a whole number from {lo} to {hi}{hint} - {default} is used"
+
+
+def session_unload(settings: "Settings") -> tuple[int, int, list[str]]:
+    """FIX idle-sessions-keep-mcp-servers: (goose.session_unload_minutes, goose.max_loaded_sessions, problems).
+    0 minutes = Goose Web never unloads a chat; 0 = no limit on the chats loaded per worker."""
+    minutes, p1 = _whole_knob(settings, "goose", "session_unload_minutes", 30, 0, 10080, " (0 = never)")
+    most, p2 = _whole_knob(settings, "goose", "max_loaded_sessions", 12, 0, 1000, " (0 = no limit)")
+    return minutes, most, [p for p in (p1, p2) if p]
+
+
+def orphan_reaper(settings: "Settings") -> tuple[bool, int, list[str]]:
+    """FIX idle-sessions-keep-mcp-servers: (goose.orphan_reaper on, goose.orphan_grace_seconds, problems). Only
+    `false` (or no, off, 0) turns the reaper off."""
+    raw = settings.get("goose", "orphan_reaper")
+    on = raw.strip().lower() not in ("false", "no", "off", "0") if isinstance(raw, str) else raw is None or bool(raw)
+    grace, p = _whole_knob(settings, "goose", "orphan_grace_seconds", 120, 30, 86400)
+    return on, grace, [p] if p else []
+
+
 def python_socketpair_on(settings: "Settings") -> bool:
     """FIX mxc-asyncio-socketpair (1.26.2): sandbox.python_socketpair, default on. Only `false` (or no, off, 0)
     turns it off; anything else keeps it on (it gives members' Python programs nothing they could not do anyway)."""
@@ -229,6 +264,12 @@ DEFAULTS: dict[str, Any] = {
         "native_scheduler": "auto",       # auto | on | off  (auto = off while Goose Desktop runs on the same profile)
         "extra_env": {},
         "default_workdir_native": "",     # admin native profile: default folder for new chats (default: home)
+        # FIX idle-sessions-keep-mcp-servers: Goose keeps a chat's agent - with all of the profile's stdio MCP
+        # servers - until the chat is closed. Close (unload) chats idle this long; 0 = never (unload.py)
+        "session_unload_minutes": 30,
+        "max_loaded_sessions": 12,        # per worker; beyond it the least recently used idle chats go at once; 0 = no limit
+        "orphan_reaper": True,            # Windows: end MCP server processes Goose released but did not end (reaper.py)
+        "orphan_grace_seconds": 120,      # ... once they have been cut off from the worker's goose for this long
     },
     # Windows: run every isolated non-admin user's worker in a sandbox of its own (spec 012, spec 025).
     "sandbox": {

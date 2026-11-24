@@ -30,6 +30,7 @@ class Rpc extends Emitter {
     this.retryTimer = null;
     this.hello = null;
     this.watched = new Set();
+    this.current = '';      // the chat this tab shows: the gateway never unloads it (FIX idle-sessions-keep-mcp-servers)
   }
 
   url(extra = '') {
@@ -69,7 +70,7 @@ class Rpc extends Emitter {
       if (hello && hello.agent) store.set('agentInfo', hello.agent);
       if (hello && hello.gooseCaps) store.set('gooseCaps', hello.gooseCaps);
       this.emit('hello', hello);
-      if (this.watched.size) this._send('_gw/watch', { sessionIds: [...this.watched] }, 15000, true).catch(() => {});
+      if (this.watched.size || this.current) this._send('_gw/watch', { sessionIds: [...this.watched], current: this.current }, 15000, true).catch(() => {});
       const w = this.waiters; this.waiters = [];
       w.forEach((fn) => fn.resolve());
     } catch (e) {
@@ -177,11 +178,12 @@ class Rpc extends Emitter {
     return true;
   }
 
-  setWatched(ids) {
+  setWatched(ids, current = '') {
     const next = new Set(ids);
-    const same = next.size === this.watched.size && [...next].every((x) => this.watched.has(x));
+    const same = next.size === this.watched.size && [...next].every((x) => this.watched.has(x)) && (current || '') === this.current;
     this.watched = next;
-    if (!same && this.ready) this._send('_gw/watch', { sessionIds: [...next] }, 15000).catch(() => {});
+    this.current = current || '';
+    if (!same && this.ready) this._send('_gw/watch', { sessionIds: [...next], current: this.current }, 15000).catch(() => {});
   }
 }
 

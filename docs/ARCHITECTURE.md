@@ -658,7 +658,7 @@ delete.
 | `_gw/ask_resolved {id, by}` | gateway -> tab | An ask was answered in another tab, or cancelled by a worker restart. |
 | `_gw/sessions_changed` | gateway -> tab | The profile's session database changed on disk. Refresh the list. |
 | `_gw/prompt_created {sessionId, created}` | gateway -> tab | Sent only to the tab that sent a `session/prompt`: the server time (unix seconds) the gateway stamped on that prompt. The same value is in the prompt's echo (`_meta.goose.created`) for other tabs and replays. Needed to edit the prompt later (1.6.0). |
-| `_gw/session_changed {sessionId, messageCount, updatedAt, title}` | gateway -> tab | A buffered session was changed by another client (for example Goose Desktop). |
+| `_gw/session_changed {sessionId, messageCount, updatedAt, title}` | gateway -> tab | A buffered session was changed by another client (for example Goose Desktop). With `reason: "truncated"` another tab edited it; with `reason: "unloaded"` the gateway closed the idle chat in Goose (section 7.3) and a tab reloads it when it shows it. |
 | `_gw/resync {sessionId}` | gateway -> tab | The gateway dropped frames of this chat because the tab could not keep up (6.1). The tab loads the chat again (the open one at once, others when opened next). |
 
 Unknown `_gw/*` methods return `-32601 unknown gateway method`. `_gw/notice
@@ -830,6 +830,47 @@ to 15 s). On a change it does the following:
    count is available), it invalidates the buffer and broadcasts
    `_gw/session_changed`. The open tab reloads, and other tabs mark the chat
    unloaded. A title-only change updates the herd.
+
+**Unloading idle chats** (`unload.py`, FIX idle-sessions-keep-mcp-servers).
+Goose keeps one agent, with a full set of the profile's stdio MCP servers, for
+every chat created, opened, forked or prompted on a connection until the chat is
+closed, deleted or archived or the connection ends; the gateway's connection
+lives as long as the worker. Each `Upstream` therefore has an `Unloader`:
+
+1. It tracks the chats Goose holds an agent for (`held`, from the answers to
+   `session/new`, `session/load`, `session/fork` and the per-session methods for
+   which Goose creates an agent: prompt, set_mode, set_config_option, steer,
+   working-dir update, extensions, tools, live voice).
+2. Every 60 s, when the worker's `initialize` result advertises
+   `sessionCapabilities.close`, it sends `session/close` for chats idle longer than
+   `goose.session_unload_minutes` (30) and, while more than
+   `goose.max_loaded_sessions` (12) are held, for the least recently used idle
+   ones (used at least 2 minutes ago). Never for a chat that runs, has a prompt,
+   question or request in flight, queued messages or steers, is being loaded, or is
+   the current chat of a connected tab (`current` in `_gw/watch`, or `_gw/seen`).
+   A "method not found" answer turns unloading off for that worker.
+3. The close is an internal request whose pending entry carries the
+   pseudo-method `_gw/unload`, so the close/delete branch of `_post_response`
+   (which forgets the chat's state, queue and herd mark) never runs for it. The
+   buffer and cached load result go (the next load comes from Goose); queue,
+   title, herd status and marks stay; tabs get `_gw/session_changed {sessionId,
+   reason: "unloaded"}` (no "updated elsewhere" notice; a cached chat reloads when
+   shown).
+4. A per-session method for an unloaded chat first triggers a silent
+   `session/load` (its replay goes into the buffer, to no tab), then is forwarded;
+   a per-chat lock keeps a load or prompt from racing a close. A tab that still
+   gets -32002 for a chat reported unloaded reloads it once and retries.
+   `_prune_sessions` closes a held chat before forgetting its state.
+
+Windows: the **orphan reaper** (`reaper.py`) ends what a release leaves behind.
+Goose kills only a server's direct child, so a launcher's child (uvx, npx, a
+virtual environment's python.exe) survives in the worker's job object. Every
+60 s the reaper lists each running worker's job (`QueryInformationJobObject`),
+classifies MCP server trees (a direct child of the worker's goose.exe whose
+command line matches a configured stdio extension, plus its descendants, keyed by
+pid and creation time) and ends a classified process whose tree root has ended
+and whose ancestor chain no longer reaches goose.exe, after
+`goose.orphan_grace_seconds` (120). Audited as `worker.orphan_ended`.
 
 ### 7.4 Asks fan-out, first answer wins
 

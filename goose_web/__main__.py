@@ -1164,6 +1164,24 @@ def cmd_check(args, settings) -> int:
               "gateway runs; restrict it")
     if os.name == "nt":
         line("goose desktop running", desktop_running(gb))
+    from .config import orphan_reaper, session_unload    # FIX idle-sessions-keep-mcp-servers
+    um, most, probs = session_unload(settings)
+    for p in probs:
+        line("idle chats", p, False)
+    if um <= 0:
+        print("[--] idle chats: never unloaded (goose.session_unload_minutes = 0) - every chat opened in a worker keeps "
+              "its agent and all its stdio MCP servers until the worker stops")
+    else:
+        print(f"[OK] idle chats: unloaded from their worker after {um} min idle, so Goose ends their MCP servers"
+              + (f"; at most {most} loaded per worker" if most else "") + " (they load again when opened)")
+    if os.name == "nt":
+        on, grace, probs = orphan_reaper(settings)
+        for p in probs:
+            line("orphan reaper", p, False)
+        print(f"[OK] orphan reaper: an MCP server process Goose let go but did not end is ended {grace} s after it was "
+              "cut off from its worker's goose" if on else
+              "[--] orphan reaper: off (goose.orphan_reaper: false) - a launcher's child (uvx, npx, a venv's python) "
+              "can outlive its released server until the worker stops")
     port = int(settings.get("server", "port"))
     # the address the gateway binds (server.host); 0.0.0.0 / :: also answer on the loopback address. Probing
     # 127.0.0.1 only reported "free" for a gateway bound to a LAN address.
