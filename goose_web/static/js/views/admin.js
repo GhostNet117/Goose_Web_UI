@@ -8,6 +8,7 @@ import { setBaseTitle } from '../herd.js';
 import { router } from '../router.js';
 import { mdElement } from '../markdown.js';
 import { groupPicker, ownGroups } from '../providergroups.js';
+import { filesAndChatsSection } from './filesettings.js';
 
 const TABS = [
   { id: 'users', label: 'Users', icon: 'users' },
@@ -990,6 +991,7 @@ function settingsTab(body) {
       return h('div', { class: 'row kv-row' }, n, u, t, iconBtn('x', 'Remove', () => { peers.splice(i, 1); drawPeers(); }));
     }), btn('Add peer', () => { peers.push({ name: '', url: '' }); drawPeers(); }, { size: 'sm', icon: 'plus', variant: 'ghost' }));
     drawPeers();
+    const files = filesAndChatsSection(s);   // specs 039, 040: largest upload, chat retention
     body.replaceChildren(
       section('Branding', null, h('div', { class: 'card grid2' }, field('Name', bn), field('Tagline', bt))),
       section('Accounts', null, h('div', { class: 'card stack' }, h('div', { class: 'grid2' }, field('Default team for new users', dt), field('Sign-in lifetime (hours)', hrs, 'From 1 to ' + hrsMax + '. Counted from signing in and never extended: after it, everyone signs in again. There is no "keep me signed in".'),
@@ -997,10 +999,11 @@ function settingsTab(body) {
         h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Users may enable two-factor themselves'), toggle(allowSelfTotp, (v) => { allowSelfTotp = v; })),
         h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Require two-factor for administrators'), toggle(reqTotp, (v) => { reqTotp = v; })),
         h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Require two-factor for everyone (a team can require it for its members: Teams > Experience > Other)'), toggle(reqTotpAll, (v) => { reqTotpAll = v; })))),
+      files.el,
       section('Herd peers', null, h('p', { class: 'muted small' }, 'Other Goose Web gateways shown in everyone’s Herd (“every machine in one sidebar”). The token must belong to a user on that machine.'), peersBox),
       h('div', { class: 'row sticky-foot' }, actionBtn('Save settings', async () => {
         const pp = peers.filter((p) => p.url).map((p) => { const x = { name: p.name || p.url, url: p.url }; if (p._tok) x.token = p._tok; else if (p.token) x.token = p.token; return x; });
-        await PUT('/api/admin/settings', { brand: { name: bn.value.trim() || 'Goose Web', tagline: bt.value.trim() }, defaultTeamId: dt.value || null, sessionHours: Math.min(hrsMax, Number(hrs.value) || hrsMax), idleMinutes: Number(idle.value) || 0, allowSelfTotp, requireTotpForAdmins: reqTotp, requireTotpForAll: reqTotpAll, peers: pp });
+        await PUT('/api/admin/settings', { brand: { name: bn.value.trim() || 'Goose Web', tagline: bt.value.trim() }, defaultTeamId: dt.value || null, sessionHours: Math.min(hrsMax, Number(hrs.value) || hrsMax), idleMinutes: Number(idle.value) || 0, allowSelfTotp, requireTotpForAdmins: reqTotp, requireTotpForAll: reqTotpAll, peers: pp, ...files.values() });
         const ac = store.get('authConfig'); if (ac) store.set('authConfig', { ...ac, brand: { name: bn.value.trim(), tagline: bt.value.trim() } });
       }, { variant: 'primary', success: 'Settings saved' })));
   })();

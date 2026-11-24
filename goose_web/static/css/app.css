@@ -847,7 +847,12 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
 .att img { width: 22px; height: 22px; object-fit: cover; border-radius: 4px; }
 .att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .att-size { color: var(--fg-3); flex: none; }
-.att-loading { opacity: .7; }
+.att-loading { opacity: .85; position: relative; max-width: 360px; }
+/* spec 039: upload progress (percent, bytes, a thin bar) and the "link only" note of an image the model does not see */
+.att-pct { font-variant-numeric: tabular-nums; }
+.att-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--border); border-radius: 0 0 var(--r-sm) var(--r-sm); overflow: hidden; }
+.att-bar { display: block; height: 100%; width: 0; background: var(--accent, #7c5cff); transition: width .2s linear; }
+.att-note { flex: none; font-size: .78em; padding: 0 4px; border: 1px solid var(--warn, #d97706); color: var(--warn, #d97706); border-radius: 4px; }
 .att-error { border-color: var(--err); color: var(--err); }
 .att .btn-icon { width: 20px; height: 20px; }
 .composer-menu {

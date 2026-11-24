@@ -414,6 +414,7 @@ async def sweep(c, *, now: float | None = None, dry_run: bool = False, days: int
         plan = await asyncio.to_thread(_plan, c, keys, sessions, cutoff)
         existing: set[str] | None = plan["existing"]
         gone: set[str] = set()                     # deleted in this sweep (or counted as such in the preview)
+        handled: set[str] = set()                  # uploads already dealt with as a chat's files
 
         def live() -> set[str]:
             return (existing or set()) - gone
@@ -437,6 +438,7 @@ async def sweep(c, *, now: float | None = None, dry_run: bool = False, days: int
             gone.add(sid)
             keep_shared = [r for r in files if (_links(c, r["id"]) - {sid}) & live()]
             todo = [r for r in files if r not in keep_shared]
+            handled.update(r["id"] for r in todo)
             if dry_run:
                 entry["chats"] += 1
                 for r in todo:
@@ -477,6 +479,8 @@ async def sweep(c, *, now: float | None = None, dry_run: bool = False, days: int
         un = unb = 0
         for r in c.db.query(f"SELECT * FROM uploads WHERE state='done' AND profile IN ({_marks(keys)}) AND "  # nosec B608
                             "created_at>=? AND COALESCE(completed_at, created_at)<?", (*keys, since, cutoff)):
+            if r["id"] in handled:
+                continue
             links = _links(c, r["id"])
             if existing is None:
                 if links:

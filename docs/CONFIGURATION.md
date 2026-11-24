@@ -51,7 +51,7 @@ server:
   trusted_proxies: ["127.0.0.1", "::1"]
   allowed_origins: []
   allowed_hosts: []
-  max_upload_mb: 25
+  max_upload_mb: 25                         # 1 to 5120 MB per file; Admin > Settings overrides it
   allow_elevated: false
   priority: normal                          # normal | inherit (process priority, ADMINISTRATION 5.1)
   tls: auto                                 # auto | self-signed | files | off (ADMINISTRATION 6.3)
@@ -80,6 +80,8 @@ auth:
   ip_block_exempt: []                       # addresses/CIDR networks never blocked
 notify:
   allow_private_targets: false
+retention:
+  chat_days: 180                            # 0 = keep forever; 1 to 3650; Admin > Settings overrides it
 host_tasks:
   enabled: true
   path_filter: "\\*"
@@ -93,7 +95,8 @@ host_tasks:
 | `server.trusted_proxies` | `["127.0.0.1", "::1"]` | IPs or CIDRs whose `X-Forwarded-For` (rightmost entry), `X-Forwarded-Proto` and `X-Forwarded-Host` are trusted. A trusted `X-Forwarded-Host` must also be on the Host allow-list. |
 | `server.allowed_origins` | `[]` | Extra Origins (`scheme://host[:port]`) accepted for the WebSocket and for cookie-authenticated writes. Without `public_url`, the request's own `scheme://Host` is accepted as well (its Host has passed the allow-list). With `public_url` set, direct access under another address, for example `http://192.168.1.10:8710` or `http://127.0.0.1:8710`, works only if that origin is listed here. |
 | `server.allowed_hosts` | `[]` | Extra host names or IPs (no ports, no wildcards) accepted in the `Host` header. This guards against DNS rebinding (`app.py: HostGuard`). Always allowed: the `public_url` host, `localhost`, `127.0.0.1`, `::1`, and `server.host` unless it is `0.0.0.0` or `::`. Other Host values get `400 invalid host`, and `GET /healthz` is exempt. Environment: `GOOSE_WEB__SERVER__ALLOWED_HOSTS=goose,192.168.1.10` (comma separated) or a YAML list. |
-| `server.max_upload_mb` | `25` | Size limit per uploaded file (`/api/fs/upload`, at most 20 files per request). |
+| `server.max_upload_mb` | `25` | Size limit per uploaded file, 1 to 5120 (5 GB; a larger value counts as 5120 and `goose-web check` reports it). Applies to the chunked upload (`/api/fs/uploads`) and the single-request `/api/fs/upload` (at most 20 files per request). **Admin > Settings > Files and chats > Largest file upload** overrides it once saved (setting `max_upload_mb`, section 4). |
+| `retention.chat_days` | `180` | Chats unused for this many days are deleted, with the files uploaded to them (spec 040, ADMINISTRATION 9.9d); 0 = keep forever; 1 to 3650 (larger counts as 3650). **Admin > Settings > Files and chats** overrides it once saved (setting `retention_days`). |
 | `server.allow_elevated` | `false` | If true, the gateway runs with an elevated token instead of refusing. Leave it false. |
 | `server.priority` | `normal` | `normal`: at start the gateway raises its own CPU priority class, I/O priority and memory priority to normal when they are lower (Task Scheduler starts a task below normal unless the task has a priority), never higher. `inherit`: leave the process as it was started. Any other value means `normal`. |
 | `paths.profiles_root` | `C:\Goose_Web_Profiles` | Parent of all isolated profiles and of `_system`. |
@@ -102,7 +105,7 @@ host_tasks:
 | `server.tls_cert_file`, `server.tls_key_file` | `""` | PEM certificate (chain) and private key for `tls: files`. |
 | `server.tls_names` | `[]` | Extra DNS names or IP addresses for the built-in certificate (it already covers localhost, 127.0.0.1, ::1, the host name, FQDN, the machine's addresses, the bind address, the public_url host and `allowed_hosts`). |
 | `logs.max_disk_percent` | `0.5` | All Goose Web logs (gateway, activity, workers, isolated profiles' Goose logs) stay under this share of the disk volume; the oldest unused files are deleted (ADMINISTRATION 18). |
-| `logs.check_minutes` | `30` | How often the log budget, the audit retention and the built-in certificate are checked. |
+| `logs.check_minutes` | `30` | How often the log budget, the audit retention and the built-in certificate are checked; also when partial upload files idle for 24 hours are removed and whether the hourly chat-retention sweep is due. |
 | `logs.activity` | `true` | User activity log `<system_dir>/logs/activity.jsonl` (JSON lines). |
 | `logs.activity_file_mb`, `logs.activity_files` | `20`, `10` | Rotation of the activity log. |
 | `logs.gateway_file_mb`, `logs.gateway_files` | `10`, `5` | Rotation of `gateway.log`. |
@@ -332,6 +335,10 @@ Admins change these in the UI (Admin > Settings / Sign-in). They are stored in t
 | `allow_self_totp` | `true` | When false, non-admins cannot set up or enable TOTP themselves (`403 totp_self_disabled`). Admins can always enrol. |
 | `require_totp_admins` | `false` | Admins cannot turn off their TOTP. It can only be switched on by an admin who already uses TOTP (`409 totp_needed_first`). The login response and `/api/me` report `totpEnrolmentRequired` for an admin without TOTP. Enrolment is not yet forced at sign-in. |
 | `peers` | `[]` | Herd peers: `{name, url, token, verifyTls}` (max 50). The gateway calls `<url>/api/herd` with `Bearer <token>`. Tokens are masked in reads. |
+| `max_upload_mb` | not stored = `server.max_upload_mb` | Largest file upload in MB (Admin > Settings > Files and chats, spec 039), 1 to 5120; more is stored as 5120, less as 1. Saving an empty value goes back to the configuration. |
+| `retention_days` | not stored = `retention.chat_days` | Days without use after which a chat and its uploads are deleted (spec 040); 0 = never, at most 3650. |
+| `retention_armed_at` | set when retention first applies | The first automatic retention sweep runs 7 days later (Run now does not wait). |
+| `retention_last` | - | Summary of the last retention sweep: `{at, days, chats, files, bytes, busy, more, manual, by, errors}`. |
 | `auth` | see below | Sign-in methods. |
 
 `auth` (`auth.py: DEFAULT_AUTH`). Secrets are write-only: reads return `********`, and saving `********` keeps the

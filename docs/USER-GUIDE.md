@@ -455,14 +455,30 @@ Then `Ctrl+Enter` sends. The hint next to the send button shows the current key.
 You can attach in three ways: click the paper-clip button, paste from the clipboard, or drag files onto the
 message box.
 
-- **Images up to 8 MB** are sent to the model as images. A thumbnail appears in the message box.
 - **Every attached file** is written into a `Web_Uploads` folder inside the chat's working folder (1.25.0;
   images too). Goose gets a link to the file. In a folder your team may only read, attaching is refused:
   "You do not have write access to this folder, so files cannot be uploaded here." - choose your workspace,
   or another folder you may write, as the chat's folder. Existing files are never overwritten: a second `report.pdf`
   becomes `report (1).pdf`.
+- **Big files** (spec 039): a file goes up in pieces of 16 MB. Each file in the message box shows how far it is
+  ("37% · 1.2 GB of 3.3 GB"); its X cancels the upload, and what was sent is deleted on the server. A piece that
+  fails is tried again by itself (up to 3 times, after 1, 2 and 4 seconds), continuing where the server stopped,
+  so a short network drop does not start the file again. Two files go up at the same time; the others wait. A file
+  larger than the limit, or one the server's disk has no room for, is refused before anything is sent. Keep the
+  tab open until the upload has finished: a reloaded page cannot continue it.
+- **Images** are also shown to the model, as a smaller copy made in your browser: at most 1600 pixels on the
+  longest side and about 1 MB (JPEG; PNG for small images with transparent parts). The file in `Web_Uploads` is
+  always the original, unchanged. A thumbnail appears in the message box. All images of one message together are
+  kept under 10 MB; further images, and formats the browser cannot read (HEIC, TIFF, ...), are attached as a
+  file link only - the file in the message box says "link only" (the agent can still open the file with its tools).
+- **The model only sees an image when Goose knows it can.** For a model of a custom provider (for example one your
+  administrator set up for a company endpoint) the model's entry in the provider needs `"supports_vision": true`;
+  otherwise Goose replaces the image with "[image omitted: model does not support vision]" and the model gets only
+  the link. Models Goose knows (for example Claude through an Anthropic-type provider) see images as they are. If
+  the model says it got no image, ask your administrator.
 - You need a working folder before you can upload a file.
-- The administrator sets the maximum file size. Up to 20 files can be uploaded at once.
+- The administrator sets the maximum file size (up to 5 GB); the paper-clip button's tooltip shows it. Up to 20
+  files can be attached at once.
 - Files named `AGENTS.md`, `.goosehints` or `.goose-web-hints.md` cannot be uploaded, and you cannot create a
   folder with those names ("... is a Goose hints file name"). Your team's hints are managed by your
   administrator, and Goose ignores such files in your folders anyway. Rename the file (for example
@@ -1336,7 +1352,14 @@ sign out; it does not follow you to another device.
 **Where do my uploaded files go?**
 Into `Web_Uploads` inside the chat's working folder, for example
 `C:\work\project\Web_Uploads\report.pdf` (before 1.25.0: `.goose-web-uploads`; older files stay there).
-Images up to 8 MB are also shown to the model directly.
+Images are also shown to the model as a smaller copy (at most 1600 pixels, about 1 MB; 10 MB of images per
+message) - if the model can see images at all (`"supports_vision": true`, see "Attach files and images").
+
+**Are old chats deleted?**
+Your administrator can set a retention period (spec 040; 180 days unless changed): a chat nobody has opened or used
+for that long - in Goose Web, Goose Desktop or the goose CLI - is deleted, together with the files uploaded to it.
+Using a chat (opening it is enough) starts its period again. A chat that is running or open in a tab is never
+deleted. Files you uploaded but never sent in a chat count from their upload. Deleted chats cannot be restored.
 
 **Why does a folder say "read only"?**
 Your administrator gave your team that folder to read, not to change - a knowledge base, for example. You and
