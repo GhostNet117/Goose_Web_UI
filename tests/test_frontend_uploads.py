@@ -174,6 +174,8 @@ def test_composer_uses_chunked_uploads_and_the_image_budget():
     api_js = _js("api.js")
     assert "new XMLHttpRequest()" in api_js and "file.slice(offset, end)" in api_js
     assert "x.setRequestHeader('X-CSRF-Token', csrf)" in api_js and "x.upload.onprogress" in api_js
+    # a piece without progress is stopped before the server's own idle limit and tried again as a network error
+    assert "export const UPLOAD_STALL_MS = 90 * 1000;" in api_js and "new ApiError(0, 'network', 'The upload stalled')" in api_js
     assert "export const UPLOAD_PARALLEL = 2;" in api_js and "export const UPLOAD_RETRIES = 3;" in api_js
     assert "export async function upload(dir, files)" in api_js                          # the old call stays
     css = (JS.parent / "css" / "app.css").read_text(encoding="utf-8")

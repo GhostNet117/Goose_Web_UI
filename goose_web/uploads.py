@@ -54,6 +54,7 @@ MAX_OPEN_PER_USER = 20                 # unfinished uploads per person (the "20 
 MAX_PUTS_PER_USER = 4                  # pieces being received for one person at the same time
 PARALLEL = 2                           # files the page sends at the same time
 IDLE_SECONDS = 24 * 3600               # a partial file nobody added to for this long is deleted
+PIECE_IDLE_SECONDS = 120               # a piece that brings no byte for this long ends (its slot is freed)
 DISK_MARGIN = 1024 * MB                # free space that must remain on the drive after the upload (1 GB)
 KEEP_ENDED_SECONDS = 30 * 86400        # rows of cancelled / abandoned / deleted uploads are dropped after this
 PARTIAL_PREFIX = ".goose-web-upload-"
@@ -668,8 +669,15 @@ async def _receive(request: Request, fd: int, offset: int, size: int, live: _Liv
     parts: list[bytes] = []
     held = 0
     n = 0
+    stream = request.stream().__aiter__()
     try:
-        async for piece in request.stream():
+        while True:
+            try:   # a connection that stalls must not hold the upload (and one of the person's 4 slots) forever
+                piece = await asyncio.wait_for(stream.__anext__(), PIECE_IDLE_SECONDS)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                raise HTTPError(408, "timeout", f"No data for {PIECE_IDLE_SECONDS} seconds; send this piece again")
             if not piece:
                 continue
             n += len(piece)
@@ -698,6 +706,11 @@ async def _receive(request: Request, fd: int, offset: int, size: int, live: _Liv
         except OSError:
             pass
         raise
+    finally:
+        try:
+            await stream.aclose()
+        except Exception:
+            pass
     return n
 
 

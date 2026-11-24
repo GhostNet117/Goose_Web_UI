@@ -61,6 +61,7 @@ export async function upload(dir, files) {
 // Cancel = the AbortSignal: the request in flight stops and the server deletes the partial file (DELETE).
 export const UPLOAD_PARALLEL = 2;
 export const UPLOAD_RETRIES = 3;
+export const UPLOAD_STALL_MS = 90 * 1000;   // below the server's 120 s per-piece idle limit
 const slots = { active: 0, waiters: [] };
 function acquireSlot(signal) {
   return new Promise((resolve, reject) => {
@@ -96,23 +97,27 @@ export const xhrTransport = {
   status: (id) => api('GET', UPLOADS + '/' + encodeURIComponent(id), undefined, { quiet: true }),
   abort: (id) => api('DELETE', UPLOADS + '/' + encodeURIComponent(id), undefined, { quiet: true }),
   // One piece with XMLHttpRequest: the browser reads the Blob slice from disk while it sends, and reports progress.
+  // A piece that makes no progress for UPLOAD_STALL_MS is stopped and counts as a network error (tried again).
   put: (id, offset, blob, onSent, signal) => new Promise((resolve, reject) => {
     const x = new XMLHttpRequest();
+    let last = Date.now(), stalled = false;
+    const watch = setInterval(() => { if (Date.now() - last > UPLOAD_STALL_MS) { stalled = true; x.abort(); } }, 5000);
+    const done = (fn, v) => { clearInterval(watch); fn(v); };
     x.open('PUT', UPLOADS + '/' + encodeURIComponent(id) + '?offset=' + offset);
     if (csrf) x.setRequestHeader('X-CSRF-Token', csrf);
     x.setRequestHeader('Content-Type', 'application/octet-stream');
     x.setRequestHeader('Accept', 'application/json');
-    x.upload.onprogress = (e) => { if (onSent) onSent(e.loaded); };
+    x.upload.onprogress = (e) => { last = Date.now(); if (onSent) onSent(e.loaded); };
     x.onload = () => {
       let d = null; try { d = JSON.parse(x.responseText); } catch { d = null; }
-      if (x.status >= 200 && x.status < 300) { resolve(d); return; }
+      if (x.status >= 200 && x.status < 300) { done(resolve, d); return; }
       const err = new ApiError(x.status, d && d.error, d && (d.message || d.error), d);
       if (x.status === 401) bus.emit('unauthorized', err);
-      reject(err);
+      done(reject, err);
     };
-    x.onerror = () => reject(new ApiError(0, 'network', 'Network error while uploading'));
-    x.ontimeout = () => reject(new ApiError(0, 'network', 'The upload timed out'));
-    x.onabort = () => reject(abortError());
+    x.onerror = () => done(reject, new ApiError(0, 'network', 'Network error while uploading'));
+    x.ontimeout = () => done(reject, new ApiError(0, 'network', 'The upload timed out'));
+    x.onabort = () => done(reject, stalled ? new ApiError(0, 'network', 'The upload stalled') : abortError());
     if (signal) signal.addEventListener('abort', () => x.abort(), { once: true });
     x.send(blob);
   }),

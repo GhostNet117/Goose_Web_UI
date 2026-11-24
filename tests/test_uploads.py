@@ -5,6 +5,7 @@ resolves - at the start, before every piece and before the final name -, cleaned
 members); an upload belongs to whoever started it; the declared size is the most the server takes; pieces are all or
 nothing and must continue exactly where the last ended; bytes go straight to disk; the final name never replaces a
 file; idle partial files go after 24 hours; free disk space is checked first."""
+import asyncio
 import inspect
 import itertools
 import json
@@ -431,6 +432,44 @@ def test_a_piece_is_written_while_it_arrives(env):
     assert all(have >= (k * piece // uploads.WRITE_BYTES - 1) * uploads.WRITE_BYTES for k, have in seen)
     assert seen[-1][1] >= size - 2 * uploads.WRITE_BYTES
     assert peak < 8 * MB, peak                            # 24 MB went through; memory stayed small
+
+
+def test_a_stalled_piece_ends_and_frees_its_slot(env, monkeypatch):
+    s, db, pr, c = env
+    dee, _ = member(env)
+    ws = pr.workspace(dee)
+    monkeypatch.setattr(uploads, "PIECE_IDLE_SECONDS", 0.3)
+    app = Starlette(routes=api.routes, exception_handlers={HTTPError: lambda r, e: e.response()})
+    app.state.ctx = c
+    with TestClient(app, base_url="http://localhost") as tc:
+        h = sign_in(tc, c, dee)
+        uid = start(tc, h, ws, "slow.bin", 100).json()["id"]
+    token, csrf = c.auth.create_session(dee, "127.0.0.1", "pytest", "password")
+    steps = iter([b"x" * 10, None])        # 10 bytes, then nothing
+    sent = []
+
+    async def receive():
+        b = next(steps)
+        if b is None:
+            await asyncio.sleep(10)
+            return {"type": "http.disconnect"}
+        return {"type": "http.request", "body": b, "more_body": True}
+
+    async def send(m):
+        sent.append(m)
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "PUT", "scheme": "http",
+             "path": f"/api/fs/uploads/{uid}", "raw_path": f"/api/fs/uploads/{uid}".encode(), "query_string": b"offset=0",
+             "root_path": "", "client": ("127.0.0.1", 5000), "server": ("localhost", 80),
+             "headers": [(b"cookie", f"{c.cookie_name}={token}".encode()), (b"x-csrf-token", csrf.encode()),
+                         (b"host", b"localhost")]}
+    t0 = time.time()
+    asyncio.run(app(scope, receive, send))
+    assert time.time() - t0 < 5
+    assert next(m["status"] for m in sent if m["type"] == "http.response.start") == 408
+    row = row_of(db, uid)
+    assert row["received"] == 0 and Path(row["partial"]).stat().st_size == 0     # the half piece was cut back
+    live = uploads._live(db)
+    assert row["id"] not in live.busy and dee["id"] not in live.puts             # the slot is free again
 
 
 def test_body_limit_caps_the_piece_route(tmp_path):

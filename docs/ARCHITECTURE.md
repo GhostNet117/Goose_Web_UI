@@ -1767,7 +1767,8 @@ are audited.
   person at once, one per upload. The folder is checked again; the partial file is opened only if `lstat` shows a
   regular file and `fstat` of the opened handle has the stored identity; a longer file is cut back, a shorter one
   ends the upload. The body is written while it arrives (at most 1 MiB gathered, writes in a thread), `fsync`,
-  then `received` stored - a piece is all or nothing (cut back on any error or disconnect). At the last byte:
+  then `received` stored - a piece is all or nothing (cut back on any error, a disconnect, or 120 s without a byte:
+  `408`; the page stops a piece itself after 90 s without progress and tries again). At the last byte:
   checked again, renamed without replacing (`MoveFileEx` without replace; `link`+`unlink` elsewhere) to
   `name`, `name (1).ext`, ...; afterwards it must still be the same file in the same resolved folder (else deleted,
   `409 upload_moved`, audited); hidden attribute removed, row `done`, link to `session_id`, audit `fs.upload`
