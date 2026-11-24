@@ -611,6 +611,25 @@ rules.
 - **Updated elsewhere**: if the same chat is continued in Goose Desktop, the CLI or a schedule, the open chat
   reloads within a few seconds and shows "This chat was updated in another Goose app".
 
+### When a chat cannot be opened: the read-only copy
+
+Sometimes Goose cannot load a chat: the chat page then shows **Could not open this session** with the reason and
+the buttons **Retry** and **Back to herd**. Click **Show a read-only copy** on that card to read the conversation
+anyway. Goose Web then reads the messages straight from Goose's own record of your chats (the session database in
+your profile) instead of asking Goose to open the chat:
+
+- A banner says **Read-only copy - Goose could not load this chat:** and the reason. The chat's name, folder and
+  the time it last changed are shown under it.
+- Your messages and Goose's replies appear as in a normal chat. Thinking is shown as a folded **Thinking** block.
+  Each tool call shows the tool's name and its (shortened) input; each tool result shows its (shortened) output.
+  Images are not shown, only a note that there was one. A very long message is shortened and says so.
+- The first 200 messages are shown. Click **Load more** at the bottom for the next 200.
+- It is a copy for reading: you cannot send, edit, steer or stop anything in it. Messages Goose keeps for itself
+  (not shown in a normal chat either) are not shown.
+- **Try again** opens the chat normally again. When that works, the live chat replaces the copy.
+- You see the same chats as when opening them: your own, in folders your team may use. An administrator viewing
+  another person's profile can read their copies too; that is recorded in the audit log (`transcript.view`).
+
 ## 6. Watching Goose work (live activity)
 
 New in this release. While Goose works on a turn, Goose Web shows what it is thinking and doing, step by step.

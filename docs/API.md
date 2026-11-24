@@ -67,6 +67,12 @@ is a number.
 | GET | `/api/fs/download?path=` | the file as an attachment: always `Content-Type: application/octet-stream`, `Content-Disposition: attachment`, `Content-Security-Policy: sandbox; default-src 'none'`, `Cache-Control: no-store` |
 | GET | `/api/fs/read?path=` | `{path, content, truncated}` (text, max 1 MB) |
 
+## Chats: read-only copy
+
+| Method | Path | Body / result |
+|---|---|---|
+| GET | `/api/sessions/{id}/transcript[?profile=<username>][&after=<message id>&limit=<n>]` | A read-only copy of a chat for when Goose cannot load it (the chat page's **Show a read-only copy**), read from the profile's Goose session database (`<profile>/data/sessions/sessions.db`) over a read-only connection (`mode=ro`, `PRAGMA query_only`); nothing is written and Goose is not asked. Result: `{session:{id, name, workingDir, created, updated, type, archived, parent}, messages:[Message], total, after, next, more, limit}`, oldest first. Only messages the person would see in the chat (metadata `userVisible` not `false`). Paging by message id: `after` (default 0) and `limit` (default 200, at most 1000); continue with `after=<next>` while `more` is true. `Message = {id, role, created, blocks:[Block], truncated?}`; `Block` is `{type:"text", text}`, `{type:"thinking", text, redacted?}`, `{type:"toolRequest", id, tool, text (the arguments), error}`, `{type:"toolResponse", id, tool, text, error}`, `{type:"image", mimeType}` (never the image itself) or `{type:"notice", kind, text}`. Caps: a tool call's arguments or result 2,000 characters, one message's text 200 KB (`truncated`), a page 4 MB of JSON and 64 MB of stored content read (the page ends early with `more`); a stored message over 16 MB is replaced by a notice. Access is that of opening the chat, never wider: your own profile; `?profile=` for administrators only (`403 forbidden` for anyone else, `404 not_found` for an unknown user), audited as `transcript.view`; for a member the folder rules of `session/load` with the chat's folder (`403 forbidden`, message `forbidden: <reason>`, audited as `acp.denied` with `via: transcript`). Errors: `400 bad_request` (an id with characters other than letters, digits, `_ . : -`, or a bad `after` / `limit`), `404 not_found` (no such chat in the profile), `429 rate_limited` (more than 60 requests per person and minute), `503 unavailable` (the database cannot be read now). `Cache-Control: no-store` |
+
 ## Apps
 
 | Method | Path | Body / result |

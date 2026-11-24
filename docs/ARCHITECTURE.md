@@ -131,6 +131,7 @@ The main ideas:
 | `control.py` | 1.16.0: the local control channel in `<system_dir>/run/` (`gateway.json`, `req-*.json` / `resp-*.json`): the gateway answers "what is running" (`Hub.busy_report`) and drains before a restart; the client side of `goose-web gateway status|drain|undrain`, with the fallback for gateways older than 1.16 (herd marks in the database). Section [7.8](#78-deploy-busy-check-and-drain-controlpy). |
 | `effort.py` | 1.16.1: thinking-effort defaults - the effort ranking shared with `chatoptions.js` (`top_effort`), `DEFAULT_EFFORT` (`max`, set on isolated profiles by `profiles.py`), and each custom provider's engine read from `custom_providers/*.json`, added as `gwEngine` to `providers/list` replies (`Upstream._with_engines`) so the New chat picker can say when Goose sends no effort for a model. |
 | `elsewhere.py` | Spec 020: "Working elsewhere" - reads the native profile's `sessions.db` read-only (only when it changed, only while an administrator watches), derives running / finished, groups sessions of one job, `ElsewhereWatcher` per native profile. Section [7.9](#79-running-elsewhere-elsewherepy-spec-020). |
+| `transcript.py` | FIX chat-open-readonly-fallback: the read-only copy of a chat Goose cannot load (`GET /api/sessions/{id}/transcript`). Reads a profile's `sessions.db` read-only (`mode=ro`, `PRAGMA query_only`, short busy timeout, closed at once; never created when missing), only user-visible messages, paged by message id; reduces content blocks to text, thinking, tool name + shortened arguments / result, image placeholders and notices; caps per message and per page. Access is checked by `api.session_transcript` ([section 5.5](#55-rest-endpoints-that-reach-the-agent)). |
 | `workers.py` | `WorkerManager` and `Worker`: spawns, health-checks, restarts and idles out `goose serve`; scheduler ownership; worker logs; Windows Job Object; Goose Desktop detection. |
 | `policy.py` | Least-privilege default, legacy (1.4) and admin policies, `effective_policy` (one team + overrides), chat gating (`chat_block`, `check_session_choice`), team warnings (`team_warnings`), roots (`user_roots`), path containment (`path_allowed`), and the ACP method firewall (`check`). |
 | `guard.py` | Prompt guard (spec 018): rule sets (validation, SPL-aware pipeline parser, globs, defaults), `GuardContext` per user (team or admin guard), `Classifier` (Prompt Guard 2 22M on ONNX Runtime: windows, cache, lazy load), `GuardService` (contexts cached per user, `check_prompt`, `check_tool`, health, fail open, `guard.unavailable`). |
@@ -167,6 +168,7 @@ The main ideas:
 | `js/chatoptions.js` | Per-chat options shared by the chat header and the New chat screen: `pillSelect`, Goose's approval `MODES`, the learned thinking-effort values (`localStorage` `gw-effort-options`), `loadNewChatOptions()` and `applyNewChatOptions()` (spec 008). |
 | `js/chatsession.js` | `ChatSession`: per-session controller. Maps ACP updates to transcript calls. Handles send, queue, steer, cancel and modes. |
 | `js/transcript.js` | `Transcript`: incremental, windowed rendering of messages, thoughts, tool cards, plans, asks and inline MCP Apps. |
+| `js/readonly.js` | The read-only copy of a chat Goose cannot load: `offerReadOnly` adds **Show a read-only copy** to the chat view's error card (and keeps an open copy in place when the card is redrawn); `renderReadOnly` shows `GET /api/sessions/{id}/transcript` pages under the banner "Read-only copy - Goose could not load this chat: <reason>", with **Load more** and **Try again** (the normal open). Goose's text and thinking go through `markdown.js` (marked, then DOMPurify); everything else is set as text. |
 | `js/composer.js` | Message input: slash commands, @mentions, attachments, send/stop/steer/queue. |
 | `js/asks.js` | Permission, elicitation and recipe-parameter cards and their answers. |
 | `js/herd.js` | Herd store, status transitions, browser notifications, title and favicon badges. |
@@ -528,6 +530,16 @@ hub and audits denials as `acp.denied`:
 
 Both return the HTML with the app frame CSP described in
 [section 12.8](#128-mcp-apps).
+
+One REST path runs the same check without calling Goose:
+`GET /api/sessions/{id}/transcript` (`api.session_transcript`, `transcript.py`),
+the read-only copy of a chat Goose cannot load. It reads the profile's
+`sessions.db` read-only and allows exactly what opening the chat allows: the
+caller's own profile, `?profile=` for administrators only (the `/ws` rule,
+audited as `transcript.view`), and for a member `policy.check("session/load",
+{cwd: <the chat's folder>})` - a refusal is the same `403 forbidden: <reason>`,
+audited as `acp.denied` (`via: transcript`). Requests are limited to 60 per
+person and minute.
 
 ---
 
