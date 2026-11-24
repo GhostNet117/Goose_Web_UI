@@ -63,9 +63,12 @@ Use this for local accounts and for directory (LDAP or Active Directory) account
 configured, the username field is labelled with its name, for example "Directory username".
 
 1. Enter your username and password.
-2. There is no "Keep me signed in": a sign-in lasts eight hours at most (your administrator can make it
-   shorter), and then you sign in again. An agent that is working is not stopped by that; it is there when you
-   are back.
+2. Leave **Keep me signed in** off on a shared or public computer. Without it, closing the browser signs you out,
+   and a sign-in lasts eight hours at most (your administrator can make it shorter). With it ticked, closing the
+   browser does not sign you out: the sign-in lasts the time shown next to the box (24 hours at most, set by your
+   administrator), counted from signing in and never extended. Either way you then sign in again (with your code,
+   if you use two-factor). An agent that is working is not stopped by that; it is there when you are back. If the
+   box is not there, your administrator has switched it off.
 3. Click **Sign in**.
 
 ### Sign in with single sign-on
@@ -1134,9 +1137,10 @@ The parts are combined from lowest to highest precedence: your personal hints fi
 you, then your team's hints last. **Team hints win**: if one of your hints conflicts with a team hint, Goose follows
 the team hint.
 
-Your team decides whether you may have personal hints ("Members may add personal hints", off unless your
-administrator turns it on). If it is off, the editor is read-only, and any personal hints you saved earlier are kept
-but not used: a warning says "Your personal hints are not used: your team does not allow personal hints."
+Your team decides whether you may have personal hints ("Members may add personal hints"; on for teams created
+since version 1.27.0, and your administrator can switch it on or off for any team). If it is off, the editor is
+read-only, and any personal hints you saved earlier are kept but not used: a warning says "Your personal hints are
+not used: your team does not allow personal hints."
 
 Goose loads only these combined hints. `AGENTS.md` or `.goosehints` files in your working folders are ignored, and
 you cannot upload or create files with those names.
@@ -1225,7 +1229,8 @@ administrator accounts. See [ADMINISTRATION.md](ADMINISTRATION.md). If you lose 
 reset your two-factor so you can sign in with your password and set it up again (see the FAQ).
 
 **Active sign-ins**: every browser where you are signed in, with device, address, sign-in time and last activity.
-The current browser is marked "this browser". Click **Revoke** to sign out another one.
+The current browser is marked "this browser"; a sign-in made with **Keep me signed in** is marked "kept" (point at
+it to see when it ends). Click **Revoke** to sign out another one, for example a computer you forgot to sign out of.
 
 **API tokens**: tokens let scripts use the Goose Web API as you (see [API.md](API.md)).
 
@@ -1254,7 +1259,7 @@ new team allows nothing until the administrator turns things on. If a button is 
 | `schedules` | Create, change, pause, run and delete schedules | Not allowed |
 | `apps` | Import and delete apps, app tool calls | Not allowed |
 | `prompts_edit` | Change system prompts, including per-chat prompts | Not allowed |
-| `hints_edit` | Personal Goose hints ("Members may add personal hints"); without it your personal hints are not used | Not allowed |
+| `hints_edit` | Personal Goose hints ("Members may add personal hints"); without it your personal hints are not used | Allowed (since 1.27.0; teams created earlier keep their setting) |
 | `tools_permissions` | Set per-tool permissions | Not allowed |
 | `config_edit` | Raw Goose configuration (Advanced config tab) | Not allowed |
 | `allow_shell` | Shell and command extensions, command (stdio) MCP extensions | Not allowed |
@@ -1265,7 +1270,7 @@ Lists and limits:
 | Setting | Effect |
 |---|---|
 | Allowed approval modes | Only these modes appear in the mode picker. None allowed = you cannot chat. |
-| Allowed providers / models | Only these appear in the pickers and in Models & Providers. None allowed = you cannot chat. |
+| Allowed providers / models | Only these appear in the pickers and in Models & Providers. None allowed = you cannot chat. Since 1.27.0 your administrator can also give you alone a provider with some of its models: it appears in your pickers next to your team's, and those models are offered with that provider only. |
 | Default provider / model | What new chats start with. |
 | Team folder | A folder shared by your team, shown as **Team:** and the team name. |
 | Extra folders | Folders you can use besides your workspace and the team folder. |

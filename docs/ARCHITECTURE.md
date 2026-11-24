@@ -142,6 +142,7 @@ The main ideas:
 | `security.py` | Stdlib-only primitives: scrypt password hashing, strong-password rules, `ip_in`, tokens, constant-time compare, TOTP, `RateLimiter`, `safe_name`. |
 | `db.py` | SQLite storage (WAL), schema, additive migrations, JSON column decoding, audit log and retention purge. `update_prefs` (1.18.2): one user's prefs read-modify-write in a single `BEGIN IMMEDIATE` transaction. |
 | `prefsync.py` | 1.18.2: merge rules of a preferences save. Server-owned keys `_rev` (revision), `_keyRev` (revision of each key's last change) and `_hist` (short hashes of each key's last superseded values, never sent). PATCH: only the listed keys, a key changed after the client's `baseRev` is a conflict (409). PUT from an old front end: merge-only, no deletes, a stale echo (a superseded value) skipped. Caps: 100 client keys, 256 KB. |
+| `useritems.py` | Spec 038 (1.27.0): providers given to one person (`user_items`): `rows`, `grants` (for `effective_policy`), `merge` (with the team's items, for `provision`), `refresh` (follows the administrator's profile), `clean_models`, `grant_provider_id`. |
 | `profiles.py` | Profile layout, provisioning of isolated profiles from team items, team folders, hints composition (`.goose-web-hints.md`), cross-profile library and item export, profile archiving. |
 | `winsec.py` | Windows token helpers: elevation and integrity checks, un-elevated relaunch (SAFER), file ownership reports. Safe no-ops on other platforms. |
 | `hosttasks.py` | Admin view of Windows scheduled tasks with an elevation-risk flag; run/end/enable/disable actions. Returns nothing on other platforms. |
@@ -1261,10 +1262,11 @@ secrets, schedules) stays in each profile and is never copied into it.
 | `hints_docs` | Shared hints documents: `name`, `description`, `content` |
 | `user_hints`, `team_hints` | Hints documents assigned to users or teams |
 | `team_items` | Items provisioned into members' profiles: `kind` (`recipe`, `skill`, `extension`, `provider`), `name`, `payload` (JSON), `source`. Unique per `(team_id, kind, name)`. |
-| `auth_sessions` | `token_hash` (primary key, SHA-256 of the cookie value), `user_id`, `csrf`, `created_at`, `expires_at`, `last_seen`, `ip`, `user_agent`, `method` |
+| `user_items` | Spec 038 (1.27.0): what an administrator gave ONE person: `user_id` (cascades on delete), `kind` (`provider`), `name`, `payload` (JSON: as a team provider item - `providerId`, `json`, `secretsFrom`, `secretKeys`, never a key value - plus `models`, the models allowed with it, `["*"]` = all), `source` (`<administrator>:<ref>`), `created_at`. Unique per `(user_id, kind, name)`. |
+| `auth_sessions` | `token_hash` (primary key, SHA-256 of the cookie value), `user_id`, `csrf`, `created_at`, `expires_at`, `last_seen`, `ip`, `user_agent`, `method`, `remember` (1 = a "Keep me signed in" sign-in, its own lifetime; spec 037, 1.27.0) |
 | `api_tokens` | `name`, `token_hash` (unique), `prefix` (first 10 characters, for display), `created_at`, `last_used`, `expires_at` |
 | `audit` | `ts`, `user_id`, `username`, `ip`, `action`, `target`, `detail` (JSON), `ok`. Indexed on `ts`. |
-| `settings` | `key`, `value` (JSON): `auth`, `brand`, `default_team_id`, `session_hours`, `allow_self_totp`, `require_totp_admins`, `peers`, `native_root` |
+| `settings` | `key`, `value` (JSON): `auth`, `brand`, `default_team_id`, `session_hours`, `remember_hours`, `idle_minutes`, `allow_self_totp`, `require_totp_admins`, `peers`, `native_root` |
 | `oidc_states` | `state`, `verifier`, `nonce`, `created_at` (10-minute login handshakes) |
 | `ip_blocks` | `ip` (address key: IPv4 or IPv6 /64), `failures` (JSON list of timestamps of the current run), `last_username`, `blocked_at` (0 = not blocked), `blocked_until` (0 = until unblocked), `updated_at` (schema version 3) |
 | `chat_state` | Per-chat live state the hub keeps for each profile (spec 019, schema version 6): `(profile, session_id, kind)` primary key, `data` (JSON), `updated_at`. `kind = 'queue'`: the composer queue; `kind = 'mark'`: the herd status not yet seen (`working`, `needs_you`, `done`, `error` with title, folder, last text). Written on queue changes and status changes only; read when the profile's `Upstream` is created (`Upstream.restore_state`). Rows are deleted when the queue empties, the status becomes idle (`_gw/seen`), the chat is deleted, or the user is deleted; marks older than 30 days are dropped. |
@@ -1311,6 +1313,11 @@ On open:
 Columns are never dropped or renamed, so an older gateway can still open a
 newer database. To change the schema, append to `MIGRATIONS` and bump
 `SCHEMA_VERSION`.
+
+1.27.0 added the column `auth_sessions.remember` (`INTEGER DEFAULT 0`, through
+`MIGRATIONS`; rows from before count as normal sign-ins) and the table
+`user_items` (`CREATE TABLE IF NOT EXISTS`). Both are created on every open,
+whatever `meta.schema_version` says.
 
 **Policy model migration** (`_migrate_policy_model`, `POLICY_MODEL = 2`). It
 runs in one transaction when `meta.policy_model` is missing or lower than 2,
@@ -1389,7 +1396,12 @@ or memberships change (`_reprovision`).
    Shell-capable extensions (`developer`, `computercontroller`,
    `code_execution`, `orchestrator`) stay disabled unless the policy has
    `allow_shell`.
-3. **Team items:**
+3. **Team items, and the person's own (spec 038, 1.27.0).** `useritems.merge`
+   adds the providers given to this person alone (`user_items`) to the team's
+   items, one per kind and name, the person's row winning. They are written
+   like the team's, so only that person's profile gets the provider file and
+   its key, and the manifest removes both when the row goes. The policy used
+   here is `effective_policy(user, teams, grants=useritems.grants(...))`.
    - **Extensions.** Shell or stdio extensions are disabled without
      `allow_shell`. `secretsFrom` copies the named environment secrets from
      the source profile.
@@ -1533,11 +1545,18 @@ lists the mechanisms.
   token, returned to the SPA in the login and `/api/me` responses.
 - **Cookie.** `__Host-gw` when `public_url` is `https`, otherwise `gw`. It is
   `HttpOnly`, `SameSite=Strict`, `Secure` on https, and `Path=/`. It is
-  always a session cookie (no `Max-Age`); there is no "remember me" (1.25.0).
-- **Lifetime.** `session_hours`, 1 to 8 (`auth.SESSION_HOURS_MAX`; default 8). The
+  a session cookie (no `Max-Age`), except for a "Keep me signed in" sign-in
+  (spec 037, 1.27.0): `remember: true` in the login body, while
+  `remember_hours` is not 0, gives `Max-Age`/`Expires` = `remember_hours`
+  and marks the row `auth_sessions.remember = 1`. Single sign-on sign-ins
+  are never kept.
+- **Lifetime.** `session_hours`, 1 to 8 (`auth.SESSION_HOURS_MAX`; default 8);
+  a kept sign-in `remember_hours`, 0 to 24 (`auth.REMEMBER_HOURS_MAX`;
+  default 24; 0 = off), with its database setting likewise. The
   `session_hours` database setting overrides the configuration. Expiry is
-  fixed, not sliding. `clamp_sessions` cuts stored sign-ins to the lifetime at
-  start-up and when an administrator lowers it. `last_seen` is updated at most
+  fixed, not sliding. `clamp_sessions` cuts stored sign-ins to the lifetime of
+  their kind at start-up and when an administrator lowers either (with
+  `remember_hours` 0 the kept ones are deleted). `last_seen` is updated at most
   once a minute - by requests and by the 30-second re-check of an open socket
   (`session_alive`). With `idle_minutes` (off by default) a sign-in whose
   `last_seen` is older than that is deleted when it is next presented.
@@ -1620,7 +1639,18 @@ sign-in.
   the base: switches, lists, `max_concurrent_runs`, `default_provider`,
   `default_model`, plus `team: {id, name}`. `Ctx.policy_for` adds
   `team_folder`.
-- The user's `policy_overrides` are applied last.
+- The user's `policy_overrides` are applied next.
+- Then the providers given to this person alone (spec 038, `grants`,
+  `add_user_grants`): each joins `allowed_providers` unless that is `"*"`,
+  and `granted_models` (`{provider: [models]}`) keeps the models given with
+  it. `model_allowed(policy, model, provider)` allows a model of
+  `allowed_models` with any provider, and one of `granted_models[provider]`
+  with that provider only. The prompt check (`check_session_choice`),
+  `defaults/save`, recipe settings and provisioning pass the provider;
+  `set_config_option` and `config/upsert` of a model cannot know it and
+  accept a given model for its providers (the prompt holds the pair).
+  `chat_block` counts given models as models; the browser filters its
+  pickers the same way (`store.allowedValue(listKey, value, provider)`).
 - `chat_blocked` is the reason text from `chat_block` when the user has no
   team or the team allows no providers, models or modes, otherwise empty.
 
@@ -1633,7 +1663,7 @@ sign-in.
 | `schedules` | off | Creating and changing schedules |
 | `apps` | off | Importing and deleting apps, `tools/call` from apps |
 | `prompts_edit` | off | Editing system prompt templates |
-| `hints_edit` | off | Personal hints (included in the composed hints only when on) |
+| `hints_edit` | on (1.27.0; off before) | Personal hints (included in the composed hints only when on) |
 | `tools_permissions` | off | Per-tool permission settings |
 | `config_edit` | off | Writing Goose configuration keys (never `CONTEXT_FILE_NAMES`) |
 | `allow_shell` | off | Shell-capable extensions (`developer`, `computercontroller`, `code_execution`, `orchestrator`), stdio extensions, inline `mcpServers` |
