@@ -123,7 +123,7 @@ CHAT_ACTIVITY = {"session/new": "chat.new", "session/load": "chat.open", "sessio
                  STEER: "chat.steer"}
 # Composer queue kept by the gateway per chat (spec 019): survives a refresh, another device and a restart.
 QUEUE_MAX_ITEMS = 20
-QUEUE_ITEM_BYTES = 9 * 1024 * 1024   # an inline image is at most 8 MB (composer.js)
+QUEUE_ITEM_BYTES = 15 * 1024 * 1024   # a message's inline images are at most 10 MB of base64 (composer.js, spec 039)
 # Security review 2026-11-11 (SC-2/SC-4): one member must not be able to fill the gateway's memory, disk or event loop
 QUEUE_MAX_SESSIONS = 20              # chats with a non-empty queue per profile (was 200)
 QUEUE_PROFILE_BYTES = 32 * 1024 * 1024   # all queued messages of a profile together

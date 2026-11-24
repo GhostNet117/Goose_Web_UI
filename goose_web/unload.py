@@ -39,7 +39,8 @@ CLOSE = "session/close"
 TICK_SECONDS = 60.0
 LRU_MIN_IDLE_SECONDS = 120.0     # max_loaded_sessions never unloads a chat used less than this long ago
 CLOSE_TIMEOUT = 30.0
-LOAD_TIMEOUT = 120.0
+LOAD_TIMEOUT = 120.0             # a silent load waits at least this long (or the hub's load watchdog + 5 s)
+LOAD_POLL_SECONDS = 0.05
 DEFAULT_MINUTES = 30
 DEFAULT_MAX_LOADED = 12
 UNLOADED_MAX = 5000              # unloaded chat ids remembered per connection
@@ -72,14 +73,6 @@ def close_supported(init_result: Any) -> bool:
         if isinstance(sc, dict) and sc.get("close") not in (None, False):
             return True
     return False
-
-
-class _Discard:
-    """The loading client of a silent load: the replay goes into the gateway's buffer and to no tab."""
-    closed = False
-
-    def send(self, obj: Any) -> None:
-        pass
 
 
 class Unloader:
@@ -180,8 +173,9 @@ class Unloader:
         if sid not in self.held or sid in (self.busy_sids() if busy is None else busy):
             return False
         s = up.sessions.get(sid)
-        if s is not None and (s.running() or s.prompts or s.queue or s.steers or s.loading_client is not None):
-            return False
+        if s is not None and (s.running() or s.prompts or s.queue or s.steers or s.loading is not None
+                              or s.abandoned is not None):
+            return False   # (loading/abandoned: the chat's one upstream load, FIX chat-open-replay-overflow)
         try:
             if up.hub.elsewhere_running(up.key, sid):   # spec 020: another program runs it (read-only here)
                 return False
@@ -354,23 +348,37 @@ class Unloader:
                       "params": {"sessionId": sid, "reason": "unloaded"}})
 
     async def _silent_load(self, sid: str, method: str) -> None:
-        from .hub import SESSION_INFO, RpcError
+        """Load a chat the gateway unloaded before `method` needs its agent. It is the chat's one upstream load
+        (hub.UpstreamLoad, FIX chat-open-replay-overflow) with no tab waiting: Goose's history fills only the hub
+        buffer, so a tab that opens the chat later gets it replayed, and a tab that opens it meanwhile joins the same
+        load. A load already in flight (a tab's) is waited for instead of sending a second one."""
+        from .hub import SESSION_INFO, RpcError, UpstreamLoad
         up = self.up
         s = up.sess(sid)
-        if s.loading_client is not None:
-            return   # a tab's load of this chat is on its way to Goose
-        sink = _Discard()
-        try:
+        if s.abandoned is not None:
+            raise RpcError(-32000, "Goose has not answered an earlier load of this chat: try again later")
+        ld = s.loading
+        if ld is None:
             cwd = s.cwd
             if not cwd:
-                info = await up.request(SESSION_INFO, {"sessionId": sid}, timeout=30)
+                try:
+                    info = await up.request(SESSION_INFO, {"sessionId": sid}, timeout=30)
+                except asyncio.TimeoutError:
+                    raise RpcError(-32000, "Goose did not say where this chat works in time; try once more") from None
                 cwd = str((((info or {}).get("session") or {}) if isinstance(info, dict) else {}).get("cwd") or "")
                 s.cwd = s.cwd or cwd
-            s.loading_client = sink
-            await up.request("session/load", {"sessionId": sid, "cwd": cwd, "mcpServers": []}, timeout=LOAD_TIMEOUT)
-        except asyncio.TimeoutError:
-            raise RpcError(-32000, "Goose did not load this chat again in time; try once more") from None
-        finally:
-            if s.loading_client is sink:
-                s.loading_client = None
+            ld = s.loading
+            if ld is None:   # nobody started a load while Goose was asked for the folder
+                up.hub.total_buffer -= s.buffer_bytes
+                s.buffer.clear()
+                s.buffer_bytes, s.truncated, s.fp = 0, False, None
+                ld = s.loading = UpstreamLoad(up._new_id())
+                await up._send_load(ld, {"sessionId": sid, "cwd": s.cwd or cwd, "mcpServers": []})
+        deadline = time.monotonic() + max(LOAD_TIMEOUT, up._load_timeout() + 5.0)
+        while s.loading is ld and time.monotonic() < deadline and not up.closed:
+            await asyncio.sleep(LOAD_POLL_SECONDS)
+        # Answered: on_response moved the chat from `unloaded` to `held`. Anything else (an error, the watchdog, the
+        # connection ending, no answer at all) leaves Goose without the chat's agent.
+        if sid in self.unloaded or sid not in self.held:
+            raise RpcError(-32000, "Goose did not load this chat again; try once more")
         log.info("loaded the unloaded chat %s of %s again for %s", sid, up.key, method)

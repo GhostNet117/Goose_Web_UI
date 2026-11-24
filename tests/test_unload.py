@@ -91,7 +91,8 @@ class Sink:
         self.event = asyncio.Event()
 
     async def send(self, raw):
-        self.msgs.append(json.loads(raw))
+        m = json.loads(raw)   # a replay comes in JSON-array batches (FIX chat-open-replay-overflow)
+        self.msgs.extend(m if isinstance(m, list) else [m])
         self.event.set()
 
     async def wait_for(self, pred, timeout=5):
@@ -217,7 +218,7 @@ BLOCKERS = {
     "queued message": lambda up, c, s: setattr(s, "queue", [queue_item([{"type": "text", "text": "x"}], "alice")]),
     "steer": lambda up, c, s: setattr(s, "steers", [{"id": "x", "messageId": "m1", "runId": "", "blocks": [],
                                                      "by": "alice", "at": time.time(), "state": "pending"}]),
-    "being loaded": lambda up, c, s: setattr(s, "loading_client", c),
+    "being loaded": lambda up, c, s: setattr(s, "loading", hubmod.UpstreamLoad(99998)),
     "current chat of a tab": lambda up, c, s: setattr(c, "current", s.sid),
     "prompt being checked": lambda up, c, s: setattr(up, "starting", 1),
 }
@@ -289,7 +290,7 @@ async def test_a_method_for_an_unloaded_chat_loads_it_silently_first(mk, method)
         assert not any(m.get("method") == "session/update" and
                        ((m["params"]["update"].get("content") or {}).get("text") == "replayed") for m in snk.msgs)
     assert sid in up.unloader.held and sid not in up.unloader.unloaded
-    assert up.sessions[sid].loading_client is None and up.sessions[sid].cwd == CWD
+    assert up.sessions[sid].loading is None and up.sessions[sid].cwd == CWD
 
 
 async def test_a_prompt_during_a_close_waits_then_loads_the_chat(mk):

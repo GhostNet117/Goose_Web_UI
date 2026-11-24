@@ -647,7 +647,7 @@ def _conn(peer: str, xff: str | None) -> HTTPConnection:
     ("127.0.0.1", "198.51.100.7:4711", "198.51.100.7"),
     ("127.0.0.1", "[2001:db8::1]:443", "2001:db8::1"),
     ("127.0.0.1", "2001:DB8::1", "2001:db8::1"),
-    ("127.0.0.1", "10.9.9.9", "10.9.9.9"),                                 # only trusted hops: the left-most one
+    ("127.0.0.1", "10.0.9.9", "10.0.9.9"),                                 # only trusted hops: the left-most one
     ("192.0.2.50", "198.51.100.7", "192.0.2.50"),                           # untrusted peer: header ignored
 ])
 def test_client_ip_uses_only_valid_forwarded_addresses(tmp_path, peer, xff, want):

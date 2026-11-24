@@ -221,10 +221,16 @@ def sessions_in_use(hub: Any, key: str) -> set[str]:
     if up is None:
         return out
     for s in list(up.sessions.values()):
-        if s.running() or s.loading_client is not None or s.queue or s.steers or s.prompts:
+        # loading / abandoned: the chat's one upstream load (FIX chat-open-replay-overflow)
+        if s.running() or getattr(s, "loading", None) is not None or getattr(s, "abandoned", None) is not None \
+                or s.queue or s.steers or s.prompts:
             out.add(s.sid)
     for cl in list(up.clients):
         out |= {str(x) for x in (getattr(cl, "watch", None) or ())}
+        out |= {str(x) for x in (getattr(cl, "replays", None) or ())}   # being opened in this tab
+        cur = getattr(cl, "current", None)   # the chat the tab shows (FIX idle-sessions-keep-mcp-servers)
+        if cur:
+            out.add(str(cur))
     for a in list(up.asks.values()):
         out.add(str(a.get("sessionId") or ""))
     for e in list(up.pending.values()):

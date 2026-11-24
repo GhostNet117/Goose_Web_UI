@@ -349,7 +349,7 @@ def test_running_loading_and_open_chats_are_skipped(rt):
         chat(rt, dee, sid, 400)
     up = hub.upstreams["dee"]
     up.sessions["RUN"] = SessionState(sid="RUN", status="working")
-    up.sessions["LOAD"] = SessionState(sid="LOAD", loading_client=object())
+    up.sessions["LOAD"] = SessionState(sid="LOAD", loading=object())
     up.sessions["QUEUE"] = SessionState(sid="QUEUE", queue=[{"id": "q1"}])
     up.clients.add(Tab("TAB"))
     up.asks["r1"] = {"sessionId": "ASK", "msg": {}}
