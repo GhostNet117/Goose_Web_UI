@@ -102,12 +102,12 @@ export function renderChat(ctx, sessionId) {
       const vis0 = visibilityContext();
       const pOpts = filt(optionById(chat.configOptions, 'provider')).filter((x) => allowedValue('allowed_providers', x.value) || x.value === curP)
         .filter((x) => x.value === curP || !pickerHidden(x.value, vis0)).map((x) => ({ value: x.value, label: x.name || x.value, title: x.description }));
-      const mOpts = filt(optionById(chat.configOptions, 'model')).filter((x) => allowedValue('allowed_models', x.value) || x.value === curM)
+      const mOpts = filt(optionById(chat.configOptions, 'model')).filter((x) => allowedValue('allowed_models', x.value, curP) || x.value === curM)
         .map((x) => ({ value: x.value, label: x.name || x.value, title: x.description }));
       const inv = inventory();
       if (!inv && groupOfProvider(curP, gcfg)) loadInventoryOnce().then((l) => { if (l) renderSelects(); });   // once per page
       const invList = (inv || []).filter((p) => allowedValue('allowed_providers', p.id))
-        .map((p) => ({ ...p, models: (p.models || []).filter((m) => allowedValue('allowed_models', m.id) || (p.id === curP && m.id === curM)) }));
+        .map((p) => ({ ...p, models: (p.models || []).filter((m) => allowedValue('allowed_models', m.id, p.id) || (p.id === curP && m.id === curM)) }));
       const entries = groupPicker(invList, gcfg, { ...vis0, current: curP });
       gp = headerPickers(pOpts, curP, curM, mOpts, entries, gcfg);
       gp.entries = entries;
@@ -121,7 +121,7 @@ export function renderChat(ctx, sessionId) {
       const listKey = o.id === 'provider' ? 'allowed_providers' : o.id === 'model' ? 'allowed_models' : null;
       // spec 023: after the policy, the providers the user hid in Settings are left out - except the one this chat uses
       const vis = o.id === 'provider' ? visibilityContext() : null;
-      let opts = o.options.filter((x) => !listKey || allowedValue(listKey, x.value) || x.value === o.currentValue)
+      let opts = o.options.filter((x) => !listKey || allowedValue(listKey, x.value, curP) || x.value === o.currentValue)
         .filter((x) => !vis || x.value === o.currentValue || !pickerHidden(x.value, vis))
         .map((x) => ({ value: x.value, label: (x.name || x.value) + (vis && pickerHidden(x.value, vis) === 'user' ? HIDDEN_LABEL : ''), title: x.description }));
       let value = o.currentValue;

@@ -24,7 +24,7 @@ from starlette.routing import Route
 
 from . import auth as auth_mod
 from . import guard as guardmod
-from . import guardmodel, hosttasks, logjanitor, prefsync, security, tls, winsec
+from . import guardmodel, hosttasks, logjanitor, prefsync, security, tls, useritems, winsec
 from . import policy as acp_policy
 from .auth import AuthError
 from .context import Ctx, HTTPError, body_json, read_body
@@ -1715,6 +1715,80 @@ async def admin_team_item_delete(request: Request):
     return ok()
 
 
+def _user_item_view(r: dict, gone: bool) -> dict:
+    p = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+    return {"id": r["id"], "kind": r["kind"], "name": r["name"], "providerId": useritems.grant_provider_id(p),
+            "models": [m for m in p.get("models") or [] if isinstance(m, str)], "source": r["source"],
+            "fromProfile": str(r.get("source") or "").partition(":")[0], "createdAt": r["created_at"],
+            "sourceGone": gone}
+
+
+async def admin_user_items(request: Request):
+    """Spec 038: providers given to ONE person (user dialog > "Providers for this user only"). GET lists them, with
+    what the person's team gives (to show an overlap); POST {kind: "provider", fromProfile: <an administrator>,
+    ref: <provider>, models: [...] | ["*"]} gives one or replaces its models. Only an administrator's own profile can
+    be the source: its key is copied to this person's profile at every provisioning, never to anyone else's."""
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    u = _get_user(c, request)
+    if request.method == "GET":
+        rows = useritems.rows(c.db, u["id"])
+        gone = await asyncio.to_thread(lambda: {r["id"]: _source_gone(c, r) for r in rows})
+        t = c.db.user_team(u["id"])
+        tp = (t or {}).get("policy") or {}
+        team = {"id": t["id"], "name": t["name"],
+                "providers": [r["name"] for r in c.db.query("SELECT name FROM team_items WHERE team_id=? AND "
+                                                            "kind='provider' ORDER BY name", (t["id"],))],
+                "allowedProviders": tp.get("allowed_providers") or [],
+                "allowedModels": tp.get("allowed_models") or []} if t else None
+        return ok({"items": [_user_item_view(r, gone[r["id"]]) for r in rows], "team": team,
+                   "native": c.profiles.is_native(u)})
+    b = await body_json(request, 64 * 1024)
+    kind = b.get("kind")
+    if kind not in useritems.KINDS:
+        raise HTTPError(400, "bad_kind", "kind must be provider")
+    if c.profiles.is_native(u):
+        raise HTTPError(400, "native", "A native profile is never provisioned: it has its own providers")
+    src = c.db.user_by_name(str(b.get("fromProfile") or ""))
+    if not src or src.get("role") != "admin" or src.get("disabled"):
+        raise HTTPError(400, "bad_source", "A provider for one person is taken from an administrator's own profile")
+    try:
+        models = useritems.clean_models(b.get("models"))
+    except ValueError as e:
+        raise HTTPError(400, "bad_models", str(e))
+    ref = str(b.get("ref") or "")
+    try:
+        name, payload = await asyncio.to_thread(c.profiles.export_item, src, kind, ref)
+        name = security.safe_name(name.replace(" ", "-"), 128)
+    except (ValueError, KeyError, OSError) as e:
+        raise HTTPError(400, "bad_ref", str(e))
+    import json as _json
+    source = f"{src['username']}:{ref}"
+    c.db.execute("INSERT INTO user_items(user_id, kind, name, payload, source, created_at) VALUES(?,?,?,?,?,?) "
+                 "ON CONFLICT(user_id, kind, name) DO UPDATE SET payload=excluded.payload, source=excluded.source",
+                 (u["id"], kind, name, _json.dumps({**payload, "models": models}), source, time.time()))
+    changes = await _reprovision(c, [c.db.user_by_id(u["id"])])
+    c.audit(request, "user.item.add", admin, target=f"{u['username']}:{kind}:{name}",
+            detail={"source": source, "models": models[:50]})
+    return ok({"name": name, "providerId": useritems.grant_provider_id(payload), "models": models,
+               "changes": changes.get(u["username"], []), "restartPending": _restart_pending(c, [u])})
+
+
+async def admin_user_item_delete(request: Request):
+    """Spec 038: take a provider given to one person away again - its file and its key leave that profile at once
+    (a copy the person's team gives stays)."""
+    c = ctx(request)
+    admin = c.require(request, admin=True).user
+    u = _get_user(c, request)
+    it = c.db.one("SELECT * FROM user_items WHERE id=? AND user_id=?", (int(request.path_params["iid"]), u["id"]))
+    if not it:
+        raise HTTPError(404, "not_found")
+    c.db.execute("DELETE FROM user_items WHERE id=?", (it["id"],))
+    changes = await _reprovision(c, [c.db.user_by_id(u["id"])])
+    c.audit(request, "user.item.remove", admin, target=f"{u['username']}:{it['kind']}:{it['name']}")
+    return ok({"changes": changes.get(u["username"], []), "restartPending": _restart_pending(c, [u])})
+
+
 async def refresh_library(c: Ctx) -> dict:
     """Library items taken from an administrator's profile are brought in line with it (profiles.refresh_team_items)
     and the members of the teams concerned are provisioned: their profiles get the new version, and an agent that
@@ -1723,7 +1797,15 @@ async def refresh_library(c: Ctx) -> dict:
     for tid, names in changed.items():
         await _reprovision(c, _team_members(c, tid))
         c.db.audit("team.item.refresh", target=str(tid), detail={"items": names[:20]})
-    return {str(tid): names for tid, names in changed.items()}
+    out = {str(tid): names for tid, names in changed.items()}
+    # spec 038: providers given to one person follow the administrator's profile too
+    for uid, names in (await asyncio.to_thread(useritems.refresh, c.profiles, c.db)).items():
+        u = c.db.user_by_id(uid)
+        if u:
+            await _reprovision(c, [u])
+            c.db.audit("user.item.refresh", target=u["username"], detail={"items": names[:20]})
+            out[f"user:{u['username']}"] = names
+    return out
 
 
 async def admin_host_tools(request: Request):
@@ -2366,6 +2448,8 @@ routes = [
     Route("/api/admin/users/{uid:int}/reset-totp", admin_user_reset_totp, methods=["POST"]),
     Route("/api/admin/users/{uid:int}/provision", admin_user_provision, methods=["POST"]),
     Route("/api/admin/users/{uid:int}/hints", admin_user_hints, methods=["GET"]),
+    Route("/api/admin/users/{uid:int}/items", admin_user_items, methods=["GET", "POST"]),     # spec 038
+    Route("/api/admin/users/{uid:int}/items/{iid:int}", admin_user_item_delete, methods=["DELETE"]),
     Route("/api/admin/ip-blocks", admin_ip_blocks),
     Route("/api/admin/ip-blocks/unblock", admin_ip_unblock, methods=["POST"]),
     Route("/api/admin/teams", admin_teams, methods=["GET", "POST"]),

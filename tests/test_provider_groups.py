@@ -174,7 +174,8 @@ def test_frontend_wiring():
     chat = _js("views/chat.js")
     sel = chat.split("const renderSelects = () => {", 1)[1].split("\n  };", 1)[0]
     assert "headerPickers(pOpts, curP, curM, mOpts, entries, gcfg)" in sel
-    assert "allowedValue('allowed_providers', x.value)" in sel and "allowedValue('allowed_models', x.value)" in sel
+    # spec 038: the model filter names the chat's provider (a model given to one person counts with its provider)
+    assert "allowedValue('allowed_providers', x.value)" in sel and "allowedValue('allowed_models', x.value, curP)" in sel
     # a label switches the provider first, then the model
     sw = sel.split("const switchTo = async (p, m) => {", 1)[1].split("};", 1)[0]
     assert sw.index("chat.setConfig('provider', p)") < sw.index("chat.setConfig('model', m)")

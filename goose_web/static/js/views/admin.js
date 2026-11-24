@@ -139,6 +139,7 @@ function usersTab(body) {
         h('div', { class: 'grid2' }, field('Username', username), field('Display name', dn), field('Email', em), field('Role', role), field('Sign-in', src), field('Profile mode', mode, 'Native maps to the Windows user’s real Goose profile – use for one admin at most.')),
         isNew ? field('Initial password', pw, 'The user must change it at the first sign-in. At least 12 characters with upper- and lower-case letters, a number and a symbol.') : null,
         field('Team', tp, 'One team per user. The team decides hints, providers, models, approval modes and folders. Administrators are not restricted.'), field('Extra hints for this user', hp.el, 'Hints documents for this user only. They come before the team hints, which take precedence.'),
+        !isNew && u.profileMode !== 'native' ? h('details', { class: 'user-providers', ontoggle: (e) => { const d = e.currentTarget; if (d.open && !d.querySelector('[data-user-providers]')) d.appendChild(userProviders(u)); } }, h('summary', null, 'Providers for this user only')) : null,   // spec 038: loaded when opened
         !isNew ? h('details', null, h('summary', null, 'Policy overrides (advanced)'), field(null, ov, 'JSON object merged over the team policy for this user only.')) : null, err),
       footer: [btn('Cancel', () => m.close()), btn(isNew ? 'Create user' : 'Save', async () => {
         err.textContent = '';
@@ -239,6 +240,91 @@ async function loadProviderCatalog(force = false) {
       .sort((a, b) => (b.configured - a.configured) || a.name.localeCompare(b.name));
   } catch (e) { providerCatalog = { error: errMsg(e) }; }
   return providerCatalog;
+}
+
+// Spec 038: providers of your own profile given to ONE person, not to the rest of their team (user dialog). A switch
+// gives the provider - its address, its models, its key, copied into this person's profile only - or takes it back;
+// the models under it are the ones this person may use WITH it, saved as you tick them. The team's lists stay as they
+// are: what is given here is added to them for this person. Models come from the providers Goose knows
+// (loadProviderCatalog, as on the team page).
+function userProviders(u) {
+  const box = h('div', { class: 'stack-sm', 'data-user-providers': String(u.id) }, spinner(14));
+  const url = '/api/admin/users/' + encodeURIComponent(u.id) + '/items';
+  const me = (store.get('me').user || {}).username || '';
+  let mine = [], items = [], team = null, cat = [];
+  const busy = new Set();
+  const act = async (key, fn) => { if (busy.has(key)) return; busy.add(key); try { await fn(); } catch (e) { toastError(e); await load(); } finally { busy.delete(key); } };
+  const give = (p, models) => POST(url, { kind: 'provider', fromProfile: me, ref: p.ref, models });
+  const take = (it) => DEL(url + '/' + encodeURIComponent(it.id));
+  const chk = (checked, onchange, label, sub) => h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked, onchange: (e) => onchange(e.target.checked) }), h('span', null, label, sub ? h('span', { class: 'muted small mono' }, ' ' + sub) : null));
+  const itemOf = (p) => items.find((i) => i.source === me + ':' + p.ref) || items.find((i) => i.name === p.ref && i.fromProfile === me);
+  const row = (p) => {
+    const it = itemOf(p);
+    const pid = (it && it.providerId) || p.ref;
+    const c = cat.find((x) => x.id === pid) || cat.find((x) => x.id === p.ref);
+    const viaTeam = !!team && (team.providers || []).includes(p.ref);
+    const teamAny = !!team && (team.allowedModels || []).includes('*');
+    const sel = new Set((it ? it.models : []).filter((m) => m !== '*'));
+    let anyM = !!it && it.models.includes('*');
+    let saving = false, again = false;
+    const saveNow = async () => {        // a tick made while a save runs is saved right after it, never dropped
+      if (saving) { again = true; return; }
+      saving = true;
+      try {
+        const r = await give(p, anyM ? ['*'] : [...sel]);
+        it.models = (r && r.models) || [];
+        toast('Saved: the models ' + u.username + ' may use with ' + p.name, { kind: 'success' });
+      } catch (e) { toastError(e); }
+      finally { saving = false; if (again) { again = false; saveNow(); } }
+    };
+    const saveModels = debounce(saveNow, 700);
+    const tg = toggle(!!it, (v) => act(p.ref, async () => {
+      if (v) await give(p, c && c.defaultModel ? [c.defaultModel] : []);   // the provider's default model to start with
+      else if (it) await take(it);
+      toast((v ? 'Given to ' : 'Taken away from ') + u.username + ': ' + p.name, { kind: 'info' });
+      await load();
+    }), { label: 'Give ' + p.name + ' to ' + u.username });
+    const models = c ? c.models : [];
+    const mBox = h('div', { class: 'chk-list' });
+    const drawM = () => {
+      mBox.hidden = anyM;
+      const listed = new Set(models.map((m) => m.id));
+      mBox.replaceChildren(...models.map((m) => chk(sel.has(m.id), (v) => { if (v) sel.add(m.id); else sel.delete(m.id); saveModels(); }, m.name, m.name !== m.id ? m.id : '')),
+        ...[...sel].filter((id) => !listed.has(id)).map((id) => chk(true, (v) => { if (!v) { sel.delete(id); drawM(); saveModels(); } }, id, '(not listed for this provider)')),
+        models.length ? null : h('div', { class: 'muted small' }, 'Goose lists no models for this provider here: switch on "Any model of this provider", or check its definition in your profile.'));
+    };
+    drawM();
+    const notes = [];
+    if (it && it.sourceGone) notes.push(h('div', { class: 'small warn-text' }, 'It is no longer in your profile, so its key is not delivered: put it back there, or take it away here.'));
+    if (viaTeam) notes.push(h('div', { class: 'muted small' }, 'Their team (' + team.name + ') gives it too: taking it away here leaves the team\'s copy.'));
+    if (it && teamAny) notes.push(h('div', { class: 'muted small' }, 'Their team allows every model, so every model of this provider can be used.'));
+    return h('div', { class: 'set-row prov-row', 'data-user-provider': p.ref, 'data-state': it ? 'on' : 'off' },
+      h('div', { class: 'grow stack-sm' },
+        h('div', null, p.name, ' ', h('span', { class: 'muted small mono' }, pid), it ? h('span', null, ' ', badge('given', 'accent')) : null, viaTeam ? h('span', null, ' ', badge('also from the team')) : null),
+        ...notes,
+        it ? h('div', { class: 'stack-sm' }, toggle(anyM, (v) => { anyM = v; drawM(); saveModels(); }, { text: 'Any model of this provider' }), mBox) : null),
+      tg);
+  };
+  // given from another administrator's profile: shown so that it can be seen and taken away
+  const otherRow = (it) => h('div', { class: 'set-row prov-row', 'data-user-provider': it.name, 'data-state': 'on' },
+    h('div', { class: 'grow' }, h('div', null, it.name, ' ', h('span', { class: 'muted small mono' }, it.providerId), ' ', badge('given', 'accent')),
+      h('div', { class: 'muted small' }, 'From ' + (it.fromProfile || '?') + '\'s profile; models: ' + ((it.models || []).join(', ') || 'none beyond the team\'s') + '.')),
+    toggle(true, (v) => { if (!v) act('other:' + it.id, async () => { await take(it); toast('Taken away from ' + u.username + ': ' + it.name, { kind: 'info' }); await load(); }); }, { label: 'Take ' + it.name + ' away from ' + u.username }));
+  const draw = () => box.replaceChildren(
+    h('div', { class: 'muted small' }, 'For ' + u.username + ' only: the rest of ' + (team ? 'the team ' + team.name : 'their team') + ' gets nothing from here. On = the provider (address, models, key) is copied into ' + u.username + '\'s profile and may be used with the models ticked below, in addition to what the team allows. Off = taken away again. Saved at once. Changes you make to the provider in your profile reach ' + u.username + ' by themselves.'),
+    team ? null : banner('warn', u.username + ' is in no team, so cannot chat yet: a provider given here only counts once they are in one.'),
+    ...mine.map(row),
+    ...items.filter((i) => !mine.some((p) => itemOf(p) === i)).map(otherRow),
+    mine.length ? null : h('div', { class: 'muted small' }, 'No provider in your own profile yet (Settings > Models & Providers).'));
+  async function load() {
+    try {
+      const [r, lib, c] = await Promise.all([GET(url), GET('/api/admin/library' + qs({ profile: me, kind: 'provider' })).then((x) => arr(x, 'items')), loadProviderCatalog()]);
+      items = arr(r, 'items'); team = (r && r.team) || null; mine = lib; cat = Array.isArray(c) ? c : [];
+      draw();
+    } catch (e) { box.replaceChildren(banner('error', errMsg(e))); }
+  }
+  load();
+  return box;
 }
 
 // Spec 031: a team's extra folders, one row each. The switch says whether the members (and their agents) may

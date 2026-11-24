@@ -154,8 +154,10 @@ class Ctx:
 
     # ---------------------------------------------------------- users / profiles / policy
     def policy_for(self, user: dict) -> dict:
+        from . import useritems
         teams = self.db.user_teams(user["id"])
-        p = pol.effective_policy(user, teams)
+        # spec 038: plus the providers given to this person alone (in the socket's rights fingerprint too)
+        p = pol.effective_policy(user, teams, grants=useritems.grants(self.db, user["id"]))
         if teams and user.get("role") != "admin":
             folder = self.profiles.ensure_team_folder(teams[0])
             p["team_folder"] = str(folder or self.profiles.team_folder(teams[0]))

@@ -39,7 +39,7 @@ from .config import Settings, default_native_goose_root
 from .db import Database
 from .effort import DEFAULT_EFFORT
 from .policy import (ANY, GUARDED_EXTENSIONS, allows, effective_policy, ext_key, extension_needs, guard_on,
-                     is_command_extension, missing)
+                     is_command_extension, missing, model_allowed)
 from .security import safe_name
 
 MANAGED_MARK = ".goose-web-managed"
@@ -926,8 +926,11 @@ class Profiles:
         root = self.root_for(user)
         cfg_dir = self.config_dir(user)
         teams = self.db.user_teams(user["id"])
-        pol = effective_policy(user, teams)
-        items = self.team_items(user)
+        # spec 038: plus what an administrator gave this person alone - added to the team's lists and delivered with
+        # the team's items (the person's row wins a provider both give), so nobody else gets its file or its key
+        from . import useritems
+        pol = effective_policy(user, teams, grants=useritems.grants(self.db, user["id"]))
+        items = useritems.merge(self.team_items(user), useritems.rows(self.db, user["id"]))
         old = self._load_manifest(user)
         new_manifest: dict[str, Any] = {"extensions": [], "providers": [], "secrets": [], "skills": [],
                                         "updatedAt": time.time()}
@@ -1172,7 +1175,7 @@ class Profiles:
         allowed_p = [p for p in pol.get("allowed_providers") or [] if p != ANY]
         team_default = [default_provider, default_model] if default_provider else None
         default_ok = bool(team_default) and allows(pol, "allowed_providers", default_provider) and \
-            (not default_model or allows(pol, "allowed_models", default_model))
+            (not default_model or model_allowed(pol, default_model, default_provider))
         prev_default = old.get("teamDefault")
         current = [cfg.get("GOOSE_PROVIDER"), cfg.get("GOOSE_MODEL")]
         if team_default:
@@ -1202,7 +1205,7 @@ class Profiles:
             else:
                 cfg.pop("GOOSE_PROVIDER", None)
             changes.append("provider reset to an allowed one")
-        if cfg.get("GOOSE_MODEL") and not allows(pol, "allowed_models", cfg["GOOSE_MODEL"]):
+        if cfg.get("GOOSE_MODEL") and not model_allowed(pol, cfg["GOOSE_MODEL"], cfg.get("GOOSE_PROVIDER")):
             if default_ok and default_model and cfg.get("GOOSE_PROVIDER") == default_provider:
                 cfg["GOOSE_MODEL"] = default_model
             else:
