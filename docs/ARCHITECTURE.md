@@ -562,9 +562,18 @@ policy, allowed roots, IP), attaches it to the profile's `Upstream` with
 
 Detaching never cancels anything upstream.
 
-Each `Client` has an outbound `asyncio.Queue(maxsize=20000)` drained by a pump
-task. If a tab stops reading and its queue fills, that client is closed. A
-stuck tab therefore cannot block the profile.
+Each `Client` has an outbound queue drained by a pump task, bounded by bytes
+(`CLIENT_QUEUE_BYTES`, 64 MiB). Session notifications in it may be dropped;
+responses, agent requests and gateway notices are kept. When a tab reads slower
+than its chats stream (or not at all) and the queue passes the limit, the
+gateway drops that tab's session notifications, logs a WARNING (profile, user,
+session, frames, bytes), sends `_gw/resync {sessionId}` for each chat
+affected, and stops queueing that chat for the tab until the tab loads it
+again. Only kept frames beyond `CLIENT_QUEUE_HARD_BYTES` (128 MiB, a tab that
+never reads its responses) end the socket (`ws.disconnect` reason
+`queue-full`). A stuck tab therefore cannot block the profile, and opening a
+long chat can no longer close the tab's own socket (before the FIX
+chat-open-replay-overflow, a queue of 20,000 frames did).
 
 ### 6.2 The upstream connection
 
@@ -644,6 +653,7 @@ delete.
 | `_gw/sessions_changed` | gateway -> tab | The profile's session database changed on disk. Refresh the list. |
 | `_gw/prompt_created {sessionId, created}` | gateway -> tab | Sent only to the tab that sent a `session/prompt`: the server time (unix seconds) the gateway stamped on that prompt. The same value is in the prompt's echo (`_meta.goose.created`) for other tabs and replays. Needed to edit the prompt later (1.6.0). |
 | `_gw/session_changed {sessionId, messageCount, updatedAt, title}` | gateway -> tab | A buffered session was changed by another client (for example Goose Desktop). |
+| `_gw/resync {sessionId}` | gateway -> tab | The gateway dropped frames of this chat because the tab could not keep up (6.1). The tab loads the chat again (the open one at once, others when opened next). |
 
 Unknown `_gw/*` methods return `-32601 unknown gateway method`. `_gw/notice
 {level, kind, message}` is a toast (prompt guard, queue limits, and since 1.16.0
@@ -737,7 +747,7 @@ claimed with `manual: true`, i.e. by the user's click.
 |---|---|
 | Response | `_post_response()` updates state, then the response goes to the originating tab (original id restored) or to an internal future. |
 | Agent request (`session/request_permission`, `elicitation/create`, `_goose/unstable/session/recipe/request-params`) | Stored as an ask keyed by its JSON id. The session status becomes `needs_you`, with `last_text` set to "Needs approval: <tool title>" or the message. The raw request is broadcast to all tabs of the profile, and a `needs_you` event is raised (webhook). |
-| `session/update`, `_goose/unstable/session/update` | Herd derivation (7.5). Buffered if the session is loaded or replaying. During a replay it goes only to the loading tab, otherwise to every tab whose watch set contains the session. |
+| `session/update`, `_goose/unstable/session/update` | Herd derivation (7.5). Buffered if the session is loaded or being loaded. While Goose answers a `session/load` it goes only to the tabs waiting for that load, otherwise to every tab whose watch set contains the session. A tab that is being sent the chat holds it back until its catch-up and load result are out (7.3). After a load the watchdog gave up on, Goose's late history is dropped. |
 | Other notifications | Broadcast to all tabs of the profile. |
 
 `_post_response()` side effects by method:
@@ -757,12 +767,20 @@ claimed with `manual: true`, i.e. by the user's click.
 ### 7.3 Buffering and replay
 
 Every loaded session keeps the raw session notifications it has received in a
-buffer. Limits:
+buffer. Consecutive `agent_message_chunk` / `agent_thought_chunk` text chunks
+of one message (same session, kind and `messageId`, or both without one) are
+merged into one frame: the last buffered frame is kept unserialized as a
+`ChunkTail` (the message and its text pieces) and serialized once when the
+next frame does not belong to it. A long run therefore buffers about one frame
+per message or tool event, as Goose's own replay sends, instead of one per
+streamed chunk. Limits:
 
-- `SESSION_BUFFER_BYTES` = 12 MB per session. Older entries are dropped and the
-  buffer is marked `truncated`.
+- `SESSION_BUFFER_BYTES` = 12 MB and `SESSION_BUFFER_FRAMES` = 5,000 frames per
+  session. Older entries are dropped and the buffer is marked `truncated` (an
+  idle chat is then loaded from Goose again).
 - `TOTAL_BUFFER_BYTES` = 256 MB across all sessions. `evict_buffers()` drops
-  the buffers of the oldest idle, unwatched sessions until usage is at 70%.
+  the buffers of the oldest idle, unwatched sessions (never one being loaded)
+  until usage is at 70%.
 
 When a tab sends `session/load`:
 
@@ -772,10 +790,27 @@ When a tab sends `session/load`:
    and then continues live.
 2. **Session loaded and idle, fingerprint unchanged.** Same replay, which is
    cheaper than asking Goose to replay from its database.
-3. **Otherwise.** The buffer is cleared, the requesting tab becomes
-   `loading_client`, and the load is forwarded. Goose replays the history as
-   `session/update` notifications. They are buffered and sent only to the
-   loading tab.
+3. **A load of this chat is in flight.** The tab waits for it: there is one
+   upstream `session/load` per chat.
+4. **Otherwise.** The buffer is cleared and the load is forwarded with an
+   internal pending entry. Goose replays the history as `session/update`
+   notifications. They are buffered and sent only to the tabs waiting for this
+   load, and Goose's answer goes to each of them.
+
+A replay runs as a task: the frames as JSON arrays of at most
+`REPLAY_BATCH_BYTES` (256 KB), pausing while the tab still has more than
+`REPLAY_QUEUE_BYTES` (4 MiB) to receive. Frames, then the load result as it was
+when the frames were taken, then the frames that arrived meanwhile (held for
+that tab). A tab joining a load in flight gets the frames so far the same way,
+then the held ones, then Goose's answer. If the tab's queue overflowed during
+this, the load is answered `-32000` with `data: {resync: true}` and the tab
+retries.
+
+**Watchdog.** When Goose does not answer a `session/load` within
+`goose.session_load_timeout_seconds` (180), every waiting tab gets `-32000
+"Goose did not answer within N s"`. Goose's late frames for that load are
+dropped until its late answer arrives; a new load of the chat meanwhile is
+refused at once with `-32000`. A worker restart answers every waiting tab too.
 
 **External changes.** The same profile may also be used by Goose Desktop or
 the CLI. Each `Upstream` runs a watcher that calls `stat()` on
@@ -1061,6 +1096,15 @@ and `transcript` (a `Transcript`).
    extension results, and `_meta.gw.running`.
 6. Re-inserts pending asks for this session and takes the running state from
    the herd.
+
+Steps 1-6 are one attempt (`loadOnce()`). A dropped connection, `-32000` or a
+time-out (`session/load` gives up after 180 s) is retried up to 4 times, after
+0.5, 1, 2 and 4 s; `-32002`, `-32602` and `-32003` are not. `reload()` shares
+a load in flight. `_gw/resync` reloads the open chat once (after the load in
+flight, if any). Every reconnect's hello still reloads the open chat: the
+gateway keeps no record of what a tab already received. `rpc.js` resets its
+reconnect backoff only once a socket stayed up 10 s, so a socket that dies
+right after hello backs off instead of reconnecting every 0.7 s.
 
 **send(blocks).**
 
@@ -1988,6 +2032,7 @@ location) and disables the cache plugin.
 | `tests/test_profiles.py` | Isolated layout and base extensions, team items and secrets, library listing, native scheduler yielding to Goose Desktop. |
 | `tests/test_team_profiles.py` | Spec 009: new teams allow nothing, no team cannot chat, Any and explicit lists, config writes and the locked `CONTEXT_FILE_NAMES`, prompts refused in chats with a disallowed model, team warnings, roots, the 1.4 migration, hints order and dropped personal hints, the hints file and worker environment, team folder and default model, one team per user (moves), effective hints view and upload refusal. |
 | `tests/test_hub.py` | A `FakeAgent` WebSocket server (`initialize`, `session/new`, `session/load`, `session/prompt`). Tests: a run survives a tab disconnect and is replayed, policy denial, the second answer to an ask loses, idle replay only while unchanged elsewhere, the watcher announces external changes, Retry/add/remove of an extension updates the replayed start-up status. `tests/test_edit_and_paths.py`: prompt stamping (`_gw/prompt_created` + echo), truncate guard and buffer invalidation, `native-root`, `GOOSE_PATH_ROOT` auto-detection, no author-specific goose path. |
+| `tests/test_chat_open.py` | FIX chat-open-replay-overflow, against a fake Goose and tabs that can stop reading: a replay of 25,000 buffered frames keeps the tab open and sends the result between the replay and later live frames, 30,000 thought chunks of one message coalesce into one frame with identical text, the 5,000-frame cap, two tabs share one upstream load, a worker restart answers every waiting tab, a dead stdio channel answers `-32000` without a leaked pending entry and `ensure()` reconnects, the load watchdog and its dropped late frames, queue overflow sends `_gw/resync` without closing, the hard cap closes with `queue-full`, an overflow during a replay answers `{resync: true}`, the `ws.disconnect` reason, and the front-end wiring (backoff reset, retries per error code, 180 s timeout, error texts). |
 | `tests/test_guard.py` | Spec 018: Splunk/shell default rules (pipelines, quotes, subsearches, macros), words/regex/globs, rule validation, team guard policy and mode filtering, `always_allow` refused, provisioning resets mode and `permission.yaml`, rule-set seeding and migration, classifier windows/cache with the tiny test model (`tests/data/guard_tiny`), fail open and health, model install checks (hash, zip slip, 86M, tamper), CLI, admin API. |
 | `tests/test_live_state.py` | 1.15: a `SteerAgent` that queues steers and drops them when the run ends, like Goose. Steer tracked to delivery (pending not echoed to the sender, in the hello snapshot, `chat.steer` audited without text); steer + Stop returned held to the queue, persisted and restored, claimed once and only manually; refused steer not tracked; worker restart returns steers; steers pass the prompt guard (refused openly); queue ops, limits and per-user isolation; herd marks survive a restart (running -> *Interrupted*, queue held), `_gw/seen` clears them. |
 | `tests/test_guard_hub.py` | Spec 018 against a fake agent that asks permission: prompt blocked (error / silent), unguarded member untouched, tool call blocked with notice and audit, card without *Always allow* and the downgrade, guarded auto, admin Auto bypass / Smart approve refused / Approve checked, classifier down = fail open with health for admins. |

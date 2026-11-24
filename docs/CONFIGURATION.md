@@ -65,6 +65,7 @@ goose:
   binary: ""                                # "" = auto-detect
   idle_minutes: 30
   start_timeout_seconds: 45
+  session_load_timeout_seconds: 180         # 0 = wait for Goose forever
   native_scheduler: auto                    # auto | on | off
   extra_env: {}
   default_workdir_native: ""                # "" = home folder
@@ -122,6 +123,7 @@ host_tasks:
 | `goose.binary` | `""` | Path to `goose`. When empty: `goose` on `PATH`, then `%LOCALAPPDATA%\Programs\Goose\resources\bin\goose.exe`, `%ProgramFiles%\Goose\resources\bin\goose.exe`, `%USERPROFILE%\.local\bin\goose.exe`. Set it for any other location (for example `C:\AI\Goose\resources\bin\goose.exe`); `install.ps1 -GooseBinary` writes it. |
 | `goose.idle_minutes` | `30` | A worker is stopped after this long with no browser clients, no active runs and no scheduler duty. |
 | `goose.start_timeout_seconds` | `45` | How long `goose serve` may take to answer `/status`. |
+| `goose.session_load_timeout_seconds` | `180` | How long Goose may take to open a chat (`session/load`). After that every tab waiting for it gets `-32000 "Goose did not answer within N s"`, and a new attempt is refused at once until Goose's late answer arrives. `0` = wait forever (the earlier behaviour). The browser gives up after 180 s too. |
 | `goose.native_scheduler` | `auto` | Who runs the scheduler for the admin's native profile (section 7). |
 | `goose.extra_env` | `{}` | Extra environment variables for **every** worker, isolated ones included. |
 | `goose.default_workdir_native` | `""` | Default folder for new chats of native-profile users (home folder when empty). |
