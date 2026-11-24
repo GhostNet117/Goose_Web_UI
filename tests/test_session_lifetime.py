@@ -8,6 +8,7 @@ Spec 037: a sign-in with "Keep me signed in" ticked has a cookie the browser kee
 24, 0 = no checkbox, never more than 24), also fixed at sign-in and never extended; each stored sign-in knows its kind,
 so the start-up cut holds each kind to its own limit."""
 import base64
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -90,6 +91,24 @@ def test_admin_settings_hold_the_limit(gw):
     assert c.db.get_setting("session_hours") == 1 and c.db.get_setting("idle_minutes") == 0
     assert client.put("/api/admin/settings", headers=h, json={"sessionHours": "soon"}).status_code == 200
     assert c.db.get_setting("session_hours") == 8
+
+
+def test_a_remember_hours_that_is_not_a_number_is_refused_and_nothing_is_written(gw):
+    """M-4 (assessment 2026-11-24): "soon" used to be stored as the 24-hour maximum. Now 400, and the other values of
+    the same request are not written either."""
+    client, c = gw
+    admin = mk_user(c.db, "boss", role="admin")
+    h = sign_in(client, c, admin)
+    assert client.put("/api/admin/settings", headers=h, json={"rememberHours": 6}).status_code == 200
+    for bad in ("soon", None, "", True, float("nan")):
+        body = {"rememberHours": bad, "idleMinutes": 30, "retentionDays": 9}
+        r = client.put("/api/admin/settings", headers={**h, "content-type": "application/json"},
+                       content=json.dumps(body, allow_nan=True))   # NaN is not valid JSON for json=: send it raw
+        assert r.status_code == 400 and r.json()["error"] == "bad_request", (bad, r.text)
+        assert c.db.get_setting("remember_hours") == 6 and c.db.get_setting("idle_minutes") in (None, 0)
+        assert c.db.get_setting("retention_days") is None
+    assert client.put("/api/admin/settings", headers=h, json={"rememberHours": 99}).status_code == 200
+    assert c.db.get_setting("remember_hours") == 24   # above the limit: stored as the limit (unchanged rule)
 
 
 def test_old_sign_ins_are_cut_at_start_up(gw):
@@ -365,10 +384,13 @@ def test_admin_settings_hold_the_remembered_limit(gw):
     h = sign_in(client, c, admin)
     s = client.get("/api/admin/settings").json()
     assert s["rememberHours"] == 24 and s["rememberHoursMax"] == 24
-    for sent, kept in ((99, 24), (12, 12), (0.2, 1), (-3, 0), (0, 0), ("soon", 24), (None, 24), (24, 24)):
+    for sent, kept in ((99, 24), (12, 12), (0.2, 1), (-3, 0), (0, 0), (24, 24)):
         assert client.put("/api/admin/settings", headers=h, json={"rememberHours": sent}).status_code == 200
         assert c.db.get_setting("remember_hours") == kept, sent
         assert client.get("/api/admin/settings").json()["rememberHours"] == kept
+    for sent in ("soon", None):   # M-4: not a number = 400 (it used to be stored as 24); the stored value stays
+        assert client.put("/api/admin/settings", headers=h, json={"rememberHours": sent}).status_code == 400
+        assert c.db.get_setting("remember_hours") == 24
     # a member cannot change it
     bob = mk_user(c.db, "bob")
     hb = sign_in(client, c, bob)

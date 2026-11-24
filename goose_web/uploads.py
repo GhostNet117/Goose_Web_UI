@@ -793,7 +793,8 @@ async def link(request: Request):
         n += c.db.execute_count("INSERT OR IGNORE INTO upload_links(upload_id, profile, session_id, linked_at) "
                                 "SELECT upload_id, profile, ?, ? FROM upload_links WHERE profile=? AND session_id=?",
                                 (session, now, profile, src))
-    _touch(c, profile, session)
+    if n:   # M-5 (assessment 2026-11-24): a use is recorded only for a chat files were really linked to
+        _touch(c, profile, session)
     return api.ok({"linked": n})
 
 

@@ -227,6 +227,10 @@ def test_pre_chat_uploads_are_linked_and_forks_share_them(rt):
         tc.put(f"/api/fs/uploads/{uid2}", params={"offset": 0}, content=b"m", headers=h)
         assert db.query("SELECT * FROM upload_links WHERE session_id='S3'")[0]["upload_id"] == uploads._key(uid2)
         assert tc.post("/api/fs/uploads/link", json={"ids": [uid]}, headers=h).status_code == 400   # no chat
+        # M-5 (assessment 2026-11-24): a link that links nothing records no use (any well-formed id used to)
+        r = tc.post("/api/fs/uploads/link", json={"session": "MADE-UP", "ids": ["y" * 43]}, headers=h)
+        assert r.json() == {"linked": 0}
+        assert db.one("SELECT * FROM chat_access WHERE session_id='MADE-UP'") is None
         assert tc.post("/api/fs/uploads/link", json={"session": "S4", "ids": [uid], "profile": "boss"}, headers=h).status_code == 403
     with client_for(c) as tc:   # an administrator in dee's profile links dee's chats only through `profile`
         h = sign_in(tc, c, boss)
@@ -432,13 +436,36 @@ def test_disabled_accounts_are_skipped(rt):
     assert sweep(c)["chats"] == 0 and chats_left(rt, dee) == ["OLD"]
 
 
+def test_automatic_deletion_waits_for_an_administrator_to_confirm(rt):
+    """M-3 (assessment 2026-11-24): an upgrade must never start deleting chats by itself. The default period applies
+    only after an administrator saved it (Admin > Settings); `check` says so meanwhile."""
+    s, db, pr, c, hub = rt
+    dee = member(rt)
+    chat(rt, dee, "OLD", 300)
+    for later in (0, DAY, 30 * DAY, 400 * DAY):
+        assert asyncio.run(retention.maybe_sweep(c, now=NOW + later)) is None
+    assert chats_left(rt, dee) == ["OLD"] and db.get_setting("retention_armed_at") is None
+    v = retention.settings_view(c)
+    assert v["retentionConfirmed"] is False and v["retentionFirstAutoRun"] is None
+    retention.store_settings(c, {"retentionDays": 180}, by="boss", now=NOW)      # saved = confirmed
+    v = retention.settings_view(c)
+    assert v["retentionConfirmed"] is True and v["retentionConfirmedBy"] == "boss"
+    assert v["retentionFirstAutoRun"] == NOW + retention.FIRST_RUN_DELAY
+    retention.store_settings(c, {"retentionDays": 180}, by="other", now=NOW + DAY)  # the same period: no new delay
+    assert db.get_setting("retention_armed_at") == NOW
+    retention.store_settings(c, {"retentionDays": 30}, by="other", now=NOW + DAY)   # a new period: a day of grace again
+    assert db.get_setting("retention_armed_at") == NOW + DAY and db.get_setting("retention_confirmed_by") == "other"
+
+
 def test_maybe_sweep_runs_hourly_after_the_first_run_delay(rt):
     s, db, pr, c, hub = rt
     dee = member(rt)
     chat(rt, dee, "OLD", 300)
     t0 = NOW
+    retention.confirm(db, "boss", now=t0)   # M-3: an administrator confirmed the period
     assert asyncio.run(retention.maybe_sweep(c, now=t0)) is None and db.get_setting("retention_armed_at") == t0
-    assert asyncio.run(retention.maybe_sweep(c, now=t0 + DAY)) is None and chats_left(rt, dee) == ["OLD"]
+    assert asyncio.run(retention.maybe_sweep(c, now=t0 + retention.FIRST_RUN_DELAY - 60)) is None
+    assert chats_left(rt, dee) == ["OLD"]
     r = asyncio.run(retention.maybe_sweep(c, now=t0 + retention.FIRST_RUN_DELAY + 1))
     assert r["chats"] == 1 and chats_left(rt, dee) == []
     chat(rt, dee, "OLD2", 300)
@@ -510,6 +537,14 @@ def test_check_reports_retention(tmp_path):
     from goose_web.db import Database
     from tests.test_sec_web import make_settings
     s = make_settings(tmp_path)
+    # M-3: the default is configured but not in force until an administrator confirms it
+    assert retention.check_lines(s) == [("!!", "retention: 180 days without use (retention.chat_days) is NOT in force yet - "
+                                               "nothing is deleted automatically until an administrator checks the Preview "
+                                               "and saves Admin > Settings > Files and chats (or sets 0)")]
+    s.system_dir.mkdir(parents=True, exist_ok=True)
+    db = Database(s.system_dir / "goose-web.db")
+    retention.confirm(db, "boss")
+    db.close()
     assert retention.check_lines(s) == [("--", "retention: chats and their attachments are deleted after 180 days without "
                                                "use (retention.chat_days); hourly, at most 200 chats per sweep")]
     s.data["retention"]["chat_days"] = 9999

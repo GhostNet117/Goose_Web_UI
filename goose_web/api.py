@@ -2217,9 +2217,17 @@ async def admin_settings(request: Request):
     if b.get("requireTotpForAll") and not c.db.get_setting("require_totp_all") and not admin["totp_enabled"]:
         raise HTTPError(409, "totp_needed_first",
                         "Turn on two-factor for your own account before requiring it for everyone")
+    if "rememberHours" in b:
+        # M-4 (assessment 2026-11-24): a value that is not a number is refused, never stored as the 24-hour maximum
+        v = b["rememberHours"]
+        try:
+            if isinstance(v, bool) or v in (None, "") or float(v) != float(v):   # numbers keep the clamp below
+                raise ValueError
+        except (TypeError, ValueError):
+            raise HTTPError(400, "bad_request", "Keep me signed in lasts 0 (off) or 1 to 24 hours") from None
     storage = {**uploads.clean_settings(b), **retention.clean_settings(b)}   # specs 039, 040: both checked first
     uploads.store_settings(c, storage)
-    retention.store_settings(c, storage)
+    retention.store_settings(c, storage, by=str(admin["username"]))   # M-3: saving the period confirms it
     if "brand" in b and isinstance(b["brand"], dict):
         c.db.set_setting("brand", {k: str(v)[:120] for k, v in b["brand"].items() if k in ("name", "tagline", "machine")})
     if "defaultTeamId" in b:

@@ -45,7 +45,7 @@ SWEEP_SECONDS = 3600               # at most one automatic sweep an hour
 TOUCH_SECONDS = 60                 # chat_access is written at most once a minute per chat
 CHATS_PER_SWEEP = 200
 CHILDREN_PER_CHAT = 200            # sub-agent sessions deleted with a chat (per sweep)
-FIRST_RUN_DELAY = 7 * 86400        # the first automatic sweep after retention is first in force
+FIRST_RUN_DELAY = 86400            # the first automatic sweep: a day after an administrator confirmed the period
 CHAT_TYPES = ("user", "scheduled", "acp")   # Goose's ACP_VISIBLE_SESSION_TYPES: what Goose lists as chats
 ACCESS_ACTIONS = frozenset({"chat.open", "chat.prompt", "chat.cancel", "chat.fork", "chat.mode", "chat.steer"})
 SESSION_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -99,8 +99,19 @@ def settings_view(c) -> dict:
     return {"retentionDays": retention_days(c), "retentionDaysMax": DAYS_MAX, "retentionDaysDefault": DAYS_DEFAULT,
             "retentionDaysConfig": config_days(c.settings),
             "retentionDaysStored": c.db.get_setting("retention_days") is not None,
+            # M-3: automatic deletion is in force only after an administrator confirmed the period (or `init`)
+            "retentionConfirmed": bool(armed), "retentionConfirmedAt": float(armed) if armed else None,
+            "retentionConfirmedBy": c.db.get_setting("retention_confirmed_by") if armed else None,
             "retentionFirstAutoRun": float(armed) + FIRST_RUN_DELAY if armed else None,
             "retentionLast": c.db.get_setting("retention_last")}
+
+
+def confirm(db, by: str, now: float | None = None) -> None:
+    """Automatic deletion is in force from now on (the first sweep FIRST_RUN_DELAY later). Called when an
+    administrator saves the period in Admin > Settings, and by `init` for a new installation. M-3 (assessment
+    2026-11-24): an upgrade never starts deleting chats by itself - the default only applies once confirmed."""
+    db.set_setting("retention_armed_at", time.time() if now is None else float(now))
+    db.set_setting("retention_confirmed_by", str(by or "")[:100])
 
 
 def clean_settings(b: dict) -> dict:
@@ -117,21 +128,30 @@ def clean_settings(b: dict) -> dict:
     return {"retentionDays": clamp_days(v)}
 
 
-def store_settings(c, cleaned: dict) -> None:
+def store_settings(c, cleaned: dict, by: str = "", now: float | None = None) -> None:
     if "retentionDays" in cleaned:
+        old = c.db.get_setting("retention_days")
         c.db.set_setting("retention_days", cleaned["retentionDays"])
+        # Saving the period confirms it (M-3); a changed period starts the day of grace again.
+        if cleaned["retentionDays"] > 0 and (not c.db.get_setting("retention_armed_at") or old != cleaned["retentionDays"]):
+            confirm(c.db, by, now)
 
 
 def check_lines(settings) -> list[tuple[str, str]]:
     """`goose-web check`: the retention in force (the database is opened read-only)."""
     from .uploads import read_stored
-    stored = read_stored(settings, "retention_days", "retention_last")
+    stored = read_stored(settings, "retention_days", "retention_last", "retention_armed_at")
     days = clamp_days(stored["retention_days"]) if stored.get("retention_days") is not None else config_days(settings)
     src = "Admin > Settings" if stored.get("retention_days") is not None else "retention.chat_days"
     if days <= 0:
         return [("--", f"retention: off ({src} = 0) - chats and their attachments are kept forever")]
-    out = [("--", f"retention: chats and their attachments are deleted after {days} days without use ({src}); "
-                  f"hourly, at most {CHATS_PER_SWEEP} chats per sweep")]
+    if not stored.get("retention_armed_at"):   # M-3: configured, but no administrator has confirmed it
+        out = [("!!", f"retention: {days} days without use ({src}) is NOT in force yet - nothing is deleted "
+                      "automatically until an administrator checks the Preview and saves Admin > Settings > Files and "
+                      "chats (or sets 0)")]
+    else:
+        out = [("--", f"retention: chats and their attachments are deleted after {days} days without use ({src}); "
+                      f"hourly, at most {CHATS_PER_SWEEP} chats per sweep")]
     last = stored.get("retention_last")
     if isinstance(last, dict) and last.get("at"):
         out.append(("--", f"retention: last sweep {time.strftime('%Y-%m-%d %H:%M', time.localtime(last['at']))}: "
@@ -549,15 +569,18 @@ async def run(c, *, by: dict | None = None, now: float | None = None) -> dict:
 
 
 async def maybe_sweep(c, now: float | None = None) -> dict | None:
-    """From the maintenance loop: at most hourly, and not before FIRST_RUN_DELAY after retention first applied."""
+    """From the maintenance loop: at most hourly, only once an administrator confirmed the period, and not before
+    FIRST_RUN_DELAY after that."""
     now = time.time() if now is None else now
     if retention_days(c) <= 0:
         return None
     armed = c.db.get_setting("retention_armed_at")
-    if not armed:
-        c.db.set_setting("retention_armed_at", now)
-        log.info("retention: in force; the first automatic sweep runs after %s",
-                 time.strftime("%Y-%m-%d %H:%M", time.localtime(now + FIRST_RUN_DELAY)))
+    if not armed:   # M-3: never armed by itself - an administrator confirms the period first (store_settings / init)
+        st = _state(c.db)
+        if not getattr(st, "warned", False):
+            st.warned = True
+            log.warning("retention: %d days without use is set but not confirmed: nothing is deleted automatically "
+                        "until an administrator saves Admin > Settings > Files and chats", retention_days(c))
         return None
     if now < float(armed) + FIRST_RUN_DELAY:
         return None

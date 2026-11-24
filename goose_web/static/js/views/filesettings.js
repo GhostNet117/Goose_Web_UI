@@ -2,7 +2,7 @@
 // uploaded to them are kept (spec 040), with a Preview and Run now. The two numbers are saved with the other settings
 // (PUT /api/admin/settings: maxUploadMb, retentionDays); `values()` gives them to the settings tab's Save button.
 import { h, input, field, section, table, banner, confirmDialog, toast, fmtBytes, fmtDateTime, actionBtn } from '../ui.js';
-import { GET, POST, qs } from '../api.js';
+import { GET, POST, PUT, qs } from '../api.js';
 
 function lastText(last) {
   if (!last || !last.at) return 'No sweep has run yet.';
@@ -38,9 +38,28 @@ export function filesAndChatsSection(s) {
   const daysValue = () => (String(days.value).trim() === '' ? Number(s.retentionDays ?? 180) : Math.max(0, Math.min(daysMax, Math.floor(Number(days.value) || 0))));
   const out = h('div', { class: 'stack-sm' });
   const lastEl = h('div', { class: 'muted small' }, lastText(s.retentionLast));
-  const first = s.retentionFirstAutoRun && s.retentionFirstAutoRun * 1000 > Date.now()
-    ? h('div', { class: 'muted small' }, 'Automatic deletion starts ' + fmtDateTime(s.retentionFirstAutoRun) + ' (7 days after retention first applied, so the preview can be checked first). Run now does not wait.')
-    : null;
+  // M-3 (assessment 2026-11-24): automatic deletion is in force only after an administrator confirmed the period.
+  const confirmBtn = actionBtn('Start automatic deletion', async () => {
+    const n = daysValue();
+    if (!n) { toast('0 days: chats are kept forever; nothing to start.', { kind: 'warn' }); return; }
+    const p = await GET('/api/admin/retention/preview' + qs({ days: n }));
+    out.replaceChildren(report(p, 'would be deleted now'));
+    const ok = await confirmDialog({
+      title: 'Delete chats unused for ' + n + ' days?', danger: true, confirmText: 'Start automatic deletion',
+      message: 'From a day after now, every hour, chats nobody has used for ' + n + ' days are deleted for good with their attachments - in Goose Web, Goose Desktop and the goose CLI alike. Right now that would be ' + p.chats + ' chat(s) and ' + p.files + ' file(s).',
+    });
+    if (!ok) return;
+    await PUT('/api/admin/settings', { retentionDays: n });
+    toast('Automatic deletion confirmed: the first sweep runs in a day.', { kind: 'success', timeout: 8000 });
+    pending.replaceChildren(h('div', { class: 'muted small' }, 'Confirmed: automatic deletion starts in a day. Run now does not wait.'));
+  }, { size: 'sm', icon: 'check', variant: 'danger' });
+  const pending = h('div', {});
+  if (!s.retentionConfirmed && Number(s.retentionDays) > 0) {
+    pending.replaceChildren(banner('warn', 'Not in force yet: nothing is deleted automatically until you confirm the period. Check the Preview first. ', confirmBtn));
+  } else if (s.retentionFirstAutoRun && s.retentionFirstAutoRun * 1000 > Date.now()) {
+    pending.replaceChildren(h('div', { class: 'muted small' }, 'Automatic deletion starts ' + fmtDateTime(s.retentionFirstAutoRun) + ' (a day after the period was confirmed' + (s.retentionConfirmedBy ? ' by ' + s.retentionConfirmedBy : '') + '). Run now does not wait.'));
+  }
+  const first = pending;
   const preview = actionBtn('Preview', async () => {
     out.replaceChildren(h('div', { class: 'muted small' }, 'Counting…'));
     const r = await GET('/api/admin/retention/preview' + qs({ days: daysValue() }));

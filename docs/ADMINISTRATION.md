@@ -1041,9 +1041,12 @@ profile), `retention.run` (per sweep).
 
 - **Preview** shows per user how many chats, files and bytes would be deleted now - also for a number typed but not
   saved yet. **Run now** runs a sweep at once (after a confirmation) and shows what was deleted.
-- **The first automatic sweep waits 7 days** after retention first applies (the page shows the date), so you can
-  look at the Preview first. This includes the native profile: Goose Desktop and CLI chats unused for the period go
-  too. Set 0 before upgrading if you are not ready.
+- **Nothing is deleted automatically until an administrator confirms the period** (1.27.0, M-3 of the
+  2026-11-24 assessment): the page shows "Not in force yet" with **Start automatic deletion**, which shows the
+  Preview numbers and asks once; saving a period in Admin > Settings confirms it too. The first automatic sweep runs
+  a day after the confirmation (the page shows the date), and changing the period starts that day again. This
+  includes the native profile: Goose Desktop and CLI chats unused for the period go too. `goose-web check` prints a
+  `!!` line while the period is not confirmed.
 - Not covered: disabled accounts (skipped until enabled again), Goose's hidden sessions, files attached before
   this version (no record), and forks made in Goose Desktop (they do not share the original's files).
 

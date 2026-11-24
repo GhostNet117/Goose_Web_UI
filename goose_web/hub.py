@@ -986,8 +986,18 @@ class Upstream:
             if method == "session/prompt":
                 self._check_concurrency(client, params)
                 if not client.is_admin:
-                    s0 = self.sessions.get(str(params.get("sessionId") or ""))
-                    pol.check_session_choice(client.policy, s0.load_result if s0 else None)
+                    sid0 = str(params.get("sessionId") or "")
+                    s0 = self.sessions.get(sid0)
+                    if s0 is None or s0.load_result is None:
+                        # M-1 (assessment 2026-11-24): the chat's provider, model and mode are known only from a
+                        # load. A chat the gateway unloaded, or never loaded on this connection, is loaded first;
+                        # without its values the prompt is refused (fail closed), never passed unchecked.
+                        await self.ensure()
+                        await self.unloader.ensure_loaded(sid0, method)
+                        s0 = self.sessions.get(sid0)
+                    if s0 is None or s0.load_result is None:
+                        raise RpcError(-32000, "this chat could not be loaded to check its settings: open it again")
+                    pol.check_session_choice(client.policy, s0.load_result)
                 if self.hub.guard is not None and await self._guard_prompt(client, mid, params):
                     return
             elif method == STEER:

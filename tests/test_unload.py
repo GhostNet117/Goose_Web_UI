@@ -29,6 +29,7 @@ class Agent:
         self.close_gate = None
         self.calls = []   # (method, sessionId)
         self.n = 0
+        self.load_result = {}   # what session/load answers (M-1 tests: the chat's current provider)
 
     def methods(self, sid=None):
         return [m for m, s in self.calls if sid is None or s == sid]
@@ -53,6 +54,7 @@ class Agent:
                 await ws.send(json.dumps({"jsonrpc": "2.0", "method": "session/update", "params": {
                     "sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk",
                                                  "content": {"type": "text", "text": "replayed"}}}}))
+                res = dict(self.load_result)
             elif meth == "session/close":
                 asyncio.create_task(self._close(ws, mid))
                 continue
@@ -291,6 +293,69 @@ async def test_a_method_for_an_unloaded_chat_loads_it_silently_first(mk, method)
                        ((m["params"]["update"].get("content") or {}).get("text") == "replayed") for m in snk.msgs)
     assert sid in up.unloader.held and sid not in up.unloader.unloaded
     assert up.sessions[sid].loading is None and up.sessions[sid].cwd == CWD
+
+
+# ------------------------------------------------------------------ M-1 (assessment 2026-11-24)
+def member(roots=(CWD,)):
+    from goose_web import policy as pol
+    sink = Sink()
+    p = {**pol.DEFAULT_POLICY, "allowed_providers": ["good-provider"], "allowed_models": ["*"], "allowed_modes": ["*"]}
+    c = Client(sink.send, {"id": 2, "username": "alice", "role": "user"}, p, list(roots))
+    c.start()
+    return c, sink
+
+
+def uses(provider):
+    return {"configOptions": [{"id": "provider", "currentValue": provider}]}
+
+
+async def test_a_members_prompt_to_an_unloaded_chat_is_checked_after_a_reload(mk):
+    """The prompt-time check of the chat's provider used to see no load result once the unloader had closed the
+    chat, and let one prompt through unchecked. Now the chat is loaded first and the prompt refused."""
+    agent, hub, up, c, sink = await mk()
+    sid = await new_chat(up, c, sink)
+    await settle(up)
+    age(up, sid, 3600)
+    assert await up.unloader.tick() == [sid]
+    assert up.sessions[sid].load_result is None
+    agent.load_result = uses("forbidden-provider")
+    m, msink = member()
+    hub.attach(up, m)
+    start = len(agent.calls)
+    await up.from_client(m, prompt(9, sid))
+    r = await msink.wait_for(lambda x: x.get("id") == 9)
+    assert "error" in r and "forbidden-provider" in r["error"]["message"], r
+    seq = [meth for meth, s in agent.calls[start:] if s == sid]
+    assert "session/load" in seq and "session/prompt" not in seq
+
+
+async def test_a_members_prompt_to_an_unloaded_allowed_chat_goes_through_after_the_load(mk):
+    agent, hub, up, c, sink = await mk()
+    sid = await new_chat(up, c, sink)
+    await settle(up)
+    age(up, sid, 3600)
+    assert await up.unloader.tick() == [sid]
+    agent.load_result = uses("good-provider")
+    m, msink = member()
+    hub.attach(up, m)
+    start = len(agent.calls)
+    await up.from_client(m, prompt(10, sid))
+    r = await msink.wait_for(lambda x: x.get("id") == 10)
+    assert "error" not in r, r
+    seq = [meth for meth, s in agent.calls[start:] if s == sid and meth in ("session/load", "session/prompt")]
+    assert seq == ["session/load", "session/prompt"]
+
+
+async def test_a_members_prompt_to_a_chat_never_loaded_here_is_loaded_and_checked_first(mk):
+    agent, hub, up, c, sink = await mk()
+    agent.load_result = uses("forbidden-provider")
+    m, msink = member()
+    hub.attach(up, m)
+    await up.from_client(m, prompt(11, "old-chat"))   # no state in the gateway at all
+    r = await msink.wait_for(lambda x: x.get("id") == 11)
+    assert "error" in r and "forbidden-provider" in r["error"]["message"], r
+    calls = agent.methods("old-chat")   # its folder is asked first (session/info), then it is loaded
+    assert "session/load" in calls and "session/prompt" not in calls   # loaded to learn its settings; no prompt
 
 
 async def test_a_prompt_during_a_close_waits_then_loads_the_chat(mk):

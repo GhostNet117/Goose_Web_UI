@@ -227,6 +227,22 @@ class Unloader:
             if method != "session/load" and sid in self.unloaded and self.up.ws is not None:
                 await self._silent_load(sid, method)
 
+    async def ensure_loaded(self, sid: str, method: str) -> None:
+        """M-1 (assessment 2026-11-24): a member's prompt is checked against the chat's CURRENT provider, model and
+        mode (policy.check_session_choice), which the gateway knows only from a load. A chat it unloaded - or never
+        loaded on this connection - is loaded first (the same silent load), so the check always has the values."""
+        s = self.up.sessions.get(sid)
+        if not sid or (s is not None and s.load_result is not None) or self.up.ws is None:
+            return
+        self._sync()
+        async with self._locked(sid):
+            s = self.up.sessions.get(sid)
+            if s is not None and s.load_result is not None:
+                return
+            if s is not None and s.running():
+                return   # a running chat is never loaded again upstream; the caller refuses (no load result)
+            await self._silent_load(sid, method)
+
     def before_forget(self, s: Any) -> None:
         """Upstream._prune_sessions is about to forget this chat's state: Goose closes the chat first."""
         if s.sid in self.held and self.active():

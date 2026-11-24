@@ -1466,10 +1466,12 @@ A chat and the files uploaded to it are deleted after `retention_days` (Admin > 
   link call that follows cover a new chat. `hub.py` is not involved beyond the existing hook.
 - **Files of a chat**: `uploads` rows in state `done` joined through `upload_links`. Rows older than the account
   (a deleted account of the same name) are ignored.
-- **Sweep** (`maybe_sweep` from the maintenance loop: retention on, 7 days after `retention_armed_at`, an hour
-  after `retention_last.at`, one at a time): enabled users grouped by Goose profile folder; per profile the
+- **Sweep** (`maybe_sweep` from the maintenance loop: retention on, an administrator confirmed the period
+  (`retention.confirm` sets `retention_armed_at` when the period is saved in Admin > Settings; never by itself, M-3),
+  a day (`FIRST_RUN_DELAY`) after that, an hour after `retention_last.at`, one at a time): enabled users grouped by
+  Goose profile folder; per profile the
   top-level sessions of type `user`, `scheduled` or `acp` whose last use is older than the period, oldest first, at
-  most `CHATS_PER_SWEEP` (200) in total. Right before each: `sessions_in_use(hub, key)` (running, `loading_client`,
+  most `CHATS_PER_SWEEP` (200) in total. Right before each: `sessions_in_use(hub, key)` (running, `loading` / `abandoned`,
   queue, steers, prompts, a tab's `watch`, asks, pending requests naming it), `hub.elsewhere_running`, and the
   scheduler jobs of `hub.busy_report()` (asked once). Deletion: `ctx.upstream_for(user).request("session/delete")`
   (starts the worker if needed; the hub's `_post_response` drops the chat's state), then its `sub_agent` sessions,

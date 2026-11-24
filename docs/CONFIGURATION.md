@@ -350,7 +350,7 @@ Admins change these in the UI (Admin > Settings / Sign-in). They are stored in t
 | `peers` | `[]` | Herd peers: `{name, url, token, verifyTls}` (max 50). The gateway calls `<url>/api/herd` with `Bearer <token>`. Tokens are masked in reads. |
 | `max_upload_mb` | not stored = `server.max_upload_mb` | Largest file upload in MB (Admin > Settings > Files and chats, spec 039), 1 to 5120; more is stored as 5120, less as 1. Saving an empty value goes back to the configuration. |
 | `retention_days` | not stored = `retention.chat_days` | Days without use after which a chat and its uploads are deleted (spec 040); 0 = never, at most 3650. |
-| `retention_armed_at` | set when retention first applies | The first automatic retention sweep runs 7 days later (Run now does not wait). |
+| `retention_armed_at` | not stored = automatic deletion not in force | Set when an administrator confirms the period (saves it in Admin > Settings, or **Start automatic deletion**); never set by itself, so an upgrade deletes nothing until then (M-3). The first automatic sweep runs a day later; a changed period sets it again (Run now does not wait). `retention_confirmed_by` holds who confirmed. |
 | `retention_last` | - | Summary of the last retention sweep: `{at, days, chats, files, bytes, busy, more, manual, by, errors}`. |
 | `auth` | see below | Sign-in methods. |
 
