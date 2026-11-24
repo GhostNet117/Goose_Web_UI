@@ -700,7 +700,8 @@ function accountTab(body) {
       const rows = await GET('/api/me/logins');
       loginsBox.replaceChildren(table([
         { label: 'Device', render: (l) => h('div', null, h('div', { class: 'small' }, uaLabel(l.userAgent)), h('div', { class: 'muted small' }, l.ip || '')) },
-        { label: 'Signed in', render: (l) => h('span', { title: fmtDateTime(l.createdAt) }, relTime(l.createdAt)) },
+        { label: 'Signed in', render: (l) => h('span', { title: fmtDateTime(l.createdAt) }, relTime(l.createdAt),
+          l.remembered ? [' ', h('span', { class: 'badge', title: 'Keep me signed in: kept by the browser until ' + fmtDateTime(l.expiresAt) }, 'kept')] : null) },   // spec 037
         { label: 'Last seen', render: (l) => h('span', { title: fmtDateTime(l.lastSeen) }, relTime(l.lastSeen)) },
         { label: '', class: 'right', render: (l) => l.current ? h('span', { class: 'badge badge-accent' }, 'this browser') : btn('Revoke', async () => { try { await DEL('/api/me/logins/' + encodeURIComponent(l.id)); toast('Signed out that session', { kind: 'success' }); loadLogins(); } catch (e) { toastError(e); } }, { size: 'sm', variant: 'danger-soft' }) },
       ], Array.isArray(rows) ? rows : rows.logins || [], { empty: 'No active sign-ins' }));

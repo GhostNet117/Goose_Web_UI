@@ -33,6 +33,10 @@ GUARDED_MODES = ["approve", "chat"]
 # The base every team starts from (spec 009): everything off, nothing allowed.
 DEFAULT_POLICY: dict[str, Any] = {**{k: False for k in BOOL_KEYS}, **{k: [] for k in LIST_KEYS},
                                   "max_concurrent_runs": 3}
+# What a team CREATED from now on stores on top of that base (Admin > Teams > New team, `init`'s Everyone, native-hints
+# --team): its members may write personal hints - added before the team's hints, which stay last and final. Stored in
+# the new team's policy, so teams that exist keep what they have, and a person without a team keeps DEFAULT_POLICY.
+NEW_TEAM_POLICY: dict[str, Any] = {"hints_edit": True}
 
 # The defaults of Goose Web 1.4 and earlier (empty list = unrestricted). Used only to migrate old teams.
 LEGACY_DEFAULT_POLICY: dict[str, Any] = {
@@ -176,19 +180,54 @@ def allows(policy: dict, key: str, value: Any) -> bool:
     return ANY in lst or value in lst
 
 
+def model_allowed(policy: dict, model: Any, provider: Any = None) -> bool:
+    """May this model be used - with `provider`, when the caller knows it? The team's allowed_models (any provider,
+    as always), or a model given to this person with that provider (spec 038, `granted_models`). Without a provider
+    (a check that cannot know it) a given model counts for the providers it was given with; the prompt check, which
+    knows both, holds the pair (check_session_choice)."""
+    if allows(policy, "allowed_models", model):
+        return True
+    granted = policy.get("granted_models")
+    if not model or not isinstance(granted, dict) or not isinstance(model, str) or \
+            (provider is not None and not isinstance(provider, str)):
+        return False
+    lists = [granted.get(provider)] if provider is not None else list(granted.values())
+    return any(isinstance(lst, list) and (ANY in lst or model in lst) for lst in lists)
+
+
+def add_user_grants(pol: dict, grants: dict | None) -> None:
+    """Spec 038: providers an administrator gave this one person (useritems), each with the models allowed with it.
+    They ADD to the person's lists - after the team and the person's overrides, never replacing either: the provider
+    joins allowed_providers (a "*" stays "*"); the models are kept per provider in `granted_models`, so a model given
+    with one provider is not allowed with every other one (the team's allowed_models stays provider-agnostic)."""
+    if not grants:
+        return
+    clean = {str(p): [str(m) for m in (ms or []) if isinstance(m, str) and m]
+             for p, ms in grants.items() if p and isinstance(ms, list)}
+    if not clean:
+        return
+    provs = pol.get("allowed_providers")
+    if isinstance(provs, list) and ANY not in provs:
+        pol["allowed_providers"] = provs + [p for p in clean if p not in provs]
+    pol["granted_models"] = clean
+
+
 def chat_block(policy: dict) -> str:
     """Why this (non-admin) policy cannot chat, or "" if it can."""
     if policy.get("no_team"):
         return NO_TEAM_REASON
     for k in ("allowed_providers", "allowed_models", "allowed_modes"):
         if not policy.get(k):
+            if k == "allowed_models" and any((policy.get("granted_models") or {}).values()):
+                continue    # spec 038: models given to this person with a provider
             return f"Your team allows no {_LIST_LABELS[k]}, so you cannot chat. Ask your administrator."
     return ""
 
 
-def effective_policy(user: dict, teams: list[dict]) -> dict:
+def effective_policy(user: dict, teams: list[dict], grants: dict | None = None) -> dict:
     """The policy of a user. Admins: ADMIN_POLICY. Everyone else: their ONE team over the least-privilege base
-    (spec 009; a second team, which the database no longer allows, is ignored), then the user's overrides."""
+    (spec 009; a second team, which the database no longer allows, is ignored), then the user's overrides, then what
+    an administrator gave this person alone (`grants`, spec 038: {provider id: [models]}, see add_user_grants)."""
     if user.get("role") == "admin":
         return dict(ADMIN_POLICY)
     pol: dict[str, Any] = {k: (list(v) if isinstance(v, list) else v) for k, v in DEFAULT_POLICY.items()}
@@ -217,6 +256,7 @@ def effective_policy(user: dict, teams: list[dict]) -> dict:
     for k, v in (user.get("policy_overrides") or {}).items():
         if k in DEFAULT_POLICY:
             pol[k] = v
+    add_user_grants(pol, grants)
     if (pol.get("guard") or {}).get("enabled"):
         pol["allowed_modes"] = guarded_modes(pol.get("allowed_modes") or [])
     pol["chat_blocked"] = chat_block(pol)
@@ -244,12 +284,16 @@ def check_session_choice(policy: dict, load_result: dict | None) -> None:
     if not isinstance(load_result, dict):
         return
     names = {"allowed_providers": "provider", "allowed_models": "model", "allowed_modes": "approval mode"}
-    for o in load_result.get("configOptions") or []:
-        if not isinstance(o, dict):
-            continue
+    opts = [o for o in load_result.get("configOptions") or [] if isinstance(o, dict)]
+    provider = next((o.get("currentValue") for o in opts if o.get("id") == "provider"), None)
+    for o in opts:
         cur = o.get("currentValue")
         key = {"provider": "allowed_providers", "model": "allowed_models", "mode": "allowed_modes"}.get(o.get("id"))
-        if key and cur and not allows(policy, key, cur):
+        if key == "allowed_models" and cur and not model_allowed(policy, cur, provider):
+            # spec 038: a model given to this person counts only with the provider it was given with
+            raise Denied(f"this chat uses the model '{cur}'" + (f" with the provider '{provider}'" if provider else "")
+                         + ", which your team does not allow. Pick an allowed model for this chat first.")
+        if key and key != "allowed_models" and cur and not allows(policy, key, cur):
             raise Denied(f"this chat uses the {names[key]} '{cur}', which your team does not allow. "
                          f"Pick an allowed {names[key]} for this chat first.")
     modes = load_result.get("modes")
@@ -775,7 +819,7 @@ def recipe_problems(recipe: Any, policy: dict, enabled: dict[str, dict] | None) 
     settings = recipe.get("settings") if isinstance(recipe.get("settings"), dict) else {}
     if settings.get("goose_provider") and not allows(policy, "allowed_providers", settings["goose_provider"]):
         out.append(f"uses the provider '{str(settings['goose_provider'])[:80]}', which your team does not allow")
-    if settings.get("goose_model") and not allows(policy, "allowed_models", settings["goose_model"]):
+    if settings.get("goose_model") and not model_allowed(policy, settings["goose_model"], settings.get("goose_provider")):
         out.append(f"uses the model '{str(settings['goose_model'])[:80]}', which your team does not allow")
     return out
 
@@ -937,7 +981,8 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
     if method == "session/set_config_option":
         cid, val = params.get("configId"), params.get("value")
         key = {"provider": "allowed_providers", "model": "allowed_models", "mode": "allowed_modes"}.get(cid)
-        if key and not allows(policy, key, val):
+        # a model given to this person with a provider (spec 038): the pair is held at the prompt (check_session_choice)
+        if key and not (model_allowed(policy, val) if key == "allowed_models" else allows(policy, key, val)):
             raise Denied(f"{cid} not allowed: {val}")
     if method in (P + "config/upsert", P + "config/remove"):
         managed = str(params.get("key") or "").strip().upper()
@@ -1008,12 +1053,14 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
                 check_recipe(params.get("recipe"), policy, None, what="the scheduled recipe")
             if method == P + "config/upsert":
                 key = CONFIG_LIST_KEYS.get(str(params.get("key")).upper())
-                if key and params.get("value") is not None and not allows(policy, key, params.get("value")):
+                val = params.get("value")
+                if key and val is not None and \
+                        not (model_allowed(policy, val) if key == "allowed_models" else allows(policy, key, val)):
                     raise Denied(f"{params.get('key')} value not allowed by your team")
             if method == P + "defaults/save":
                 if not allows(policy, "allowed_providers", params.get("providerId")):
                     raise Denied("provider not allowed")
-                if params.get("modelId") and not allows(policy, "allowed_models", params.get("modelId")):
+                if params.get("modelId") and not model_allowed(policy, params.get("modelId"), params.get("providerId")):
                     raise Denied("model not allowed")
             return
     raise Denied(f"method not available to your account: {method}")

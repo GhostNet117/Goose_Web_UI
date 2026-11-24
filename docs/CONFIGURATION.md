@@ -70,6 +70,7 @@ goose:
   default_workdir_native: ""                # "" = home folder
 auth:
   session_hours: 8                          # 1 to 8; a sign-in never lasts longer
+  remember_hours: 24                        # "Keep me signed in": 1 to 24; 0 = no such box
   idle_minutes: 0                           # 0 = off; 5 to 480: end a sign-in no browser has used this long
   lockout_threshold: 8
   lockout_minutes: 15
@@ -125,8 +126,9 @@ host_tasks:
 | `goose.native_scheduler` | `auto` | Who runs the scheduler for the admin's native profile (section 7). |
 | `goose.extra_env` | `{}` | Extra environment variables for **every** worker, isolated ones included. |
 | `goose.default_workdir_native` | `""` | Default folder for new chats of native-profile users (home folder when empty). |
-| `auth.session_hours` | `8` | How long a sign-in lasts, counted from signing in and never extended. 1 to 8; a value above 8 counts as 8 (`check` says so). Overridden by the DB setting `session_hours` (Admin > Settings). There is no "keep me signed in" (removed in 1.25.0). |
-| `auth.idle_minutes` | `0` | 0 = off. 5 to 480: a sign-in that no browser has used for this long ends on the server. "Used" is any request and the 30-second re-check of an open tab's connection, so an open tab counts as use: this ends forgotten sign-ins, not open ones. Overridden by the DB setting `idle_minutes`. `auth.remember_days` no longer exists; a file that still has it is reported by `check` as removed. |
+| `auth.session_hours` | `8` | How long a sign-in lasts, counted from signing in and never extended. 1 to 8; a value above 8 counts as 8 (`check` says so). Overridden by the DB setting `session_hours` (Admin > Settings). A "Keep me signed in" sign-in lasts `auth.remember_hours` instead. |
+| `auth.remember_hours` | `24` | Since 1.27.0: how long a sign-in made with **Keep me signed in** ticked lasts, counted from signing in and never extended; its cookie is kept by the browser (`Max-Age`), so closing the browser does not sign out. 0 = the sign-in page has no such box. 1 to 24; a value above 24 counts as 24 and `check` says so. Overridden by the DB setting `remember_hours` (Admin > Settings). Lowering it, or 0, shortens or ends the kept sign-ins that exist (at once and at every start). |
+| `auth.idle_minutes` | `0` | 0 = off. 5 to 480: a sign-in that no browser has used for this long ends on the server. "Used" is any request and the 30-second re-check of an open tab's connection, so an open tab counts as use: this ends forgotten sign-ins, not open ones. Overridden by the DB setting `idle_minutes`. Applies to kept sign-ins too. `auth.remember_days` no longer exists (1.25.0); a file that still has it is reported by `check`, which points to `auth.remember_hours`. |
 | `auth.lockout_threshold` | `8` | Failed passwords before a lockout. |
 | `auth.lockout_minutes` | `15` | Lockout duration. |
 | `auth.min_password_length` | `12` | Minimum length for new passwords. Values below 12 are raised to 12. New passwords also need a lower-case letter, an upper-case letter, a number and a symbol, must not contain the user name, must not be (or be built from) a common password and must not repeat a character 4 times in a row ([ADMINISTRATION.md](ADMINISTRATION.md#72-creating-accounts)). |
@@ -324,6 +326,7 @@ Admins change these in the UI (Admin > Settings / Sign-in). They are stored in t
 | `default_team_id` | the Everyone team | The team a new user joins when none is given: users created in the admin UI or API without `team`, users created with `user add`, and users auto-created by LDAP/OIDC when no group or claim maps to a team. Empty = new users have no team (they can sign in but cannot chat). |
 | `brand` | `{name: "Goose Web", tagline: ...}` | `name`, `tagline`, `machine` (shown in Herd). |
 | `session_hours` | config `auth.session_hours` | 1 to 8 (more is stored as 8). Lowering it cuts the sign-ins that exist to the new lifetime. |
+| `remember_hours` | config `auth.remember_hours` | 0 (no "Keep me signed in") or 1 to 24 (more is stored as 24). Lowering it cuts the kept sign-ins that exist; 0 ends them. |
 | `idle_minutes` | config `auth.idle_minutes` | 0 (off) or 5 to 480. |
 | `guard_admin` | off | The administrators' prompt guard (Admin > Prompt guard): `enabled`, `check_input`, `rulesets`, `on_block`. Prompt-guard rule sets are in the `guard_rulesets` table. |
 | `goose_security` | not stored = the defaults | Goose-native security (1.20.0, Admin > Prompt guard, `goose-web security`): `enabled` (default `true`), `threshold` (`0.8`, 0.01-1.0, lower = stricter), `classifier` (`true`), `adversary: {members: false, native: false, tools: ["shell"], rules: ""}`. Not stored until an administrator or the installer chooses; a stored choice survives upgrades. |

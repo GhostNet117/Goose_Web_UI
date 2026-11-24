@@ -284,9 +284,10 @@ def cmd_init(args, settings) -> int:
     if not db.query("SELECT id FROM teams"):
         import json
         import time
+        from .policy import NEW_TEAM_POLICY
         db.execute("INSERT INTO teams(name, description, policy, created_at) VALUES(?,?,?,?)",
                    ("Everyone", "Default team for new users. Starts with nothing allowed: choose its providers, models and "
-                    "approval modes in Admin > Teams.", json.dumps({}),
+                    "approval modes in Admin > Teams.", json.dumps(NEW_TEAM_POLICY),
                     time.time()))
         db.set_setting("default_team_id", db.one("SELECT id FROM teams WHERE name='Everyone'")["id"])
     db.audit("system.init", target=name, detail={"native_root": native, "generated_password": generated})
@@ -358,8 +359,11 @@ def cmd_native_hints(args, settings) -> int:
     if args.team:
         team = db.one("SELECT * FROM teams WHERE name=?", (args.team,))
         if not team:
+            import json
+            from .policy import NEW_TEAM_POLICY
             tid = db.execute("INSERT INTO teams(name, description, policy, created_at) VALUES(?,?,?,?)",
-                             (args.team, "Administrators (created by goose-web native-hints)", "{}", time.time()))
+                             (args.team, "Administrators (created by goose-web native-hints)",
+                              json.dumps(NEW_TEAM_POLICY), time.time()))
             team = db.one("SELECT * FROM teams WHERE id=?", (tid,))
             print(f"Created team {args.team!r} (administrators bypass team policies; non-admin members get nothing "
                   "until you allow it on its Experience page)")
@@ -1409,7 +1413,8 @@ def _signin_lines(settings) -> list[tuple[str, str]]:
     database is opened read-only."""
     import json as _json
     import sqlite3
-    from .auth import SESSION_HOURS_MAX, clamp_idle_minutes, clamp_session_hours, oidc_url_insecure
+    from .auth import (REMEMBER_HOURS_MAX, SESSION_HOURS_MAX, clamp_idle_minutes, clamp_remember_hours,
+                       clamp_session_hours, oidc_url_insecure)
     dbf = Path(settings.system_dir) / "goose-web.db"
     out = []
     stored: dict = {}
@@ -1419,7 +1424,7 @@ def _signin_lines(settings) -> list[tuple[str, str]]:
             con = sqlite3.connect(dbf.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
             try:
                 row = con.execute("SELECT value FROM settings WHERE key='auth'").fetchone()
-                for k in ("session_hours", "idle_minutes"):
+                for k in ("session_hours", "idle_minutes", "remember_hours"):
                     r = con.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
                     if r:
                         stored[k] = _json.loads(r[0])
@@ -1431,7 +1436,12 @@ def _signin_lines(settings) -> list[tuple[str, str]]:
     asked = stored.get("session_hours") or settings.get("auth", "session_hours")
     hours = clamp_session_hours(asked)
     idle = clamp_idle_minutes(stored["idle_minutes"] if "idle_minutes" in stored else settings.get("auth", "idle_minutes"))
-    out.append(("--", f"sign-in: lasts {hours:g} h from signing in, never extended; no \"keep me signed in\"; "
+    # spec 037: "keep me signed in" - its own lifetime, 24 hours at most, 0 = off
+    kept_asked = stored["remember_hours"] if "remember_hours" in stored else settings.get("auth", "remember_hours")
+    kept = clamp_remember_hours(kept_asked)
+    out.append(("--", f"sign-in: lasts {hours:g} h from signing in, never extended; "
+                      + (f"\"keep me signed in\" lasts {kept:g} h (auth.remember_hours); " if kept else
+                         "no \"keep me signed in\" (auth.remember_hours is 0); ")
                       + (f"an unused sign-in ends after {idle:g} min" if idle else "no idle limit (auth.idle_minutes)")))
     try:
         if asked not in (None, "") and float(asked) > SESSION_HOURS_MAX:
@@ -1439,6 +1449,13 @@ def _signin_lines(settings) -> list[tuple[str, str]]:
                               f"{SESSION_HOURS_MAX:g} is used"))
     except (TypeError, ValueError):
         out.append(("!!", f"sign-in lifetime: {asked!r} is not a number of hours - {SESSION_HOURS_MAX:g} is used"))
+    try:
+        if kept_asked not in (None, "") and float(kept_asked) > REMEMBER_HOURS_MAX:
+            out.append(("!!", f"keep me signed in: {kept_asked} hours is configured, the limit is "
+                              f"{REMEMBER_HOURS_MAX:g} - {REMEMBER_HOURS_MAX:g} is used"))
+    except (TypeError, ValueError):
+        out.append(("!!", f"keep me signed in: {kept_asked!r} is not a number of hours - {REMEMBER_HOURS_MAX:g} is "
+                          "used"))
     if not dbf.is_file():
         return out
     try:

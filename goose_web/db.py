@@ -24,11 +24,13 @@ AUDIT_RETENTION_DAYS = 365
 #   v2: users.totp_last_counter - last accepted TOTP time step (replay protection, GW-14)
 #       users.oidc_issuer / users.oidc_subject - OIDC identity binding by (iss, sub) (GW-12)
 #   v3: oidc_states.binding - hash of the pre-sign-in browser cookie the OIDC state is bound to (A-4)
+#   auth_sessions.remember - 1 = a "keep me signed in" sign-in (spec 037: its own lifetime, its own start-up cut)
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("users", "totp_last_counter", "INTEGER"),
     ("users", "oidc_issuer", "TEXT"),
     ("users", "oidc_subject", "TEXT"),
     ("oidc_states", "binding", "TEXT"),
+    ("auth_sessions", "remember", "INTEGER DEFAULT 0"),
 )
 POST_MIGRATION_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_oidc ON users(oidc_issuer, oidc_subject)"
@@ -100,6 +102,18 @@ CREATE TABLE IF NOT EXISTS team_items (
   created_at REAL NOT NULL,
   UNIQUE (team_id, kind, name)
 );
+-- spec 038: what an administrator gave ONE person, outside their team (kind 'provider': a provider of an administrator's
+-- own profile, payload as team_items plus "models" allowed with it); delivered with the team's items (useritems.py)
+CREATE TABLE IF NOT EXISTS user_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  source TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL,
+  UNIQUE (user_id, kind, name)
+);
 CREATE TABLE IF NOT EXISTS auth_sessions (
   token_hash TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -110,6 +124,7 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
   ip TEXT NOT NULL DEFAULT '',
   user_agent TEXT NOT NULL DEFAULT '',
   method TEXT NOT NULL DEFAULT 'password'
+  -- later column (remember, spec 037) is added by MIGRATIONS in db.py
 );
 CREATE INDEX IF NOT EXISTS ix_auth_sessions_user ON auth_sessions(user_id);
 CREATE TABLE IF NOT EXISTS api_tokens (

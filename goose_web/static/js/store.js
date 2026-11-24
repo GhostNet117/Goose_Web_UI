@@ -52,11 +52,17 @@ export function policyList(key) {
   return Array.isArray(v) ? v : [];
 }
 // Spec 009: "*" = any value; an empty list allows nothing. Admins are never restricted.
-export function allowedValue(listKey, value) {
+// Spec 038: a model an administrator gave this person with ONE provider (policy.granted_models) is allowed with that
+// provider only - pass the provider the model is listed for (the gateway holds the same pair at the prompt).
+export function allowedValue(listKey, value, provider) {
   const me = store.get('me');
   if (!me || me.isAdmin) return true;
   const l = policyList(listKey);
-  return l.includes('*') || l.includes(value);
+  if (l.includes('*') || l.includes(value)) return true;
+  if (listKey !== 'allowed_models' || provider == null) return false;
+  const g = (me.policy || {}).granted_models;
+  const given = g && typeof g === 'object' && Array.isArray(g[provider]) ? g[provider] : [];
+  return given.includes('*') || given.includes(value);
 }
 // Why this user cannot start or continue chats ('' = they can). Set by the gateway (policy.chat_block).
 export function chatBlocked() {

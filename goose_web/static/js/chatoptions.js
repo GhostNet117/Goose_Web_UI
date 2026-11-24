@@ -120,7 +120,7 @@ export async function loadNewChatOptions() {
       id: e.providerId, name: e.providerName || e.providerId, defaultModel: e.defaultModel || '',
       engine: e.gwEngine || '',   // spec 021: added by the gateway (custom_providers/*.json)
       variantOf: e.gwVariantOf || '',   // spec 022 hook (not set yet): an effort variant of another provider
-      models: (e.models || []).filter((m) => allowedValue('allowed_models', m.id)).map((m) => ({ id: m.id, name: m.name || m.id })),
+      models: (e.models || []).filter((m) => allowedValue('allowed_models', m.id, e.providerId)).map((m) => ({ id: m.id, name: m.name || m.id })),
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
   rememberEngines(allProviders);

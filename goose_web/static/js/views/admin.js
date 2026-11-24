@@ -139,6 +139,7 @@ function usersTab(body) {
         h('div', { class: 'grid2' }, field('Username', username), field('Display name', dn), field('Email', em), field('Role', role), field('Sign-in', src), field('Profile mode', mode, 'Native maps to the Windows user’s real Goose profile – use for one admin at most.')),
         isNew ? field('Initial password', pw, 'The user must change it at the first sign-in. At least 12 characters with upper- and lower-case letters, a number and a symbol.') : null,
         field('Team', tp, 'One team per user. The team decides hints, providers, models, approval modes and folders. Administrators are not restricted.'), field('Extra hints for this user', hp.el, 'Hints documents for this user only. They come before the team hints, which take precedence.'),
+        !isNew && u.profileMode !== 'native' ? h('details', { class: 'user-providers', ontoggle: (e) => { const d = e.currentTarget; if (d.open && !d.querySelector('[data-user-providers]')) d.appendChild(userProviders(u)); } }, h('summary', null, 'Providers for this user only')) : null,   // spec 038: loaded when opened
         !isNew ? h('details', null, h('summary', null, 'Policy overrides (advanced)'), field(null, ov, 'JSON object merged over the team policy for this user only.')) : null, err),
       footer: [btn('Cancel', () => m.close()), btn(isNew ? 'Create user' : 'Save', async () => {
         err.textContent = '';
@@ -239,6 +240,91 @@ async function loadProviderCatalog(force = false) {
       .sort((a, b) => (b.configured - a.configured) || a.name.localeCompare(b.name));
   } catch (e) { providerCatalog = { error: errMsg(e) }; }
   return providerCatalog;
+}
+
+// Spec 038: providers of your own profile given to ONE person, not to the rest of their team (user dialog). A switch
+// gives the provider - its address, its models, its key, copied into this person's profile only - or takes it back;
+// the models under it are the ones this person may use WITH it, saved as you tick them. The team's lists stay as they
+// are: what is given here is added to them for this person. Models come from the providers Goose knows
+// (loadProviderCatalog, as on the team page).
+function userProviders(u) {
+  const box = h('div', { class: 'stack-sm', 'data-user-providers': String(u.id) }, spinner(14));
+  const url = '/api/admin/users/' + encodeURIComponent(u.id) + '/items';
+  const me = (store.get('me').user || {}).username || '';
+  let mine = [], items = [], team = null, cat = [];
+  const busy = new Set();
+  const act = async (key, fn) => { if (busy.has(key)) return; busy.add(key); try { await fn(); } catch (e) { toastError(e); await load(); } finally { busy.delete(key); } };
+  const give = (p, models) => POST(url, { kind: 'provider', fromProfile: me, ref: p.ref, models });
+  const take = (it) => DEL(url + '/' + encodeURIComponent(it.id));
+  const chk = (checked, onchange, label, sub) => h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked, onchange: (e) => onchange(e.target.checked) }), h('span', null, label, sub ? h('span', { class: 'muted small mono' }, ' ' + sub) : null));
+  const itemOf = (p) => items.find((i) => i.source === me + ':' + p.ref) || items.find((i) => i.name === p.ref && i.fromProfile === me);
+  const row = (p) => {
+    const it = itemOf(p);
+    const pid = (it && it.providerId) || p.ref;
+    const c = cat.find((x) => x.id === pid) || cat.find((x) => x.id === p.ref);
+    const viaTeam = !!team && (team.providers || []).includes(p.ref);
+    const teamAny = !!team && (team.allowedModels || []).includes('*');
+    const sel = new Set((it ? it.models : []).filter((m) => m !== '*'));
+    let anyM = !!it && it.models.includes('*');
+    let saving = false, again = false;
+    const saveNow = async () => {        // a tick made while a save runs is saved right after it, never dropped
+      if (saving) { again = true; return; }
+      saving = true;
+      try {
+        const r = await give(p, anyM ? ['*'] : [...sel]);
+        it.models = (r && r.models) || [];
+        toast('Saved: the models ' + u.username + ' may use with ' + p.name, { kind: 'success' });
+      } catch (e) { toastError(e); }
+      finally { saving = false; if (again) { again = false; saveNow(); } }
+    };
+    const saveModels = debounce(saveNow, 700);
+    const tg = toggle(!!it, (v) => act(p.ref, async () => {
+      if (v) await give(p, c && c.defaultModel ? [c.defaultModel] : []);   // the provider's default model to start with
+      else if (it) await take(it);
+      toast((v ? 'Given to ' : 'Taken away from ') + u.username + ': ' + p.name, { kind: 'info' });
+      await load();
+    }), { label: 'Give ' + p.name + ' to ' + u.username });
+    const models = c ? c.models : [];
+    const mBox = h('div', { class: 'chk-list' });
+    const drawM = () => {
+      mBox.hidden = anyM;
+      const listed = new Set(models.map((m) => m.id));
+      mBox.replaceChildren(...models.map((m) => chk(sel.has(m.id), (v) => { if (v) sel.add(m.id); else sel.delete(m.id); saveModels(); }, m.name, m.name !== m.id ? m.id : '')),
+        ...[...sel].filter((id) => !listed.has(id)).map((id) => chk(true, (v) => { if (!v) { sel.delete(id); drawM(); saveModels(); } }, id, '(not listed for this provider)')),
+        models.length ? null : h('div', { class: 'muted small' }, 'Goose lists no models for this provider here: switch on "Any model of this provider", or check its definition in your profile.'));
+    };
+    drawM();
+    const notes = [];
+    if (it && it.sourceGone) notes.push(h('div', { class: 'small warn-text' }, 'It is no longer in your profile, so its key is not delivered: put it back there, or take it away here.'));
+    if (viaTeam) notes.push(h('div', { class: 'muted small' }, 'Their team (' + team.name + ') gives it too: taking it away here leaves the team\'s copy.'));
+    if (it && teamAny) notes.push(h('div', { class: 'muted small' }, 'Their team allows every model, so every model of this provider can be used.'));
+    return h('div', { class: 'set-row prov-row', 'data-user-provider': p.ref, 'data-state': it ? 'on' : 'off' },
+      h('div', { class: 'grow stack-sm' },
+        h('div', null, p.name, ' ', h('span', { class: 'muted small mono' }, pid), it ? h('span', null, ' ', badge('given', 'accent')) : null, viaTeam ? h('span', null, ' ', badge('also from the team')) : null),
+        ...notes,
+        it ? h('div', { class: 'stack-sm' }, toggle(anyM, (v) => { anyM = v; drawM(); saveModels(); }, { text: 'Any model of this provider' }), mBox) : null),
+      tg);
+  };
+  // given from another administrator's profile: shown so that it can be seen and taken away
+  const otherRow = (it) => h('div', { class: 'set-row prov-row', 'data-user-provider': it.name, 'data-state': 'on' },
+    h('div', { class: 'grow' }, h('div', null, it.name, ' ', h('span', { class: 'muted small mono' }, it.providerId), ' ', badge('given', 'accent')),
+      h('div', { class: 'muted small' }, 'From ' + (it.fromProfile || '?') + '\'s profile; models: ' + ((it.models || []).join(', ') || 'none beyond the team\'s') + '.')),
+    toggle(true, (v) => { if (!v) act('other:' + it.id, async () => { await take(it); toast('Taken away from ' + u.username + ': ' + it.name, { kind: 'info' }); await load(); }); }, { label: 'Take ' + it.name + ' away from ' + u.username }));
+  const draw = () => box.replaceChildren(
+    h('div', { class: 'muted small' }, 'For ' + u.username + ' only: the rest of ' + (team ? 'the team ' + team.name : 'their team') + ' gets nothing from here. On = the provider (address, models, key) is copied into ' + u.username + '\'s profile and may be used with the models ticked below, in addition to what the team allows. Off = taken away again. Saved at once. Changes you make to the provider in your profile reach ' + u.username + ' by themselves.'),
+    team ? null : banner('warn', u.username + ' is in no team, so cannot chat yet: a provider given here only counts once they are in one.'),
+    ...mine.map(row),
+    ...items.filter((i) => !mine.some((p) => itemOf(p) === i)).map(otherRow),
+    mine.length ? null : h('div', { class: 'muted small' }, 'No provider in your own profile yet (Settings > Models & Providers).'));
+  async function load() {
+    try {
+      const [r, lib, c] = await Promise.all([GET(url), GET('/api/admin/library' + qs({ profile: me, kind: 'provider' })).then((x) => arr(x, 'items')), loadProviderCatalog()]);
+      items = arr(r, 'items'); team = (r && r.team) || null; mine = lib; cat = Array.isArray(c) ? c : [];
+      draw();
+    } catch (e) { box.replaceChildren(banner('error', errMsg(e))); }
+  }
+  load();
+  return box;
 }
 
 // Spec 031: a team's extra folders, one row each. The switch says whether the members (and their agents) may
@@ -466,7 +552,7 @@ function teamsTab(body) {
     icon('users', 14), h('div', { class: 'litem-main' }, h('div', { class: 'litem-title' }, t.name, (t.warnings || []).some((w) => w.level === 'err') ? h('span', { class: 'muted small' }, ' · cannot chat') : null), h('div', { class: 'litem-sub' }, ((t.members || []).length) + ' members' + (t.description ? ' · ' + t.description : ''))))) : [empty('users', 'No teams')]));
   const newTeam = async () => {
     const n = input({ placeholder: 'InfoSec Ops' }); const d = input({ placeholder: 'optional' });
-    const m = modal({ title: 'New team', size: 'sm', body: h('div', { class: 'stack' }, field('Name', n), field('Description', d), h('div', { class: 'muted small' }, 'A new team starts with everything off and nothing allowed. Then choose its providers, models, approval modes and hints.')), footer: [btn('Cancel', () => m.close()), btn('Create', async () => {
+    const m = modal({ title: 'New team', size: 'sm', body: h('div', { class: 'stack' }, field('Name', n), field('Description', d), h('div', { class: 'muted small' }, 'A new team starts with nothing allowed and every switch off except "Members may add personal hints" (your team hints still come last and take precedence). Then choose its providers, models, approval modes and hints.')), footer: [btn('Cancel', () => m.close()), btn('Create', async () => {
       if (!n.value.trim()) return;
       try { const r = await POST('/api/admin/teams', { name: n.value.trim(), description: d.value.trim(), policy: {} }); m.close(); selId = (r && (r.id || (r.team && r.team.id))) || null; load(); } catch (e) { toastError(e); }
     }, { variant: 'primary' })] });
@@ -979,6 +1065,8 @@ function settingsTab(body) {
     const dt = select([{ value: '', label: '— none —' }, ...teams.map((t) => ({ value: t.id, label: t.name }))], s.defaultTeamId || '');
     const hrsMax = Number(s.sessionHoursMax) || 8;
     const hrs = input({ type: 'number', min: '1', max: String(hrsMax), step: '1', value: s.sessionHours ?? hrsMax, class: 'inp inp-sm' });
+    const remMax = Number(s.rememberHoursMax) || 24;   // spec 037: "Keep me signed in" lasts 0 (off) to 24 hours
+    const rem = input({ type: 'number', min: '0', max: String(remMax), step: '1', value: s.rememberHours ?? remMax, class: 'inp inp-sm', 'data-remember-hours': '1' });
     const idle = input({ type: 'number', min: '0', max: '480', step: '5', value: s.idleMinutes || 0, class: 'inp inp-sm' });
     let allowSelfTotp = s.allowSelfTotp !== false, reqTotp = !!s.requireTotpForAdmins, reqTotpAll = !!s.requireTotpForAll;
     const peers = (s.peers || []).map((p) => ({ ...p }));
@@ -992,7 +1080,8 @@ function settingsTab(body) {
     drawPeers();
     body.replaceChildren(
       section('Branding', null, h('div', { class: 'card grid2' }, field('Name', bn), field('Tagline', bt))),
-      section('Accounts', null, h('div', { class: 'card stack' }, h('div', { class: 'grid2' }, field('Default team for new users', dt), field('Sign-in lifetime (hours)', hrs, 'From 1 to ' + hrsMax + '. Counted from signing in and never extended: after it, everyone signs in again. There is no "keep me signed in".'),
+      section('Accounts', null, h('div', { class: 'card stack' }, h('div', { class: 'grid2' }, field('Default team for new users', dt), field('Sign-in lifetime (hours)', hrs, 'From 1 to ' + hrsMax + '. Counted from signing in and never extended: after it, everyone signs in again. The browser does not keep this sign-in: closing it signs you out.'),
+          field('Keep me signed in lasts (hours)', rem, '0 = off: the sign-in page has no "Keep me signed in". From 1 to ' + remMax + ': a sign-in with the box ticked survives closing the browser and lasts this long, counted from signing in and never extended. A stolen device or cookie works that long. Lowering it, or 0, shortens or ends the ones that exist.'),
           field('End an unused sign-in after (minutes)', idle, '0 = off. From 5 to 480. A sign-in that no browser has used for this long ends. An open tab counts as use, so this ends forgotten sign-ins, not open ones.')),
         h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Users may enable two-factor themselves'), toggle(allowSelfTotp, (v) => { allowSelfTotp = v; })),
         h('div', { class: 'set-row' }, h('div', { class: 'grow' }, 'Require two-factor for administrators'), toggle(reqTotp, (v) => { reqTotp = v; })),
@@ -1000,7 +1089,7 @@ function settingsTab(body) {
       section('Herd peers', null, h('p', { class: 'muted small' }, 'Other Goose Web gateways shown in everyone’s Herd (“every machine in one sidebar”). The token must belong to a user on that machine.'), peersBox),
       h('div', { class: 'row sticky-foot' }, actionBtn('Save settings', async () => {
         const pp = peers.filter((p) => p.url).map((p) => { const x = { name: p.name || p.url, url: p.url }; if (p._tok) x.token = p._tok; else if (p.token) x.token = p.token; return x; });
-        await PUT('/api/admin/settings', { brand: { name: bn.value.trim() || 'Goose Web', tagline: bt.value.trim() }, defaultTeamId: dt.value || null, sessionHours: Math.min(hrsMax, Number(hrs.value) || hrsMax), idleMinutes: Number(idle.value) || 0, allowSelfTotp, requireTotpForAdmins: reqTotp, requireTotpForAll: reqTotpAll, peers: pp });
+        await PUT('/api/admin/settings', { brand: { name: bn.value.trim() || 'Goose Web', tagline: bt.value.trim() }, defaultTeamId: dt.value || null, sessionHours: Math.min(hrsMax, Number(hrs.value) || hrsMax), rememberHours: rem.value.trim() === '' ? remMax : Math.max(0, Math.min(remMax, Number(rem.value) || 0)), idleMinutes: Number(idle.value) || 0, allowSelfTotp, requireTotpForAdmins: reqTotp, requireTotpForAll: reqTotpAll, peers: pp });
         const ac = store.get('authConfig'); if (ac) store.set('authConfig', { ...ac, brand: { name: bn.value.trim(), tagline: bt.value.trim() } });
       }, { variant: 'primary', success: 'Settings saved' })));
   })();

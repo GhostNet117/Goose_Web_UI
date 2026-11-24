@@ -621,7 +621,7 @@ C:\GooseWeb\.venv\Scripts\python.exe -m goose_web --config C:\Goose_Web_Profiles
 | Rate limit | at most 40 sign-in attempts per 5 minutes per client IP and 10 per 5 minutes per IP and user name (`429`, in memory, cleared by a gateway restart) |
 | Lockout | after `auth.lockout_threshold` (8) failed factors - wrong passwords and wrong or replayed TOTP codes both count - the account is locked for `auth.lockout_minutes` (15) (`423`, also with the right password) |
 | Address block | after `auth.ip_block_threshold` (10) failed sign-ins in a row from one client address within `auth.ip_block_window_days` (30), that address is blocked for `auth.ip_block_days` (30; `0` = until an admin unblocks it). Stored in the database, so it survives restarts. See section 7.9. |
-| Session length | fixed from sign-in, never extended: `session_hours` (Admin > Settings > Sign-in lifetime, 1 to 8 hours, default `auth.session_hours` = 8). There is no "Keep me signed in" (removed in 1.25.0) and the cookie is a session cookie. Lowering the lifetime, and every start of the gateway, cuts the sign-ins that exist to it. An open tab is closed within 30 seconds of its sign-in ending; a running agent is not stopped. Optional: "End an unused sign-in after" (`auth.idle_minutes`, off by default, 5 to 480): a sign-in no browser has used for that long ends - an open tab counts as use, so it ends forgotten sign-ins, not open ones |
+| Session length | fixed from sign-in, never extended: `session_hours` (Admin > Settings > Sign-in lifetime, 1 to 8 hours, default `auth.session_hours` = 8); the cookie is a session cookie, so closing the browser signs out. **Keep me signed in** (back in 1.27.0, unchecked by default on the sign-in page; password and directory sign-ins - a single sign-on sign-in is always a normal one): a sign-in with the box ticked gets a cookie the browser keeps (`Max-Age`/`Expires`) and lasts `remember_hours` instead (Admin > Settings > "Keep me signed in lasts (hours)", 0 to 24, default `auth.remember_hours` = 24; 0 = no box; a value above 24 counts as 24) - also fixed from sign-in and never extended, two-factor still asked at sign-in. Each stored sign-in knows its kind: lowering either lifetime, and every start of the gateway, cuts the sign-ins of that kind that exist to it, and 0 ends the kept ones. An open tab is closed within 30 seconds of its sign-in ending; a running agent is not stopped. Optional: "End an unused sign-in after" (`auth.idle_minutes`, off by default, 5 to 480), for kept sign-ins too: a sign-in no browser has used for that long ends - an open tab counts as use, so it ends forgotten sign-ins, not open ones. The trade-off: a stolen device or cookie of a kept sign-in works for up to `remember_hours`, not only until the browser closes; set 0 where devices are shared (SECURITY-ASSESSMENT) |
 | Cookie | `HttpOnly`, `SameSite=Strict`; `__Host-gw` with `Secure` when `public_url` is `https://`, otherwise `gw` |
 | Writes | need the CSRF header and an allowed Origin |
 | Signed-in devices | users see and revoke their own sessions in their account settings |
@@ -755,8 +755,9 @@ starts at the default team), users created with `user add`, and new LDAP/OIDC us
 Change it in Admin > Settings > "Default team for new users". If you delete the default team, choose another
 default (or none) in Admin > Settings.
 
-On a new install **Everyone**, like every new team, starts with every switch off and nothing allowed. Allow its
-providers, models and approval modes before its members can chat.
+On a new install **Everyone**, like every new team, starts with nothing allowed and every switch off except
+"Members may add personal hints" (on since 1.27.0). Allow its providers, models and approval modes before its members
+can chat.
 
 ### 9.3 The team's Experience page
 
@@ -786,7 +787,9 @@ will experience:
 
 Policies apply to non-admins only. A switch that is off grants nothing. For the three chat lists (approval modes,
 providers, models) an empty list allows **nothing**, and the **Any** switch stores `"*"`, which allows every value.
-A new team starts with every switch off and every list empty.
+A new team starts with every list empty and every switch off except `hints_edit` (since 1.27.0: members may add
+personal hints; the team's hints still come last and take precedence). Teams that existed before keep the value
+they have; switch it on or off on the team's Experience page (Hints).
 
 | Key | UI label | New team | When on (or set), members may |
 |---|---|---|---|
@@ -797,7 +800,7 @@ A new team starts with every switch off and every list empty.
 | `schedules` | Manage schedules | off | create, update, delete, pause, resume and run schedules. Since 1.26.0 it also decides what their agents get: Goose's `scheduler` tool needs Schedules **and** Shell, and a member's worker runs Goose's scheduler only with Schedules - off, the member's agent cannot schedule anything and no scheduled job in the member's profile runs (also one an agent with Shell wrote into the profile itself). Before 1.26.0 Shell alone gave the agent the scheduler. |
 | `apps` | Manage apps | off | import and delete MCP Apps, and call tools directly from an app (`tools/call`) |
 | `prompts_edit` | Edit system prompts | off | change system prompts |
-| `hints_edit` | Members may add personal hints | off | write personal goose hints, which are then included before the team hints (section 10) |
+| `hints_edit` | Members may add personal hints | on (since 1.27.0; off before) | write personal goose hints, which are then included before the team hints (section 10) |
 | `tools_permissions` | Set tool permissions | off | change per-tool permission settings |
 | `config_edit` | Edit raw config | off | read and write the raw Goose configuration (treat like `allow_shell`) |
 | `allow_shell` | Allow shell / stdio extensions | off | use command-running extensions (`developer`, `computercontroller`, `code_execution`, `orchestrator`; `scheduler` also needs Schedules), stdio MCP extensions, per-session MCP servers and direct shell tool calls. See the known risk in section 11.3. Host tools (11.9) do not need it. |
@@ -836,7 +839,8 @@ names, and `session/new` is always tagged with the client name `goose-web`.
 | user is an admin | everything allowed, no lists, no run limit; the team and overrides are ignored |
 | user without a team | nothing allowed, and chatting is blocked |
 | user in a team | the team's policy laid over the least-privilege base (every switch off, every list empty, 3 runs) |
-| per-user overrides | applied last; each key in the override replaces the team's value |
+| per-user overrides | applied after the team; each key in the override replaces the team's value |
+| providers for this user only (1.27.0) | applied last and only ADDED: each provider given to this person joins `allowed_providers` (a team's Any stays Any), and its models are allowed with that provider only (section 9.9d) |
 
 There is no merging of several teams any more: a user has one team, and that team's policy applies.
 
@@ -1041,6 +1045,33 @@ content to the team. To share a skill that uses links, make it real files first.
 
 **You are sharing text.** Read a skill before you offer it. Whatever its files say (paths, host names, a key someone
 pasted into an example) is copied into every member's profile, where the member's agent reads it.
+
+#### 9.9d Providers for one person (1.27.0)
+
+To give ONE person a provider of your own profile - without giving the rest of their team access - open Admin >
+Users > the person > Edit > **Providers for this user only**. Each provider of your own profile has a switch:
+
+- **On**: the provider is copied into this person's profile only - its address, its models and its key (the key is
+  read from your profile at every provisioning and never stored in the database) - with the provider's default model
+  ticked. Tick the **models** this person may use with it, or switch on **Any model of this provider**. Saved at once.
+- **Off**: the provider file and its key leave the person's profile at once (a chat running at that moment keeps what
+  it loaded until its agent restarts, as soon as it is idle). A copy the person's team gives stays.
+
+What it does to the policy: the provider is ADDED to the person's allowed providers, and its models are allowed WITH
+THAT PROVIDER ONLY. Nothing of the team is replaced: a team's Any stays Any, and a model the team allows is allowed
+with the given provider too. The team stays the base: a person without a team still cannot chat. The person's pickers
+(New chat, the chat header, Models & Providers) offer the provider with those models; the team's page and the rest of
+the team see nothing of it. The person's open tabs reconnect with the new rights by themselves.
+
+- Only an administrator's own profile can be the source (`400 bad_source` otherwise): a member's provider would carry
+  that member's definition and key into someone else's profile.
+- It follows your profile: when you change the provider there (address, models), the person's copy is replaced
+  within five minutes (`POST /api/admin/library/refresh` at once), like a team's item (section 9.9). Deleting it from
+  your profile keeps the copy without its key; the section says so.
+- A provider both the team and the person are given is delivered once, with the person's models.
+- Audit: `user.item.add`, `user.item.remove`, `user.item.refresh`.
+- The team's own allowed models stay provider-agnostic, as before: a model id the team allows is allowed with every
+  provider the member has. Only the models given here are tied to their provider.
 
 ### 9.10 Prompt guard (since 1.14.0)
 
@@ -2230,7 +2261,7 @@ Recorded actions:
 | Sign-in | `auth.login` (success and failure), `auth.logout`, `auth.totp` (wrong code), `auth.ldap` (insecure LDAP refused), `auth.oidc` (OIDC failure), `user.oidc.bind`, `auth.password.weak` (existing password below the policy, change forced), `auth.ip.blocked`, `auth.ip.unblocked` (`"via": "cli"` from the console) |
 | Own account | `user.password`, `user.totp.enable`, `user.totp.disable`, `user.token.create`, `user.token.delete`, `hints.personal.save`, `hints.native.save`, `prefs.update` (1.18.2: the changed, deleted and skipped preference NAMES - never values - the tab's client id and the new revision; a refused save is `ok=false` with `error`, for example `prefs_conflict`) |
 | User admin | `user.create`, `user.update` (changed field names, never the password), `user.delete`, `user.reset_password`, `user.totp.reset` (two-factor reset, `"via": "cli"` from the console), `user.unlock`, `user.provision`, `user.team.directory` (directory sign-in matched several teams; the first was used) |
-| Teams and hints | `team.create`, `team.update` (with `moved`: users moved here from another team), `team.delete`, `team.migrate.membership` (1.5.0 upgrade: a second team membership was dropped), `team.item.add`, `team.item.remove`, `hints.create`, `hints.update`, `hints.delete` |
+| Teams and hints | `team.create`, `team.update` (with `moved`: users moved here from another team), `team.delete`, `team.migrate.membership` (1.5.0 upgrade: a second team membership was dropped), `team.item.add`, `team.item.remove`, `user.item.add`, `user.item.remove`, `user.item.refresh` (1.27.0: providers for one person, section 9.9d), `hints.create`, `hints.update`, `hints.delete` |
 | Settings | `settings.auth`, `settings.update` |
 | Operations | `worker.restart`, `worker.stop`, `hosttask.<action>`, `fs.upload` |
 | Agent calls | `acp.denied` (policy denials, with the reason), `acp.<method>` for sensitive methods (configuration, providers and secrets, recipes save/delete, schedules create/delete, apps import/delete, sources, tool permissions, direct tool calls, adding session extensions, defaults, session delete) and for every call on another user's profile, `acp.answer` (answers to permission prompts and forms, with the choice) |
@@ -2535,7 +2566,8 @@ everything gone (back up first).
 8. Set up each team on its Experience page, starting with **Everyone** (which allows nothing on a new install):
    allowed providers, models and approval modes, a default model, team hints, folders and run limits. Clear every
    warning marked as an error.
-9. Set the default team, the sign-in lifetime (8 hours at most) and the branding in Admin > Settings. Consider
+9. Set the default team, the sign-in lifetime (8 hours at most), how long Keep me signed in lasts (24 hours at
+   most, 0 = off) and the branding in Admin > Settings. Consider
    an idle limit (`auth.idle_minutes`) where devices are shared.
 10. Add shared providers, extensions, skills and recipes as team items, and shared hints documents.
 11. Create user accounts (or let LDAP/OIDC create them) and check one user's experience with a non-admin account.
@@ -2557,10 +2589,10 @@ This list follows the code's behaviour; the full reasoning is in
 | Proxies | Put only the proxy's own address in `server.trusted_proxies`, and make the proxy overwrite `X-Forwarded-For`. |
 | Host and Origin | Keep `server.allowed_hosts` and `server.allowed_origins` empty unless users really use another name or a direct address. |
 | Admin accounts | Few admins. Two-factor for all of them, then "Require two-factor for administrators". One local break-glass admin with a strong password stored safely. |
-| Sessions | A sign-in lasts 8 hours at most; lower the sign-in lifetime, and set "End an unused sign-in after", if devices are shared. Users can revoke sessions in their settings. |
+| Sessions | A sign-in lasts 8 hours at most, a Keep me signed in sign-in 24 hours at most. Where devices are shared, set "Keep me signed in lasts" to 0, lower the sign-in lifetime and set "End an unused sign-in after". Users see their kept sign-ins and can revoke sessions in their settings. |
 | Failed sign-ins | Keep the address block on (`auth.ip_block_threshold` 10). Check Admin > Blocked addresses now and then; exempt only networks you control. |
 | Directory sign-in | LDAP over `ldaps://` or StartTLS with `caFile` for a private CA, least-privilege bind account, `allowInsecure` off. OIDC with an `https://` issuer, exact redirect URI, and `stripDomain: false` if the identity provider has more than one domain. |
-| Policies | Leave `allow_shell`, `config_edit`, `extensions_edit`, `providers_edit` and `notify_webhook` off for ordinary teams. Set `allowed_modes`, `allowed_providers`, `allowed_models`, `allowed_roots` and `max_concurrent_runs`, with explicit values rather than Any where you can. Keep personal hints off where team hints must be final. Remember that all teams share one Windows account (section 11.3). |
+| Policies | Leave `allow_shell`, `config_edit`, `extensions_edit`, `providers_edit` and `notify_webhook` off for ordinary teams. Set `allowed_modes`, `allowed_providers`, `allowed_models`, `allowed_roots` and `max_concurrent_runs`, with explicit values rather than Any where you can. New teams start with personal hints on (1.27.0): switch them off where the team's hints must be the only ones (team hints always come last and take precedence). Remember that all teams share one Windows account (section 11.3). |
 | Shared items | Share extensions and providers only when every member may hold the copied credentials. Import MCP Apps and extensions only from trusted sources. |
 | Webhooks | Keep `notify.allow_private_targets: false`. |
 | Native profile | Bind at most one admin to it. Restrict its folder's permissions to the gateway user (plus SYSTEM and Administrators). |
