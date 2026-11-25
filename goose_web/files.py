@@ -377,14 +377,18 @@ def _holds_protected(p: Path) -> tuple[str, str] | None:
     if not stat.S_ISDIR(st.st_mode) or is_link(st):
         return None
     names = _api().REFUSED_FILE_NAMES
-    for i, (_, e, _st) in enumerate(_walk(str(p))):
-        if i >= HOLDS_SCAN_MAX:
-            return "hint_file_refused", str(p)
-        n = e.name.split(":", 1)[0].strip().rstrip(". ").lower()
-        if n in names:
-            return "hint_file_refused", e.path
-        if n in pol.AGENT_CONFIG_DIRS:          # `n` is cleaned as is_agents_name cleans it
-            return "agents_folder_refused", e.path
+    try:
+        for i, (_, e, _st) in enumerate(_walk(str(p), strict=True)):
+            if i >= HOLDS_SCAN_MAX:
+                return "hint_file_refused", str(p)
+            n = e.name.split(":", 1)[0].strip().rstrip(". ").lower()
+            if n in names:
+                return "hint_file_refused", e.path
+            if n in pol.AGENT_CONFIG_DIRS:          # `n` is cleaned as is_agents_name cleans it
+                return "agents_folder_refused", e.path
+    except OSError as ex:
+        # third review H-5: a folder that cannot be read is not known to be free of them - fails closed, like too many
+        return "unreadable", str(getattr(ex, "filename", None) or p)
     return None
 
 
@@ -396,6 +400,10 @@ async def _protect_tree(u: dict, src: Path) -> None:
     found = await asyncio.to_thread(_holds_protected, src)
     if found:
         code, where = found
+        if code == "unreadable":
+            raise HTTPError(403, "denied", f"Part of this folder cannot be read ({where}), so it cannot be checked for "
+                                           "Goose settings; it is not renamed, moved or deleted. Ask your "
+                                           "administrator.")
         raise HTTPError(403, code, f"This folder holds Goose settings your administrator manages ({where}); it cannot "
                                    "be renamed, moved or deleted from the file browser. Ask your administrator.")
 
@@ -611,20 +619,29 @@ def _is_link_entry(st) -> bool:
     return False
 
 
-def _walk(root: str):
-    """(folder, entry, its lstat) for everything below the folder `root`; never enters a link. Blocking."""
+def _walk(root: str, strict: bool = False):
+    """(folder, entry, its lstat) for everything below the folder `root`; never enters a link. Blocking. `strict`: a
+    folder or entry that cannot be read raises OSError instead of being skipped (one that vanished is skipped)."""
     stack = [root]
     while stack:
         d = stack.pop()
         try:
             it = os.scandir(d)
+        except FileNotFoundError:
+            continue
         except OSError:
+            if strict:
+                raise
             continue
         with it:
             for e in it:
                 try:
                     st = e.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
                 except OSError:
+                    if strict:
+                        raise
                     continue
                 yield d, e, st
                 if stat.S_ISDIR(st.st_mode) and not _is_link_entry(st):
@@ -1050,7 +1067,7 @@ class _Live:
 # Assessment F-12: what can take long - a SHA-256 of a large file, a move (a copy across volumes) - runs in a small
 # pool of its own, never in asyncio's shared one (sign-in, listings and upload writes use that); one person runs at
 # most a few such requests at a time.
-HEAVY_THREADS = 4
+HEAVY_THREADS = 8              # mostly disk work; 8 so that four people at their share still leave none waiting (H-4)
 HEAVY_PER_PERSON = 2           # of those threads one person uses at a time; the rest of their work waits its turn
 CHANGES_PER_PERSON = 2         # move / delete requests of one person at the same time
 PREVIEWS_PER_PERSON = 2        # previews (an image holds up to 20 MB) of one person at the same time
@@ -1827,7 +1844,13 @@ async def restore_route(request: Request):
     detail: dict[str, Any] = {"id": rid, "size": r["size"], "deletedBy": r["deleted_by"]}
     if left:
         # F-10, as for a move: across volumes the copy is back; what could not be deleted stays in the (hidden) bin.
-        # The row stays too, so the rest is still shown there and purged with it - without it nothing would.
+        # The row stays too, so the rest is still shown there and purged with it - without it nothing would. Third
+        # review H-2: with the size of what is left (a second Restore brings that back as "name (restored)").
+        try:
+            rest, _ = await asyncio.to_thread(_measure, src)
+        except OSError:
+            rest = 0
+        c.db.execute("UPDATE file_recycle SET size=? WHERE id=?", (rest, rid))
         detail["sourceLeft"] = left[:50]
         out["warning"] = (f"Restored, but {len(left)} item(s) could not be removed from the recycle bin (in use or "
                           "access denied); they stay there until it is emptied.")

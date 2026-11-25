@@ -691,9 +691,15 @@ UPLOAD_FOLDER = "Web_Uploads"
 READ_ONLY_MESSAGE = "You do not have write access to this folder, so files cannot be uploaded here."
 
 
+MAX_PATH_CHARS = 4096      # no real path is longer; resolving a 10 KB one took 9.6 s (1.28.0 third review H-1)
+MKDIR_MAX_NEW = 32         # folders one "New folder" may create at once (parents included)
+
+
 def _check_path(c: Ctx, u: dict, p: str, write: bool = False) -> Path:
     """The path as a Path when the user may be there; `write`: when the user may create or change things there
     (403 read_only_folder otherwise - a folder the team may only read, spec 031)."""
+    if p and len(p) > MAX_PATH_CHARS:
+        raise HTTPError(400, "bad_path", f"That path is longer than {MAX_PATH_CHARS} characters")
     if not p or not c.path_ok(u, p):
         raise HTTPError(403, "path_forbidden", "That folder is outside your allowed folders")
     if write and not c.path_ok(u, p, write=True):
@@ -744,16 +750,23 @@ async def fs_mkdir(request: Request):
     p = _check_path(c, u, os.path.abspath(str(b.get("path") or "")), write=True)
     _refuse_hint_name(u, p.name)
     _refuse_agents_dir(u, p)
-    # Files second review (F-15): the folders this makes may not carry Unicode format characters (U+202E shows
-    # "case<RLO>txt.exe" reversed, U+200B is invisible). Refused, not cleaned: the path is the one asked for.
-    new, q = [], p
-    while not q.exists() and q.parent != q:
-        new.append(q.name)
-        q = q.parent
-    if any(unicodedata.category(ch) == "Cf" for n in new for ch in n):
-        raise HTTPError(400, "bad_name", "A folder name cannot contain invisible or direction-changing characters.")
-    try:
+    def make() -> None:
+        # Files second review (F-15): the folders this makes may not carry format characters that reorder or hide
+        # text (U+202E shows "case<RLO>txt.exe" reversed, U+200B is invisible). Refused, not cleaned: the path is the
+        # one asked for. Third review H-1: bounded, and off the event loop.
+        new, q = [], p
+        while not q.exists() and q.parent != q:
+            new.append(q.name)
+            if len(new) > MKDIR_MAX_NEW:
+                raise HTTPError(400, "bad_path", f"At most {MKDIR_MAX_NEW} new folders can be made at once")
+            q = q.parent
+        if any(has_unwanted_format_chars(n) for n in new):
+            raise HTTPError(400, "bad_name", "A folder name cannot contain invisible or direction-changing "
+                                             "characters.")
         p.mkdir(parents=True, exist_ok=True)
+
+    try:
+        await asyncio.to_thread(make)
     except PermissionError:
         raise HTTPError(403, "denied", "Access denied by the file system")
     return ok({"path": str(p)})
@@ -801,6 +814,32 @@ _RESERVED_DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOU
 _BAD_NAME_CHARS = frozenset('<>:"/\\|?*') | {chr(i) for i in range(32)} | {"\x7f"}
 
 
+# Unicode format characters (category Cf) do not belong in new names (assessment F-15): bidirectional controls reorder
+# what is shown ("invoice<U+202E>fdp.exe" shows as "invoiceexe.pdf"); zero-width characters, the BOM and the tag
+# characters hide text. Kept: the zero-width non-joiner and joiner (U+200C, U+200D) right after a non-ASCII character
+# that is not one of them - Persian and Indic words and emoji sequences need them (third review H-7); after an ASCII
+# character they would only make two names look alike.
+_JOINERS = frozenset("\u200c\u200d")
+
+
+def _unwanted_format_char(prev: str, ch: str) -> bool:
+    if unicodedata.category(ch) != "Cf":
+        return False
+    return not (ch in _JOINERS and prev and ord(prev) > 0x7F and unicodedata.category(prev) != "Cf")
+
+
+def drop_unwanted_format_chars(s: str) -> str:
+    out: list[str] = []
+    for ch in s:
+        if not _unwanted_format_char(out[-1] if out else "", ch):
+            out.append(ch)
+    return "".join(out)
+
+
+def has_unwanted_format_chars(s: str) -> bool:
+    return drop_unwanted_format_chars(s) != s
+
+
 def safe_upload_name(raw: str | None) -> str:
     """A safe file name for an uploaded file (NEW-05).
 
@@ -810,9 +849,9 @@ def safe_upload_name(raw: str | None) -> str:
     "upload.bin" when nothing usable is left.
     """
     name = os.path.basename(str(raw or "").replace("\\", "/"))
-    # ... and no Unicode format characters (category Cf: right-to-left override, zero-width space / joiner, BOM):
-    # "invoice<U+202E>fdp.exe" would show as "invoiceexe.pdf" (assessment 2026-11-25 F-15)
-    name = "".join(ch for ch in name if ch not in _BAD_NAME_CHARS and unicodedata.category(ch) != "Cf")
+    # ... and no Unicode format characters that reorder or hide text (drop_unwanted_format_chars: right-to-left
+    # override, zero-width space, BOM; "invoice<U+202E>fdp.exe" would show as "invoiceexe.pdf", F-15)
+    name = drop_unwanted_format_chars("".join(ch for ch in name if ch not in _BAD_NAME_CHARS))
     name = name.strip().rstrip(". ")
     name = name[:180]
     while len(name.encode("utf-8")) > 200:  # stay below the 255-byte limit of common Linux file systems
@@ -1538,15 +1577,21 @@ _ON_WORDS = frozenset({"true", "yes", "on", "1"})
 
 def _policy_bool(key: str, v: Any) -> bool:
     """A team switch as stored. Files second review G-3: bool("false") is True, so a script that saved a team with
-    "false", "off" or "0" switched the feature ON. Words are read as words; any other word is refused."""
+    "false", "off" or "0" switched the feature ON. Third review H-3: and bool(["false"]) or bool(2) too. Only true and
+    false, 0 and 1, null (off) and those words are taken; anything else is refused."""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
     if isinstance(v, str):
         w = v.strip().lower()
         if w in _OFF_WORDS:
             return False
         if w in _ON_WORDS:
             return True
-        raise HTTPError(400, "bad_value", f"'{key}' must be true or false")
-    return bool(v)
+    raise HTTPError(400, "bad_value", f"'{key}' must be true or false")
 
 
 def _clean_policy_fields(p: dict) -> dict:
@@ -1584,8 +1629,10 @@ def _clean_policy_fields(p: dict) -> dict:
         out["share_folder"] = sf
     if isinstance(p.get("guard"), dict):
         out["guard"] = guardmod.clean_team_guard(p["guard"])   # spec 018
-    if p.get("require_totp") is True:
-        out["require_totp"] = True      # spec 029: this team's members must sign in with two-factor
+    # spec 029: this team's members must sign in with two-factor. Third review H-3: "true" from a script was dropped
+    # silently (200, and two-factor not required); read like the switches.
+    if "require_totp" in p and _policy_bool("require_totp", p["require_totp"]):
+        out["require_totp"] = True
     if isinstance(p.get("provider_groups"), dict):
         # spec 033: provider aliases the members see in the chat pickers; a display rule, cleaned like a person's own
         pg = _clean_provider_groups(p["provider_groups"])

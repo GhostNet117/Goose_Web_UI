@@ -1358,8 +1358,8 @@ def test_f10_delete_and_restore_across_volumes_say_what_was_left(env, monkeypatc
         assert r.status_code == 200, r.text
         assert r.json()["path"] == str(tf / "logs") and "could not be removed" in r.json()["warning"]
         assert sorted(os.listdir(tf / "logs")) == ["a.log", "b.log", "c.log"] and os.listdir(binned) == ["b.log"]
-        # the row stays, so what is left is still listed in the bin and purged with it
-        assert db.one("SELECT id FROM file_recycle WHERE id=?", (rid,)) is not None
+        # the row stays, so what is left is still listed in the bin and purged with it - with its size (H-2)
+        assert db.one("SELECT size FROM file_recycle WHERE id=?", (rid,))["size"] == 1
         a = audits(db, "files.restore")
         assert len(a) == 1 and [p.lower()[-5:] for p in a[0]["detail"]["sourceLeft"]] == ["b.log"]
 
@@ -1386,6 +1386,13 @@ def test_f15_format_characters_are_dropped_from_new_names(env):
     from goose_web import api
     assert api.safe_upload_name("invoice\u202efdp.exe") == "invoicefdp.exe"
     assert api.safe_upload_name("a\u200bb\u200d\ufeff.txt") == "ab.txt"
+    # third review H-7: the joiners stay where Persian / Indic words and emoji need them, nowhere else
+    persian = "\u06af\u0632\u0627\u0631\u0634\u200c\u0647\u0627.pdf"
+    assert api.safe_upload_name(persian) == persian
+    assert api.safe_upload_name("\U0001F469\u200d\U0001F4BB notes.txt") == "\U0001F469\u200d\U0001F4BB notes.txt"
+    assert api.safe_upload_name("invo\u200dice.pdf") == "invoice.pdf"
+    assert api.safe_upload_name("\u0628\u200c\u200c.txt") == "\u0628\u200c.txt"
+    assert api.safe_upload_name("a\U000e0041\U000e0042.txt") == "a.txt"          # tag characters hide text
     with client_for(c) as tc:
         h = sign_in(tc, c, dee)
         r = tc.post("/api/files/mkdir", json={"path": str(tf), "name": "case\u202e\u200b 1"}, headers=h)
@@ -1401,6 +1408,11 @@ def test_f15_format_characters_are_dropped_from_new_names(env):
         assert sorted(os.listdir(tf / "case 1")) == [] and not (tf / "a\u200bb").exists()
         r = tc.post("/api/fs/mkdir", json={"path": str(tf / "case 1" / "plain" / "deeper")}, headers=h)
         assert r.status_code == 200 and (tf / "case 1" / "plain" / "deeper").is_dir()
+        folder = "\u067e\u0631\u0648\u0646\u062f\u0647\u200c\u0647\u0627"      # Persian, with a zero-width non-joiner
+        r = tc.post("/api/fs/mkdir", json={"path": str(tf / folder)}, headers=h)
+        assert r.status_code == 200 and (tf / folder).is_dir(), r.text
+        r = tc.post("/api/fs/mkdir", json={"path": str(tf / "case\u200d2")}, headers=h)
+        assert r.status_code == 400 and r.json()["error"] == "bad_name"
 
 
 def test_f16_refused_attempts_are_audited_once_a_minute_per_path(env):
@@ -1588,6 +1600,82 @@ def test_downloads_go_out_as_they_are_never_compressed_on_the_fly(env):
     assert all("sent" not in x["detail"] for x in rows)        # all of the file, as it is
 
 
+def test_h1_new_folder_paths_are_bounded_and_made_off_the_event_loop(env):
+    """Third review H-1: the walk of /api/fs/mkdir (F-15) ran on the event loop without a limit and grew with the
+    square of the missing folders - a 60 KB request held the gateway for 20 s."""
+    import time as _t
+
+    from goose_web import api
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        t0 = _t.monotonic()
+        r = tc.post("/api/fs/mkdir", json={"path": str(tf) + "\\a" * 30000}, headers=h)
+        assert r.status_code == 400 and r.json()["error"] == "bad_path", r.text
+        deep = tf.joinpath(*[f"d{i}" for i in range(api.MKDIR_MAX_NEW + 5)])
+        r = tc.post("/api/fs/mkdir", json={"path": str(deep)}, headers=h)
+        assert r.status_code == 400 and r.json()["error"] == "bad_path", r.text
+        assert not (tf / "d0").exists() and _t.monotonic() - t0 < 5
+        r = tc.get("/api/fs/list", params={"path": str(tf) + "\\b" * 3000}, headers=h)
+        assert r.status_code == 400 and r.json()["error"] == "bad_path"
+        fine = tf.joinpath(*[f"e{i}" for i in range(api.MKDIR_MAX_NEW)])
+        r = tc.post("/api/fs/mkdir", json={"path": str(fine)}, headers=h)
+        assert r.status_code == 200 and fine.is_dir(), r.text
+    assert "asyncio.to_thread(make)" in inspect.getsource(api.fs_mkdir)
+
+
+def test_h3_team_switches_take_only_true_false_and_their_words(env):
+    """Third review H-3: bool(["false"]) and bool(2) are true too; and a team's require_totp sent as "true" was
+    dropped silently (200, two-factor not required)."""
+    from goose_web import api
+    from goose_web.context import HTTPError
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    admin = user(db, "root", role="admin")
+    with client_for(c) as tc:
+        h = sign_in(tc, c, admin)
+        for bad in (["false"], {"a": 1}, 2, -1, 0.5, "maybe"):
+            r = tc.patch(f"/api/admin/teams/{tid}", json={"policy": {**ANYCHAT, "files": bad}}, headers=h)
+            assert r.status_code == 400 and r.json()["error"] == "bad_value", (bad, r.text)
+        for v, want in ((None, False), (1, True), (0, False), (1.0, True)):
+            r = tc.patch(f"/api/admin/teams/{tid}", json={"policy": {**ANYCHAT, "files": v}}, headers=h)
+            stored = db.one("SELECT policy FROM teams WHERE id=?", (tid,))["policy"]
+            assert r.status_code == 200 and stored["files"] is want, (v, r.text)
+    assert api._clean_policy_fields({"require_totp": "true"})["require_totp"] is True
+    assert api._clean_policy_fields({"require_totp": 1})["require_totp"] is True
+    assert "require_totp" not in api._clean_policy_fields({"require_totp": "off"})
+    with pytest.raises(HTTPError) as e:
+        api._clean_policy_fields({"require_totp": "maybe"})
+    assert e.value.code == "bad_value"
+
+
+def test_h5_a_member_does_not_change_a_folder_with_a_part_that_cannot_be_read(env, monkeypatch):
+    """Third review H-5: the walk of F-7 / G-2 skipped a sub-folder it could not list, so the check failed open there
+    (while too many entries failed closed)."""
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    (tf / "box" / "locked").mkdir(parents=True)
+    (tf / "box" / "locked" / "x.txt").write_text("x")
+    (tf / "open" / "sub").mkdir(parents=True)
+    locked = os.path.normcase(str(tf / "box" / "locked"))
+    real = os.scandir
+
+    def scandir(path="."):
+        if os.path.normcase(os.fspath(path)) == locked:
+            raise PermissionError(13, "Access is denied", os.fspath(path))
+        return real(path)
+    monkeypatch.setattr(os, "scandir", scandir)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        j = tc.post("/api/files/delete", json={"paths": [str(tf / "box"), str(tf / "open")]}, headers=h).json()
+        assert [x["error"] for x in j["failed"]] == ["denied"] and "cannot be read" in j["failed"][0]["message"], j
+        assert [x["path"] for x in j["deleted"]] == [str(tf / "open")]
+        r = tc.post("/api/files/rename", json={"path": str(tf / "box"), "name": "box2"}, headers=h)
+        assert r.status_code == 403 and "cannot be read" in r.json()["message"], r.text
+    assert (tf / "box" / "locked" / "x.txt").exists()
+
+
 def test_f12_long_file_work_has_its_own_threads_and_a_person_runs_few_at_a_time(env):
     s, db, pr, c = env
     dee, tid, tf = crew(env, names=("dee",))
@@ -1643,6 +1731,7 @@ def test_g1_one_person_holds_at_most_two_of_the_pool_threads_until_their_work_ha
         out = await asyncio.gather(*mine[1:])
         assert sorted(out) == ["a1", "a2", "a3"] and sorted(started) == ["a0", "a1", "a2", "a3"]
     asyncio.run(main())
+    assert files.HEAVY_THREADS >= 4 * files.HEAVY_PER_PERSON         # third review H-4: four people at their share
     for f in ("_move_pinned", "hash_route"):
         assert 'who=u["id"]' in inspect.getsource(getattr(files, f)), f
     assert 'who=u["id"]' in inspect.getsource(uploads._finish)
