@@ -492,9 +492,10 @@ def is_agents_name(name: Any) -> bool:
     return str(name or "").split(":", 1)[0].strip().rstrip(". ").lower() == AGENTS_DIR
 
 
-def has_agents_component(path: str) -> bool:
-    """True if `path` has a `.agents` component, as written or resolved (realpath expands 8.3 short names such as
-    AGENTS~1 and links of the parts that exist). Fails closed when the path cannot be resolved."""
+def has_agents_component(path: str, names: tuple[str, ...] = (AGENTS_DIR,)) -> bool:
+    """True if `path` has a `.agents` component (or one of `names`), as written or resolved (realpath expands 8.3
+    short names such as AGENTS~1 and links of the parts that exist). Fails closed when the path cannot be
+    resolved."""
     cands = [str(path or "")]
     try:
         cands.append(os.path.realpath(cands[0]))
@@ -502,9 +503,21 @@ def has_agents_component(path: str) -> bool:
         return True
     for c in cands:
         rest = os.path.splitdrive(c)[1]
-        if any(is_agents_name(part) for part in rest.replace("/", "\\").split("\\")):
+        if any(str(part).split(":", 1)[0].strip().rstrip(". ").lower() in names
+               for part in rest.replace("/", "\\").split("\\")):
             return True
     return False
+
+
+# The project folders Goose reads from the folder a chat starts in (assessment 2026-11-25 F-4; Goose skills/mod.rs
+# all_skill_dirs_with_config, summon's recipe lookup): .agents (plugins, skills, agents), .goose (skills, recipes,
+# agents) and .claude (skills, agents). A member may not create, change, rename or move anything there.
+AGENT_CONFIG_DIRS = (AGENTS_DIR, ".goose", ".claude")
+
+
+def has_agent_config_component(path: str) -> bool:
+    """True if `path` has a `.agents`, `.goose` or `.claude` component (as has_agents_component)."""
+    return has_agents_component(path, AGENT_CONFIG_DIRS)
 
 
 def project_plugins(cwd: Any) -> list[str]:

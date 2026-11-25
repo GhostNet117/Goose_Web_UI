@@ -760,20 +760,29 @@ def _disconnect(c: Ctx, username: str, reason: str = "") -> None:
 def _refuse_agents_dir(u: dict, path) -> None:
     """NEW-36: a non-admin may not create or write into a `.agents` folder (any component of the path, also as an
     8.3 short name or an NTFS stream name). Goose starts the MCP servers of every plugin in <cwd>/.agents/plugins
-    when a chat starts there, i.e. runs their commands, and also reads skills and agent definitions from .agents."""
-    if u["role"] != "admin" and acp_policy.has_agents_component(str(path)):
+    when a chat starts there, i.e. runs their commands, and also reads skills and agent definitions from .agents.
+    Assessment 2026-11-25 F-4: the same for `.goose` (skills, recipes - summon runs them -, agents) and `.claude`
+    (skills, agents), which Goose reads from the chat's folder too. Used by every route that creates or changes
+    something (folder picker, chat attachments, the Files page, folder uploads)."""
+    if u["role"] != "admin" and acp_policy.has_agent_config_component(str(path)):
         raise HTTPError(403, "agents_folder_refused",
-                        "'.agents' folders hold Goose plugins and agent settings, which can run programs; they "
-                        "cannot be created or changed from the file browser. Ask your administrator.")
+                        "'.agents', '.goose' and '.claude' folders hold Goose plugins, skills, recipes and agent "
+                        "settings, which Goose loads in chats started there (and which can run programs); they cannot "
+                        "be created or changed from the file browser. Ask your administrator.")
+
+
+# Spec 009 hints files, and .gooseignore (it decides which files Goose's tools may touch in that folder; F-4).
+REFUSED_FILE_NAMES = HINT_FILE_NAMES | {".gooseignore"}
 
 
 def _refuse_hint_name(u: dict, name: str) -> None:
     """Spec 009: a non-admin may not place a Goose context file (AGENTS.md, .goosehints, .goose-web-hints.md) in
-    any folder: it would sit beside the team hints that the administrator controls."""
+    any folder: it would sit beside the team hints that the administrator controls. Nor a .gooseignore."""
     # SD-6: like is_agents_name - an NTFS stream suffix (AGENTS.md::$INDEX_ALLOCATION) names the same file/folder
-    if u["role"] != "admin" and str(name or "").split(":", 1)[0].strip().rstrip(". ").lower() in HINT_FILE_NAMES:
+    if u["role"] != "admin" and str(name or "").split(":", 1)[0].strip().rstrip(". ").lower() in REFUSED_FILE_NAMES:
         raise HTTPError(403, "hint_file_refused",
-                        f"'{name}' is a Goose hints file name. Your team's hints are managed by your administrator.")
+                        f"'{name}' is a file Goose reads in chats started in its folder (hints or ignore rules). "
+                        "Your team's hints are managed by your administrator.")
 
 
 # Windows device names: "CON", "con.txt", "COM1.tar.gz" all open the device instead of a file. Same list as
