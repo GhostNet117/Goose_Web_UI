@@ -19,6 +19,13 @@ the last one ended; the server never takes more bytes than declared; the partial
 replaced by a link or another file (its volume:file-index is stored and compared on the handle that was opened); at
 the last byte it is renamed to a name that never replaces another file ("report (1).pdf"). Free disk space is checked
 first. Idle partial files go after 24 hours (`cleanup`, maintenance loop).
+
+Spec 041 (the Files page): `target: "folder"` puts the file in the folder `dir` itself instead of <dir>\\Web_Uploads -
+the same write checks of the folder as written and as it resolves, refused with 403 files_off without the Files
+switch; the upload belongs to no chat (never linked, never deleted by retention: `uploads.target` = 'folder'); its
+SHA-256 is computed while the pieces arrive (the state is kept in memory between pieces and rebuilt from the partial
+file once when it is missing, e.g. after a restart), stored in `uploads.sha256` and audited (`files.upload`). A chat
+attachment (`target` missing or "chat") is handled exactly as before.
 """
 from __future__ import annotations
 
@@ -200,6 +207,7 @@ class _Live:
         self.busy: set[str] = set()          # uploads with a piece being received
         self.puts: dict[int, int] = {}       # user id -> pieces being received
         self.cancel: set[str] = set()        # cancelled while a piece was being received
+        self.hashes: dict[str, tuple[int, Any]] = {}   # spec 041: folder upload -> (bytes hashed, SHA-256 state)
 
 
 _LIVE: "weakref.WeakKeyDictionary[Any, _Live]" = weakref.WeakKeyDictionary()
@@ -312,7 +320,7 @@ def _discard(path: str, ident: str) -> bool:
         return False
 
 
-def _write_all(fd: int, data: bytes) -> None:
+def _write_all(fd: int, data: bytes, h: Any = None) -> None:
     view = memoryview(data)
     try:
         while len(view):
@@ -320,6 +328,29 @@ def _write_all(fd: int, data: bytes) -> None:
             view = view[n:]
     finally:
         view.release()
+    if h is not None:      # spec 041: the SHA-256 of a folder upload, from the bytes as they were written
+        h.update(data)
+
+
+def _hash_partial(row: dict, upto: int) -> Any:
+    """Spec 041: the SHA-256 state of the first `upto` bytes of the partial file - when the state kept in memory is
+    missing (a restart) or behind. Only the file this upload created is read. Blocking."""
+    h = hashlib.sha256()
+    fd = os.open(row["partial"], os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (row["file_id"] and file_ident(st) != row["file_id"]):
+            raise _Swapped()
+        left = upto
+        while left > 0:
+            data = os.read(fd, min(4 * MB, left))
+            if not data:
+                raise _Swapped()    # shorter than what was counted
+            h.update(data)
+            left -= len(data)
+    finally:
+        os.close(fd)
+    return h
 
 
 def _rename_noreplace(src: Path, dst: Path) -> None:
@@ -393,6 +424,21 @@ def _upload_dir(c, u: dict, raw_dir: str) -> Path:
         raise
     if os.path.lexists(d) and not d.is_dir():
         raise HTTPError(409, "name_taken", f"{api.UPLOAD_FOLDER} exists in this folder and is not a folder")
+    return d
+
+
+def _folder_dir(c, u: dict, raw_dir: str) -> Path:
+    """Spec 041 (`target: "folder"`): the folder itself, after the same write checks as Web_Uploads (the folder as
+    written and as it resolves; a read-only folder is refused). It must exist: nothing is created on the way."""
+    api = _api()
+    try:
+        d = api._check_path(c, u, os.path.abspath(raw_dir), write=True)
+    except HTTPError as e:
+        if e.code == "read_only_folder":
+            raise HTTPError(403, "read_only_folder", api.READ_ONLY_MESSAGE)
+        raise
+    if not d.is_dir():
+        raise HTTPError(404, "not_found", "Folder not found")
     return d
 
 
@@ -494,14 +540,27 @@ async def _start(c, u: dict, request: Request):
     except (ValueError, OverflowError):     # NaN, Infinity
         raise HTTPError(400, "bad_request", "size must be the file's size in bytes")
     size = int(size)
+    target = b.get("target") or "chat"
+    if target not in ("chat", "folder"):
+        raise HTTPError(400, "bad_request", 'target must be "chat" or "folder"')
+    folder = target == "folder"
+    if folder:
+        from . import files
+        files.gate(c, u)            # spec 041: the Files switch (403 files_off)
     lim = limit_bytes(c)
     if size > lim:
         raise HTTPError(413, "too_large", f"Uploads are limited to {limit_text(lim // MB)}", maxBytes=lim)
     name = api.safe_upload_name(b.get("name"))
-    profile = profile_for(c, u, b.get("profile"))
-    session = session_arg(b.get("session"))
+    if folder:
+        if files.is_recycle_name(name):
+            raise HTTPError(400, "bad_name", "That name cannot be used")
+        # a file of the Files page belongs to no chat: never linked, never deleted by retention (R9)
+        profile, session = str(u["username"]).lower(), ""
+    else:
+        profile = profile_for(c, u, b.get("profile"))
+        session = session_arg(b.get("session"))
     mime = "".join(ch for ch in str(b.get("mime") or "")[:200] if ch.isprintable())
-    d = _upload_dir(c, u, raw_dir)
+    d = _folder_dir(c, u, raw_dir) if folder else _upload_dir(c, u, raw_dir)
     api._refuse_agents_dir(u, d)
     api._refuse_hint_name(u, name)
     api._refuse_agents_dir(u, d / name)
@@ -512,10 +571,11 @@ async def _start(c, u: dict, request: Request):
         raise HTTPError(429, "too_many_uploads", f"You have {n_open} unfinished uploads. Wait for them to finish or "
                                                  "cancel some.")
     _check_disk(c, d, size, now)
-    try:
-        await asyncio.to_thread(d.mkdir, parents=True, exist_ok=True)
-    except PermissionError:
-        raise HTTPError(403, "read_only_folder", api.READ_ONLY_MESSAGE)
+    if not folder:       # the folder of a folder upload exists (_folder_dir); nothing is made on the way
+        try:
+            await asyncio.to_thread(d.mkdir, parents=True, exist_ok=True)
+        except PermissionError:
+            raise HTTPError(403, "read_only_folder", api.READ_ONLY_MESSAGE)
     _recheck(c, u, d)    # R-5: looked at again right before the file is made
     real_dir = os.path.realpath(d)
     try:
@@ -532,6 +592,8 @@ async def _start(c, u: dict, request: Request):
            "session_id": session, "dir": str(d), "real_dir": real_dir, "name": name, "partial": str(partial),
            "path": "", "size": size, "received": 0, "mime": mime, "state": "open", "file_id": ident,
            "created_at": now, "updated_at": now}
+    if folder:
+        row["target"] = "folder"
     cols = list(row)
     # column names are the fixed keys above; every value is a bound parameter (db.execute takes a sequence)
     c.db.execute(f"INSERT INTO uploads({', '.join(cols)}) VALUES({', '.join('?' for _ in cols)})",  # nosec B608
@@ -560,11 +622,13 @@ async def one(request: Request):
 
 async def _abort(c, row: dict) -> dict:
     if row["state"] == "done":
-        raise HTTPError(409, "upload_done", "This upload is complete; the file stays in Web_Uploads.")
+        raise HTTPError(409, "upload_done", "This upload is complete; the file stays in " +
+                        ("its folder." if row.get("target") == "folder" else "Web_Uploads."))
     if row["state"] != "open":
         return {"state": row["state"]}
     live = _live(c.db)
     c.db.execute("UPDATE uploads SET state='aborted', updated_at=? WHERE id=? AND state='open'", (time.time(), row["id"]))
+    live.hashes.pop(row["id"], None)
     if row["id"] in live.busy:
         live.cancel.add(row["id"])     # the piece being received stops and deletes the file
     else:
@@ -633,14 +697,17 @@ async def _put(c, u: dict, row: dict, request: Request) -> dict:
         if have > offset:      # a piece that ended half-way earlier (or a write by someone else): cut back
             os.ftruncate(fd, offset)
         os.lseek(fd, offset, os.SEEK_SET)
+        h = await _hash_at(c, u, row, offset) if row.get("target") == "folder" else None
         try:
-            n = await _receive(request, fd, offset, int(row["size"]), live, key)
+            n = await _receive(request, fd, offset, int(row["size"]), live, key, h)
         except ClientDisconnect:
             raise HTTPError(400, "disconnected", "The connection ended during the piece")
         received = offset + n
         await asyncio.to_thread(os.fsync, fd)
         now = time.time()
         c.db.execute("UPDATE uploads SET received=?, updated_at=? WHERE id=? AND state='open'", (received, now, key))
+        if h is not None:      # spec 041: the hash moves on only with a piece that was kept whole
+            live.hashes[key] = (received, h)
         if key in live.cancel:
             raise HTTPError(409, "upload_cancelled", "The upload was cancelled")
         if received < int(row["size"]):
@@ -663,9 +730,24 @@ async def _put(c, u: dict, row: dict, request: Request) -> dict:
             await asyncio.to_thread(_discard, row["partial"], row["file_id"])
 
 
-async def _receive(request: Request, fd: int, offset: int, size: int, live: _Live, key: str) -> int:
+async def _hash_at(c, u: dict, row: dict, offset: int) -> Any:
+    """Spec 041: a copy of the SHA-256 state of a folder upload at `offset` (a failed piece leaves the kept state as
+    it was); read from the partial file when there is none for that point (a restart)."""
+    st = _live(c.db).hashes.get(row["id"])
+    if st is not None and st[0] == offset:
+        return st[1].copy()
+    try:
+        return await asyncio.to_thread(_hash_partial, row, offset)
+    except (_Swapped, OSError):
+        _end(c, row["id"], "aborted", "the partial file was replaced")
+        log.warning("upload: the partial file of %s in %s was replaced; the upload is ended", u["username"], row["dir"])
+        raise HTTPError(409, "upload_lost", "The partial file was changed by something else; start this upload again.")
+
+
+async def _receive(request: Request, fd: int, offset: int, size: int, live: _Live, key: str, h: Any = None) -> int:
     """Write one piece to disk while it arrives: at most WRITE_BYTES are gathered before each write. All or
-    nothing: whatever goes wrong, the file is cut back to where the piece started."""
+    nothing: whatever goes wrong, the file is cut back to where the piece started. `h`: a SHA-256 state the bytes
+    are added to (spec 041; the caller keeps it only when the piece is kept)."""
     parts: list[bytes] = []
     held = 0
     n = 0
@@ -690,16 +772,16 @@ async def _receive(request: Request, fd: int, offset: int, size: int, live: _Liv
             if len(piece) >= WRITE_BYTES:
                 if parts:
                     data, parts, held = b"".join(parts), [], 0
-                    await asyncio.to_thread(_write_all, fd, data)
-                await asyncio.to_thread(_write_all, fd, piece)
+                    await asyncio.to_thread(_write_all, fd, data, h)
+                await asyncio.to_thread(_write_all, fd, piece, h)
                 continue
             parts.append(piece)
             held += len(piece)
             if held >= WRITE_BYTES:
                 data, parts, held = b"".join(parts), [], 0
-                await asyncio.to_thread(_write_all, fd, data)
+                await asyncio.to_thread(_write_all, fd, data, h)
         if parts:
-            await asyncio.to_thread(_write_all, fd, b"".join(parts))
+            await asyncio.to_thread(_write_all, fd, b"".join(parts), h)
     except BaseException:
         try:
             os.ftruncate(fd, offset)
@@ -717,6 +799,7 @@ async def _receive(request: Request, fd: int, offset: int, size: int, live: _Liv
 def _end(c, key: str, state: str, note: str) -> None:
     c.db.execute("UPDATE uploads SET state=?, note=?, updated_at=? WHERE id=? AND state='open'",
                  (state, note, time.time(), key))
+    _live(c.db).hashes.pop(key, None)
 
 
 async def _finish(c, u: dict, row: dict, request: Request) -> dict:
@@ -724,6 +807,17 @@ async def _finish(c, u: dict, row: dict, request: Request) -> dict:
     and audited (name, size, folder - no content)."""
     d = Path(row["dir"])
     _recheck(c, u, d)
+    folder = row.get("target") == "folder"
+    sha = ""
+    if folder:     # spec 041: the SHA-256 of what arrived; the partial file is read once when the state is missing
+        st = _live(c.db).hashes.pop(row["id"], None)
+        if st is not None and st[0] == int(row["size"]):
+            sha = st[1].hexdigest()
+        else:
+            try:
+                sha = (await asyncio.to_thread(_hash_partial, row, int(row["size"]))).hexdigest()
+            except (_Swapped, OSError):
+                pass          # _place below finds out what happened to the file
     try:
         target = await asyncio.to_thread(_place, row)
     except FileNotFoundError:
@@ -740,8 +834,8 @@ async def _finish(c, u: dict, row: dict, request: Request) -> dict:
         _end(c, row["id"], "aborted", "the folder changed while the file was being finished")
         log.warning("upload: the folder %s changed while an upload of %s was finished; the file was removed", d,
                     u["username"])
-        c.audit(request, "fs.upload", u, target=str(d), detail={"name": row["name"], "refused": "folder changed"},
-                ok=False)
+        c.audit(request, "files.upload" if folder else "fs.upload", u, target=str(d),
+                detail={"name": row["name"], "refused": "folder changed"}, ok=False)
         raise HTTPError(409, "upload_moved", "The upload folder changed while the file was being finished; the file "
                                              "was not kept. Try again.")
     _set_hidden(target, False)
@@ -753,6 +847,11 @@ async def _finish(c, u: dict, row: dict, request: Request) -> dict:
     if n == 0:     # cancelled while it was being renamed
         await asyncio.to_thread(_discard, str(target), row["file_id"])
         raise HTTPError(409, "upload_cancelled", "The upload was cancelled")
+    if folder:     # spec 041: a file of the Files page - in no chat, audited with its SHA-256
+        c.db.execute("UPDATE uploads SET sha256=? WHERE id=?", (sha, row["id"]))
+        c.audit(request, "files.upload", u, target=str(target),
+                detail={"name": target.name, "folder": str(d), "size": row["size"], "sha256": sha, "chunked": True})
+        return {"name": target.name, "path": str(target), "size": row["size"], "mime": mime, "sha256": sha}
     if row.get("session_id"):
         link_upload(c.db, row["id"], row["profile"], row["session_id"], now)
         _touch(c, row["profile"], row["session_id"])
@@ -784,9 +883,9 @@ async def link(request: Request):
     for raw in ids:
         if not isinstance(raw, str) or not ID_RE.match(raw):
             continue
-        row = c.db.one("SELECT id, user_id, profile FROM uploads WHERE id=?", (_key(raw),))
-        if row is None or row["user_id"] != u["id"] or row["profile"] != profile:
-            continue
+        row = c.db.one("SELECT id, user_id, profile, target FROM uploads WHERE id=?", (_key(raw),))
+        if row is None or row["user_id"] != u["id"] or row["profile"] != profile or row["target"] == "folder":
+            continue      # spec 041: a file of the Files page belongs to no chat (retention never deletes it)
         n += link_upload(c.db, row["id"], profile, session, now)
     src = session_arg(b.get("from"))
     if src and src != session:
@@ -811,6 +910,7 @@ def cleanup(c, now: float | None = None) -> int:
         gone = _discard(row["partial"], row["file_id"])
         c.db.execute("UPDATE uploads SET state='abandoned', note=?, updated_at=? WHERE id=? AND state='open'",
                      ("" if gone else "the partial file was not ours any more and was left", now, row["id"]))
+        live.hashes.pop(row["id"], None)
         n += 1
     c.db.execute("DELETE FROM uploads WHERE state IN ('aborted','abandoned','deleted','gone') AND updated_at<?",
                  (now - KEEP_ENDED_SECONDS,))

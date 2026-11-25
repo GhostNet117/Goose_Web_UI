@@ -12,7 +12,10 @@ import sys
 from typing import Any
 
 BOOL_KEYS = ["recipes_edit", "skills_edit", "extensions_edit", "providers_edit", "schedules", "apps",
-             "prompts_edit", "hints_edit", "tools_permissions", "config_edit", "allow_shell", "notify_webhook"]
+             "prompts_edit", "hints_edit", "tools_permissions", "config_edit", "allow_shell", "notify_webhook",
+             # spec 041: the Files page and its API (browse, download, preview, SHA-256; upload and new folder where
+             # the person may write), and rename / move / delete (with the recycle folder) on top of it
+             "files", "files_manage"]
 LIST_KEYS = ["allowed_modes", "allowed_providers", "allowed_models", "allowed_roots", "read_roots"]
 # Lists that gate chatting. "*" = any value; empty = none. allowed_roots has no "*" (folders are explicit).
 # allowed_roots: extra folders the members may read AND write. read_roots (spec 031): extra folders they may only
@@ -36,7 +39,44 @@ DEFAULT_POLICY: dict[str, Any] = {**{k: False for k in BOOL_KEYS}, **{k: [] for 
 # What a team CREATED from now on stores on top of that base (Admin > Teams > New team, `init`'s Everyone, native-hints
 # --team): its members may write personal hints - added before the team's hints, which stay last and final. Stored in
 # the new team's policy, so teams that exist keep what they have, and a person without a team keeps DEFAULT_POLICY.
-NEW_TEAM_POLICY: dict[str, Any] = {"hints_edit": True}
+NEW_TEAM_POLICY: dict[str, Any] = {"hints_edit": True, "files": True, "files_manage": True}
+# Spec 041: the two Files switches are on for the teams that existed before them too - set once at start-up
+# (apply_files_switches); the settings key records that it ran, so a switch an administrator turns off stays off.
+FILES_KEYS = ("files", "files_manage")
+FILES_SWITCHES_SETTING = "files_switches_applied"
+
+
+def files_allowed(user: dict, policy: dict | None) -> bool:
+    """Spec 041: the Files page and its API - administrators always, everyone else when the policy says so."""
+    return user.get("role") == "admin" or bool((policy or {}).get("files"))
+
+
+def files_manage_allowed(user: dict, policy: dict | None) -> bool:
+    """Spec 041: rename, move and delete (on top of `files`) - administrators always."""
+    return user.get("role") == "admin" or bool((policy or {}).get("files")) and bool((policy or {}).get("files_manage"))
+
+
+def apply_files_switches(db, now: float | None = None) -> int:
+    """Spec 041, once (the settings key FILES_SWITCHES_SETTING): `files` and `files_manage` are switched on in every
+    team that exists, each change audited as team.update by the system. A key a team already has is left as it is.
+    Returns the number of teams changed."""
+    import json
+    import time
+    if db.get_setting(FILES_SWITCHES_SETTING):
+        return 0
+    n = 0
+    for t in db.query("SELECT id, name, policy FROM teams ORDER BY id"):
+        stored = t.get("policy")
+        add = {k: True for k in FILES_KEYS if k not in stored} if isinstance(stored, dict) else {}
+        if not add:
+            continue
+        db.execute("UPDATE teams SET policy=? WHERE id=?", (json.dumps({**stored, **add}), t["id"]))
+        db.audit("team.update", target=str(t["name"]), detail={"fields": ["policy"], "policy": add,
+                                                                "reason": "Files switches on for existing teams "
+                                                                          "(spec 041, once)"})
+        n += 1
+    db.set_setting(FILES_SWITCHES_SETTING, time.time() if now is None else float(now))
+    return n
 
 # The defaults of Goose Web 1.4 and earlier (empty list = unrestricted). Used only to migrate old teams.
 LEGACY_DEFAULT_POLICY: dict[str, Any] = {

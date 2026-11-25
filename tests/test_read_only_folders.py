@@ -121,7 +121,8 @@ def test_file_api_reads_but_does_not_write_and_uploads_go_to_web_uploads(env, tm
     for d in (rw, kb, out):
         d.mkdir()
     (kb / "facts.md").write_text("FACTS", encoding="utf-8")
-    tid = team(db, "A", {**ANYCHAT, "allowed_roots": [str(rw)], "read_roots": [str(kb)]})
+    # spec 041: /api/fs/read and /api/fs/download need the team's Files switch
+    tid = team(db, "A", {**ANYCHAT, "allowed_roots": [str(rw)], "read_roots": [str(kb)], "files": True})
     dee = user(db, "dee")
     db.set_user_team(dee["id"], tid)
     dee = db.user_by_id(dee["id"])

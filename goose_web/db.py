@@ -14,7 +14,8 @@ SCHEMA_VERSION = 6   # v3 (1.3.0): ip_blocks table; v4 (1.5.0): one team per use
 #                      v5 (1.14.0): guard_rulesets table (prompt guard, spec 018)
 #                      v6 (1.15.0): chat_state table (composer queues and herd marks survive a restart, spec 019)
 #                      (specs 039/040 add the uploads, upload_links and chat_access tables - additive, created on
-#                      every open like all tables; the release that ships them may number them v7)
+#                      every open like all tables; the release that ships them may number them v7; spec 041 adds
+#                      file_hashes, file_recycle and the uploads columns target and sha256 the same way)
 POLICY_MODEL = 2     # meta 'policy_model': 2 = spec 009 semantics (empty list = nothing, "*" = any)
 
 # Audit rows older than this are deleted when the database is opened (GW-23).
@@ -27,12 +28,17 @@ AUDIT_RETENTION_DAYS = 365
 #       users.oidc_issuer / users.oidc_subject - OIDC identity binding by (iss, sub) (GW-12)
 #   v3: oidc_states.binding - hash of the pre-sign-in browser cookie the OIDC state is bound to (A-4)
 #   auth_sessions.remember - 1 = a "keep me signed in" sign-in (spec 037: its own lifetime, its own start-up cut)
+#   uploads.target - 'chat' (an attachment in <chat folder>\Web_Uploads, spec 039) or 'folder' (uploaded on the Files
+#       page into the folder itself, spec 041: never deleted by chat retention); uploads.sha256 - of a folder upload,
+#       computed while its pieces arrived ('' = not known)
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("users", "totp_last_counter", "INTEGER"),
     ("users", "oidc_issuer", "TEXT"),
     ("users", "oidc_subject", "TEXT"),
     ("oidc_states", "binding", "TEXT"),
     ("auth_sessions", "remember", "INTEGER DEFAULT 0"),
+    ("uploads", "target", "TEXT NOT NULL DEFAULT 'chat'"),
+    ("uploads", "sha256", "TEXT NOT NULL DEFAULT ''"),
 )
 POST_MIGRATION_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_oidc ON users(oidc_issuer, oidc_subject)"
@@ -214,6 +220,7 @@ CREATE TABLE IF NOT EXISTS uploads (
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
   completed_at REAL
+  -- later columns (target, sha256: spec 041) are added by MIGRATIONS in db.py
 );
 CREATE INDEX IF NOT EXISTS ix_uploads_user ON uploads(user_id, state);
 CREATE INDEX IF NOT EXISTS ix_uploads_profile ON uploads(profile, state);
@@ -233,6 +240,31 @@ CREATE TABLE IF NOT EXISTS chat_access (
   last_access REAL NOT NULL,
   PRIMARY KEY (profile, session_id)
 );
+-- SHA-256 of files computed on request on the Files page (files.py, spec 041): valid while the file at `path` (its
+-- normcase'd absolute path) still has this size and modification time
+CREATE TABLE IF NOT EXISTS file_hashes (
+  path TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  mtime REAL NOT NULL,
+  sha256 TEXT NOT NULL,
+  at REAL NOT NULL,
+  PRIMARY KEY (path)
+);
+-- items deleted on the Files page (spec 041): moved into <location>\\.goose-web-recycle\\<id>\\<name> until they are
+-- restored or files.recycle_days have passed
+CREATE TABLE IF NOT EXISTS file_recycle (
+  id TEXT PRIMARY KEY,
+  location TEXT NOT NULL,
+  original_path TEXT NOT NULL,
+  recycle_path TEXT NOT NULL,
+  name TEXT NOT NULL,
+  is_dir INTEGER NOT NULL DEFAULT 0,
+  size INTEGER NOT NULL DEFAULT 0,
+  sha256 TEXT NOT NULL DEFAULT '',
+  deleted_by TEXT NOT NULL DEFAULT '',
+  deleted_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_file_recycle_location ON file_recycle(location, deleted_at);
 """
 
 JSON_COLUMNS = {"prefs", "policy_overrides", "policy", "payload", "detail", "value", "failures", "rules"}

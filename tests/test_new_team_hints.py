@@ -58,7 +58,8 @@ def test_a_new_team_lets_its_members_add_personal_hints(env):
     assert pr.hint_sections(db.user_by_id(bob["id"]))["personalDropped"] is True
     nobody = user(db, "nobody")
     assert pol.effective_policy(nobody, [])["hints_edit"] is False and pol.DEFAULT_POLICY["hints_edit"] is False
-    assert pol.NEW_TEAM_POLICY == {"hints_edit": True}
+    # spec 041: a new team also has the two Files switches on
+    assert pol.NEW_TEAM_POLICY == {"hints_edit": True, "files": True, "files_manage": True}
 
 
 def test_init_and_native_hints_create_teams_with_personal_hints(tmp_path):
@@ -74,7 +75,7 @@ def test_init_and_native_hints_create_teams_with_personal_hints(tmp_path):
     db = Database(tmp_path / "_system" / "goose-web.db")
     try:
         got = {t["name"]: t["policy"] for t in db.query("SELECT name, policy FROM teams")}
-        assert got == {"Everyone": {"hints_edit": True}, "Admins": {"hints_edit": True}}
+        assert got == {"Everyone": pol.NEW_TEAM_POLICY, "Admins": pol.NEW_TEAM_POLICY}
         assert json.dumps(got["Everyone"]) == json.dumps(pol.NEW_TEAM_POLICY)
     finally:
         db.close()

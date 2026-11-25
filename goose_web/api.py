@@ -26,6 +26,7 @@ from . import auth as auth_mod
 from . import guard as guardmod
 from . import guardmodel, hosttasks, logjanitor, prefsync, security, tls, useritems, winsec
 from . import retention, uploads   # specs 039 (chunked uploads) and 040 (chat retention)
+from . import files as files_api   # spec 041: the Files page
 from . import policy as acp_policy
 from . import transcript as transcript_mod
 from .auth import AuthError
@@ -698,6 +699,8 @@ def _check_path(c: Ctx, u: dict, p: str, write: bool = False) -> Path:
     if write and not c.path_ok(u, p, write=True):
         raise HTTPError(403, "read_only_folder", "Your team may only read this folder; nothing can be created or "
                                                  "changed in it.")
+    if files_api.has_recycle_component(p):    # spec 041: the recycle folder is reached by no route but restore
+        raise HTTPError(404, "not_found", "Not found")
     return Path(p)
 
 
@@ -715,6 +718,8 @@ async def fs_list(request: Request):
             for i, e in enumerate(it):
                 if i >= 5000:
                     break
+                if files_api.is_recycle_name(e.name):    # spec 041: never listed
+                    continue
                 try:
                     st = e.stat()
                     out.append({"name": e.name, "path": e.path, "dir": e.is_dir(), "size": st.st_size,
@@ -891,9 +896,11 @@ async def fs_upload(request: Request):
 async def fs_download(request: Request):
     c = ctx(request)
     u = c.require(request).user
+    files_api.gate(c, u)     # spec 041: the Files switch, audited like /api/files/download
     p = _check_path(c, u, os.path.abspath(request.query_params.get("path") or ""))
     if not p.is_file():
         raise HTTPError(404, "not_found", "File not found")
+    await files_api.audit_file(c, request, u, p, "files.download", route="/api/fs/download")
     # Always a download: octet-stream (never a type a browser renders inline) + attachment + sandbox CSP.
     return FileResponse(p, filename=p.name, media_type="application/octet-stream",
                         content_disposition_type="attachment",
@@ -903,9 +910,11 @@ async def fs_download(request: Request):
 async def fs_read(request: Request):
     c = ctx(request)
     u = c.require(request).user
+    files_api.gate(c, u)     # spec 041: the Files switch, audited
     p = _check_path(c, u, os.path.abspath(request.query_params.get("path") or ""))
     if not p.is_file():
         raise HTTPError(404, "not_found", "File not found")
+    await files_api.audit_file(c, request, u, p, "files.read", route="/api/fs/read")
     data = await asyncio.to_thread(lambda: p.open("rb").read(1024 * 1024 + 1))
     return ok({"path": str(p), "content": data[:1024 * 1024].decode("utf-8", "replace"),
                "truncated": len(data) > 1024 * 1024})
@@ -2512,6 +2521,7 @@ routes = [
     *uploads.routes,     # spec 039: /api/fs/uploads (chunked, resumable) and /api/fs/uploads/link (spec 040)
     Route("/api/fs/download", fs_download),
     Route("/api/fs/read", fs_read),
+    *files_api.routes,   # spec 041: /api/files/* (the Files page)
     Route("/api/apps/frame", apps_frame),
     Route("/api/herd", herd),
     Route("/api/sessions/{sid}/transcript", session_transcript),

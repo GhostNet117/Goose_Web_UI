@@ -27,6 +27,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import __version__, activity, api, logjanitor, security, tls
 from . import retention, uploads   # specs 039 (chunked uploads) and 040 (chat retention)
+from . import files                # spec 041: the Files page (recycle purge, the one-time team switches)
 from .auth import AuthService
 from .config import Settings
 from .context import DEFAULT_BODY_LIMIT, BodyTooLarge, Ctx, HTTPError, _ip_in
@@ -326,6 +327,7 @@ async def _maintenance_loop(c: Ctx) -> None:
         try:   # spec 039: partial upload files idle for 24 hours; spec 040: chat retention, at most hourly
             await asyncio.to_thread(uploads.cleanup, c)
             await retention.maybe_sweep(c)
+            await files.purge_recycle(c)    # spec 041: recycled items older than files.recycle_days
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -725,6 +727,12 @@ def create_app(settings: Settings) -> Starlette:
         settings.system_dir.mkdir(parents=True, exist_ok=True)
         db = Database(settings.system_dir / "goose-web.db")
         uploads.load_admin_limit(settings, db)   # spec 039: app.BodyLimit has no database
+        try:   # spec 041, once: the two Files switches on for the teams that exist (audited team.update by the system)
+            from .policy import apply_files_switches
+            if apply_files_switches(db):
+                log.info("files: the Files switches were turned on for the existing teams (once)")
+        except Exception:
+            log.exception("files: turning the Files switches on for the existing teams")
         workers = WorkerManager(settings)
         hub = Hub(workers)
         profiles = Profiles(settings, db)
