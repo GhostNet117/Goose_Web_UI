@@ -1528,3 +1528,27 @@ def test_f13_stuck_items_wait_behind_the_others_and_an_administrator_can_empty_a
     a = audits(db, "files.purge")[-1]
     assert a["username"] == "root" and a["detail"]["early"] is True and a["detail"]["id"] == ids[2]
     assert not (tf / files.RECYCLE_DIR / ids[2]).exists()
+
+
+@pytest.mark.skipif(not WIN, reason="NTFS junctions")
+def test_changes_work_in_a_team_folder_that_sits_behind_a_junction(env, tmp_path):
+    s, db, pr, c = env
+    real = tmp_path / "real-share"
+    real.mkdir()
+    if not _junction(tmp_path / "share", real):
+        pytest.skip("junctions cannot be made here")
+    dee, tid, tf = crew(env, policy={"share_folder": str(tmp_path / "share")}, names=("dee",))
+    assert tf == tmp_path / "share"
+    (tf / "a.txt").write_text("A")
+    (tf / "sub").mkdir()
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        r = tc.post("/api/files/rename", json={"path": str(tf / "a.txt"), "name": "b.txt"}, headers=h)
+        assert r.status_code == 200, r.text
+        j = tc.post("/api/files/move", json={"paths": [str(tf / "b.txt")], "to": str(tf / "sub")}, headers=h).json()
+        assert j["moved"] and not j["failed"], j
+        j = tc.post("/api/files/delete", json={"paths": [str(tf / "sub" / "b.txt")]}, headers=h).json()
+        assert j["deleted"] and not j["failed"], j
+        r = tc.post("/api/files/restore", json={"id": j["deleted"][0]["id"]}, headers=h)
+        assert r.status_code == 200, r.text
+    assert (real / "sub" / "b.txt").read_text() == "A"

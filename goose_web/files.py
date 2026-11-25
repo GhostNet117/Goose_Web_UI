@@ -52,6 +52,7 @@ from starlette.responses import FileResponse, Response
 from starlette.routing import Route
 
 from . import policy as pol
+from . import security
 from .context import HTTPError, body_json
 from .uploads import PARTIAL_PREFIX, _set_hidden, file_ident, is_link
 
@@ -680,9 +681,20 @@ def _pin(c, u: dict, src: Path, dest_dir: Any, dest_real: str = "") -> _Pin:
     except OSError:
         raise HTTPError(404, "not_found", NOT_FOUND)
     parent, dest = _real(src.parent), dest_real or _real(dest_dir)
-    if not (parent and dest and c.path_ok(u, parent, write=True) and c.path_ok(u, dest, write=True)):
+    if not (_resolved_ok(c, u, parent) and _resolved_ok(c, u, dest)):
         raise HTTPError(403, "denied", CHANGED)
     return _Pin(file_ident(st), parent, dest)
+
+
+def _resolved_ok(c, u: dict, real: str) -> bool:
+    """A resolved folder (no links, no `..`) the person may write: inside one of their writable folders as those
+    resolve (a team folder may sit behind a junction), never the system folder or a UNC path."""
+    if not real or security.is_unc_path(real) or c.in_system_dir(real):
+        return False
+    if u["role"] == "admin":
+        return os.path.isabs(real)
+    roots = [_real(r) for r in c.write_roots_for(u)]
+    return any(r and (real == r or real.startswith(r.rstrip("\\/") + os.sep)) for r in roots)
 
 
 # Windows: the item and both folders are held open (CreateFileW) while the item moves. A handle with data or delete
