@@ -751,17 +751,18 @@ def test_move_never_replaces_and_not_into_itself(env, monkeypatch):
         assert tc.post("/api/files/move", json={"paths": [str(tf / "r.txt")], "to": str(ws / "nope")},
                        headers=h).status_code == 404
         # another volume: copied next to the target under a hidden name, then renamed, then the original deleted
-        real = files._rename_noreplace
-
-        def other_volume(src, dst):
-            if Path(src).name.startswith(files.MOVE_PREFIX):
-                return real(src, dst)
-            raise OSError(errno.EXDEV, "Invalid cross-device link")
-        monkeypatch.setattr(files, "_rename_noreplace", other_volume)
+        os.chmod(ws / "case" / "log.txt", stat.S_IREAD)       # a read-only file is copied and deleted too
+        mt = os.stat(ws / "case" / "log.txt").st_mtime_ns
+        other_volume(monkeypatch)
         j = tc.post("/api/files/move", json={"paths": [str(ws / "case")], "to": str(tf)}, headers=h).json()
         assert j == {"moved": [{"from": str(ws / "case"), "to": str(tf / "case")}], "failed": []}
         assert (tf / "case" / "log.txt").read_text() == "L" and (tf / "case" / "inner").is_dir()
+        assert os.stat(tf / "case" / "log.txt").st_mtime_ns == mt and not os.access(tf / "case" / "log.txt", os.W_OK)
         assert not (ws / "case").exists() and not list(tf.glob(files.MOVE_PREFIX + "*"))
+        # a single file too
+        (ws / "one.txt").write_text("1")
+        j = tc.post("/api/files/move", json={"paths": [str(ws / "one.txt")], "to": str(tf)}, headers=h).json()
+        assert j["moved"] and (tf / "one.txt").read_text() == "1" and not (ws / "one.txt").exists()
 
 
 def test_delete_goes_to_the_recycle_folder_and_restore_brings_it_back(env):
@@ -954,41 +955,321 @@ def test_recycle_days_setting_and_check_line(tmp_path):
     assert "files.check_lines(settings)" in inspect.getsource(cli)
 
 
-def test_an_item_is_put_back_when_its_new_folder_changed_meanwhile(env, monkeypatch):
+@pytest.mark.skipif(not WIN, reason="NTFS junctions")
+def test_nothing_moves_when_the_target_folder_changed_meanwhile(env, monkeypatch, tmp_path):
     s, db, pr, c = env
     dee, tid, tf = crew(env, names=("dee",))
+    vic, wv = outsider(env)
     (tf / "a.txt").write_text("A")
     (tf / "b.txt").write_text("B")
     (tf / "to").mkdir()
-    real_move, real_rename, real_real = files._move_item, files._rename_noreplace, files._real
-    landed: list[Path] = []
+    if not _junction(tmp_path / "probe", wv):
+        pytest.skip("junctions cannot be made here")
+    real_move, real_slot = files._move_item, files._recycle_slot
 
-    def move(src, dst):
-        real_move(src, dst)
-        landed.append(Path(dst))
+    def swapped(src, dst, *a, **k):     # between the check and the move the target folder becomes a junction
+        if Path(dst).parent == tf / "to" and not (tf / "to-real").exists():
+            os.rename(tf / "to", tf / "to-real")
+            assert _junction(tf / "to", wv)
+        return real_move(src, dst, *a, **k)
 
-    def rename(src, dst):
-        real_rename(src, dst)
-        landed.append(Path(dst))
-
-    def real(p):        # once something landed, its folder resolves elsewhere (swapped for a link meanwhile)
-        if landed and Path(p) == landed[0].parent:
-            return "x:\\elsewhere"
-        return real_real(p)
-    monkeypatch.setattr(files, "_move_item", move)
-    monkeypatch.setattr(files, "_rename_noreplace", rename)
-    monkeypatch.setattr(files, "_real", real)
+    def slot(loc, rid):                 # ... and the recycle slot, right after it was made
+        out = real_slot(loc, rid)
+        os.rename(out[0], str(out[0]) + "-real")
+        assert _junction(out[0], wv)
+        return out
+    monkeypatch.setattr(files, "_move_item", swapped)
+    monkeypatch.setattr(files, "_recycle_slot", slot)
     with client_for(c) as tc:
         h = sign_in(tc, c, dee)
         j = tc.post("/api/files/move", json={"paths": [str(tf / "a.txt")], "to": str(tf / "to")}, headers=h).json()
         assert j["moved"] == [] and j["failed"][0]["error"] == "denied"
-        assert (tf / "a.txt").read_text() == "A" and not (tf / "to" / "a.txt").exists()
-        landed.clear()
+        assert (tf / "a.txt").read_text() == "A" and not (wv / "a.txt").exists()
+        j = tc.post("/api/files/delete", json={"paths": [str(tf / "b.txt")]}, headers=h).json()
+        assert j["deleted"] == [] and j["failed"][0]["error"] == "denied" and (tf / "b.txt").exists()
+        assert not (wv / "b.txt").exists() and not db.query("SELECT * FROM file_recycle")
+        # had it landed elsewhere all the same, it would be put back where it was taken from and refused
+        monkeypatch.setattr(files, "_landed", lambda fd, dest: False)
         r = tc.post("/api/files/rename", json={"path": str(tf / "b.txt"), "name": "c.txt"}, headers=h)
         assert r.status_code == 403 and r.json()["error"] == "denied"
         assert (tf / "b.txt").read_text() == "B" and not (tf / "c.txt").exists()
-        landed.clear()
-        j = tc.post("/api/files/delete", json={"paths": [str(tf / "b.txt")]}, headers=h).json()
-        assert j["deleted"] == [] and j["failed"][0]["error"] == "denied" and (tf / "b.txt").exists()
-        assert not db.query("SELECT * FROM file_recycle") and os.listdir(tf / files.RECYCLE_DIR) == []
     assert not audits(db, "files.move") and not audits(db, "files.rename") and not audits(db, "files.delete")
+
+
+# ------------------------------------------------------------------ independent assessment 2026-11-25 (spec 041)
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def outsider(env, name="vic"):
+    """A member of another team, with a file in her workspace."""
+    s, db, pr, c = env
+    vt = team(db, "Other-" + name, {**ANYCHAT, **FILES_ON})
+    v = user(db, name)
+    db.set_user_team(v["id"], vt)
+    v = db.user_by_id(v["id"])
+    pr.ensure_layout(v)
+    wv = pr.workspace(v)
+    (wv / "secret.txt").write_text("VICTIM SECRET")
+    (wv / "deep").mkdir()
+    (wv / "deep" / "more.txt").write_text("M")
+    return v, wv
+
+
+def other_volume(monkeypatch):
+    """Every first rename of an item fails as between two volumes; the copy's own rename into place works."""
+    real = files._rename_noreplace
+
+    def old(src, dst):
+        if Path(src).name.startswith(files.MOVE_PREFIX):
+            return real(src, dst)
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+    monkeypatch.setattr(files, "_rename_noreplace", old)
+
+    def new(fd, dst):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+    monkeypatch.setattr(files, "_rename_item", new, raising=False)
+
+
+@pytest.mark.skipif(not WIN, reason="NTFS junctions")
+def test_f1_a_move_to_another_volume_never_copies_through_a_link_inside(env, monkeypatch):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    vic, wv = outsider(env)
+    ws = pr.workspace(dee)
+    (tf / "pack").mkdir()
+    (tf / "pack" / "mine.txt").write_text("mine")
+    (tf / "pack" / "sub").mkdir()
+    if not _junction(tf / "pack" / "sub" / "j", wv):
+        pytest.skip("junctions cannot be made here")
+    other_volume(monkeypatch)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        assert tc.get("/api/files/list", params={"path": str(tf / "pack" / "sub" / "j")}).status_code == 403
+        j = tc.post("/api/files/move", json={"paths": [str(tf / "pack")], "to": str(ws)}, headers=h).json()
+        assert j["moved"] == [] and j["failed"][0]["error"] == "has_link", j
+        assert "link" in j["failed"][0]["message"]
+    # nothing copied, nothing deleted, the other person's files untouched
+    assert not (ws / "pack").exists() and not list(ws.glob(files.MOVE_PREFIX + "*"))
+    assert (tf / "pack" / "mine.txt").read_text() == "mine" and os.path.isdir(tf / "pack" / "sub" / "j")
+    assert (wv / "secret.txt").read_text() == "VICTIM SECRET" and (wv / "deep" / "more.txt").exists()
+    assert not audits(db, "files.move")
+
+
+@pytest.mark.skipif(not WIN, reason="NTFS junctions")
+def test_f2_a_source_folder_swapped_for_a_link_moves_nobody_elses_files(env, monkeypatch):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    vic, wv = outsider(env)
+    (tf / "a").mkdir()
+    (tf / "a" / "secret.txt").write_text("decoy")
+    (tf / "loot").mkdir()
+    if not _junction(tf / "probe", wv):
+        pytest.skip("junctions cannot be made here")
+    os.rmdir(tf / "probe")
+    real_move = files._move_item
+
+    def swapped(*a, **k):      # between the check and the move: tf\a becomes a junction to vic's workspace
+        if not (tf / "a-real").exists():
+            os.rename(tf / "a", tf / "a-real")
+            assert _junction(tf / "a", wv)
+        return real_move(*a, **k)
+
+    def reset():
+        if (tf / "a-real").exists():
+            os.rmdir(tf / "a")
+            os.rename(tf / "a-real", tf / "a")
+    monkeypatch.setattr(files, "_move_item", swapped)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        j = tc.post("/api/files/delete", json={"paths": [str(tf / "a" / "secret.txt")]}, headers=h).json()
+        assert j["deleted"] == [] and j["failed"][0]["error"] == "denied", j
+        assert (wv / "secret.txt").read_text() == "VICTIM SECRET"
+        reset()
+        j = tc.post("/api/files/move", json={"paths": [str(tf / "a" / "secret.txt")], "to": str(tf / "loot")},
+                    headers=h).json()
+        assert j["moved"] == [] and j["failed"][0]["error"] == "denied", j
+        assert (wv / "secret.txt").read_text() == "VICTIM SECRET" and not (tf / "loot" / "secret.txt").exists()
+        reset()
+        r = tc.post("/api/files/rename", json={"path": str(tf / "a" / "secret.txt"), "name": "mine.txt"}, headers=h)
+        assert r.status_code == 403 and r.json()["error"] == "denied"
+        assert (wv / "secret.txt").read_text() == "VICTIM SECRET" and not (wv / "mine.txt").exists()
+        reset()
+    assert (tf / "a" / "secret.txt").read_text() == "decoy"
+    assert not db.query("SELECT * FROM file_recycle")
+    assert not audits(db, "files.delete") and not audits(db, "files.move") and not audits(db, "files.rename")
+
+
+def test_f3_a_member_cannot_remove_another_teams_location_inside_their_own(env, tmp_path):
+    s, db, pr, c = env
+    cases = tmp_path / "Cases"
+    nested = cases / "sub" / "2026-1124"
+    nested.mkdir(parents=True)
+    (nested / "n.txt").write_text("N")
+    soc = team(db, "SOC", {**ANYCHAT, **FILES_ON, "allowed_roots": [str(cases)]})
+    team(db, "IR-Ext", {**ANYCHAT, **FILES_ON, "allowed_roots": [str(nested)]})
+    sam = user(db, "sam")
+    db.set_user_team(sam["id"], soc)
+    sam = db.user_by_id(sam["id"])
+    pr.ensure_layout(sam)
+    ws = pr.workspace(sam)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, sam)
+        r = tc.post("/api/files/rename", json={"path": str(nested), "name": "renamed"}, headers=h)
+        assert r.status_code == 403 and r.json()["error"] == "denied", r.text
+        for p in (nested, cases / "sub"):        # the other team's top, and a folder holding it
+            j = tc.post("/api/files/delete", json={"paths": [str(p)]}, headers=h).json()
+            assert j["failed"] and j["failed"][0]["error"] == "denied", (p, j)
+            j = tc.post("/api/files/move", json={"paths": [str(p)], "to": str(ws)}, headers=h).json()
+            assert j["failed"] and j["failed"][0]["error"] == "denied", (p, j)
+        r = tc.post("/api/files/rename", json={"path": str(cases / "sub"), "name": "other"}, headers=h)
+        assert r.status_code == 403
+        # what lies inside it is handled as before by whoever may write there
+        j = tc.post("/api/files/delete", json={"paths": [str(nested / "n.txt")]}, headers=h).json()
+        assert j["deleted"] and not (nested / "n.txt").exists()
+    assert nested.is_dir() and (cases / "sub").is_dir() and not audits(db, "files.rename")
+
+
+def test_f4_goose_and_claude_project_folders_and_gooseignore_are_refused_for_members(env):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    admin = user(db, "root", role="admin")
+    (tf / ".goose").mkdir()
+    (tf / ".goose" / "memory").mkdir()       # e.g. Goose's own, or an administrator's
+    (tf / "x.txt").write_text("x")
+    (tf / "sub").mkdir()
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        for name in (".goose", ".claude", ".Claude. ", ".GOOSE"):
+            r = tc.post("/api/files/mkdir", json={"path": str(tf), "name": name}, headers=h)
+            assert r.json().get("error") == "agents_folder_refused", (name, r.text)
+        r = tc.post("/api/files/mkdir", json={"path": str(tf / ".goose"), "name": "skills"}, headers=h)
+        assert r.json()["error"] == "agents_folder_refused"
+        r = tc.post("/api/fs/mkdir", json={"path": str(tf / ".claude" / "skills")}, headers=h)
+        assert r.json()["error"] == "agents_folder_refused"
+        for d, name in ((tf / ".goose", "helper.yaml"), (tf / ".goose" / "memory", "SKILL.md"), (tf, ".gooseignore"),
+                        (tf, ".GooseIgnore.")):
+            r = tc.post("/api/fs/uploads", json={"dir": str(d), "name": name, "size": 1, "target": "folder"},
+                        headers=h)
+            assert r.status_code == 403 and r.json()["error"] in ("agents_folder_refused", "hint_file_refused"), \
+                (d, name, r.text)
+        # chat attachments (Web_Uploads of a chat folder) and the multipart upload get the same rule
+        r = tc.post("/api/fs/uploads", json={"dir": str(tf / ".goose"), "name": "a.txt", "size": 1}, headers=h)
+        assert r.json()["error"] == "agents_folder_refused"
+        r = tc.post("/api/fs/upload", params={"dir": str(tf / ".claude")}, files={"f": ("a.txt", b"x")}, headers=h)
+        assert r.json()["error"] == "agents_folder_refused"
+        r = tc.post("/api/fs/upload", params={"dir": str(tf)}, files={"f": (".gooseignore", b"x")}, headers=h)
+        assert r.json()["error"] == "hint_file_refused"
+        assert tc.post("/api/files/rename", json={"path": str(tf / "x.txt"), "name": ".gooseignore"},
+                       headers=h).json()["error"] == "hint_file_refused"
+        assert tc.post("/api/files/rename", json={"path": str(tf / "sub"), "name": ".claude"},
+                       headers=h).json()["error"] == "agents_folder_refused"
+        assert tc.post("/api/files/move", json={"paths": [str(tf / "x.txt")], "to": str(tf / ".goose")},
+                       headers=h).json()["error"] == "agents_folder_refused"
+        assert tc.post("/api/files/rename", json={"path": str(tf / ".goose"), "name": "g"},
+                       headers=h).json()["error"] == "agents_folder_refused"
+        j = tc.post("/api/files/delete", json={"paths": [str(tf / ".goose")]}, headers=h).json()
+        assert j["failed"][0]["error"] == "agents_folder_refused"
+    assert sorted(os.listdir(tf)) == [".goose", "sub", "x.txt"] and os.listdir(tf / ".goose") == ["memory"]
+    with client_for(c) as tc:      # an administrator may
+        h = sign_in(tc, c, admin)
+        assert tc.post("/api/files/mkdir", json={"path": str(tf), "name": ".claude"}, headers=h).status_code == 200
+
+
+def test_f5a_a_folder_upload_changed_on_the_server_while_it_arrived_is_not_kept(env):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    data = os.urandom(30_000)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        k = tc.post("/api/fs/uploads", json={"dir": str(tf), "name": "ev.bin", "size": len(data), "target": "folder"},
+                    headers=h).json()
+        assert put(tc, h, k["id"], 0, data[:10_000]).status_code == 200
+        part = next(tf.glob(uploads.PARTIAL_PREFIX + "*"))
+        with open(part, "r+b") as f:        # a teammate's agent writes into the hidden partial file
+            f.write(b"EVILAA")
+        assert put(tc, h, k["id"], 10_000, data[10_000:20_000]).status_code == 200
+        r = put(tc, h, k["id"], 20_000, data[20_000:])
+    assert r.status_code == 409 and r.json()["error"] == "upload_changed", r.text
+    assert not (tf / "ev.bin").exists() and not list(tf.glob(uploads.PARTIAL_PREFIX + "*"))
+    row = db.one("SELECT state, sha256 FROM uploads WHERE id=?", (uploads._key(k["id"]),))
+    assert row["state"] == "aborted" and row["sha256"] == ""
+    a = audits(db, "files.upload")
+    assert len(a) == 1 and a[0]["ok"] == 0
+    assert a[0]["detail"]["sha256Received"] == sha(data) and a[0]["detail"]["sha256OnDisk"] == sha(b"EVILAA" + data[6:])
+
+
+def test_f5b_a_stored_sha256_is_shown_only_for_the_unchanged_file_and_says_where_it_comes_from(env):
+    s, db, pr, c = env
+    dee, ann, tid, tf = crew(env)
+    data = b"evidence " * 1000
+    with client_for(c) as td, client_for(c) as ta:
+        hd = sign_in(td, c, dee)
+        ha = sign_in(ta, c, ann)
+        p = Path(upload(td, hd, tf, "e.bin", data)["file"]["path"])
+        i = ta.get("/api/files/info", params={"path": str(p)}).json()
+        assert i["sha256"] == sha(data) and i["sha256Source"] == "upload" and i["recordedAt"] == i["uploadedAt"]
+        e = {x["name"]: x for x in ta.get("/api/files/list", params={"path": str(tf)}).json()["entries"]}["e.bin"]
+        assert e["sha256"] == sha(data) and e["sha256Source"] == "upload" and "mtime_ns" not in e
+        j = ta.post("/api/files/hash", json={"path": str(p)}, headers=ha).json()
+        assert j["sha256"] == sha(data) and j["cached"] is True and j["sha256Source"] == "upload"
+        # changed in place, same size, its modification time set back near the upload's: not shown any more
+        st = os.stat(p)
+        with open(p, "r+b") as f:
+            f.write(b"EVIDENCE")
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 500_000_000))
+        i = ta.get("/api/files/info", params={"path": str(p)}).json()
+        assert "sha256" not in i and "sha256Source" not in i and i["uploadedBy"] == "dee"
+        j = ta.post("/api/files/hash", json={"path": str(p)}, headers=ha).json()
+        assert j["sha256"] == sha(b"EVIDENCE" + data[8:]) and j["cached"] is False and j["sha256Source"] == "computed"
+        assert abs(j["recordedAt"] - __import__("time").time()) < 60
+        i = ta.get("/api/files/info", params={"path": str(p)}).json()
+        assert i["sha256"] == j["sha256"] and i["sha256Source"] == "computed" and i["recordedAt"] == j["recordedAt"]
+
+
+def test_f5c_a_download_is_audited_with_the_sha256_of_the_bytes_sent(env):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    f = tf / "x.bin"
+    f.write_bytes(b"A" * 5000)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        assert tc.post("/api/files/hash", json={"path": str(f)}, headers=h).json()["sha256"] == sha(b"A" * 5000)
+        st = os.stat(f)
+        with open(f, "r+b") as fh:       # changed in place; size and modification time as they were
+            fh.write(b"B" * 10)
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+        r = tc.get("/api/files/download", params={"path": str(f)})
+        assert r.status_code == 200 and r.content == b"B" * 10 + b"A" * 4990
+        assert tc.head("/api/files/download", params={"path": str(f)}).status_code == 200
+        r2 = tc.get("/api/files/download", params={"path": str(f)}, headers={"Range": "bytes=0-9"})
+        assert r2.status_code == 206 and r2.content == b"B" * 10
+    rows = audits(db, "files.download")
+    assert len(rows) == 2, [x["detail"] for x in rows]          # HEAD sends nothing and records nothing
+    assert rows[0]["detail"] == {"size": 5000, "sha256": sha(r.content)}
+    assert "sha256" not in rows[1]["detail"] and rows[1]["detail"]["range"] == "bytes=0-9"
+    assert rows[1]["detail"]["sha256Omitted"]
+
+
+def test_f6_a_switch_override_must_be_a_real_boolean(env):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    set_policy(db, tid, files=False, files_manage=False)
+    admin = user(db, "root", role="admin")
+    with client_for(c) as tc:
+        h = sign_in(tc, c, admin)
+        for bad in ("false", "off", "0", 0, 1, None):
+            r = tc.patch(f"/api/admin/users/{dee['id']}", json={"policyOverrides": {"files": bad}}, headers=h)
+            assert r.status_code == 400 and r.json()["error"] == "bad_request", (bad, r.text)
+        assert db.user_by_id(dee["id"])["policy_overrides"] in (None, {})
+        r = tc.patch(f"/api/admin/users/{dee['id']}", json={"policyOverrides": {"files": False}}, headers=h)
+        assert r.status_code == 200
+    db.update_user(dee["id"], policy_overrides={"files": "false", "files_manage": "on", "schedules": 1})
+    eff = c.policy_for(db.user_by_id(dee["id"]))
+    assert eff["files"] is False and eff["files_manage"] is False and eff["schedules"] is False
+    with client_for(c) as td:
+        sign_in(td, c, dee)
+        assert td.get("/api/files/locations").status_code == 403
+    db.update_user(dee["id"], policy_overrides={"files": True, "files_manage": True})
+    eff = c.policy_for(db.user_by_id(dee["id"]))
+    assert eff["files"] is True and eff["files_manage"] is True

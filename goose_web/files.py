@@ -42,6 +42,7 @@ import stat
 import sys
 import time
 import weakref
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,11 @@ ID_RE = re.compile(r"^[0-9a-f]{20}$")
 FILES_OFF = "Files is not enabled for your team. Ask your administrator."
 MANAGE_OFF = "Your team may not rename, move or delete files. Ask your administrator."
 NOT_FOUND = "Not found"
+CHANGED = ("The item or one of its folders changed while it was being moved (a link put in its place?); nothing was "
+           "moved.")
+HAS_LINK = ("This folder holds a link (a junction or a symbolic link), so it is not copied to another drive; nothing "
+            "was moved. Move it on the server.")
+COPY_BLOCK = 1024 * 1024
 IMAGE_TYPES = {"PNG image": "image/png", "JPEG image": "image/jpeg", "GIF image": "image/gif",
                "WebP image": "image/webp"}
 
@@ -507,68 +513,422 @@ def _remove_tree(p: Any) -> None:
         shutil.rmtree(p, onerror=_clear_readonly)
 
 
-def _move_item(src: Path, dst: Path) -> None:
-    """Move a file or folder to `dst`, which must not exist: a rename on the same volume; across volumes a copy under
-    a hidden temporary name next to `dst`, renamed to `dst`, then the original is deleted. Blocking."""
-    try:
-        _rename_noreplace(src, dst)
-        return
-    except OSError as e:
-        if not _cross_device(e):
-            raise
-    if os.path.lexists(dst):
-        raise FileExistsError(errno.EEXIST, "File exists", str(dst))
-    tmp = dst.parent / f"{MOVE_PREFIX}{secrets.token_hex(8)}"
+def _is_link_entry(st) -> bool:
+    """A link no walk enters and no copy takes: a symbolic link, a junction or a mount point (a name-surrogate
+    reparse point; a reparse point of unknown kind counts as one). Other reparse points - deduplicated or cloud
+    files - are ordinary data."""
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    if getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        tag = getattr(st, "st_reparse_tag", 0)
+        return not tag or bool(tag & 0x20000000)
+    return False
+
+
+def _walk(root: str):
+    """(folder, entry, its lstat) for everything below the folder `root`; never enters a link. Blocking."""
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                yield d, e, st
+                if stat.S_ISDIR(st.st_mode) and not _is_link_entry(st):
+                    stack.append(e.path)
+
+
+def _find_link(root: str) -> str | None:
+    """The first link (symbolic link, junction, mount point) inside the folder `root`, or None (assessment F-1)."""
+    for _, e, st in _walk(root):
+        if _is_link_entry(st):
+            return e.path
+    return None
+
+
+def _measure(p: Path) -> tuple[int, bool]:
+    """(bytes, is a folder) - a folder's files added up (at most SCAN_MAX entries looked at; links are not
+    entered)."""
+    st = os.lstat(p)
+    if not stat.S_ISDIR(st.st_mode) or is_link(st):
+        return st.st_size, False
+    total = seen = 0
+    for _, _, est in _walk(str(p)):
+        seen += 1
+        if seen > SCAN_MAX:
+            break
+        if not stat.S_ISDIR(est.st_mode):
+            total += est.st_size
+    return total, True
+
+
+# ---------------------------------------------------------------------- an item held while it moves (assessment F-1/F-2)
+class _Changed(Exception):
+    """The item, the folder it is in or the folder it goes to is not what was checked (a link or another item put in
+    its place)."""
+
+
+class _HasLink(Exception):
+    """A folder to be copied to another volume holds a link (junction, symbolic link, mount point)."""
+
+
+@dataclass(frozen=True)
+class _Pin:
+    """What was checked: the item's identity (volume:file index; '' when the file system has none) and - resolved,
+    normcase - the folder it is in and the folder it goes to."""
+    ident: str
+    parent: str
+    dest: str
+
+
+def _pin(c, u: dict, src: Path, dest_dir: Any, dest_real: str = "") -> _Pin:
+    """Taken right after the checks of a rename / move / delete / restore: the item's identity and both folders as
+    they resolve now, each resolved folder checked once more - a link swapped in before this point is refused here;
+    one swapped in later is found by _move_item, which holds the item and both folders while it moves the item."""
     try:
         st = os.lstat(src)
-        if stat.S_ISDIR(st.st_mode) and not is_link(st):
-            shutil.copytree(src, tmp, symlinks=True)
+    except OSError:
+        raise HTTPError(404, "not_found", NOT_FOUND)
+    parent, dest = _real(src.parent), dest_real or _real(dest_dir)
+    if not (parent and dest and c.path_ok(u, parent, write=True) and c.path_ok(u, dest, write=True)):
+        raise HTTPError(403, "denied", CHANGED)
+    return _Pin(file_ident(st), parent, dest)
+
+
+# Windows: the item and both folders are held open (CreateFileW) while the item moves. A handle with data or delete
+# access that does not share delete keeps anyone from renaming or deleting that item; any open handle keeps the folders
+# above it from being renamed (NTFS) - so no path the move uses can be swapped for a link while it runs.
+_GENERIC_READ, _DELETE, _LIST_DIRECTORY = 0x80000000, 0x00010000, 0x00000001
+_READ_ATTRIBUTES, _SYNCHRONIZE = 0x00000080, 0x00100000
+_SHARE_READ_WRITE = 0x1 | 0x2       # never FILE_SHARE_DELETE
+_WIN: Any = None
+
+
+def _win():
+    global _WIN
+    if _WIN is None:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateFileW.restype = wintypes.HANDLE
+        k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                  wintypes.DWORD, wintypes.HANDLE]
+        k.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        k.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+        k.SetFileInformationByHandle.restype = wintypes.BOOL
+        k.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        _WIN = (ctypes, msvcrt, wintypes, k)
+    return _WIN
+
+
+def _hopen(path: Any, access: int, follow: bool) -> int:
+    """A handle on `path` as a file descriptor (os.close closes it). `follow`: what a link leads to; else the link
+    itself. Shared for reading and writing, never for deleting."""
+    ctypes, msvcrt, wintypes, k = _win()
+    flags = 0x02000000 | (0 if follow else 0x00200000)   # FILE_FLAG_BACKUP_SEMANTICS (folders), _OPEN_REPARSE_POINT
+    h = k.CreateFileW(str(path), access | _READ_ATTRIBUTES | _SYNCHRONIZE, _SHARE_READ_WRITE, None, 3, flags, None)
+    if h is None or h == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return msvcrt.open_osfhandle(h, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except BaseException:
+        k.CloseHandle(h)
+        raise
+
+
+def _hpath(fd: int) -> str:
+    """Where the held item is now, as the file system resolves it (without the \\\\?\\ prefix)."""
+    ctypes, msvcrt, wintypes, k = _win()
+    h = msvcrt.get_osfhandle(fd)
+    n = 520
+    while True:
+        buf = ctypes.create_unicode_buffer(n)
+        r = k.GetFinalPathNameByHandleW(h, buf, n, 0)
+        if not r:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if r < n:
+            break
+        n = r + 1
+    p = buf.value
+    if p.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + p[8:]
+    return p[4:] if p.startswith("\\\\?\\") else p
+
+
+def _hrename(fd: int, dst: str) -> None:
+    """Rename the held item to `dst` (a full path) - FileRenameInfo, never replacing anything."""
+    ctypes, msvcrt, wintypes, k = _win()
+    n = len(dst)
+
+    class _RenameInfo(ctypes.Structure):
+        _fields_ = [("replace", wintypes.DWORD), ("root", wintypes.HANDLE), ("length", wintypes.DWORD),
+                    ("name", wintypes.WCHAR * (n + 1))]
+    info = _RenameInfo(0, None, n * 2, dst)
+    if not k.SetFileInformationByHandle(msvcrt.get_osfhandle(fd), 3, ctypes.byref(info), ctypes.sizeof(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _rename_item(fd: int, dst: str) -> None:
+    """The move itself (on the same volume); fails with ERROR_NOT_SAME_DEVICE across volumes."""
+    _hrename(fd, dst)
+
+
+def _hdelete(fd: int) -> None:
+    """Delete the held item (a read-only file too; a link itself, never what it leads to)."""
+    ctypes, msvcrt, wintypes, k = _win()
+    h = msvcrt.get_osfhandle(fd)
+    for flags in (0x13, 0x11):     # FileDispositionInfoEx: DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE
+        v = wintypes.DWORD(flags)
+        if k.SetFileInformationByHandle(h, 21, ctypes.byref(v), ctypes.sizeof(v)):
+            return
+    one = ctypes.c_ubyte(1)        # FileDispositionInfo (older Windows)
+    if not k.SetFileInformationByHandle(h, 4, ctypes.byref(one), 1):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _held(fd: int, pin: _Pin) -> str:
+    """The held item's path, once it was found to be the item that was checked, in the folder that was checked."""
+    path = _hpath(fd)
+    if (pin.ident and file_ident(os.fstat(fd)) != pin.ident) or os.path.normcase(os.path.dirname(path)) != pin.parent:
+        raise _Changed(path)
+    return path
+
+
+def _hold_dir(path: Any, want: str, access: int = _LIST_DIRECTORY) -> int:
+    """A folder held open while things move into it - after it was found to resolve to `want` (normcase)."""
+    fd = _hopen(path, access, follow=True)
+    try:
+        if os.path.normcase(_hpath(fd)) != want or not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise _Changed(str(path))
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _landed(fd: int, dest: str) -> bool:
+    return os.path.normcase(os.path.dirname(_hpath(fd))) == dest
+
+
+def _move_item(src: Path, dst: Path, pin: _Pin) -> list[str]:
+    """Move a file or folder to `dst`, which must not exist (nothing is ever replaced) - the item that was checked,
+    from the folder that was checked into the folder that was checked: all three are held open meanwhile, and a swap
+    of any of them (for a link or another item) raises _Changed with nothing moved (assessment F-2). On the same volume
+    a rename; across volumes a copy under a hidden name next to `dst`, renamed to `dst`, then the original is deleted -
+    a folder holding a link raises _HasLink before anything is copied (F-1). Returns what of the original could not be
+    deleted (across volumes: the copy is in place all the same, F-10). Blocking."""
+    if os.name != "nt":
+        return _move_item_posix(src, dst, pin)
+    fd = _hopen(src, _DELETE, follow=False)
+    try:
+        dfd = _hold_dir(dst.parent, pin.dest)
+        try:
+            origin = _held(fd, pin)
+            target = os.path.join(_hpath(dfd), dst.name)
+            try:
+                _rename_item(fd, target)
+            except OSError as e:
+                if not _cross_device(e):
+                    raise
+            else:
+                if not _landed(fd, pin.dest):      # cannot happen while the folder is held; never left elsewhere
+                    _hrename(fd, origin)
+                    raise _Changed(target)
+                return []
+            os.close(fd)            # across volumes: the item is read as well - held again, looked at again
+            fd = -1
+            fd = _hopen(origin, _DELETE | _GENERIC_READ, follow=False)
+            origin = _held(fd, pin)
+            return _copy_across(fd, origin, dfd, dst.name)
+        finally:
+            os.close(dfd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _copy_across(fd: int, origin: str, dfd: int, name: str) -> list[str]:
+    """The held item `origin` copied into the held folder `dfd` as `name` (through a hidden temporary name), then
+    deleted. Blocking."""
+    st = os.fstat(fd)
+    if is_link(st):
+        raise _HasLink(origin)          # a link (or another reparse point) itself is not copied to another volume
+    is_dir = stat.S_ISDIR(st.st_mode)
+    if is_dir:
+        found = _find_link(origin)
+        if found:
+            raise _HasLink(found)
+    dest_dir = _hpath(dfd)
+    tmp = os.path.join(dest_dir, f"{MOVE_PREFIX}{secrets.token_hex(8)}")
+    try:
+        if is_dir:
+            _copy_dir(origin, tmp, st)
         else:
-            shutil.copy2(src, tmp, follow_symlinks=False)
-        _rename_noreplace(tmp, dst)
+            _copy_file(fd, st, tmp)
+        tfd = _hopen(tmp, _DELETE, follow=False)
+        try:
+            if os.path.normcase(_hpath(tfd)) != os.path.normcase(tmp) or is_link(os.fstat(tfd)):
+                raise _Changed(tmp)
+            _hrename(tfd, os.path.join(dest_dir, name))
+        finally:
+            os.close(tfd)
     except BaseException:
         try:
             _remove_tree(tmp)
         except OSError:
             log.warning("files: the temporary copy %s could not be removed", tmp)
         raise
-    _remove_tree(src)
+    left = _delete_entries(origin) if is_dir else []
+    if not left:
+        try:
+            _hdelete(fd)
+        except OSError:
+            left.append(origin)
+    return left
 
 
-async def _move_checked(c, u: dict, src: Path, dst: Path, real_parent: str) -> None:
-    """_move_item in a thread, then the item is looked at where it landed: its folder must still resolve to
-    `real_parent` (resolved when it was checked) and be writable for the person. A folder swapped for a link
-    meanwhile (by the person's agent, say) does not take the item elsewhere: it is moved back and refused."""
+def _copy_file(sfd: int, st, dst: str) -> None:
+    """The held file `sfd` copied to the new file `dst` (its times and read-only flag too). Blocking."""
+    os.lseek(sfd, 0, os.SEEK_SET)
+    out = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0))
     try:
-        await asyncio.to_thread(_move_item, src, dst)
+        while chunk := os.read(sfd, COPY_BLOCK):
+            view = memoryview(chunk)
+            while len(view):
+                view = view[os.write(out, view):]
+    finally:
+        os.close(out)
+    os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+    if not st.st_mode & stat.S_IWRITE:
+        os.chmod(dst, stat.S_IREAD)
+
+
+def _copy_dir(src: str, dst: str, st) -> None:
+    """The held folder `src` copied into the new folder `dst`, entry by entry: each one opened, found to be right
+    there (not a link leading elsewhere: _HasLink) and held while it is copied; `dst` is held while it fills."""
+    os.mkdir(dst)
+    dfd = _hopen(dst, _LIST_DIRECTORY, follow=False)
+    try:
+        if os.path.normcase(_hpath(dfd)) != os.path.normcase(dst) or is_link(os.fstat(dfd)):
+            raise _Changed(dst)
+        with os.scandir(src) as it:
+            names = [e.name for e in it]
+        for nm in names:
+            sp = os.path.join(src, nm)
+            try:
+                cfd = _hopen(sp, _GENERIC_READ, follow=True)
+            except OSError:
+                if os.path.lexists(sp) and _is_link_entry(os.lstat(sp)):
+                    raise _HasLink(sp)
+                raise
+            try:
+                if os.path.normcase(_hpath(cfd)) != os.path.normcase(sp):
+                    raise _HasLink(sp)
+                cst = os.fstat(cfd)
+                if stat.S_ISDIR(cst.st_mode):
+                    _copy_dir(sp, os.path.join(dst, nm), cst)
+                else:
+                    _copy_file(cfd, cst, os.path.join(dst, nm))
+            finally:
+                os.close(cfd)
+        os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+    finally:
+        os.close(dfd)
+
+
+def _delete_entries(d: str) -> list[str]:
+    """Everything in the held folder `d` deleted, entry by entry: each one opened without following a link, found to
+    be right there and deleted through its handle (a link: the link itself). Returns what could not be deleted."""
+    left: list[str] = []
+    try:
+        with os.scandir(d) as it:
+            names = [e.name for e in it]
+    except OSError:
+        return [d]
+    for nm in names:
+        p = os.path.join(d, nm)
+        try:
+            cfd = _hopen(p, _DELETE, follow=False)
+        except OSError:
+            left.append(p)
+            continue
+        try:
+            cst = os.fstat(cfd)
+            if os.path.normcase(_hpath(cfd)) != os.path.normcase(p):
+                left.append(p)
+                continue
+            sub = _delete_entries(p) if stat.S_ISDIR(cst.st_mode) and not is_link(cst) else []
+            if sub:
+                left += sub
+                continue
+            _hdelete(cfd)
+        except OSError:
+            left.append(p)
+        finally:
+            os.close(cfd)
+    return left
+
+
+def _move_item_posix(src: Path, dst: Path, pin: _Pin) -> list[str]:
+    """_move_item where items cannot be held open by handle: looked at before and after, put back on a mismatch."""
+    st = os.lstat(src)
+    if (pin.ident and file_ident(st) != pin.ident) or _real(src.parent) != pin.parent or \
+            _real(dst.parent) != pin.dest:
+        raise _Changed(str(src))
+    try:
+        _rename_noreplace(src, dst)
+    except OSError as e:
+        if not _cross_device(e):
+            raise
+        if os.path.lexists(dst):
+            raise FileExistsError(errno.EEXIST, "File exists", str(dst))
+        is_dir = stat.S_ISDIR(st.st_mode) and not is_link(st)
+        found = str(src) if is_link(st) else _find_link(str(src)) if is_dir else None
+        if found:
+            raise _HasLink(found)
+        tmp = dst.parent / f"{MOVE_PREFIX}{secrets.token_hex(8)}"
+        try:
+            if is_dir:
+                shutil.copytree(src, tmp, symlinks=True)
+            else:
+                shutil.copy2(src, tmp, follow_symlinks=False)
+            _rename_noreplace(tmp, dst)
+        except BaseException:
+            _remove_tree(tmp)
+            raise
+        try:
+            _remove_tree(src)
+        except OSError:
+            return [str(src)]
+        return []
+    if (pin.ident and file_ident(os.lstat(dst)) != pin.ident) or _real(dst.parent) != pin.dest:
+        _rename_noreplace(dst, src)
+        raise _Changed(str(dst))
+    return []
+
+
+async def _move_pinned(c, u: dict, src: Path, dst: Path, pin: _Pin) -> list[str]:
+    """_move_item in a thread, its refusals as answers: 403 denied when the item or a folder changed meanwhile, 409
+    has_link for a folder with a link that would be copied to another volume."""
+    try:
+        return await asyncio.to_thread(_move_item, src, dst, pin)
+    except _HasLink as e:
+        log.warning("files: %s holds a link (%s); %s's move to another volume was refused", src, e, u["username"])
+        raise HTTPError(409, "has_link", HAS_LINK)
+    except _Changed as e:
+        log.warning("files: %s changed while %s moved it (%s); nothing was moved", src, u["username"], e)
+        raise HTTPError(403, "denied", CHANGED)
     except OSError as e:
         raise _os_error(e)
-    if _real(dst.parent) == real_parent and c.path_ok(u, str(dst.parent), write=True):
-        return
-    log.warning("files: %s changed while %s moved %s there; the item is put back", dst.parent, u["username"], src)
-    try:
-        await asyncio.to_thread(_move_item, dst, src)
-    except OSError:
-        log.error("files: %s could not be put back from %s", src, dst, exc_info=True)
-    raise HTTPError(403, "denied", "The folder changed while the item was being moved; nothing was moved.")
-
-
-def _measure(p: Path) -> tuple[int, bool]:
-    """(bytes, is a folder) - a folder's files added up (at most SCAN_MAX entries looked at)."""
-    st = os.lstat(p)
-    if not stat.S_ISDIR(st.st_mode) or is_link(st):
-        return st.st_size, False
-    total = seen = 0
-    for root, dirs, names in os.walk(p):
-        for nm in names:
-            seen += 1
-            if seen > SCAN_MAX:
-                return total, True
-            try:
-                total += os.lstat(os.path.join(root, nm)).st_size
-            except OSError:
-                continue
-    return total, True
 
 
 def _os_error(e: OSError, what: str = "") -> HTTPError:
@@ -859,14 +1219,7 @@ async def rename_route(request: Request):
         return api.ok({"path": str(src)})
     if os.path.lexists(dst) and os.path.normcase(str(dst)) != os.path.normcase(str(src)):
         raise HTTPError(409, "exists", f"'{name}' already exists in this folder; nothing was replaced.")
-    real_parent = _real(src.parent)
-    try:
-        await asyncio.to_thread(_rename_noreplace, src, dst)
-    except OSError as e:
-        raise _os_error(e)
-    if _real(dst.parent) != real_parent or not c.path_ok(u, str(dst.parent), write=True):
-        await asyncio.to_thread(_rename_noreplace, dst, src)     # swapped for a link meanwhile: put back
-        raise HTTPError(403, "denied", "The folder changed while the item was being renamed; nothing was renamed.")
+    await _move_pinned(c, u, src, dst, _pin(c, u, src, src.parent))
     _repath(c, src, dst)
     c.audit(request, "files.rename", u, target=str(dst), detail={"from": str(src), "to": str(dst)})
     return api.ok({"path": str(dst)})
@@ -892,7 +1245,6 @@ async def move_route(request: Request):
     if not await asyncio.to_thread(to.is_dir):
         raise HTTPError(404, "not_found", "Folder not found")
     tops = await asyncio.to_thread(_tops, c, u, policy)
-    real_to = _real(to)
     moved: list[dict] = []
     failed: list[dict] = []
     for raw in paths:
@@ -912,18 +1264,24 @@ async def move_route(request: Request):
                 raise HTTPError(400, "bad_request", "A folder cannot be moved into itself or one of its folders.")
             if os.path.lexists(dst):
                 raise HTTPError(409, "exists", f"'{src.name}' already exists there; nothing was replaced.")
-            await _move_checked(c, u, src, dst, real_to)
+            left = await _move_pinned(c, u, src, dst, _pin(c, u, src, to))
             _repath(c, src, dst)
-            c.audit(request, "files.move", u, target=str(dst), detail={"from": str(src), "to": str(dst)})
-            moved.append({"from": str(src), "to": str(dst)})
+            detail: dict[str, Any] = {"from": str(src), "to": str(dst)}
+            item = {"from": str(src), "to": str(dst)}
+            if left:      # F-10: across volumes the copy is in place; what of the original could not be deleted stays
+                detail["sourceLeft"] = left[:50]
+                item["warning"] = (f"Moved, but {len(left)} item(s) of the original could not be deleted (in use or "
+                                   "access denied); they are still in the old place.")
+            c.audit(request, "files.move", u, target=str(dst), detail=detail)
+            moved.append(item)
         except HTTPError as e:
             failed.append(_failed(raw, e))
     return api.ok({"moved": moved, "failed": failed})
 
 
-def _recycle_slot(loc: Path, rid: str) -> Path:
+def _recycle_slot(loc: Path, rid: str) -> tuple[Path, str]:
     """<location>\\.goose-web-recycle\\<id>, made (the recycle folder hidden) and checked: a real folder, right in the
-    location (never a link that leads elsewhere). Blocking."""
+    location (never a link that leads elsewhere). Returns the slot and where it resolves to. Blocking."""
     rec = loc / RECYCLE_DIR
     try:
         os.mkdir(rec)
@@ -936,7 +1294,7 @@ def _recycle_slot(loc: Path, rid: str) -> Path:
     _set_hidden(rec, True)
     slot = rec / rid
     os.mkdir(slot)
-    return slot
+    return slot, os.path.join(_real(rec), rid)
 
 
 async def delete_route(request: Request):
@@ -956,25 +1314,29 @@ async def delete_route(request: Request):
             if loc is None:
                 raise HTTPError(403, "denied", "This item is in none of your locations.")
             _check(c, u, loc, write=True)
+            rid = secrets.token_hex(10)
             try:
-                size, is_dir = await asyncio.to_thread(_measure, src)
-                sha = "" if is_dir else await asyncio.to_thread(known_sha256, c, src)
-                rid = secrets.token_hex(10)
-                slot = await asyncio.to_thread(_recycle_slot, Path(loc), rid)
+                slot, slot_real = await asyncio.to_thread(_recycle_slot, Path(loc), rid)
             except OSError as e:
                 raise _os_error(e)
             dst = slot / src.name
             try:
-                await _move_checked(c, u, src, dst, _real(slot))
+                await _move_pinned(c, u, src, dst, _pin(c, u, src, slot, slot_real))
             except HTTPError:
                 await asyncio.to_thread(_remove_empty, slot)
                 raise
+            _repath(c, src, dst)
+            # F-2: measured where it is now - the item that really moved, in its recycle slot
+            try:
+                size, is_dir = await asyncio.to_thread(_measure, dst)
+            except OSError:
+                size, is_dir = 0, False
+            sha = "" if is_dir else await asyncio.to_thread(known_sha256, c, dst)
             now = time.time()
             c.db.execute("INSERT INTO file_recycle(id, location, original_path, recycle_path, name, is_dir, size, "
                          "sha256, deleted_by, deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                          (rid, str(loc), str(src), str(dst), src.name, 1 if is_dir else 0, size, sha, u["username"],
                           now))
-            _repath(c, src, dst)
             detail: dict[str, Any] = {"id": rid, "size": size, "dir": is_dir}
             if sha:
                 detail["sha256"] = sha
@@ -1059,7 +1421,7 @@ async def restore_route(request: Request):
     if not c.path_ok(u, str(parent), write=True):
         raise HTTPError(403, "denied", "The original folder changed; the item is not restored.")
     dst = await asyncio.to_thread(_free_name, orig, bool(r["is_dir"]))
-    await _move_checked(c, u, src, dst, _real(parent))
+    await _move_pinned(c, u, src, dst, _pin(c, u, src, parent))
     await asyncio.to_thread(_remove_empty, src.parent)
     c.db.execute("DELETE FROM file_recycle WHERE id=?", (rid,))
     _repath(c, src, dst)
