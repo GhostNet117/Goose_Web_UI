@@ -116,7 +116,7 @@ The main ideas:
 | `__init__.py` | Package version. |
 | `__main__.py` | CLI: `python -m goose_web [--config FILE] serve|init|user|check|gateway|version`. Logging setup, first-run initialisation (database, native root, first admin, `Everyone` team), user management, environment checks, `uvicorn.run`. |
 | `config.py` | `Settings`: built-in defaults, then `config.yaml`, then `GOOSE_WEB__SECTION__KEY` environment variables. Goose binary auto-detection, default native Goose root. |
-| `app.py` | ASGI app factory `create_app`: middleware (`SecurityHeaders`, `GZipMiddleware`, `HostGuard`, `IPBlockGuard`), static and SPA routes, `/ws` endpoint, lifespan, webhook SSRF guard and sender, event/audit handlers wired into the hub. |
+| `app.py` | ASGI app factory `create_app`: middleware (`SecurityHeaders`, `GZipExceptDownloads` - `GZipMiddleware` but for the two download routes -, `HostGuard`, `IPBlockGuard`), static and SPA routes, `/ws` endpoint, lifespan, webhook SSRF guard and sender, event/audit handlers wired into the hub. |
 | `context.py` | `Ctx` (shared services), `HTTPError`, request helpers: identity resolution, `require()` (auth, CSRF, origin, role), allowed origins, client IP, policy and roots for a user, `upstream_for(user)`, `body_json`. |
 | `api.py` | All REST handlers and the `routes` list: auth, current user, preferences, TOTP, API tokens, hints, notifications, file system, MCP App frames, herd, and every `/api/admin/*` endpoint. |
 | `uploads.py` | Spec 039: chunked, resumable uploads (`/api/fs/uploads`, section [12.7](#127-uploads-and-downloads)): the upload limit (Admin > Settings over `server.max_upload_mb`, 1..5120 MB; `limit_mb` for `app.BodyLimit`), start / piece / status / cancel, the hidden partial file and its identity checks, the never-replacing rename, `record_saved` (the single-request upload's files), `cleanup` (partial files idle 24 h), `POST /api/fs/uploads/link` (spec 040). |
@@ -437,11 +437,14 @@ headers are handled by the gateway's own trusted-proxy logic),
 ### 5.1 Middleware order
 
 ```
-request -> SecurityHeaders -> GZipMiddleware(min 1024 B, level 5) -> HostGuard -> IPBlockGuard -> router
+request -> SecurityHeaders -> GZipExceptDownloads(min 1024 B, level 5) -> HostGuard -> IPBlockGuard -> router
 ```
 
 `HostGuard` and `IPBlockGuard` are the innermost middleware, so their `400 invalid host` and
 `403 ip_blocked` responses still pass through `SecurityHeaders`.
+
+`GZipExceptDownloads` (1.28.0) is `GZipMiddleware` for every answer except `/api/files/download` and
+`/api/fs/download`: a file download keeps its `Content-Length` and is never compressed on the gateway.
 
 **IPBlockGuard.** For HTTP and WebSocket scopes (except `GET`/`HEAD /healthz`) it takes the context from
 `scope["app"].state.ctx`, computes `Ctx.client_ip` on an `HTTPConnection` and asks
@@ -712,6 +715,8 @@ covers the full rules. In short:
 - For other users:
   - `cwd`/`additionalDirectories` on session new, load, fork and resume, and
     `session/working-dir/update`, must be inside the user's roots.
+  - For everyone (1.28.0): `additionalDirectories` is a list of at most 32 (`MAX_EXTRA_DIRS`), and a path
+    longer than 4,096 characters or with more than 128 levels (`path_too_long`) is never resolved.
   - Modes, providers and models must be on the allow-lists.
   - A fixed `ALWAYS` set of read and session methods is allowed.
   - Other methods need the matching permission (`BY_PERMISSION`).
@@ -1872,6 +1877,10 @@ denied with "method not available to your account". Extra argument checks:
 **Path checks** (`path_allowed(path, roots)`):
 
 - The path must be absolute, non-empty and contain no NUL.
+- A path longer than `MAX_PATH_CHARS` (4,096) or with more than `MAX_PATH_PARTS` (128) separators
+  (`path_too_long`) is refused before anything resolves it: `_real` gives None, `path_allowed` False,
+  `has_agents_component` and `project_plugins` fail closed, `api._check_path` answers `400 bad_path`
+  (1.28.0; `realpath` walks a long missing path part by part, on the event loop).
 - It must be inside a root both lexically (`normpath`/`abspath`) and after
   resolving symlinks and junctions (`realpath`).
 - Comparison is case-insensitive on Windows.
@@ -2020,7 +2029,7 @@ and are audited (`files.download`, `files.read`).
   and path). `GET /api/files/activity` shows the successful rows of a folder and everything in it (and moves out
   of it).
 - **Load.** `heavy()`: SHA-256 computations, moves and the final read of an upload run in a pool of
-  `HEAVY_THREADS` (4) threads of their own, at most `HEAVY_PER_PERSON` (2) of them per person at a time (a semaphore
+  `HEAVY_THREADS` (8) threads of their own, at most `HEAVY_PER_PERSON` (2) of them per person at a time (a semaphore
   per person and event loop, given back when the thread has finished - not when the request went away); `_limited` allows a person 2 move/delete requests and 2 previews at a
   time (`429 busy`).
 

@@ -926,8 +926,11 @@ With the team switch **Rename, move and delete files**, in a folder you may chan
 existing name), **Move...** (to a folder you may change; never into the moved folder itself) and **Delete...**
 (asks first). Use them in the details, or tick several items and use the bar above the list. The top folder of a
 location (yours, or another team's that lies inside your folder) cannot be renamed, moved or deleted, nor a folder
-that holds one, Goose hints files or a `.agents` folder. Moving a folder to another drive is refused when it holds
-a link (a junction); if part of the original cannot be removed after such a move (a file in use), you are told.
+that holds one. Neither can Goose hints files, `.agents`, `.goose` and `.claude` folders, nor a folder that holds
+any of these - Goose reads its settings from them, so ask your administrator (such a folder may also hold the
+memories Goose keeps for chats started there), nor a folder with a part Goose Web cannot read. Moving a folder to another drive is refused when it holds a
+link (a junction); if part of the original cannot be removed after such a move, delete or restore (a file in
+use), you are told.
 
 A delete moves the item into the location's hidden recycle folder. The message that follows offers **Undo**; later
 the **Recycle bin** lists what was deleted in this location (by anyone), with **Restore**: the item goes back to its

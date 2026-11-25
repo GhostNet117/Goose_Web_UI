@@ -2234,7 +2234,7 @@ refused.
 **Using a run.** Goose creates runs in the Auto approval mode; in a team that does not allow Auto, the member picks
 an allowed mode in the chat header before continuing the run (the prompt check of 23.2 refuses it until then, S-8).
 
-**Independent review (2026-11-25, before release, read-only, Claude-based reviewer separate from the author).**
+**Independent review (2026-11-25, before release, read-only, by a separate AI agent, not the one that wrote the changes).**
 Verdict "ship after fixes"; findings S-1 (Medium: the plugin rule did not cover the new start folder; no exploit
 found) and S-2 to S-8 (Low/Info: the cache race of two tabs, a check that could start a stopped worker, the
 residual, a slow scheduler, test strength, what else follows the worker's folder, the approval mode). All fixed or
@@ -2254,8 +2254,8 @@ download them, see their SHA-256, preview text and common images, hand a file to
 incident's captures, logs and exports - in its team folder, where the audit of who uploaded, downloaded or changed
 what serves as a chain of custody. Built in two packages (server, browser), merged into a release candidate
 (`a4f31a0`), assessed independently before release (24.3), corrected after that assessment (commits `cb0957e` to
-`3cf2842`), and the fixes reviewed again (24.4). Sections 24.1 and 24.2 describe the feature as released, including
-what the assessment changed.
+`3cf2842`), and the fixes reviewed three more times, with a browser test between, and corrected each time (`e249652` to
+`f7b1ed0`, 24.4). Sections 24.1 and 24.2 describe the feature as released, including what the reviews changed.
 
 ### 24.1 What the feature exposes, and to whom
 
@@ -2274,7 +2274,9 @@ what the assessment changed.
 - **Two switches.** `files` (the page and its API: browse, download, preview, SHA-256; upload and new folder where
   the person may write) and `files_manage` (rename, move, delete, restore; counts only with `files`). Both are in
   `BOOL_KEYS`, so per-person overrides apply; an override must be JSON `true` or `false` (400 otherwise) and a
-  stored one that is not `true` counts as off (F-6). Both are on for new teams (`NEW_TEAM_POLICY`) and were switched
+  stored one that is not `true` counts as off (F-6); a team switch - and a team's `require_totp` - is `true` or
+  `false`, `1` or `0`, `null` (off) or one of the words `true`, `on`, `yes`, `1`, `false`, `off`, `no`, `0`, `""`;
+  anything else is refused (`400 bad_value`, G-3, H-3). Both are on for new teams (`NEW_TEAM_POLICY`) and were switched
   on once for every existing team at the first start (`policy.apply_files_switches`, settings key
   `files_switches_applied`, each change audited `team.update` by the system); only keys a team does not have are
   added, so an explicit off stays off, even when the settings key is lost, and a team saved without the keys keeps
@@ -2329,7 +2331,9 @@ folder tree that already carries junctions) - a sandboxed agent cannot create a 
     (its final path is the expected one, so a link on the way is found) and is held while it is copied under a
     hidden `.goose-web-move-<hex>` name next to the target; a link item itself is never copied to another volume.
     The rename of the finished copy is the commit; the original is then deleted entry by entry through handles (a
-    link as a link), and what cannot be deleted is answered as a warning and audited (`sourceLeft`).
+    link as a link), and what cannot be deleted is answered as a warning and audited (`sourceLeft`) -
+    by a move, a delete and a restore (F-10, completed in `e249652`); a restore that leaves something keeps the
+    item in the bin, so the rest is purged with it.
   - *Uploads* keep the defences of spec 039 (23.6): the folder as written and as resolved at the start and before
     every piece, the partial file's identity, a final rename that never replaces, checked afterwards. A folder
     upload goes into the folder itself, which must exist (nothing is created on the way). *New folders* are checked
@@ -2356,13 +2360,15 @@ folder tree that already carries junctions) - a sandboxed agent cannot create a 
   stream names, 8.3 short names through the resolved path; `403 agents_folder_refused`) and the names of the hints
   files and `.gooseignore` (`403 hint_file_refused`). On the Files page members also cannot rename, move or delete
   such a file (also by its 8.3 short name) or anything in those folders, nor a folder that holds a hints file, a
-  `.gooseignore` or an `.agents` folder (a walk of at most 100,000 entries that enters no link; a larger folder is
-  refused). A member's agent that may write a folder (with Shell) can still write such files there, as before
+  `.gooseignore` or an `.agents`, `.goose` or `.claude` folder (G-2; a walk of at most 100,000 entries that enters
+  no link; a larger folder, or one with a part the walk cannot read, is refused: H-5). A member's agent that may write a folder (with Shell) can still write such files there, as before
   (spec 009, NEW-36).
 - **Content of downloads and previews.** Downloads (`/api/files/download`, `/api/fs/download`) are always
   `application/octet-stream` with `Content-Disposition: attachment` (RFC 5987 for odd names), the CSP
   `sandbox; default-src 'none'`, `nosniff` and `Cache-Control: no-store`; the page starts them as a plain
-  navigation, so a file is never loaded into the page (any size, resumable with `Range`). Text previews are JSON -
+  navigation, so a file is never loaded into the page (any size, resumable with `Range`). It goes out as it is: the two download
+  routes bypass the gateway's GZip middleware, so `Content-Length` is the file's size and the audit counts the
+  file's bytes (found in the browser test, 24.4). Text previews are JSON -
   the first 256 KB as UTF-8, or UTF-16 with a byte order mark, with replacement characters - which the page puts
   into a `<pre>` with `textContent`, never with `innerHTML` (a test checks `views/files.js` has none) or Markdown.
   An image is previewed only when its first bytes are PNG, JPEG, GIF or WebP, and sent with that type whatever its
@@ -2376,11 +2382,14 @@ folder tree that already carries junctions) - a sandboxed agent cannot create a 
 - **Resource limits** (F-12, F-13). A listing looks at 20,000 entries of a folder at most (`truncated`; a probe
   listed 21,000 files in 0.11 s) and pages of at most 500; a move or delete takes 200 paths at most; the recycle
   listing 1,000 items, the activity 200 rows. SHA-256 computations, moves and the final read of an upload run in
-  four threads of their own, not in the shared pool that sign-in, listings and upload writes use; per person at
-  most two SHA-256 computations, two move or delete requests and two previews at a time (`429 busy`), and one
+  eight threads of their own (H-4), not in the shared pool that sign-in, listings and upload writes use, and one person
+  holds at most two of them at a time, given back when the work has finished (G-1); per person at most two SHA-256
+  computations, two move or delete requests and two previews at a time (`429 busy`), and one
   forced SHA-256 of a file every 10 s. Previews read at most 256 KB of text or 20 MB of an image. Uploads keep the
   limits of spec 039 (23.6). Purge removes at most 500 items a run; an item it cannot remove waits an hour and then
-  goes behind the others.
+  goes behind the others. Request paths longer than 4,096 characters or with more than 128 levels are refused before
+  anything resolves them (`400 bad_path`; a chat's folders: denied), a chat takes at most 32 `additionalDirectories`,
+  and **New folder** makes at most 32 folders at once, off the event loop (H-1, I-1, I-2, J-1).
 - **Recycle bin and purge.** A delete moves the item into `<location top>\.goose-web-recycle\<id>\<name>` (same
   volume, hidden, made when needed; refused when it is a link or does not resolve right inside the location).
   Anything else under that name - a file or a link a teammate's agent made - is moved aside to
@@ -2453,21 +2462,114 @@ folder tree that already carries junctions) - a sandboxed agent cannot create a 
 | F-4 | Medium | A member with every Goose permission off could plant skills, recipes and agents in `.goose` / `.claude` folders, and a `.gooseignore` | Fixed in `b93e7f9`: refused for members on every route that creates or changes something |
 | F-5 | Medium | The SHA-256 recorded for an upload was of the bytes received, not of the file, and was shown and written into download audit rows after the file changed | Fixed in `cb68222`: the finished file is read and must match; stored values only for the unchanged file, labelled; downloads audited with the SHA-256 of the bytes sent |
 | F-6 | Low | A per-person override that is not a boolean (`"false"`, `"off"`, `"0"`) switched Files and manage on | Fixed in `2f4126a`: 400 when saved; anything but `true` is off |
-| F-7 | Low | Hints files could be renamed, moved or deleted through their 8.3 short name, or with the folder holding them (also an `.agents` folder) | Fixed in `3cede7f`: the long name is checked too; members do not change a folder holding them |
+| F-7 | Low | Hints files could be renamed, moved or deleted through their 8.3 short name, or with the folder holding them (also an `.agents` folder) | Fixed in `3cede7f`: the long name is checked too; members do not change a folder holding them (also `.goose` / `.claude` folders since `e249652`, G-2) |
 | F-8 | Low | A team saved without the two keys lost both switches silently; a lost settings key would switch them on again | Fixed in `2524f87`: stored values kept on such a save; the policy change audited |
 | F-9 | Low | The Files switch was checked only when an upload started; its pieces and the finish went on after it was switched off | Fixed in `643cd17`: checked for every piece and at the finish |
-| F-10 | Low | A move across volumes that could not delete the whole source answered "denied", yet left a full copy, a half-deleted source and no audit row | Fixed in `cb0957e`, `643cd17`: answered as moved with a warning, audited `sourceLeft` |
-| F-11 | Low | Anything named `.goose-web-recycle` that is not a folder blocked every delete in that location | Fixed in `643cd17`: moved aside, audited `files.recycle_conflict` |
-| F-12 | Low | Heavy work shared asyncio's default thread pool with sign-in and uploads; no global cap on hashing, none on copies and previews | Fixed in `8d231c6`: four threads of its own; per-person limits; a pause between forced hashes |
+| F-10 | Low | A move across volumes that could not delete the whole source answered "denied", yet left a full copy, a half-deleted source and no audit row | Fixed in `cb0957e`, `643cd17`; for delete and restore in `e249652` (24.4): answered with a warning, audited `sourceLeft` |
+| F-11 | Low | Anything named `.goose-web-recycle` that is not a folder blocked every delete in that location | Fixed in `643cd17`: moved aside, audited `files.recycle_conflict`; one its maker keeps open still blocks (24.5) |
+| F-12 | Low | Heavy work shared asyncio's default thread pool with sign-in and uploads; no global cap on hashing, none on copies and previews | Fixed in `8d231c6`, `e249652` (G-1), `c3a5013` (H-4): eight threads of its own, at most two per person; per-person limits; a pause between forced hashes |
 | F-13 | Low | Purge retried the items it could not remove first, for ever, so enough of them starved the rest; no way to empty a bin early | Fixed in `0cdd009`: such items wait an hour, behind the others; administrators can empty a bin; its size is shown |
 | F-14 | Low (release gate) | The candidate's own front-end test failed | Fixed in `cb68222`: expectation corrected; a test for Compute again added |
-| F-15 | Info | Bidirectional and zero-width control characters were kept in names (`invoice<U+202E>fdp.exe` showed as `invoiceexe.pdf`) | Fixed in `643cd17`: Unicode format characters dropped |
-| F-16 | Info | Refused attempts were not audited; a `HEAD` request wrote a `files.download` row | Fixed in `cb68222`, `643cd17`: `files.refused`; `HEAD` not audited; downloads recorded when sent |
+| F-15 | Info | Bidirectional and zero-width control characters were kept in names (`invoice<U+202E>fdp.exe` showed as `invoiceexe.pdf`) | Fixed in `643cd17`: Unicode format characters dropped; refused by the folder picker's New folder since `e249652`; the zero-width joiners kept where words and emoji need them since `c3a5013` (24.4) |
+| F-16 | Info | Refused attempts were not audited; a `HEAD` request wrote a `files.download` row | Fixed in `cb68222`, `643cd17`: `files.refused`; `HEAD` not audited; downloads recorded when sent; not for the older `/api/fs/*` routes (24.5) |
 | F-17 | Info | Version, CHANGELOG and this section were missing; two rows of the builders' threat table overstated what was refused | Fixed by the release documents: version 1.28.0, CHANGELOG, this section (written from the code as released) |
 
-### 24.4 Second review of the fixes (2026-11-25)
+### 24.4 Further reviews of the fixes, and a browser test (2026-11-25)
 
-Pending.
+Three rounds: a second review of the fixes of 24.3, a third review of what that and a browser test changed, and two
+verifications of the last fixes. Each round's findings were fixed - or are residual risks (24.5) - before the next.
+
+**Second review (of `cb0957e` to `3cf2842`).**
+
+- **Who and what.** The same kind of independent review as 24.3 (a separate AI agent, not the one that wrote the
+  changes; read-only), of the fixes `cb0957e` to `3cf2842` against the candidate `a4f31a0`: each finding tried
+  again, and the new code read for what it might have broken.
+- **How.** The feature's suites (189 passed, 1 skipped: the MXC end-to-end test, MXC not installed there) and 17
+  probes in 5 files against the real routes in-process, with real NTFS junctions and 8.3 names; another volume and
+  the races simulated as the suite does. Symbolic links could not be created there (no privilege), so only junctions
+  were tried; no real second volume, network drive or browser.
+- **Verdict.** Ship. None of the new findings lets a person out of their folders.
+- **The seventeen findings.** Fixed as described (24.3): F-1 (a junction as the item, four levels down, leading into
+  the person's own folders, put in during the copy or during the delete of the original: `409 has_link` or only the
+  link removed; nothing outside touched, no temporary copies left), F-2 (every swap tried from inside a move - the
+  item's folder, the item, the target folder, the folder above it - refused by NTFS while the handles are held; no
+  handle left afterwards), F-3 (other teams' and persons' tops denied in every spelling tried: 8.3 name, both
+  `$INDEX_ALLOCATION` forms, trailing dot or space, through a junction, a team folder behind a junction), F-4 (15
+  names by 5 routes and 6 spellings of an existing `.goose` / `.claude` by 10 routes changed nothing), F-5
+  (`409 upload_changed`; the SHA-256 of what was sent; `sha256Omitted` for every `Range` form; no row for `HEAD`;
+  `complete: false` for a download broken off on a real uvicorn), F-6 to F-9, F-13 and F-14 (F-9 by the suite and
+  the code). F-12 holds for sign-in and listings (but see G-1). Two were incomplete and are completed in `e249652`:
+  F-10 (a delete or a restore across volumes dropped the list of what could not be deleted; now a warning and
+  `sourceLeft`, as for a move) and F-15 (`/api/fs/mkdir` kept U+202E and U+200B; now `400 bad_name`). Two keep a
+  residual (24.5): F-11 (something squatting the recycle folder's name that its maker keeps open still blocks
+  deletes there) and F-16 (refusals of the older `/api/fs/*` routes are not recorded). F-17 was the release
+  documents, these.
+- **Also found sound.** No deadlock; no leaked handle (none over 200 failing copies and 80 renames); no limit slot
+  left taken; chat uploads unchanged; **Empty now** needs the CSRF header and is refused to members (`403`); the
+  recycle bin's size; deep paths (232 and 430 characters); files open elsewhere.
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| G-1 | Low | One person could fill all four Files threads (two SHA-256 computations and two moves, or four upload finishes); everybody else's rename, delete, hash and upload finish waited for them (4.1 s in the probe; minutes with files of several GB) | Fixed in `e249652`: one person holds at most two of the threads, given back when the work has finished, not when the request went away |
+| G-2 | Low | A member could rename, move or delete a folder that holds an administrator's `.goose` or `.claude` folder; the walk of F-7 looked for hints files, `.gooseignore` and `.agents` only | Fixed in `e249652`: the walk looks for all three folders (`403 agents_folder_refused`) |
+| G-3 | Low | A team saved with `"false"`, `"off"` or `"0"` for a switch stored it as on (`bool("false")` is true); the Admin page sends booleans, so only a script could | Fixed in `e249652`: the words are read as words, other text is `400 bad_value` |
+| G-4 | Info | `files.refused` has no limit per person: 300 different paths gave 300 rows | Residual (24.5) |
+| G-5 | Info | A folder tree 1,100 levels deep moved across volumes raised an unhandled `RecursionError` (`500`); nothing was lost | Residual (24.5) |
+| G-6 | Info | From the code: folders that resolve to a network path would refuse rename, move and delete with a misleading message | Residual (24.5) |
+| G-7 | Info | A finished upload that something else holds open for writing is discarded as changed (`409 upload_changed`) | Residual (24.5); fails safe |
+
+- **After the review.** `e249652` fixes G-1, G-2 and G-3 and completes F-10 and F-15, each with a test in
+  `tests/test_files.py` (`test_g1_*`, `test_g2_*`, `test_g3_*`, `test_f10_delete_and_restore_*`, and
+  `test_f15_*` extended) that fails on `3cf2842` and passes on `e249652`. The full suite at `e249652`: 1,289 passed, 14 skipped, 1 failed - a test that measures wall-clock
+  time and fails when the machine is busy (the browser test was running); it passed alone.
+
+**Browser test (T11, by the builders).** The release on a throwaway gateway with two members of one team (no Shell;
+the team's Files switches on by default) and a team folder: one member uploaded a 20 MB pcap, a text file and a PNG
+through the file chooser and by drag-and-drop and made a folder; the other saw them with "uploaded by", the type
+recognised from the bytes and the SHA-256 recorded at upload - equal to the SHA-256 taken before the upload -,
+computed it again, downloaded, previewed the text and the image, used **Ask Goose about this** (the agent, with the
+base extensions only, read the teammate's file and answered correctly), renamed, moved, deleted with **Undo**,
+restored from the recycle bin and read the folder's activity; all 13 audit rows had the right SHA-256. A 1 GiB file went
+through the same chunked upload (12 s) and download (9 s, `Content-Length` the file's size, not compressed) with
+the same SHA-256 at every step, and the page was used at a phone's width (390 pixels). Found and
+fixed in `8c25d92`: downloads went through the gateway's GZip middleware - compressed on the fly, without
+`Content-Length` (no size or progress in the browser), and the audit row's `sent` counted compressed bytes (its
+SHA-256 was right); and with the details pane open at 1,264 pixels the list was 346 pixels wide and names broke
+after four letters.
+
+**Third review (2026-11-25, of `e249652` and `8c25d92`).** The same kind of independent review, of the delta
+`3cf2842..8c25d92`: the feature's suites (83 passed) and probes. Verdict: ship after fixes (H-1).
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| H-1 | Medium | Made by the F-15 completion: **New folder** (`/api/fs/mkdir`) walked up the missing folders on the event loop without a limit, in a time growing with their square - a 60 KB request held the gateway for 20 s, and the 2 MB body limit allows hours | Fixed in `c3a5013`: at most 32 new folders, the walk and the folder made in a thread, request paths over 4,096 characters refused before they are resolved (`400 bad_path`) |
+| H-2 | Low | A restore that left something in the bin kept the item's full size there; a second restore brings what was left back as `name (restored)`, and its purge is audited like an item | Partly, in `c3a5013`: the size of what is left; the rest is a residual risk (24.5) |
+| H-3 | Low | Team switches given as `["false"]`, `{"a": 1}` or `2` were stored as on; a team's `require_totp` given as `"true"` was dropped silently (two-factor not required) | Fixed in `c3a5013`: only true/false, 0/1, null and the words; `require_totp` read the same way |
+| H-4 | Low | Two people at their share still filled the four threads | Fixed in `c3a5013`: eight threads |
+| H-5 | Low | The walk of F-7 / G-2 skipped a sub-folder it could not list - the check failed open there | Fixed in `c3a5013`: a member does not change such a folder (`403 denied`) |
+| H-6 | Info | `_GATES` keeps a closed event loop alive after contention; only tests have more than one loop | Residual |
+| H-7 | Info | Dropping every format character also dropped the zero-width non-joiner and joiner that Persian and Indic words and emoji sequences need | Fixed in `c3a5013`: kept right after a non-ASCII character that is not one of them |
+| H-8 | Info | A member cannot rename, move or delete their own folder where a tool made `.goose` or `.claude` | Residual (24.5) |
+| H-9 | Info | By reading: what is left of an original after a delete across drives loses its "uploaded by" and SHA-256 records to the copy in the bin | Residual (24.5) |
+
+**Verifications (2026-11-25).** The reviewer checked `c3a5013` (132 passed; the H-1 request now answers in
+0.006 s, a 10 KB path in 0.003 s) and then `56821ca` (198 passed, 1 skipped; a 32 KB `cwd` denied in under
+0.1 ms), and found the same kind of freeze through two older doors, and lower issues:
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| I-1 | Medium (older than 1.28.0) | The chat socket resolved a member's `cwd` of `session/new` - and `additionalDirectories`, `workingDir`, `projectDir`, sub-recipe paths - with `realpath` and no length limit, on the event loop: 24 s for 32 KB | Fixed in `56821ca`: `policy.path_too_long` (over 4,096 characters or 128 levels) is checked before anything resolves a path |
+| I-2 | Low | Within 4,096 characters, 2,000 path levels still took 1.9 s per folder request | Fixed in `56821ca`: at most 128 levels (`400 bad_path` in 5 ms) |
+| I-3 | Info | Unassigned code points (U+E0000, U+E0002-E001F, U+2065) and a few invisible characters outside category Cf stay in names; none reorders text | Residual: dropping unassigned characters would also drop emoji newer than the server's Unicode tables |
+| J-1 | Medium (older than 1.28.0) | `additionalDirectories` had no limit on its entries, each resolved on the event loop: 1,000 deep entries 8.5 s, a 64 MB message minutes | Fixed in `f7b1ed0`: a list of at most 32, for administrators too |
+| J-2 | Low | A delete or move of 200 paths, each 128 levels deep, takes 10 to 14 s; the gateway is not frozen (others waited 0.2 to 0.4 s) | Residual (24.5) |
+| J-3 | Low | Made by I-1's fix, administrators only: a member-writable folder written with more than 128 separators was no longer recognised, so its plugins were not confirmed | Fixed in `f7b1ed0`: such a path counts as member-writable |
+| J-4 | Info | The Files routes answered `bad_request` for a long path, the folder routes `bad_path` | Fixed in `f7b1ed0`: `bad_path` for both |
+
+- **Tests after all fixes.** Each fix has a test in `tests/test_files.py` that fails on the code before it
+  (`test_downloads_go_out_as_they_are_never_compressed_on_the_fly`, `test_h1_*`, `test_h3_*`, `test_h5_*`,
+  `test_i1_*`, and `test_f10_delete_and_restore_*`, `test_f15_*`, `test_g1_*` extended). The full suite at
+  `56821ca`: 1,295 passed, 14 skipped, 0 failed; at `f7b1ed0`: 1,295 passed, 14 skipped, 0 failed.
 
 ### 24.5 Residual risks
 
@@ -2498,9 +2600,9 @@ Pending.
   folder lands in that team's recycle bin: its owners see it, the member does not.
 - **Goose's folders.** Members' agents with Shell can still write hints files and `.agents`, `.goose` and `.claude`
   folders where they may write, as before. Goose's memory extension may keep `.goose\memory` in a chat folder;
-  members cannot change it through the file browser any more (their agent can). A member can still rename, move or
-  delete a folder that holds a `.goose` or `.claude` folder (the walk of F-7 looks for hints files, `.gooseignore`
-  and `.agents` only); nothing new is planted that way - the content goes with its folder, or into the recycle bin.
+  members cannot change it through the file browser any more (their agent can), nor rename, move or delete a folder
+  that holds it (G-2): such a folder - also one where only Goose's memory extension made `.goose\memory` - is
+  renamed, moved or deleted by an administrator (H-8); so is a folder with a part the gateway cannot read (H-5).
   Not done: a warning at `session/new` for a folder with project skills when the member has no `skills_edit` (an
   option the assessment named for F-4), and a `goose-web check` line for something squatting the recycle folder's
   name (handled at delete time instead, F-11).
@@ -2512,7 +2614,21 @@ Pending.
   start again after a restart. Each preview may hold up to 20 MB in memory (two per person). A Files upload that
   failed on the network keeps its partial file for **Retry** until its row is removed, or for 24 hours. Listings
   match upload rows without an index and the activity view scans the audit table; both grow with use.
+- **Left from the reviews (24.4).** Each of one person's refused attempts at a different path makes a
+  `files.refused` row (G-4; the once-a-minute limit is per path). A folder tree more than about 1,000 levels deep
+  cannot be moved to another drive (an unhandled error, `500`; nothing is lost; G-5). Folders that resolve to a
+  network path (`\\server\share`) would refuse rename, move and delete with a misleading message (G-6, from the
+  code). A finished upload that something else holds open for writing is discarded as changed (`409
+  upload_changed`: upload it again; G-7). Something squatting the recycle folder's name that its maker keeps open
+  still blocks deletes in that location until it is closed (F-11). Refusals of the older `/api/fs/*` routes (the
+  folder picker, chat attachments) are not recorded as `files.refused` (F-16). After a restore across drives that
+  left something in the bin, a second **Restore** brings what was left back as `name (restored)`, and its purge is
+  audited like an item (H-2); what is left of an original after a delete across drives loses its "uploaded by" and
+  SHA-256 records to the copy in the bin (H-9). A delete or move of 200 very deep paths takes 10 to 14 seconds
+  while the gateway goes on serving others (J-2). A few invisible characters outside Unicode's format category stay
+  in names (I-3).
 - **Platform.** Elsewhere than on Windows the held moves fall back to comparing before and after, with a put-back
   on a mismatch; the product and its CI are Windows-only.
-- **Not exercised by the assessment:** a browser session, a real second volume, a real race, and F-4 against a
-  running Goose (24.3).
+- **Not exercised:** by the reviews, a browser session (the builders' browser test of 24.4 covered the page, with
+  one browser, the two members one after the other); by anyone, a real second volume, a network drive, a real race,
+  symbolic links (junctions only), and F-4 against a running Goose (24.3).

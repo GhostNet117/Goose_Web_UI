@@ -1140,7 +1140,8 @@ and the drives).
   (a link leading elsewhere is refused), names are cleaned (Unicode format characters such as a right-to-left override
   are dropped), members cannot create, rename, move or delete Goose hints files (`AGENTS.md`, `.goosehints`,
   `.goose-web-hints.md`, also by an 8.3 short name), a `.gooseignore`, anything in `.agents`, `.goose` or `.claude`
-  folders, or a folder that holds a hints file or an `.agents`, `.goose` or `.claude` folder; nothing is ever replaced; and no location's
+  folders, or a folder that holds a hints file or an `.agents`, `.goose` or `.claude` folder (also a
+  `.goose\memory` folder made by Goose's memory extension; an administrator can); nothing is ever replaced; and no location's
   top folder - anybody's: a workspace, any team's folder or extra folder, also one that lies inside a folder this
   person may write - nor a folder holding one can be renamed, moved or deleted. A rename, move or delete holds the
   item and both folders open while it runs, so a folder swapped for a link meanwhile moves nothing (`403 denied`).
@@ -1173,10 +1174,13 @@ and the drives).
   folder, Files switched off, a protected name) is recorded as `files.refused` with `ok=false`, at most once a
   minute per person, route and path. Members see the recent successful `files.*` rows of a folder in the page
   (Activity).
-- **Load.** SHA-256 computations, moves and the final read of a Files upload run in four threads of their own (never
+- **Load.** SHA-256 computations, moves and the final read of a Files upload run in eight threads of their own (never
   the ones sign-in and listings use), of which one person holds at most two at a time - the rest of their work
   waits its turn, so one person cannot stall the others; per person at most two SHA-256 computations, two move or delete requests and two previews at a time
-  (`429 busy`), and one forced SHA-256 ("Compute again") of a file per 10 seconds.
+  (`429 busy`), and one forced SHA-256 ("Compute again") of a file per 10 seconds. Paths longer than 4,096
+  characters or with more than 128 levels are refused (`400 bad_path`), **New folder** makes at most 32 folders at
+  once, and a chat takes at most 32 extra folders; a member does not rename, move or delete a folder with a part the
+  gateway cannot read.
 
 #### 9.9e Providers for one person (1.27.0)
 

@@ -11,7 +11,9 @@ downloads any file the person may read, shows a file's details with its SHA-256 
 content, previews text and common images safely, hands a file to Goose ("Ask Goose about this", "Add to a chat"),
 renames, moves and deletes with a recycle bin, and shows a folder's activity. Every upload, download and change is
 audited with size and SHA-256, for a chain of custody. An independent review of the release candidate found five
-Medium and twelve lower findings; all are fixed in this release (SECURITY-ASSESSMENT 24).
+Medium and twelve lower findings; three more rounds of review of the fixes, and a browser test, found three more
+Medium issues - one made by a fix, two older than this release - and lower ones. All Medium findings are fixed in
+this release, and all Low ones except J-2 and part of H-2; the rest are residual risks (SECURITY-ASSESSMENT 24).
 
 ### Upgrade notes - read these before you upgrade
 - **Two new team switches, on by default.** **Files: browse, download and upload** (`files`) and **Rename, move and
@@ -28,10 +30,21 @@ Medium and twelve lower findings; all are fixed in this release (SECURITY-ASSESS
   in the folder picker, in chat attachments and on the Files page (`403 agents_folder_refused` /
   `403 hint_file_refused`), as for `.agents` folders and the hints file names before. Goose reads skills, recipes
   and agents from these folders, and its ignore rules from `.gooseignore`, in the folder a chat starts in; an
-  administrator puts them in place.
+  administrator puts them in place. On the Files page members also cannot rename, move or delete a folder that
+  holds one - also a `.goose\memory` folder that Goose's memory extension made; an administrator can.
 - **A per-person override of a switch must be `true` or `false`.** Admin > Users refuses anything else
   (`400 bad_request`), and a stored override that is not `true` - such as `"true"`, `"false"` or `1` - now counts
   as off, for every switch (before, any such value counted as on). Check the overrides in Admin > Users.
+- **A team switch saved by a script must be true or false.** `PATCH /api/admin/teams/<id>` takes `true` / `false`,
+  `1` / `0`, `null` (off) and the words `"true"`, `"on"`, `"yes"`, `"1"` / `"false"`, `"off"`, `"no"`, `"0"`, `""` - for every
+  switch and for `require_totp` - and refuses anything else (`400 bad_value`). Before, any non-empty text (`"false"`
+  included), list or number other than 0 counted as on, and a `require_totp` given as text was dropped, so two-factor
+  was not required. The Admin page sends true and false and is not affected; if a script of yours saved teams,
+  check them in Admin > Teams.
+- **Paths longer than 4,096 characters or with more than 128 levels are refused** (`400 bad_path`) by the folder
+  routes and the Files page, and a chat cannot start in one; a chat takes at most 32 `additionalDirectories`, and
+  **New folder** makes at most 32 folders at once. No real folder is that long or deep: the limits stop a single
+  request from holding the gateway.
 - **Files uploaded on the Files page are never deleted by chat retention** (spec 040): they belong to no chat. Chat
   attachments in `Web_Uploads` are handled as before.
 - **New configuration `files.recycle_days`** (default 30, 1 to 365): what is deleted on the Files page waits that
@@ -86,7 +99,13 @@ Medium and twelve lower findings; all are fixed in this release (SECURITY-ASSESS
   in it; only restore reaches the recycle folder.
 - Unicode format characters (right-to-left override, zero-width characters, byte order mark) are dropped from the
   names of uploaded files - chat attachments included - and of new folders (`invoice<U+202E>fdp.exe` showed as
-  `invoiceexe.pdf`).
+  `invoiceexe.pdf`); the folder picker's **New folder** refuses them (`400 bad_name`), as it makes the path typed.
+  The zero-width non-joiner and joiner stay where Persian and Indic words and emoji sequences need them (right
+  after a non-ASCII character).
+- File downloads (`/api/files/download`, `/api/fs/download`) go out as they are, never compressed on the fly: the
+  browser shows their size and progress, and the audit counts the file's bytes.
+- The Files list hides **Uploaded by** and **Modified** when it is narrow (the details pane open, a small window) -
+  both are in the details - before names are squeezed.
 - A team saved without the two Files keys (a script, an Admin page from before 1.28.0) keeps the stored values;
   `team.update` records the policy values a save changed.
 - The chunked upload client moved from `api.js` to the new `uploader.js`, shared by the message box and the Files
@@ -122,15 +141,50 @@ was in a released version.
 - **Info:** format characters in names (F-15); refused attempts were not audited and a `HEAD` request wrote a
   download row (F-16); the version and the release documents were missing (F-17).
 
+Found by a second review of the fixes (SECURITY-ASSESSMENT 24.4):
+- **Low (G-1):** one person's two SHA-256 computations and two moves - or four upload finishes - took all four Files
+  threads, so everybody else's renames, deletes, hashes and upload finishes waited for them. A person now holds at
+  most two of those threads at a time; the rest of their work waits its turn.
+- **Low (G-2):** a member could rename, move or delete a folder that holds an administrator's `.goose` or `.claude`
+  folder (F-7 looked for hints files and `.agents` only). Refused now (`403 agents_folder_refused`).
+- **Low (G-3):** a team switch saved by a script as `"false"`, `"off"` or `"0"` was stored as on (upgrade notes).
+- **F-10 and F-15 completed:** a delete or restore across drives that could not delete all of the original dropped
+  the list of what was left - now answered with a warning and audited `sourceLeft`, as a move is, and a restore
+  that leaves something keeps the item in the recycle bin, so the rest is purged with it; the folder picker's
+  New folder kept format characters (now `400 bad_name`).
+
+Found by the builders' browser test (SECURITY-ASSESSMENT 24.4): downloads were compressed on the fly - no size or
+progress in the browser, the gateway's processor busy for a large file, the audit's `sent` counting compressed bytes;
+and with the details pane open on a laptop screen, names in the list broke after four letters.
+
+Found by a third review and its verifications (SECURITY-ASSESSMENT 24.4):
+- **Medium (H-1):** the folder picker's New folder - after the F-15 change above - walked up the missing folders on
+  the event loop without a limit: one request of 60 KB held the gateway for 20 seconds. Bounded and done off the
+  event loop.
+- **Medium (I-1, J-1; older than 1.28.0):** a member could hold the gateway's event loop with one chat message: a
+  32 KB folder path for a new chat took 24 seconds to resolve, 1,000 deep extra folders 8.5 seconds. Paths are
+  now bounded before they are resolved, and a chat takes at most 32 extra folders (upgrade notes).
+- **Low:** after a partial restore the bin showed the item's full size (H-2); team switches given as lists or numbers
+  were stored as on, and a team's `require_totp` given as text was dropped (H-3, upgrade notes); two people filled
+  the Files threads (H-4; now eight); a sub-folder that could not be read let a member change the folder holding
+  it (H-5; now refused); 2,000 path levels within 4,096 characters still took 1.9 seconds (I-2); an
+  administrator's plugin confirmation was skipped for an over-long path (J-3, made by I-1's fix).
+- **Info:** the zero-width joiners Persian and emoji need were dropped from names (H-7); the Files routes answered a
+  different error for a long path (J-4).
+
 ### Security
 The independent review of the release candidate - a code review, the test suites and 21 probes against the real
 routes with real NTFS junctions and 8.3 names - found no Critical issue, five Medium findings (F-1 High where a
 writable folder holds a link made outside the sandbox), nine Low and three informational ones; all are fixed in
-this release, the code findings each with a regression test (Fixed, above). The threat model, the mitigations, the
-findings, the second review of the fixes and the residual risks: SECURITY-ASSESSMENT 24.
+this release, the code findings each with a regression test (Fixed, above). A second, focused review of the fixes
+(verdict: ship) confirmed them, found two incomplete and found three Low and four informational issues; the Low
+ones and the two incomplete fixes are corrected too, each with a test that fails on the code before, and the
+informational ones are documented as residual risks. A browser test with two members of one team, a third review
+and two verifications followed (Fixed, above). The threat model, the mitigations, every finding and the residual
+risks: SECURITY-ASSESSMENT 24.
 
 ### Docs
-USER-GUIDE 9 Files (new; sections 9-16 are now 10-17), ADMINISTRATION (9.4, 9.7, 9.9f, 10, 16), API (Files),
+USER-GUIDE 9 Files (new; sections 9-16 are now 10-17), ADMINISTRATION (9.4, 9.7, 9.9f, 10, 16), API (Files, teams, paths),
 ARCHITECTURE (file map, 4, 10.2, 10.3, 12.7), CONFIGURATION (2, 4), TROUBLESHOOTING 16, SECURITY-ASSESSMENT 24.
 
 ## 1.27.1 - 2026-11-25
