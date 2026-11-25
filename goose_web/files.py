@@ -1002,7 +1002,7 @@ async def _move_pinned(c, u: dict, src: Path, dst: Path, pin: _Pin) -> list[str]
     """_move_item in a thread, its refusals as answers: 403 denied when the item or a folder changed meanwhile, 409
     has_link for a folder with a link that would be copied to another volume."""
     try:
-        return await asyncio.to_thread(_move_item, src, dst, pin)
+        return await heavy(_move_item, src, dst, pin)
     except _HasLink as e:
         log.warning("files: %s holds a link (%s); %s's move to another volume was refused", src, e, u["username"])
         raise HTTPError(409, "has_link", HAS_LINK)
@@ -1028,6 +1028,53 @@ class _Live:
     def __init__(self) -> None:
         self.hashing: dict[int, int] = {}      # user id -> SHA-256 computations running
         self.refused: dict[tuple, float] = {}  # (user id, route, refusal, path) -> when last audited (F-16)
+        self.slots: dict[tuple, int] = {}      # (kind, user id) -> requests running (F-12)
+        self.forced: dict[tuple, float] = {}   # (user id, path) -> when its SHA-256 was last read with `force` (F-12)
+
+
+# Assessment F-12: what can take long - a SHA-256 of a large file, a move (a copy across volumes) - runs in a small
+# pool of its own, never in asyncio's shared one (sign-in, listings and upload writes use that); one person runs at
+# most a few such requests at a time.
+HEAVY_THREADS = 4
+CHANGES_PER_PERSON = 2         # move / delete requests of one person at the same time
+PREVIEWS_PER_PERSON = 2        # previews (an image holds up to 20 MB) of one person at the same time
+FORCE_PAUSE = 10.0             # seconds between two forced SHA-256 computations of one file by one person
+_POOL: Any = None
+
+
+def _pool():
+    global _POOL
+    if _POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _POOL = ThreadPoolExecutor(max_workers=HEAVY_THREADS, thread_name_prefix="goose-web-files")
+    return _POOL
+
+
+async def heavy(fn, *args: Any) -> Any:
+    """`fn(*args)` in the Files pool (see HEAVY_THREADS)."""
+    import functools
+    return await asyncio.get_running_loop().run_in_executor(_pool(), functools.partial(fn, *args))
+
+
+class _slot:
+    """One of a person's few requests of a kind at a time (429 busy beyond)."""
+
+    def __init__(self, c, u: dict, kind: str, limit: int, what: str) -> None:
+        self.live, self.key, self.limit, self.what = _live(c.db), (kind, u["id"]), limit, what
+
+    def __enter__(self):
+        if self.live.slots.get(self.key, 0) >= self.limit:
+            raise HTTPError(429, "busy", f"{self.limit} {self.what} of yours are running; try again when one has "
+                                         "finished.")
+        self.live.slots[self.key] = self.live.slots.get(self.key, 0) + 1
+        return self
+
+    def __exit__(self, *exc) -> None:
+        left = self.live.slots.get(self.key, 1) - 1
+        if left > 0:
+            self.live.slots[self.key] = left
+        else:
+            self.live.slots.pop(self.key, None)
 
 
 _LIVE: "weakref.WeakKeyDictionary[Any, _Live]" = weakref.WeakKeyDictionary()
@@ -1080,6 +1127,18 @@ def _refused(c, request: Request, u: dict, target: str, e: HTTPError) -> None:
                 ok=False)
     except Exception:
         log.exception("files: a refusal of %s could not be audited", request.url.path)
+
+
+def _limited(kind: str, limit: int, what: str):
+    """A route one person runs at most `limit` times at once (F-12)."""
+    def wrap(handler):
+        async def endpoint(request: Request):
+            c = _api().ctx(request)
+            with _slot(c, c.require(request).user, kind, limit, what):
+                return await handler(request)
+        endpoint.__name__, endpoint.__doc__ = handler.__name__, handler.__doc__
+        return endpoint
+    return wrap
 
 
 def _audited(handler):
@@ -1224,16 +1283,24 @@ async def hash_route(request: Request):
         raise HTTPError(400, "bad_request", "Only a file has a SHA-256")
     # `force`: read the file again even when its SHA-256 is known (size and modification time can be kept by
     # whoever changes a file in place)
-    known = {} if b.get("force") is True else await asyncio.to_thread(known_hash, c, p, st)
+    force = b.get("force") is True
+    known = {} if force else await asyncio.to_thread(known_hash, c, p, st)
     if known:
         return api.ok({**known, "cached": True})
     live = _live(c.db)
+    if force:      # F-12: "Compute again" reads the whole file - not over and over
+        fkey, now = (u["id"], _key(p)), time.monotonic()
+        if now - live.forced.get(fkey, -FORCE_PAUSE) < FORCE_PAUSE:
+            raise HTTPError(429, "busy", "The SHA-256 of this file was just computed; try again in a few seconds.")
+        if len(live.forced) > 10000:
+            live.forced.clear()
+        live.forced[fkey] = now
     if live.hashing.get(u["id"], 0) >= HASH_PARALLEL:
         raise HTTPError(429, "busy", f"{HASH_PARALLEL} SHA-256 computations of yours are running; try again when one "
                                      "has finished.")
     live.hashing[u["id"]] = live.hashing.get(u["id"], 0) + 1
     try:
-        sha, size, mtime, mtime_ns, stable = await asyncio.to_thread(_hash_file, str(p))
+        sha, size, mtime, mtime_ns, stable = await heavy(_hash_file, str(p))
     except OSError as e:
         raise _os_error(e)
     finally:
@@ -1777,11 +1844,13 @@ routes = [
     Route("/api/files/info", _audited(info_route)),
     Route("/api/files/hash", _audited(hash_route), methods=["POST"]),
     Route("/api/files/download", _audited(download_route)),
-    Route("/api/files/preview", _audited(preview_route)),
+    Route("/api/files/preview", _audited(_limited("preview", PREVIEWS_PER_PERSON, "previews")(preview_route))),
     Route("/api/files/mkdir", _audited(mkdir_route), methods=["POST"]),
     Route("/api/files/rename", _audited(rename_route), methods=["POST"]),
-    Route("/api/files/move", _audited(move_route), methods=["POST"]),
-    Route("/api/files/delete", _audited(delete_route), methods=["POST"]),
+    Route("/api/files/move", _audited(_limited("change", CHANGES_PER_PERSON, "moves or deletes")(move_route)),
+          methods=["POST"]),
+    Route("/api/files/delete", _audited(_limited("change", CHANGES_PER_PERSON, "moves or deletes")(delete_route)),
+          methods=["POST"]),
     Route("/api/files/recycle", _audited(recycle_route)),
     Route("/api/files/restore", _audited(restore_route), methods=["POST"]),
     Route("/api/files/activity", _audited(activity_route)),

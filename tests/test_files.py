@@ -534,7 +534,7 @@ def test_sha256_is_computed_on_request_and_cached(env):
         assert r.status_code == 429 and r.json()["error"] == "busy"
         files._live(db).hashing.clear()
         assert tc.post("/api/files/hash", json={"path": str(tf / "other.bin")}, headers=h).status_code == 200
-    assert "asyncio.to_thread(_hash_file" in inspect.getsource(files.hash_route)     # off the event loop
+    assert "heavy(_hash_file" in inspect.getsource(files.hash_route)     # off the event loop, in the Files pool
 
 
 def test_preview_shows_text_and_true_images_only(env, monkeypatch):
@@ -1457,3 +1457,34 @@ def test_f8_a_team_saved_without_the_files_switches_keeps_them_and_the_change_is
         stored = db.one("SELECT policy FROM teams WHERE id=?", (tid,))["policy"]
         assert r.status_code == 200 and stored["files"] is True and stored["files_manage"] is True
         assert audits(db, "team.update")[-1]["detail"]["policy"] == {"files": True, "schedules": None}
+
+
+def test_f12_long_file_work_has_its_own_threads_and_a_person_runs_few_at_a_time(env):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    (tf / "a.txt").write_text("a")
+    (tf / "img.png").write_bytes(PNG)
+    live = files._live(db)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        live.slots[("change", dee["id"])] = files.CHANGES_PER_PERSON        # two moves / deletes running
+        for route, body in (("/api/files/move", {"paths": [str(tf / "a.txt")], "to": str(tf)}),
+                            ("/api/files/delete", {"paths": [str(tf / "a.txt")]})):
+            r = tc.post(route, json=body, headers=h)
+            assert r.status_code == 429 and r.json()["error"] == "busy", route
+        live.slots.clear()
+        live.slots[("preview", dee["id"])] = files.PREVIEWS_PER_PERSON
+        assert tc.get("/api/files/preview", params={"path": str(tf / "img.png")}).status_code == 429
+        live.slots.clear()
+        assert tc.get("/api/files/preview", params={"path": str(tf / "img.png")}).status_code == 200
+        assert live.slots == {}
+        # "Compute again" reads the whole file - not twice within a few seconds
+        assert tc.post("/api/files/hash", json={"path": str(tf / "a.txt"), "force": True}, headers=h).status_code == 200
+        r = tc.post("/api/files/hash", json={"path": str(tf / "a.txt"), "force": True}, headers=h)
+        assert r.status_code == 429 and r.json()["error"] == "busy"
+        assert tc.post("/api/files/hash", json={"path": str(tf / "a.txt")}, headers=h).json()["cached"] is True
+    import threading
+    seen: list[str] = []
+    asyncio.run(files.heavy(lambda: seen.append(threading.current_thread().name)))
+    assert seen[0].startswith("goose-web-files") and files._pool()._max_workers == files.HEAVY_THREADS
+    assert "heavy(_move_item" in inspect.getsource(files._move_pinned)
