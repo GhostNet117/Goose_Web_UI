@@ -274,26 +274,42 @@ def locations(c, u: dict, policy: dict) -> list[dict]:
     return out
 
 
-def _tops(c, u: dict, policy: dict) -> list[str]:
+class _Tops(list):
+    """The top folders (as configured) with what each resolves to."""
+    def __init__(self, paths: list[str]) -> None:
+        super().__init__(dict.fromkeys(paths))
+        self.real = {r for r in (_real(t) for t in self) if r}
+
+
+def _tops(c, u: dict, policy: dict) -> _Tops:
     """The top folders that are never renamed, moved or deleted, and whose recycle folder takes what is deleted in
-    them: the locations; for administrators also every team's folder and extra folders (what an administrator
-    deletes there lands in the recycle folder the team sees)."""
+    them: the person's locations, every team's folder and extra folders (read and write) and every person's
+    workspace - for members too (assessment F-3: another team's location may lie inside a folder this person may
+    write; it is compared, never shown) - and the folders holding Goose Web's own data. What is deleted inside one of
+    them lands in the deepest one's recycle folder (the one its team sees)."""
     tops = [loc["path"] for loc in locations(c, u, policy)]
-    if u["role"] == "admin":
-        for t in c.db.query("SELECT id, name, policy FROM teams"):
-            tp = t["policy"] if isinstance(t["policy"], dict) else {}
+    for t in c.db.query("SELECT id, name, policy FROM teams"):
+        tp = t["policy"] if isinstance(t["policy"], dict) else {}
+        try:
             tops.append(str(c.profiles.team_folder({**t, "policy": tp})))
-            tops += [str(r) for r in tp.get("allowed_roots") or [] if isinstance(r, str) and os.path.isabs(r)]
-        # every person's workspace too: an administrator cannot move or delete one (or the profile folder or the
-        # profiles root holding it) from the Files page, and what he deletes in one lands in its own recycle folder
-        for m in c.db.users():
-            try:
-                tops.append(str(c.profiles.workspace(m)))
-            except Exception:
-                continue
-        # ... and no folder holding Goose Web's own data (the system folder itself is out of reach: path_ok)
-        tops += [str(c.settings.system_dir), str(c.settings.profiles_root)]
-    return tops
+        except Exception:
+            pass
+        tops += [str(r) for k in ("allowed_roots", "read_roots") for r in tp.get(k) or []
+                 if isinstance(r, str) and os.path.isabs(r)]
+    # every person's extra folders and workspace too: nobody moves or deletes one (or the profile folder or the
+    # profiles root holding it) from the Files page, and what an administrator deletes in one lands in its own
+    # recycle folder
+    for m in c.db.users():
+        ov = m.get("policy_overrides") if isinstance(m.get("policy_overrides"), dict) else {}
+        tops += [str(r) for k in ("allowed_roots", "read_roots") for r in ov.get(k) or []
+                 if isinstance(r, str) and os.path.isabs(r)]
+        try:
+            tops.append(str(c.profiles.workspace(m)))
+        except Exception:
+            continue
+    # ... and no folder holding Goose Web's own data (the system folder itself is out of reach: path_ok)
+    tops += [str(c.settings.system_dir), str(c.settings.profiles_root)]
+    return _Tops(tops)
 
 
 def _location_of(path: Any, tops: list[str]) -> str | None:
@@ -306,8 +322,9 @@ def _location_of(path: Any, tops: list[str]) -> str | None:
 
 
 def _is_top(path: Any, tops: list[str]) -> bool:
+    """`path` is a top folder or holds one - as written, and (unless it is a link) as it resolves."""
     n = _norm(path)
-    if any(n == _norm(t) for t in tops):
+    if any(n == _norm(t) or _within(t, path) for t in tops):
         return True
     try:
         if is_link(os.lstat(path)):
@@ -315,13 +332,16 @@ def _is_top(path: Any, tops: list[str]) -> bool:
     except (OSError, ValueError):
         return False
     r = _real(path)
-    return bool(r) and any(r == _real(t) for t in tops)
+    reals = getattr(tops, "real", None)
+    if reals is None:
+        reals = {x for x in (_real(t) for t in tops) if x}
+    return bool(r) and any(t == r or t.startswith(r.rstrip("\\/") + os.sep) for t in reals)
 
 
 def _protect(c, u: dict, src: Path, tops: list[str]) -> None:
-    """What may not be renamed, moved or deleted: a location's top folder (or a folder holding one); for members a
-    Goose hints file and anything in or named `.agents` (the administrator's)."""
-    if _is_top(src, tops) or any(_within(t, src) for t in tops):
+    """What may not be renamed, moved or deleted: a top folder (a location, any team's or person's folder) or a
+    folder holding one; for members a Goose hints file and anything in or named `.agents` (the administrator's)."""
+    if _is_top(src, tops):
         raise HTTPError(403, "denied", "A location's top folder cannot be renamed, moved or deleted.")
     api = _api()
     api._refuse_hint_name(u, src.name)
