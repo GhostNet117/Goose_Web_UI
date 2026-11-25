@@ -180,7 +180,7 @@ this release, the code findings each with a regression test (Fixed, above). A se
 (verdict: ship) confirmed them, found two incomplete and found three Low and four informational issues; the Low
 ones and the two incomplete fixes are corrected too, each with a test that fails on the code before, and the
 informational ones are documented as residual risks. A browser test with two members of one team, a third review
-and two verifications followed (Fixed, above). The threat model, the mitigations, every finding and the residual
+and three verifications followed (Fixed, above). The threat model, the mitigations, every finding and the residual
 risks: SECURITY-ASSESSMENT 24.
 
 ### Docs

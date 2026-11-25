@@ -2570,6 +2570,11 @@ after four letters.
   (`test_downloads_go_out_as_they_are_never_compressed_on_the_fly`, `test_h1_*`, `test_h3_*`, `test_h5_*`,
   `test_i1_*`, and `test_f10_delete_and_restore_*`, `test_f15_*`, `test_g1_*` extended). The full suite at
   `56821ca`: 1,295 passed, 14 skipped, 0 failed; at `f7b1ed0`: 1,295 passed, 14 skipped, 0 failed.
+- **Last verification (of `f7b1ed0`).** J-1, J-3 and J-4 fixed (198 passed, 1 skipped): 10,000 extra folders, or 1,000
+  deep ones, denied in under 0.1 ms for members and administrators; the largest message still let through costs
+  0.34 s. Verdict: **ship**. It noted one older issue, not reachable with the default permissions: `session/new`'s
+  `_meta.enabledExtensions` is checked entry by entry without a cap - a member of a team with **Edit extensions**
+  could hold the event loop for seconds with one message (24.5).
 
 ### 24.5 Residual risks
 
@@ -2626,7 +2631,9 @@ after four letters.
   audited like an item (H-2); what is left of an original after a delete across drives loses its "uploaded by" and
   SHA-256 records to the copy in the bin (H-9). A delete or move of 200 very deep paths takes 10 to 14 seconds
   while the gateway goes on serving others (J-2). A few invisible characters outside Unicode's format category stay
-  in names (I-3).
+  in names (I-3). A member of a team with **Edit extensions** (`extensions_edit`, off by default) can send `session/new`
+  with a very long `_meta.enabledExtensions` list, checked on the event loop (a million names took 3.9 s); a cap on
+  that list is the follow-up.
 - **Platform.** Elsewhere than on Windows the held moves fall back to comparing before and after, with a put-back
   on a mismatch; the product and its CI are Windows-only.
 - **Not exercised:** by the reviews, a browser session (the builders' browser test of 24.4 covered the page, with
