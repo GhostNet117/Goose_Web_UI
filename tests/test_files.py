@@ -923,3 +923,43 @@ def test_recycle_days_setting_and_check_line(tmp_path):
     assert files.check_lines(S("x"))[1][0] == "!!"
     from goose_web import __main__ as cli
     assert "files.check_lines(settings)" in inspect.getsource(cli)
+
+
+def test_an_item_is_put_back_when_its_new_folder_changed_meanwhile(env, monkeypatch):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    (tf / "a.txt").write_text("A")
+    (tf / "b.txt").write_text("B")
+    (tf / "to").mkdir()
+    real_move, real_rename, real_real = files._move_item, files._rename_noreplace, files._real
+    landed: list[Path] = []
+
+    def move(src, dst):
+        real_move(src, dst)
+        landed.append(Path(dst))
+
+    def rename(src, dst):
+        real_rename(src, dst)
+        landed.append(Path(dst))
+
+    def real(p):        # once something landed, its folder resolves elsewhere (swapped for a link meanwhile)
+        if landed and Path(p) == landed[0].parent:
+            return "x:\\elsewhere"
+        return real_real(p)
+    monkeypatch.setattr(files, "_move_item", move)
+    monkeypatch.setattr(files, "_rename_noreplace", rename)
+    monkeypatch.setattr(files, "_real", real)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        j = tc.post("/api/files/move", json={"paths": [str(tf / "a.txt")], "to": str(tf / "to")}, headers=h).json()
+        assert j["moved"] == [] and j["failed"][0]["error"] == "denied"
+        assert (tf / "a.txt").read_text() == "A" and not (tf / "to" / "a.txt").exists()
+        landed.clear()
+        r = tc.post("/api/files/rename", json={"path": str(tf / "b.txt"), "name": "c.txt"}, headers=h)
+        assert r.status_code == 403 and r.json()["error"] == "denied"
+        assert (tf / "b.txt").read_text() == "B" and not (tf / "c.txt").exists()
+        landed.clear()
+        j = tc.post("/api/files/delete", json={"paths": [str(tf / "b.txt")]}, headers=h).json()
+        assert j["deleted"] == [] and j["failed"][0]["error"] == "denied" and (tf / "b.txt").exists()
+        assert not db.query("SELECT * FROM file_recycle") and os.listdir(tf / files.RECYCLE_DIR) == []
+    assert not audits(db, "files.move") and not audits(db, "files.rename") and not audits(db, "files.delete")

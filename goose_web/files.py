@@ -526,6 +526,24 @@ def _move_item(src: Path, dst: Path) -> None:
     _remove_tree(src)
 
 
+async def _move_checked(c, u: dict, src: Path, dst: Path, real_parent: str) -> None:
+    """_move_item in a thread, then the item is looked at where it landed: its folder must still resolve to
+    `real_parent` (resolved when it was checked) and be writable for the person. A folder swapped for a link
+    meanwhile (by the person's agent, say) does not take the item elsewhere: it is moved back and refused."""
+    try:
+        await asyncio.to_thread(_move_item, src, dst)
+    except OSError as e:
+        raise _os_error(e)
+    if _real(dst.parent) == real_parent and c.path_ok(u, str(dst.parent), write=True):
+        return
+    log.warning("files: %s changed while %s moved %s there; the item is put back", dst.parent, u["username"], src)
+    try:
+        await asyncio.to_thread(_move_item, dst, src)
+    except OSError:
+        log.error("files: %s could not be put back from %s", src, dst, exc_info=True)
+    raise HTTPError(403, "denied", "The folder changed while the item was being moved; nothing was moved.")
+
+
 def _measure(p: Path) -> tuple[int, bool]:
     """(bytes, is a folder) - a folder's files added up (at most SCAN_MAX entries looked at)."""
     st = os.lstat(p)
@@ -830,10 +848,14 @@ async def rename_route(request: Request):
         return api.ok({"path": str(src)})
     if os.path.lexists(dst) and os.path.normcase(str(dst)) != os.path.normcase(str(src)):
         raise HTTPError(409, "exists", f"'{name}' already exists in this folder; nothing was replaced.")
+    real_parent = _real(src.parent)
     try:
         await asyncio.to_thread(_rename_noreplace, src, dst)
     except OSError as e:
         raise _os_error(e)
+    if _real(dst.parent) != real_parent or not c.path_ok(u, str(dst.parent), write=True):
+        await asyncio.to_thread(_rename_noreplace, dst, src)     # swapped for a link meanwhile: put back
+        raise HTTPError(403, "denied", "The folder changed while the item was being renamed; nothing was renamed.")
     _repath(c, src, dst)
     c.audit(request, "files.rename", u, target=str(dst), detail={"from": str(src), "to": str(dst)})
     return api.ok({"path": str(dst)})
@@ -859,6 +881,7 @@ async def move_route(request: Request):
     if not await asyncio.to_thread(to.is_dir):
         raise HTTPError(404, "not_found", "Folder not found")
     tops = await asyncio.to_thread(_tops, c, u, policy)
+    real_to = _real(to)
     moved: list[dict] = []
     failed: list[dict] = []
     for raw in paths:
@@ -878,10 +901,7 @@ async def move_route(request: Request):
                 raise HTTPError(400, "bad_request", "A folder cannot be moved into itself or one of its folders.")
             if os.path.lexists(dst):
                 raise HTTPError(409, "exists", f"'{src.name}' already exists there; nothing was replaced.")
-            try:
-                await asyncio.to_thread(_move_item, src, dst)
-            except OSError as e:
-                raise _os_error(e)
+            await _move_checked(c, u, src, dst, real_to)
             _repath(c, src, dst)
             c.audit(request, "files.move", u, target=str(dst), detail={"from": str(src), "to": str(dst)})
             moved.append({"from": str(src), "to": str(dst)})
@@ -934,10 +954,10 @@ async def delete_route(request: Request):
                 raise _os_error(e)
             dst = slot / src.name
             try:
-                await asyncio.to_thread(_move_item, src, dst)
-            except OSError as e:
+                await _move_checked(c, u, src, dst, _real(slot))
+            except HTTPError:
                 await asyncio.to_thread(_remove_empty, slot)
-                raise _os_error(e)
+                raise
             now = time.time()
             c.db.execute("INSERT INTO file_recycle(id, location, original_path, recycle_path, name, is_dir, size, "
                          "sha256, deleted_by, deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -1028,10 +1048,7 @@ async def restore_route(request: Request):
     if not c.path_ok(u, str(parent), write=True):
         raise HTTPError(403, "denied", "The original folder changed; the item is not restored.")
     dst = await asyncio.to_thread(_free_name, orig, bool(r["is_dir"]))
-    try:
-        await asyncio.to_thread(_move_item, src, dst)
-    except OSError as e:
-        raise _os_error(e)
+    await _move_checked(c, u, src, dst, _real(parent))
     await asyncio.to_thread(_remove_empty, src.parent)
     c.db.execute("DELETE FROM file_recycle WHERE id=?", (rid,))
     _repath(c, src, dst)
