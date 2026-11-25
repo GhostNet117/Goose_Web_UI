@@ -1438,3 +1438,22 @@ def test_f7_hints_files_by_short_name_and_folders_holding_them_are_the_administr
         h = sign_in(tc, c, admin)
         j = tc.post("/api/files/delete", json={"paths": [str(tf / "pack")]}, headers=h).json()
         assert j["deleted"] and not (tf / "pack").exists()
+
+
+def test_f8_a_team_saved_without_the_files_switches_keeps_them_and_the_change_is_audited(env):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    set_policy(db, tid, files=False, files_manage=True)
+    admin = user(db, "root", role="admin")
+    with client_for(c) as tc:
+        h = sign_in(tc, c, admin)
+        r = tc.patch(f"/api/admin/teams/{tid}", json={"policy": {**ANYCHAT, "schedules": True}}, headers=h)
+        assert r.status_code == 200, r.text
+        stored = db.one("SELECT policy FROM teams WHERE id=?", (tid,))["policy"]
+        assert stored["files"] is False and stored["files_manage"] is True and stored["schedules"] is True
+        assert audits(db, "team.update")[-1]["detail"]["policy"] == {"schedules": True}
+        # an explicit value in the save is taken as it is
+        r = tc.patch(f"/api/admin/teams/{tid}", json={"policy": {**ANYCHAT, "files": True}}, headers=h)
+        stored = db.one("SELECT policy FROM teams WHERE id=?", (tid,))["policy"]
+        assert r.status_code == 200 and stored["files"] is True and stored["files_manage"] is True
+        assert audits(db, "team.update")[-1]["detail"]["policy"] == {"files": True, "schedules": None}

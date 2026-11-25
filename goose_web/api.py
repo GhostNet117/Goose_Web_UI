@@ -1682,11 +1682,21 @@ async def admin_team(request: Request):
         return ok()
     b = await body_json(request)
     import json as _json
+    policy_changes: dict[str, Any] = {}
     if "name" in b or "description" in b or "policy" in b:
+        stored = t.get("policy") if isinstance(t.get("policy"), dict) else {}
+        newp = stored
+        if "policy" in b:
+            newp = _clean_policy(b["policy"], c, t)
+            # assessment 2026-11-25 F-8: a save that does not carry the Files switches (a script, a page from before
+            # they existed) keeps what is stored instead of switching them off unasked
+            for k in acp_policy.FILES_KEYS:
+                if k not in newp and k in stored:
+                    newp[k] = stored[k]
+            policy_changes = {k: newp.get(k) for k in sorted(set(stored) | set(newp)) if stored.get(k) != newp.get(k)}
         c.db.execute("UPDATE teams SET name=?, description=?, policy=? WHERE id=?",
                      (str(b.get("name", t["name"]))[:80], str(b.get("description", t["description"]))[:500],
-                      _json.dumps(_clean_policy(b["policy"], c, t) if "policy" in b else (t.get("policy") or {})),
-                      tid))
+                      _json.dumps(newp), tid))
     moved: list[str] = []
     if "members" in b:
         ids = sorted({int(m) for m in b["members"] or []})
@@ -1704,7 +1714,10 @@ async def admin_team(request: Request):
     after = _team_members(c, tid)
     seen = {u["id"]: u for u in before + after}
     changes = await _reprovision(c, [c.db.user_by_id(i) for i in seen])
-    c.audit(request, "team.update", admin, target=t["name"], detail={"fields": sorted(b.keys()), "moved": moved})
+    detail: dict[str, Any] = {"fields": sorted(b.keys()), "moved": moved}
+    if policy_changes:      # F-8: what the save changed in the team's policy (the new values)
+        detail["policy"] = policy_changes
+    c.audit(request, "team.update", admin, target=t["name"], detail=detail)
     return ok({"team": _team_view(c, c.db.one("SELECT * FROM teams WHERE id=?", (tid,))), "changes": changes,
                "moved": moved, "restartPending": _restart_pending(c, seen.values())})
 
