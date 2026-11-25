@@ -913,7 +913,8 @@ WebSocket connection of the user.
 - **Goose plugins (since 1.13.1).** Goose loads every folder under `<chat folder>\.agents\plugins` as a plugin when
   a chat starts there and runs the plugin's MCP servers, which are commands; Goose has no setting to turn this off.
   So non-admins cannot create or upload into any folder named `.agents` through the file browser
-  (`403 agents_folder_refused`), and cannot save project skills or agents (`sources/create`, *project* scope) anywhere
+  (`403 agents_folder_refused`; since 1.28.0 also `.goose` and `.claude`, whose skills, recipes and agents Goose
+  reads from a chat's folder as well, and a file named `.gooseignore`), and cannot save project skills or agents (`sources/create`, *project* scope) anywhere
   but their own workspace (since 1.15.1). A plugin runs as the person who starts the chat, so since 1.15.1 no member
   can start a chat in the **team folder or the team's extra folders** while their `.agents\plugins` holds a plugin,
   with or without `allow_shell` ("this shared folder has Goose plugins"); in their own workspace a member needs
@@ -1124,29 +1125,55 @@ and the drives).
   when 1.28.0 first started (each such change is in the audit as `team.update` by the system; settings key
   `files_switches_applied`, so a switch you turn off stays off): **Files: browse, download and upload** (`files`)
   and **Rename, move and delete files** (`files_manage`, needs `files`). Per-person overrides work as for the other
-  switches. Administrators always have both. Without `files` the page is hidden, every `/api/files/*` route answers
+  switches - an override of a switch is `true` or `false` (anything else, such as `"false"`, is refused with
+  `400 bad_request`; a stored value that is not `true` counts as off). A team saved without the two keys (a
+  script, an Admin page from before 1.28.0) keeps what is stored; `team.update` records the policy values a save
+  changed. Administrators always have both. Without `files` the page is hidden, every `/api/files/*` route answers
   `403 files_off`, and so do `/api/fs/download` and `/api/fs/read` (the folder picker of New chat keeps working).
 - **Uploads** land in the folder shown, never replacing a file (`name (1).ext`); the largest file is Admin > Settings
-  > Files and chats > Largest file upload, as for attachments. Their SHA-256 is computed while they arrive. They
+  > Files and chats > Largest file upload, as for attachments. Their SHA-256 is computed while they arrive and
+  checked against the finished file, read once at the end: a file changed on the server during its upload (the
+  hidden partial file can be written by the teammates' agents) is not kept (`409 upload_changed`, audited
+  `files.upload` with `ok=false` and both SHA-256 values). The Files switch is checked for every piece. They
   belong to no chat: **chat retention (9.9d) never deletes them.**
 - **Protections** are those of uploads: the folder as written and as it resolves must be one the person may write
-  (a link leading elsewhere is refused), names are cleaned, members cannot create, rename, move or delete Goose hints
-  files (`AGENTS.md`, `.goosehints`, `.goose-web-hints.md`) or `.agents` folders, nothing is ever replaced, and a
-  location's top folder (a workspace, the team folder, an extra folder) cannot be renamed, moved or deleted. Previews
+  (a link leading elsewhere is refused), names are cleaned (Unicode format characters such as a right-to-left override
+  are dropped), members cannot create, rename, move or delete Goose hints files (`AGENTS.md`, `.goosehints`,
+  `.goose-web-hints.md`, also by an 8.3 short name), a `.gooseignore`, anything in `.agents`, `.goose` or `.claude`
+  folders, or a folder that holds a hints file or an `.agents` folder; nothing is ever replaced; and no location's
+  top folder - anybody's: a workspace, any team's folder or extra folder, also one that lies inside a folder this
+  person may write - nor a folder holding one can be renamed, moved or deleted. A rename, move or delete holds the
+  item and both folders open while it runs, so a folder swapped for a link meanwhile moves nothing (`403 denied`).
+  A move to another drive copies, then deletes the original; a folder that holds a link (junction, symbolic link)
+  is not copied (`409 has_link`: move it on the server), and when part of the original cannot be deleted (in use)
+  the copy stays, the answer says so and `files.move` records `sourceLeft`. Previews
   are plain text (never interpreted) and PNG / JPEG / GIF / WebP images recognised by their bytes; SVG and everything
   else are only downloaded.
 - **Recycle folder.** Delete moves an item into the hidden folder `.goose-web-recycle` at the top of its location
   (`<location>\.goose-web-recycle\<id>\<name>`, same volume). Anyone who may write in that location can restore it
   (back to its folder, `name (restored).ext` when the name is taken) for `files.recycle_days` days (configuration,
   default 30, 1 to 365; `goose-web check` shows the period in force and a value it did not take); then the
-  maintenance loop removes it for good (`files.purge`). What you delete as an
-  administrator in a team's folder goes to that team's recycle folder. The recycle folder is never listed and no
+  maintenance loop removes it for good (`files.purge`); one that cannot be removed yet (in use) is tried again an
+  hour later, after the others. **Recycle bin > Empty now** (administrators) removes everything in a location's
+  bin at once (`files.purge` with `early`); the bin shows its size. What is deleted inside a location lands in the
+  recycle folder of the deepest location it lies in - what you delete as an administrator in a team's folder goes
+  to that team's recycle folder. Something else named `.goose-web-recycle` (a file, a link) is moved aside to
+  `.goose-web-recycle.conflict-<id>` (audited `files.recycle_conflict`) instead of blocking deletes. The recycle folder is never listed and no
   route but restore reaches it - but it is an ordinary folder on disk: the members' agents (which may write in the
   location) and anyone with access to the server's disk can see and change it. Do not rely on it as a backup.
 - **Audit.** `files.upload`, `files.download`, `files.read` (`/api/fs/read`), `files.preview`, `files.mkdir`,
-  `files.rename`, `files.move`, `files.delete`, `files.restore`, `files.purge` - the path as target, size, SHA-256
-  when known, from and to for moves; like every audit row they go to `activity.jsonl` and so to the SIEM (section
-  16). Members see the recent `files.*` rows of a folder in the page (Activity).
+  `files.rename`, `files.move`, `files.delete`, `files.restore`, `files.purge`, `files.recycle_conflict` - the path
+  as target, size, from and to for moves; like every audit row they go to `activity.jsonl` and so to the SIEM
+  (section 16). A download, preview or read records the SHA-256 of the bytes actually sent when they were the
+  whole file (else `sha256Omitted` says why: a part (`Range`), a download that did not finish); a download is
+  recorded when it has been sent, a `HEAD` request not at all. A delete records a stored SHA-256 with
+  `sha256Source` (`upload` or `computed`). A request refused with 403 (another person's folder, a read-only
+  folder, Files switched off, a protected name) is recorded as `files.refused` with `ok=false`, at most once a
+  minute per person, route and path. Members see the recent successful `files.*` rows of a folder in the page
+  (Activity).
+- **Load.** SHA-256 computations and moves run in four threads of their own (never the ones sign-in and listings
+  use); per person at most two SHA-256 computations, two move or delete requests and two previews at a time
+  (`429 busy`), and one forced SHA-256 ("Compute again") of a file per 10 seconds.
 
 #### 9.9e Providers for one person (1.27.0)
 
@@ -1527,8 +1554,8 @@ and `.goosehints` files in a chat's working folder, and the `AGENTS.md` in the s
 ignored for isolated profiles. A member therefore cannot override the team hints by placing a hints file in a
 folder. In addition:
 
-- non-admins cannot upload, or create with "New folder", anything named `AGENTS.md`, `.goosehints` or
-  `.goose-web-hints.md`, in any folder (`403 hint_file_refused`);
+- non-admins cannot upload, or create with "New folder", anything named `AGENTS.md`, `.goosehints`,
+  `.goose-web-hints.md` or (since 1.28.0) `.gooseignore`, in any folder (`403 hint_file_refused`);
 - non-admins cannot change or remove `CONTEXT_FILE_NAMES` through the Goose configuration, even with `config_edit`.
   The worker's environment value is set after `goose.extra_env`, so it also wins over the configuration file;
 - the `config/.goosehints` file that Goose Web 1.4 composed is removed at the next provisioning if it still starts
@@ -2381,7 +2408,7 @@ Recorded actions:
 | Teams and hints | `team.create`, `team.update` (with `moved`: users moved here from another team), `team.delete`, `team.migrate.membership` (1.5.0 upgrade: a second team membership was dropped), `team.item.add`, `team.item.remove`, `user.item.add`, `user.item.remove`, `user.item.refresh` (1.27.0: providers for one person, section 9.9e), `hints.create`, `hints.update`, `hints.delete` |
 | Settings | `settings.auth`, `settings.update` |
 | Operations | `worker.restart`, `worker.stop`, `worker.orphan_ended` (the orphan reaper ended an MCP server process Goose had let go: profile, pid, extension, masked command line, seconds cut off; section 12), `hosttask.<action>`, `fs.upload` |
-| Files page (1.28.0, section 9.9f) | `files.upload` (`{name, folder, size, sha256, chunked}`), `files.download` (`{size, sha256 if known, range if resumed, route}`), `files.read` (`/api/fs/read`), `files.preview` (`{size, kind}`), `files.mkdir`, `files.rename` and `files.move` (`{from, to}`), `files.delete` (`{id, size, dir, sha256 if known}`), `files.restore`, `files.purge` (by the system, after `files.recycle_days`); the path is the target. The one-time switch-on of the Files switches for existing teams is `team.update` by the system with `reason` |
+| Files page (1.28.0, section 9.9f) | `files.upload` (`{name, folder, size, sha256, chunked}`), `files.download` (`{size, sha256 of the bytes sent or sha256Omitted, range if resumed, status, route}`, written when sent; not for `HEAD`), `files.read` (`/api/fs/read`), `files.preview` (`{size, kind}`), `files.mkdir`, `files.rename` and `files.move` (`{from, to}`), `files.delete` (`{id, size, dir, sha256 and sha256Source if stored}`), `files.restore`, `files.purge` (by the system, after `files.recycle_days`; by an administrator with `early`), `files.recycle_conflict` (`{movedTo}`), `files.refused` (`ok=false`, `{route, error}`, once a minute per person, route and path); a refused upload is `files.upload` with `ok=false` (`{sha256Received, sha256OnDisk, refused}`); the path is the target. The one-time switch-on of the Files switches for existing teams is `team.update` by the system with `reason` |
 | Agent calls | `acp.denied` (policy denials, with the reason), `acp.<method>` for sensitive methods (configuration, providers and secrets, recipes save/delete, schedules create/delete, apps import/delete, sources, tool permissions, direct tool calls, adding session extensions, defaults, session delete) and for every call on another user's profile, `acp.answer` (answers to permission prompts and forms, with the choice) |
 | Admin access | `ws.impersonate`, `transcript.view` (an administrator read the read-only copy of a chat in another profile, with the session id) |
 | Everyday use (1.11) | `chat.new` (with the folder), `chat.open`, `chat.prompt` (length and number of attachments - never the text), `chat.steer` (1.15, the same), `chat.cancel`, `chat.fork`, `chat.mode`; `settings.tls`, `tls.renewed` |

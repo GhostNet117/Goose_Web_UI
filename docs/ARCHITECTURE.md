@@ -1397,8 +1397,8 @@ secrets, schedules) stays in each profile and is never copied into it.
 | `uploads` | Spec 039: files uploaded through Goose Web. `id` (SHA-256 of the id the browser holds), `user_id`, `username`, `profile` (whose chats it belongs to), `session_id` (the chat named at the start), `dir` (`<chat folder>\Web_Uploads` as written) and `real_dir` (resolved at the start), `name`, `partial` (the hidden partial file while `open`), `path` (the final file), `size` (declared), `received`, `mime`, `state` (`open`, `done`, `aborted`, `abandoned`, `deleted`, `gone`, `kept`), `file_id` (volume:file index of the file written), `note`, `created_at`, `updated_at`, `completed_at`. Ended rows are dropped after 30 days; `done` rows stay for retention. Spec 041 adds `target` (`chat`: an attachment in `Web_Uploads`; `folder`: uploaded on the Files page into the folder itself - in no chat, never deleted by retention) and `sha256` (of a `folder` upload, computed while it arrived). A `folder` row's `path` follows the file when it is renamed, moved, recycled or restored on the Files page (a chat attachment's does not: retention must not find it at its new place). |
 | `upload_links` | Spec 040: `(upload_id, session_id)` primary key, `profile`, `linked_at` - the chats a file belongs to (set at completion, by New chat after `session/new`, copied to a fork or branch). |
 | `chat_access` | Spec 040: `(profile, session_id)` primary key, `last_access` - when Goose Web last saw the chat used (at most one write a minute per chat). |
-| `file_hashes` | Spec 041: `path` (normcase'd absolute path, primary key), `size`, `mtime`, `sha256`, `at` - SHA-256 computed on the Files page; valid while the file has that size and modification time; follows renames and moves; rows older than a year are dropped by the maintenance loop. |
-| `file_recycle` | Spec 041: `id` (20 hex characters), `location` (the location's top folder), `original_path`, `recycle_path` (`<location>\.goose-web-recycle\<id>\<name>`), `name`, `is_dir`, `size`, `sha256`, `deleted_by`, `deleted_at` - items deleted on the Files page until they are restored or purged after `files.recycle_days`. |
+| `file_hashes` | Spec 041: `path` (normcase'd absolute path, primary key), `size`, `mtime`, `mtime_ns`, `sha256`, `at` - SHA-256 computed on the Files page; given only while the file has exactly that size and modification time (`mtime_ns`); follows renames and moves; rows older than a year are dropped by the maintenance loop. |
+| `file_recycle` | Spec 041: `id` (20 hex characters), `location` (the location's top folder), `original_path`, `recycle_path` (`<location>\.goose-web-recycle\<id>\<name>`), `name`, `is_dir`, `size`, `sha256`, `deleted_by`, `deleted_at`, `tries` / `last_try` (failed purges: retried an hour later, after the others) - items deleted on the Files page until they are restored or purged after `files.recycle_days`. |
 
 **JSON columns.** `prefs`, `policy_overrides`, `policy`, `payload`, `detail` and
 `value` are decoded automatically in `_row()`, so callers always get Python
@@ -1956,42 +1956,71 @@ and are audited (`files.download`, `files.read`).
   start, setting `files_switches_applied`, each change audited `team.update` by the system). `files.gate` raises
   `403 files_off`. The folder picker (`/api/fs/roots|list|mkdir`) does not need it.
 - **Locations.** Members: `Ctx.roots_for` (workspace, team folder, extra folders, read-only folders) with their
-  access; administrators: workspace and drives like `/api/fs/roots`. For protection and the recycle folder an
-  administrator's "tops" also include every team's folder and extra folders and every person's workspace, so what an
-  administrator deletes there lands in the recycle folder the team (or the person) sees, and none of them - nor a
-  profile folder or the profiles root holding them - can be renamed, moved or deleted from the Files page.
+  access; administrators: workspace and drives like `/api/fs/roots`. For protection and the recycle folder the
+  "tops" (`_tops`) are, for everyone (assessment 2026-11-25 F-3), the person's locations, every team's folder and
+  extra folders (read and write), every person's workspace and extra folders, the system folder and the profiles
+  root - compared as written and resolved; a member's are only compared, never shown. What is deleted inside a top
+  lands in the recycle folder of the deepest one (the one its team or person sees), and none of them - nor a folder
+  holding one - can be renamed, moved or deleted from the Files page.
 - **Paths.** Every path through `api._check_path` (read, or write for anything that changes something) - the path
   as written and resolved must lie in the person's (writable) folders. `_check_path` also answers `404` for anything
   with a `.goose-web-recycle` component (as written or resolved), so the recycle folder is reached by no route but
-  restore; `fs_list` and the Files listing leave it out. New names: `safe_upload_name` after removing `:`;
-  `_refuse_hint_name` / `_refuse_agents_dir` for members on the new name, and on the source of a rename, move or
-  delete. A location's top folder, or a folder holding one, is never renamed, moved or deleted.
-- **Changes never replace anything.** `MoveFileEx` without replace (`os.rename` on Windows); across volumes
-  (`EXDEV` / `ERROR_NOT_SAME_DEVICE`) a copy under a hidden `.goose-web-move-<hex>` name next to the target (links
-  copied as links), renamed, then the original removed (`shutil.rmtree` never follows junctions). After a rename,
-  move, delete or restore the item's new folder must still resolve to the folder that was checked and be writable;
-  otherwise the item is put back and the request refused (a folder swapped for a link meanwhile).
+  restore; `fs_list` and the Files listing leave it out. New names: `safe_upload_name` after removing `:`
+  (it also drops Unicode format characters, category Cf); `_refuse_hint_name` (hints files and `.gooseignore`) /
+  `_refuse_agents_dir` (`policy.has_agent_config_component`: `.agents`, `.goose`, `.claude`) for members on the new
+  name, and on the source of a rename, move or delete - its name as written and expanded from an 8.3 short name
+  (`_long_name`); for members also no folder holding a hints file or an `.agents` folder (`_holds_protected`, a
+  bounded walk in a thread). A top folder, or a folder holding one, is never renamed, moved or deleted.
+- **Changes never replace anything, and hold what they change** (assessment 2026-11-25 F-1, F-2, F-10). `_pin`
+  takes, right after the checks, the item's identity (volume:file index) and both folders resolved, each checked
+  once more. `_move_item` (in Files' own threads) then opens the item (`CreateFileW`: the link itself, delete
+  access, no `FILE_SHARE_DELETE`) and the target folder: while those handles are open nobody can rename or delete
+  either, and NTFS refuses to rename any folder above an open item - so no path the move uses can be swapped for a
+  link while it runs. The item must be the one that was checked, in the folder that was checked, and the target
+  folder must resolve to the one checked (`_Changed` -> `403 denied`, nothing moved); the rename is
+  `SetFileInformationByHandle(FileRenameInfo)` on the item's handle, never replacing. Across volumes
+  (`ERROR_NOT_SAME_DEVICE`): a folder holding a link (junction, symbolic link, mount point; `_find_link`) is
+  refused whole (`409 has_link`, nothing copied); else each entry is opened, found to be exactly where it should be
+  (no link on the way) and held while it is copied under a hidden `.goose-web-move-<hex>` name next to the target,
+  which is then renamed into place; the original is deleted the same way, entry by entry through its handle (a
+  link: the link itself). What could not be deleted is answered as a warning and audited (`sourceLeft`). Where
+  such handles do not exist (not Windows) the item is looked at before and after and put back on a mismatch.
 - **Recycle.** Delete moves an item to `<location top>\.goose-web-recycle\<id>\<name>` (the recycle folder made when
   needed, hidden, and refused when it is a link or does not resolve right inside the location) and writes a
   `file_recycle` row. Restore checks the recycle folder, the id folder and the item are no links and resolve where
   Goose Web put them, recreates the original folder when needed and picks `name (restored).ext` when the name is
   taken. `purge_recycle` (maintenance loop) removes items older than `files.recycle_days` (1..365, default 30),
-  at most 500 a run, with the same checks; audit `files.purge` by the system.
+  at most 500 a run, with the same checks; an item it cannot remove waits an hour (`tries`, `last_try`) and goes
+  behind the others; audit `files.purge` by the system. `POST /api/files/recycle/empty` does the same for one
+  location at once for an administrator (`early`). Something else under the recycle folder's name is moved aside
+  (`.goose-web-recycle.conflict-<id>`, `files.recycle_conflict`).
 - **What is known about a file.** `uploads` rows (`done`, same path, size and volume:file index) give
-  `uploadedBy`/`uploadedAt`, and the SHA-256 of a Files upload while the file was not modified after it; otherwise
-  `file_hashes` (same size and mtime). `POST /api/files/hash` computes it in a thread (2 at a time per person).
+  `uploadedBy`/`uploadedAt`, and the SHA-256 of a Files upload while the file's modification time is exactly
+  `uploads.mtime_ns` (taken when the finished file was read); otherwise `file_hashes` (same size and `mtime_ns`).
+  Each comes with `sha256Source` (`upload` / `computed`) and `recordedAt` (assessment F-5). `POST
+  /api/files/hash` computes it in Files' own threads (2 at a time per person; one `force` per file per 10 s).
 - **Type and preview.** `detect_type` looks at the first 4 KB: a magic-number table (images, PDF, archives,
   executables, pcap/pcapng, EVTX, registry hives, LNK, E01, SQLite, OLE), RIFF containers, else text (no NUL, at most
   1% control characters) or data. Preview sends text as JSON (256 KB, shown with `textContent` by the page) and only
   PNG/JPEG/GIF/WebP by their bytes (never SVG) with `nosniff`, `inline` and a sandbox CSP; anything else `415`.
 - **Uploads.** `uploads.py` with `target: "folder"`: the folder itself (must exist), the same checks as
   `Web_Uploads`; the SHA-256 state is fed by the writer thread per piece, kept in memory only when a piece is kept
-  whole, and rebuilt from the partial file (read once) when it is missing (a restart). `uploads.target = 'folder'`,
+  whole, and rebuilt from the partial file (read once) when it is missing (a restart). At the finish the placed
+  file is read once through a handle nobody may write meanwhile (`_hash_finished`); a SHA-256 that differs from the
+  bytes received means the file was changed on the server - it is removed and the upload refused (`409
+  upload_changed`, `files.upload` with `ok=false`). The Files switch is checked for every piece and at the finish. `uploads.target = 'folder'`,
   `uploads.sha256`; never linked to a chat; retention's sweep only takes `target = 'chat'`.
 - **Audit.** `files.upload`, `files.download`, `files.read`, `files.preview`, `files.mkdir`, `files.rename`,
-  `files.move`, `files.delete`, `files.restore`, `files.purge` - target the path, detail size / SHA-256 / from-to;
-  they reach `activity.jsonl` (the SIEM) like every audit row. `GET /api/files/activity` shows the rows of a folder
-  and everything in it (and moves out of it).
+  `files.move`, `files.delete`, `files.restore`, `files.purge`, `files.recycle_conflict` - target the path, detail
+  size / SHA-256 / from-to; they reach `activity.jsonl` (the SIEM) like every audit row. Downloads are audited by
+  `_SentFile` when the body has gone out, with the SHA-256 of exactly the bytes sent (whole file) or
+  `sha256Omitted`; `HEAD` is not audited; previews and `/api/fs/read` hash what they read. Every route is wrapped
+  by `_audited`: a 403 answer is recorded as `files.refused` (`ok=false`, once a minute per person, route, refusal
+  and path). `GET /api/files/activity` shows the successful rows of a folder and everything in it (and moves out
+  of it).
+- **Load.** `heavy()`: SHA-256 computations, moves and the final read of an upload run in a pool of
+  `HEAVY_THREADS` (4) threads of their own; `_limited` allows a person 2 move/delete requests and 2 previews at a
+  time (`429 busy`).
 
 ### 12.8 MCP Apps
 

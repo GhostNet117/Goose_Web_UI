@@ -884,8 +884,10 @@ the browser asks first. When a file fails after the automatic tries (the network
 - The largest file is your administrator's upload limit (5 GB by default).
 - An existing file is never overwritten: a second `capture.pcap` becomes `capture (1).pcap`.
 - Folders cannot be dropped: create the folder with **New folder**, open it and drop its files there.
-- The same names are refused as for attachments (`AGENTS.md`, `.goosehints`, `.goose-web-hints.md`, `.agents`
-  folders).
+- The same names are refused as for attachments (`AGENTS.md`, `.goosehints`, `.goose-web-hints.md`,
+  `.gooseignore`, and `.agents`, `.goose` and `.claude` folders); invisible formatting characters (such as a
+  right-to-left mark) are removed from names.
+- If the file is changed on the server while it is being uploaded, it is not kept: upload it again.
 - Files uploaded here are never deleted by the clean-up of old chats and their attachments.
 
 ### Details, SHA-256 and download
@@ -895,10 +897,13 @@ Click a file's name: its details open next to the list (on a phone, over it; the
 - **Size**, **Type** (recognised from the file's first bytes, for example "PNG image", "ZIP archive", "PDF
   document", "pcap capture", "Windows executable", "text"), **Modified**, **Created**, **Uploaded** (who and when,
   for files uploaded through Goose Web) and the **Path**.
-- **SHA-256**: computed while the file was uploaded through Goose Web. For other files click **Compute** (a large
-  file takes a while); the value is kept until the file changes. The copy button next to it copies it.
+- **SHA-256**: taken from the file when its upload through Goose Web finished ("recorded at upload" and the
+  time). For other files click **Compute** (a large file takes a while; "computed" and the time). A stored value
+  is shown only while the file's size and modification time are unchanged - but someone who may change the file
+  could keep both, so for evidence use **Compute again**, which reads the whole file now. The copy button copies
+  it.
 - **Download** saves the file with the browser's normal download - any size, and the browser can resume an
-  interrupted download. Every download is recorded.
+  interrupted download. Every download is recorded, with the SHA-256 of what was sent.
 
 ### Preview
 
@@ -920,12 +925,15 @@ with the reason.
 With the team switch **Rename, move and delete files**, in a folder you may change: **Rename** (never replaces an
 existing name), **Move...** (to a folder you may change; never into the moved folder itself) and **Delete...**
 (asks first). Use them in the details, or tick several items and use the bar above the list. The top folder of a
-location cannot be renamed, moved or deleted.
+location (yours, or another team's that lies inside your folder) cannot be renamed, moved or deleted, nor a folder
+that holds one, Goose hints files or a `.agents` folder. Moving a folder to another drive is refused when it holds
+a link (a junction); if part of the original cannot be removed after such a move (a file in use), you are told.
 
 A delete moves the item into the location's hidden recycle folder. The message that follows offers **Undo**; later
 the **Recycle bin** lists what was deleted in this location (by anyone), with **Restore**: the item goes back to its
 folder, with " (restored)" added when its name is taken by then. After 30 days (your administrator may choose
-another number) the items are removed for good.
+another number) the items are removed for good. The bin shows how much it holds; an administrator can empty it at
+once (**Empty now**).
 
 ### Activity
 
