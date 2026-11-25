@@ -836,16 +836,22 @@ def test_purge_removes_old_recycled_items_for_good(env):
     for n in ("old.txt", "young.txt"):
         (tf / n).write_text(n)
     (tf / "olddir").mkdir()
-    (tf / "olddir" / "f.txt").write_text("f")
     with client_for(c) as tc:
         h = sign_in(tc, c, dee)
+        upload(tc, h, tf / "olddir", "f.txt", b"f")
+        tc.post("/api/files/hash", json={"path": str(tf / "old.txt")}, headers=h)
         j = tc.post("/api/files/delete", json={"paths": [str(tf / "old.txt"), str(tf / "young.txt"),
                                                          str(tf / "olddir")]}, headers=h).json()
     ids = {Path(x["path"]).name: x["id"] for x in j["deleted"]}
+    assert db.one("SELECT state FROM uploads WHERE target='folder'")["state"] == "done"
+    assert db.one("SELECT COUNT(*) AS n FROM file_hashes")["n"] == 1
     db.execute("UPDATE file_recycle SET deleted_at=? WHERE id IN (?,?)", (NOW - 31 * DAY, ids["old.txt"], ids["olddir"]))
     rec = tf / files.RECYCLE_DIR
     assert asyncio.run(files.purge_recycle(c)) == 2
     assert sorted(os.listdir(rec)) == [ids["young.txt"]]
+    # the upload that was in the purged folder and the cached hash of the purged file end with them
+    assert db.one("SELECT state FROM uploads WHERE target='folder'")["state"] == "deleted"
+    assert db.one("SELECT COUNT(*) AS n FROM file_hashes")["n"] == 0
     assert [r["id"] for r in db.query("SELECT id FROM file_recycle")] == [ids["young.txt"]]
     a = audits(db, "files.purge")
     assert {x["target"] for x in a} == {str(tf / "old.txt"), str(tf / "olddir")}

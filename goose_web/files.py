@@ -1133,6 +1133,12 @@ async def purge_recycle(c, now: float | None = None) -> int:
         if how is None:
             continue
         c.db.execute("DELETE FROM file_recycle WHERE id=?", (r["id"],))
+        # the records of what was in it end too (an upload row 'deleted' is dropped after 30 days, uploads.cleanup)
+        rp = str(r["recycle_path"])
+        c.db.execute("UPDATE uploads SET state='deleted', note='removed from the recycle folder', updated_at=? WHERE "
+                     "target='folder' AND state='done' AND (path=? COLLATE NOCASE OR path LIKE ? ESCAPE '^')",
+                     (now, rp, _like_prefix(rp)))
+        c.db.execute("DELETE FROM file_hashes WHERE path=? OR path LIKE ? ESCAPE '^'", (_key(rp), _like_prefix(_key(rp))))
         detail: dict[str, Any] = {"id": r["id"], "name": r["name"], "size": r["size"], "days": days,
                                   "deletedBy": r["deleted_by"]}
         if how == "missing":
