@@ -14,7 +14,8 @@ Routes (docs/API.md):
     POST /api/files/rename    {path, name}
     POST /api/files/move      {paths, to}
     POST /api/files/delete    {paths}           into <location>\\.goose-web-recycle\\<id>\\<name>
-    GET  /api/files/recycle?location=
+    GET  /api/files/recycle?location=           the items, their total size, canEmpty
+    POST /api/files/recycle/empty {location}    administrators: everything in that bin removed for good now
     POST /api/files/restore   {id}
     GET  /api/files/activity?path=&limit=
 
@@ -1686,7 +1687,34 @@ async def recycle_route(request: Request):
                       (str(loc), RECYCLE_LIST_MAX))
     items = [_recycle_view(r, days) for r in rows if _norm(r["location"]) == _norm(loc)
              and c.path_ok(u, os.path.dirname(r["original_path"]), write=True)]
-    return api.ok({"items": items})
+    # F-13: what the bin holds, and whether this person may empty it before its time (administrators)
+    return api.ok({"items": items, "size": sum(int(x["size"] or 0) for x in items), "canEmpty": u["role"] == "admin"})
+
+
+async def empty_route(request: Request):
+    """F-13: an administrator removes everything in a location's recycle bin for good now (a full disk), each item
+    audited files.purge with `early`."""
+    api, c, u, _ = _begin(request, manage=True)
+    if u["role"] != "admin":
+        raise HTTPError(403, "denied", "Only an administrator can empty a recycle bin before its time.")
+    b = await _body(request, 16 * 1024)
+    loc = _check(c, u, _arg_path(b.get("location")), write=True)
+    now = time.time()
+    purged = failed = 0
+    for r in c.db.query("SELECT * FROM file_recycle WHERE location=? COLLATE NOCASE ORDER BY deleted_at", (str(loc),)):
+        if _norm(r["location"]) != _norm(loc):
+            continue
+        how = await _purge_one(c, r, now)
+        if how is None:
+            failed += 1
+            continue
+        detail: dict[str, Any] = {"id": r["id"], "name": r["name"], "size": r["size"], "deletedBy": r["deleted_by"],
+                                  "early": True}
+        if how == "missing":
+            detail["missing"] = True
+        c.audit(request, "files.purge", u, target=r["original_path"], detail=detail)
+        purged += 1
+    return api.ok({"purged": purged, "failed": failed})
 
 
 def _free_name(dst: Path, is_dir: bool) -> Path:
@@ -1804,28 +1832,44 @@ def _purge_item(r: dict) -> str | None:
     return "deleted"
 
 
+PURGE_RETRY_SECONDS = 3600      # F-13: an item that could not be removed waits an hour, then goes behind the others
+
+
+async def _purge_one(c, r: dict, now: float) -> str | None:
+    """_purge_item in a thread and its records: 'deleted' / 'missing' (the row and what followed the item end), or
+    None (could not be removed now: counted, tried again later behind the others)."""
+    try:
+        how = await asyncio.to_thread(_purge_item, r)
+    except Exception:
+        log.exception("files: purging %s", r.get("recycle_path"))
+        how = None
+    if how is None:
+        c.db.execute("UPDATE file_recycle SET tries=tries+1, last_try=? WHERE id=?", (now, r["id"]))
+        return None
+    c.db.execute("DELETE FROM file_recycle WHERE id=?", (r["id"],))
+    # the records of what was in it end too (an upload row 'deleted' is dropped after 30 days, uploads.cleanup)
+    rp = str(r["recycle_path"])
+    c.db.execute("UPDATE uploads SET state='deleted', note='removed from the recycle folder', updated_at=? WHERE "
+                 "target='folder' AND state='done' AND (path=? COLLATE NOCASE OR path LIKE ? ESCAPE '^')",
+                 (now, rp, _like_prefix(rp)))
+    c.db.execute("DELETE FROM file_hashes WHERE path=? OR path LIKE ? ESCAPE '^'", (_key(rp), _like_prefix(_key(rp))))
+    return how
+
+
 async def purge_recycle(c, now: float | None = None) -> int:
     """Maintenance loop: recycled items older than files.recycle_days are removed for good (audited files.purge, by
-    the system); cached hashes nobody needed for a year are dropped. Returns how many items were purged."""
+    the system); one that cannot be removed now waits PURGE_RETRY_SECONDS and then comes after the others, so a few
+    stuck items never hold up the rest (F-13); cached hashes nobody needed for a year are dropped. Returns how many
+    items were purged."""
     now = time.time() if now is None else now
     days = recycle_days(c.settings)
     n = 0
-    for r in c.db.query("SELECT * FROM file_recycle WHERE deleted_at<? ORDER BY deleted_at LIMIT ?",
-                        (now - days * 86400, PURGE_PER_RUN)):
-        try:
-            how = await asyncio.to_thread(_purge_item, r)
-        except Exception:
-            log.exception("files: purging %s", r.get("recycle_path"))
-            continue
+    for r in c.db.query("SELECT * FROM file_recycle WHERE deleted_at<? AND (last_try IS NULL OR last_try<?) "
+                        "ORDER BY tries, deleted_at LIMIT ?", (now - days * 86400, now - PURGE_RETRY_SECONDS,
+                                                              PURGE_PER_RUN)):
+        how = await _purge_one(c, r, now)
         if how is None:
             continue
-        c.db.execute("DELETE FROM file_recycle WHERE id=?", (r["id"],))
-        # the records of what was in it end too (an upload row 'deleted' is dropped after 30 days, uploads.cleanup)
-        rp = str(r["recycle_path"])
-        c.db.execute("UPDATE uploads SET state='deleted', note='removed from the recycle folder', updated_at=? WHERE "
-                     "target='folder' AND state='done' AND (path=? COLLATE NOCASE OR path LIKE ? ESCAPE '^')",
-                     (now, rp, _like_prefix(rp)))
-        c.db.execute("DELETE FROM file_hashes WHERE path=? OR path LIKE ? ESCAPE '^'", (_key(rp), _like_prefix(_key(rp))))
         detail: dict[str, Any] = {"id": r["id"], "name": r["name"], "size": r["size"], "days": days,
                                   "deletedBy": r["deleted_by"]}
         if how == "missing":
@@ -1852,6 +1896,7 @@ routes = [
     Route("/api/files/delete", _audited(_limited("change", CHANGES_PER_PERSON, "moves or deletes")(delete_route)),
           methods=["POST"]),
     Route("/api/files/recycle", _audited(recycle_route)),
+    Route("/api/files/recycle/empty", _audited(empty_route), methods=["POST"]),
     Route("/api/files/restore", _audited(restore_route), methods=["POST"]),
     Route("/api/files/activity", _audited(activity_route)),
 ]

@@ -33,6 +33,8 @@ AUDIT_RETENTION_DAYS = 365
 #       computed while its pieces arrived and checked against the finished file ('' = not known)
 #   uploads.mtime_ns / file_hashes.mtime_ns - the file's modification time (ns) when its SHA-256 was taken: a stored
 #       SHA-256 is shown only while size and this time are exactly the file's (assessment 2026-11-25 F-5)
+#   file_recycle.tries / last_try - purges of the item that failed (in use, access denied), and when the last one
+#       was: such items wait and go behind the others (F-13)
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("users", "totp_last_counter", "INTEGER"),
     ("users", "oidc_issuer", "TEXT"),
@@ -43,6 +45,8 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("uploads", "sha256", "TEXT NOT NULL DEFAULT ''"),
     ("uploads", "mtime_ns", "INTEGER"),
     ("file_hashes", "mtime_ns", "INTEGER"),
+    ("file_recycle", "tries", "INTEGER NOT NULL DEFAULT 0"),
+    ("file_recycle", "last_try", "REAL"),
 )
 POST_MIGRATION_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_oidc ON users(oidc_issuer, oidc_subject)"

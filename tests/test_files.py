@@ -152,12 +152,13 @@ def _bodies(f: Path, tf: Path) -> dict:
     return {"/api/files/hash": {"path": str(f)}, "/api/files/mkdir": {"path": str(tf), "name": "new"},
             "/api/files/rename": {"path": str(f), "name": "b.txt"},
             "/api/files/move": {"paths": [str(f)], "to": str(tf / "sub")},
-            "/api/files/delete": {"paths": [str(f)]}, "/api/files/restore": {"id": "0" * 20}}
+            "/api/files/delete": {"paths": [str(f)]}, "/api/files/restore": {"id": "0" * 20},
+            "/api/files/recycle/empty": {"location": str(tf)}}
 
 
 GETS = ["/api/files/locations", "/api/files/list", "/api/files/info", "/api/files/download", "/api/files/preview",
         "/api/files/recycle", "/api/files/activity"]
-MANAGE = ["/api/files/rename", "/api/files/move", "/api/files/delete", "/api/files/restore"]
+MANAGE = ["/api/files/rename", "/api/files/move", "/api/files/delete", "/api/files/restore", "/api/files/recycle/empty"]
 
 
 def test_the_files_switch_decides_every_route_and_the_old_file_reads(env):
@@ -281,7 +282,8 @@ def test_a_read_only_folder_is_read_but_never_changed(env, tmp_path):
         assert j["moved"] == [] and j["failed"][0]["error"] == "read_only_folder"
         j = tc.post("/api/files/delete", json={"paths": [str(f), str(kb / "old")]}, headers=h).json()
         assert j["deleted"] == [] and {x["error"] for x in j["failed"]} == {"read_only_folder"}
-        assert tc.get("/api/files/recycle", params={"location": str(kb)}).json() == {"items": []}
+        assert tc.get("/api/files/recycle", params={"location": str(kb)}).json() == {"items": [], "size": 0,
+                                                                                     "canEmpty": False}
     assert sorted(os.listdir(kb)) == ["facts.md", "old"] and (ws / "mine.txt").exists()
 
 
@@ -1488,3 +1490,41 @@ def test_f12_long_file_work_has_its_own_threads_and_a_person_runs_few_at_a_time(
     asyncio.run(files.heavy(lambda: seen.append(threading.current_thread().name)))
     assert seen[0].startswith("goose-web-files") and files._pool()._max_workers == files.HEAVY_THREADS
     assert "heavy(_move_item" in inspect.getsource(files._move_pinned)
+
+
+def test_f13_stuck_items_wait_behind_the_others_and_an_administrator_can_empty_a_bin(env, monkeypatch):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    admin = user(db, "root", role="admin")
+    for n in ("stuck.txt", "fine.txt", "later.txt"):
+        (tf / n).write_text(n)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        ids = [x["id"] for x in tc.post("/api/files/delete", json={"paths": [str(tf / n) for n in (
+            "stuck.txt", "fine.txt", "later.txt")]}, headers=h).json()["deleted"]]
+        r = tc.get("/api/files/recycle", params={"location": str(tf)}).json()
+        assert r["size"] == len("stuck.txt") + len("fine.txt") + len("later.txt") and r["canEmpty"] is False
+        assert tc.post("/api/files/recycle/empty", json={"location": str(tf)}, headers=h).json()["error"] == "denied"
+    now = __import__("time").time()
+    db.execute("UPDATE file_recycle SET deleted_at=? WHERE id=?", (now - 200 * DAY, ids[0]))   # the oldest
+    db.execute("UPDATE file_recycle SET deleted_at=? WHERE id=?", (now - 100 * DAY, ids[1]))
+    real = files._purge_item
+    monkeypatch.setattr(files, "_purge_item", lambda r: None if r["id"] == ids[0] else real(r))   # in use
+    monkeypatch.setattr(files, "PURGE_PER_RUN", 1)
+    assert asyncio.run(files.purge_recycle(c, now=now)) == 0          # tried, could not: counted
+    row = db.one("SELECT tries, last_try FROM file_recycle WHERE id=?", (ids[0],))
+    assert row["tries"] == 1 and row["last_try"] == now
+    assert asyncio.run(files.purge_recycle(c, now=now + 60)) == 1     # the next one is not held up
+    assert not db.one("SELECT * FROM file_recycle WHERE id=?", (ids[1],))
+    assert asyncio.run(files.purge_recycle(c, now=now + 2 * 3600)) == 0 and \
+        db.one("SELECT tries FROM file_recycle WHERE id=?", (ids[0],))["tries"] == 2   # tried again after an hour
+    with client_for(c) as tc:        # an administrator empties the bin now (a full disk)
+        h = sign_in(tc, c, admin)
+        r = tc.get("/api/files/recycle", params={"location": str(tf)}).json()
+        assert r["canEmpty"] is True and len(r["items"]) == 2
+        j = tc.post("/api/files/recycle/empty", json={"location": str(tf)}, headers=h).json()
+        assert j == {"purged": 1, "failed": 1}
+    assert [x["id"] for x in db.query("SELECT id FROM file_recycle")] == [ids[0]]
+    a = audits(db, "files.purge")[-1]
+    assert a["username"] == "root" and a["detail"]["early"] is True and a["detail"]["id"] == ids[2]
+    assert not (tf / files.RECYCLE_DIR / ids[2]).exists()

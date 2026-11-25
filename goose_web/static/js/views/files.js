@@ -207,7 +207,16 @@ function recycleDialog(loc, days, onRestored) {
   let m;
   m = modal({ title: 'Recycle bin · ' + (loc.label || baseName(loc.path)), size: 'lg', body, footer: [btn('Close', () => m.close())] });
   const draw = () => GET('/api/files/recycle' + qs({ location: loc.path })).then((r) => {
-    body.replaceChildren(h('p', { class: 'muted small' }, 'Deleted files and folders stay here for ' + days + ' days, then they are removed for good. Anyone who may change this location can restore them.'), table([
+    const items = r.items || [];
+    // what the bin holds; an administrator can empty it before its time (a full disk) - assessment F-13
+    const emptyBtn = r.canEmpty && items.length ? actionBtn('Empty now', async () => {
+      const ok = await confirmDialog({ title: 'Empty this recycle bin?', confirmText: 'Remove for good', danger: true, message: 'Everything in it (' + items.length + ' item' + (items.length === 1 ? '' : 's') + ', ' + fmtBytes(r.size || 0) + ') is removed for good now and cannot be restored.' });
+      if (!ok) return;
+      const res = await POST('/api/files/recycle/empty', { location: loc.path });
+      toast('Removed for good: ' + res.purged + (res.failed ? '; ' + res.failed + ' could not be removed now (in use)' : ''), { kind: res.failed ? 'warn' : 'success' });
+      await draw();
+    }, { size: 'sm', icon: 'trash', variant: 'ghost', errorPrefix: 'Empty' }) : null;
+    body.replaceChildren(h('div', { class: 'row files-bin-head' }, h('p', { class: 'muted small' }, 'Deleted files and folders stay here for ' + days + ' days, then they are removed for good. Anyone who may change this location can restore them.' + (items.length ? ' Now: ' + items.length + ' item' + (items.length === 1 ? '' : 's') + ', ' + fmtBytes(r.size || 0) + '.' : '')), emptyBtn), table([
       { label: 'Name', render: (x) => h('span', { class: 'row' }, icon(x.dir ? 'folder' : 'file', 14), h('span', { class: 'files-break' }, x.name)) },
       { label: 'From', render: (x) => h('span', { class: 'mono small files-break', title: x.originalPath || '' }, parentOf(x.originalPath || '')) },
       { label: 'Size', class: 'right', render: (x) => (x.dir ? '' : fmtBytes(x.size)) },
@@ -219,7 +228,7 @@ function recycleDialog(loc, days, onRestored) {
         await draw();
         if (onRestored) onRestored(res.path);
       }, { size: 'sm', icon: 'refresh', errorPrefix: 'Restore' }) },
-    ], r.items || [], { empty: 'The recycle bin is empty' }));
+    ], items, { empty: 'The recycle bin is empty' }));
   }).catch((e) => body.replaceChildren(banner('error', errMsg(e))));
   draw();
 }

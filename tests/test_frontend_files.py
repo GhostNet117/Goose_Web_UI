@@ -112,6 +112,17 @@ def test_compute_again_reads_the_file_anew_and_the_source_of_a_sha256_is_shown()
     assert "hashSource(i)" in files
 
 
+def test_the_recycle_bin_shows_its_size_and_an_administrator_can_empty_it():
+    """Assessment F-13 (and F-10: a move that left part of the original says so)."""
+    files = _js("views/files.js")
+    body = _block(files, "function recycleDialog(loc, days, onRestored) {", "\n}\n")
+    assert "r.canEmpty && items.length ? actionBtn('Empty now'" in body
+    assert "POST('/api/files/recycle/empty', { location: loc.path })" in body
+    assert body.index("await confirmDialog(") < body.index("POST('/api/files/recycle/empty'")
+    assert "fmtBytes(r.size || 0)" in body
+    assert "for (const x of moved) if (x.warning) toast(baseName(x.from) + ': ' + x.warning, { kind: 'warn'" in files
+
+
 def test_read_only_folders_and_the_manage_switch_hide_the_changes():
     files = _js("views/files.js")
     assert "const writable = () => !!listing && listing.access === 'write';" in files
