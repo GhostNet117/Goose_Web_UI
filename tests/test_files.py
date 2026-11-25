@@ -12,7 +12,6 @@ import os
 import sqlite3
 import stat
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -864,6 +863,14 @@ def test_an_administrators_delete_in_a_team_folder_lands_in_the_teams_recycle_fo
         rid = j["deleted"][0]["id"]
         assert (tf / files.RECYCLE_DIR / rid / "a.txt").exists()
         assert tc.post("/api/files/rename", json={"path": str(tf), "name": "x"}, headers=h).json()["error"] == "denied"
+        # a person's workspace, the profile folder holding it and the profiles root stay; what is deleted in a
+        # workspace goes to that workspace's recycle folder
+        ws = pr.workspace(dee)
+        (ws / "w.txt").write_text("W")
+        j = tc.post("/api/files/delete", json={"paths": [str(ws), str(ws.parent), str(s.profiles_root),
+                                                         str(ws / "w.txt")]}, headers=h).json()
+        assert [x["error"] for x in j["failed"]] == ["denied"] * 3 and ws.is_dir()
+        assert (ws / files.RECYCLE_DIR / j["deleted"][0]["id"] / "w.txt").exists()
     with client_for(c) as tc:
         h = sign_in(tc, c, dee)
         assert [x["id"] for x in tc.get("/api/files/recycle", params={"location": str(tf)}).json()["items"]] == [rid]

@@ -278,6 +278,13 @@ def _tops(c, u: dict, policy: dict) -> list[str]:
             tp = t["policy"] if isinstance(t["policy"], dict) else {}
             tops.append(str(c.profiles.team_folder({**t, "policy": tp})))
             tops += [str(r) for r in tp.get("allowed_roots") or [] if isinstance(r, str) and os.path.isabs(r)]
+        # every person's workspace too: an administrator cannot move or delete one (or the profile folder or the
+        # profiles root holding it) from the Files page, and what he deletes in one lands in its own recycle folder
+        for m in c.db.users():
+            try:
+                tops.append(str(c.profiles.workspace(m)))
+            except Exception:
+                continue
     return tops
 
 

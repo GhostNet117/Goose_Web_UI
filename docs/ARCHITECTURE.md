@@ -1955,8 +1955,9 @@ and are audited (`files.download`, `files.read`).
   `403 files_off`. The folder picker (`/api/fs/roots|list|mkdir`) does not need it.
 - **Locations.** Members: `Ctx.roots_for` (workspace, team folder, extra folders, read-only folders) with their
   access; administrators: workspace and drives like `/api/fs/roots`. For protection and the recycle folder an
-  administrator's "tops" also include every team's folder and extra folders, so what an administrator deletes in a
-  team folder lands in the recycle folder the team sees.
+  administrator's "tops" also include every team's folder and extra folders and every person's workspace, so what an
+  administrator deletes there lands in the recycle folder the team (or the person) sees, and none of them - nor a
+  profile folder or the profiles root holding them - can be renamed, moved or deleted from the Files page.
 - **Paths.** Every path through `api._check_path` (read, or write for anything that changes something) - the path
   as written and resolved must lie in the person's (writable) folders. `_check_path` also answers `404` for anything
   with a `.goose-web-recycle` component (as written or resolved), so the recycle folder is reached by no route but
