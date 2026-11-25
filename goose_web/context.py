@@ -213,8 +213,17 @@ class Ctx:
                     log.exception("provisioning %s failed", user["username"])
         self.workers.register(key, user["username"], self.profiles.path_root_env(user), native,
                               self.profiles.team_recipe_dirs(user) if not native else [],
-                              sandbox=self.sandbox_spec(user), scheduler_allowed=self.scheduler_allowed(user))
+                              sandbox=self.sandbox_spec(user), scheduler_allowed=self.scheduler_allowed(user),
+                              plugins_allowed=self.plugins_allowed(user))
         return self.hub.upstream(key, user["username"])
+
+    def plugins_allowed(self, user: dict, policy: dict | None = None) -> bool:
+        """S-1 (review 2026-11-25): may Goose load plugins (`.agents/plugins`) from the folder a member's worker starts
+        in (their workspace, workers.start_dir)? The rule of session/new in the member's own workspace: allow_shell.
+        Administrators and the native profile are not affected."""
+        if user.get("role") == "admin" or self.profiles.is_native(user):
+            return True
+        return bool((policy or self.policy_for(user)).get("allow_shell"))
 
     def scheduler_allowed(self, user: dict, policy: dict | None = None) -> bool:
         """FIX scheduler-needs-schedules (1.26.0): an isolated member's worker runs Goose's scheduler only when the

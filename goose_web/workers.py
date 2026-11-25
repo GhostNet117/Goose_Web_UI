@@ -324,6 +324,8 @@ class Worker:
     # FIX scheduler-needs-schedules (1.26.0): an isolated profile runs Goose's scheduler only when its policy allows
     # schedules (set by register from the member's policy; administrators' isolated profiles always may)
     scheduler_allowed: bool = True
+    # FIX scheduled-runs-in-members-history (S-1): may Goose load plugins from the folder the worker starts in?
+    plugins_allowed: bool = True
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
@@ -344,20 +346,37 @@ class Worker:
                 "proxyPort": self.proxy_port if self.backend == "mxc" else 0}
 
 
-def worker_start_dir(w: "Worker") -> str:
-    """The folder a (not sandboxed) worker is started in. Goose 1.57 gives a scheduled run the worker process's own
-    folder as the run's working folder (scheduler: `std::env::current_dir()`), so for an isolated profile this is
-    the member's workspace - where the sandboxed backends already start the worker - and not the profile root, which
-    holds the profile's config and secrets and is not a folder the member may open (FIX
-    scheduled-runs-in-members-history: a member's scheduled runs land in their own chat list and can be opened and
-    continued). The native profile keeps its root or the home folder."""
+def start_dir(profile_root: str | None, native: bool, plugins_allowed: bool = True, key: str = "",
+              fallback: str | None = None) -> str:
+    """The folder a worker is started in - every backend (FIX scheduled-runs-in-members-history). Goose 1.57 gives a
+    scheduled run the worker process's own folder as the run's working folder (scheduler: `std::env::current_dir()`),
+    so for an isolated profile it is the member's workspace and not the profile root, which holds the profile's
+    config and secrets and is not a folder the member may open: the member's scheduled runs land in their own chat
+    list and can be opened and continued. The native profile keeps its root or the home folder.
+
+    S-1 (review 2026-11-25): Goose also loads plugins from this folder (`.agents/plugins`: hooks for every agent of
+    the worker, MCP servers for scheduled runs). The rule of `policy.check` for session/new applies here too: a
+    workspace with plugins is the start folder only when the member may use plugins (allow_shell); otherwise the
+    worker starts in the profile root, where the member cannot write, and the plugins are not loaded."""
     home = os.path.expanduser("~")
-    cwd = w.path_root or home
-    if w.path_root and not w.native:
-        ws = os.path.join(w.path_root, "workspace")
+    cwd = profile_root or home
+    if profile_root and not native:
+        ws = os.path.join(profile_root, "workspace")
         if os.path.isdir(ws):
-            cwd = ws
-    return cwd if os.path.isdir(cwd) else home
+            from .policy import project_plugins
+            found = [] if plugins_allowed else project_plugins(ws)
+            if found:
+                log.warning("worker %s starts in its profile root, not the workspace: the workspace has Goose plugins "
+                            "in .agents/plugins (%s) and this member may not use plugins (allow_shell is off)",
+                            key, ", ".join(n[:40] for n in found[:3]))
+            else:
+                cwd = ws
+    return cwd if os.path.isdir(cwd) else (fallback or home)
+
+
+def worker_start_dir(w: "Worker") -> str:
+    """start_dir for a worker that is not sandboxed."""
+    return start_dir(w.path_root, w.native, w.plugins_allowed, w.key)
 
 
 class SandboxUnavailable(RuntimeError):
@@ -436,7 +455,7 @@ class WorkerManager:
 
     def register(self, key: str, username: str, path_root: str | None, native: bool,
                  recipe_dirs: list[str], sandbox: dict | None = None,
-                 scheduler_allowed: bool | None = None) -> Worker:
+                 scheduler_allowed: bool | None = None, plugins_allowed: bool | None = None) -> Worker:
         """`scheduler_allowed` (FIX scheduler-needs-schedules): None keeps what the worker has (review SC-1: a caller
         that does not know the member's policy must not switch the scheduler back on); a NEW isolated worker without
         it gets no scheduler (second review R2-15: fail safe; every caller of the product passes it)."""
@@ -444,7 +463,8 @@ class WorkerManager:
         if w is None:
             w = Worker(key=key, username=username, path_root=path_root, native=native, recipe_dirs=recipe_dirs,
                        sandbox=sandbox,
-                       scheduler_allowed=bool(native) if scheduler_allowed is None else bool(scheduler_allowed))
+                       scheduler_allowed=bool(native) if scheduler_allowed is None else bool(scheduler_allowed),
+                       plugins_allowed=bool(native) if plugins_allowed is None else bool(plugins_allowed))
             self.workers[key] = w
         else:
             # a change of the scheduler permission is applied by the monitor (scheduler != wants_scheduler: restart
@@ -454,6 +474,10 @@ class WorkerManager:
             w.path_root, w.native, w.recipe_dirs, w.sandbox = path_root, native, recipe_dirs, sandbox
             if scheduler_allowed is not None:
                 w.scheduler_allowed = bool(scheduler_allowed)
+            if plugins_allowed is not None and bool(plugins_allowed) != w.plugins_allowed:
+                w.plugins_allowed = bool(plugins_allowed)
+                if w.state == "ready":
+                    w.restart_pending = True   # the start folder may change (start_dir): restart when quiet
         return w
 
     def _sandbox_env(self, w: Worker, backend: str | None = None) -> dict:
@@ -712,9 +736,7 @@ class WorkerManager:
         logf = open_append_log(self.log_dir / f"worker-{w.key}.log")
         logf.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} start {' '.join(args[1:])} (sandbox {spec['name']}, "
                    f"{state['sid']}) root={w.path_root}\n".encode())
-        cwd = os.path.join(spec["profile_root"], "workspace")
-        if not os.path.isdir(cwd):
-            cwd = spec["profile_root"]
+        cwd = start_dir(spec["profile_root"], False, w.plugins_allowed, w.key, fallback=spec["profile_root"])
         self._close_job(w)
         w.job = _Job()       # the worker's own job (goose, its children, the relay forwarders), nested in self.job
         # Relays first, so goose reads the rewritten provider URLs when it starts.
@@ -807,9 +829,7 @@ class WorkerManager:
         args = [self.s.goose_binary, "acp"]
         if w.scheduler:
             args.append("--enable-scheduler")
-        cwd = os.path.join(spec["profile_root"], "workspace")
-        if not os.path.isdir(cwd):
-            cwd = spec["profile_root"]
+        cwd = start_dir(spec["profile_root"], False, w.plugins_allowed, w.key, fallback=spec["profile_root"])
         env = self._sandbox_env(w, "mxc")
         if proxy_url:     # FIX mxc-asyncio-socketpair: Python's socket pairs through the proxy ('' = off)
             env = with_python_shim(env, str(spec.get("python_shim") or ""))

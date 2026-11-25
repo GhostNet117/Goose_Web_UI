@@ -951,7 +951,9 @@ default), and under **Past runs...** of the schedule.
   workspace folder, like your other chats.
 - **Continue it:** once the run has finished, type in its chat like in any other chat: the agent has the run's
   conversation. While the run is still in progress, a message or an edit is refused with "A scheduled job is
-  writing this chat right now" - wait until it has finished (the Schedules page shows it as running).
+  writing this chat right now" - wait until it has finished (the Schedules page shows it as running). Runs start
+  in the **Auto** approval mode; if your team does not allow Auto, pick an allowed mode in the chat header
+  before you continue the run.
 
 ### Create a schedule
 

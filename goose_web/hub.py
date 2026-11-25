@@ -73,7 +73,9 @@ ELSEWHERE_REFUSAL = ("This chat is running elsewhere (Goose Desktop, the goose C
                      "it read-only and cannot stop, steer or message it; wait until it has finished.")
 SCHEDULED_REFUSAL = ("A scheduled job is writing this chat right now. Wait until the run has finished (Schedules shows "
                      "it as running), then continue the chat here.")
-SCHEDULED_CACHE_SECONDS = 2.0   # how long the worker scheduler's list of running jobs is reused for prompt checks
+SCHEDULED_CACHE_SECONDS = 2.0   # how long the worker scheduler's list of running jobs is reused (<= 0: always ask)
+SCHEDULED_ASK_SECONDS = 3.0     # how long a prompt waits for that list at most (review 2026-11-25, S-5)
+SCHEDULED_FAIL_SECONDS = 30.0   # a scheduler that did not answer is not asked again for this long (S-5)
 SESSION_INFO = "_goose/unstable/session/info"
 WATCH_INTERVAL = 2.0          # seconds between stat() calls on the profile's sessions.db (+ -wal)
 WATCH_FALLBACK_INTERVAL = 15.0  # no sessions.db found: fingerprint-check watched sessions this often
@@ -673,8 +675,10 @@ class Upstream:
         # FIX idle-sessions-keep-mcp-servers: which chats Goose holds an agent (and its MCP servers) for; closes idle ones
         self.unloader = Unloader(self)
         # FIX scheduled-runs-in-members-history: chats the worker's own scheduler is writing (cached briefly)
-        self._sched_at = -1e9
+        self._sched_until = 0.0              # monotonic time until which _sched_sids is current
         self._sched_sids: set[str] = set()
+        self._sched_task: asyncio.Task | None = None   # the one question to the scheduler in flight (S-2)
+        self._sched_failed = False
 
     # ------------------------------------------------------------ connection
     @property
@@ -905,11 +909,11 @@ class Upstream:
                         "kind": "starting", "detail": f"{self.starting} new prompt(s) being checked"})
         return out
 
-    async def running_jobs(self) -> list[dict]:
+    async def running_jobs(self, timeout: float = 8.0) -> list[dict]:
         """Jobs of Goose's scheduler running inside this worker (they never pass through the gateway)."""
         base = {"profile": self.key, "username": self.username, "kind": "schedule"}
         try:
-            r = await asyncio.wait_for(self.request(P_SCHEDULES_LIST, {}, timeout=None), 8.0)
+            r = await asyncio.wait_for(self.request(P_SCHEDULES_LIST, {}, timeout=None), timeout)
         except RpcError as e:
             if e.code == -32601:   # this Goose has no schedules API: nothing to ask
                 return []
@@ -936,21 +940,44 @@ class Upstream:
     async def _written_by_scheduler(self, sid: str) -> bool:
         """FIX scheduled-runs-in-members-history: Goose's scheduler writes a run's chat inside this worker, out of the
         gateway's sight. A member opens such a run from their chat list to read its output and continue it; a prompt or
-        an edit while the job still writes it would make two writers of one chat. Asked only of a worker that runs a
-        scheduler, at most every SCHEDULED_CACHE_SECONDS; when the scheduler cannot answer, nothing is refused."""
+        an edit while the job still writes it would make two writers of one chat.
+
+        Asked only of a worker that runs a scheduler and is running and connected - this check never starts a worker
+        (review 2026-11-25, S-3: a stopped worker has no running job). One question at a time, the answer stamped when
+        it arrives (S-2: two tabs sending at once share it), reused SCHEDULED_CACHE_SECONDS (<= 0: always ask). A
+        scheduler that does not answer within SCHEDULED_ASK_SECONDS refuses nothing (fail open) and is not asked
+        again for SCHEDULED_FAIL_SECONDS (S-5: one slow scheduler must not cost every prompt the wait)."""
         if not sid:
             return False
         try:
-            if not getattr(self.worker, "scheduler", False):
-                return False
+            w = self.worker
         except Exception:   # no worker registered for this profile (yet)
             return False
-        now = time.monotonic()
-        if now - self._sched_at > SCHEDULED_CACHE_SECONDS:
-            self._sched_at = now
-            self._sched_sids = {j["sessionId"] for j in await self.running_jobs()
-                                if j.get("status") == "working" and j.get("sessionId")}
+        if not getattr(w, "scheduler", False) or getattr(w, "state", "") != "ready" or self.ws is None:
+            return False
+        if time.monotonic() < self._sched_until:
+            return sid in self._sched_sids
+        task = self._sched_task
+        if task is None or task.done():
+            task = self._sched_task = asyncio.ensure_future(self._ask_scheduler())
+        await asyncio.shield(task)
         return sid in self._sched_sids
+
+    async def _ask_scheduler(self) -> None:
+        jobs = await self.running_jobs(timeout=SCHEDULED_ASK_SECONDS)
+        if any(j.get("status") == "unknown" for j in jobs):
+            if not self._sched_failed:
+                log.warning("the scheduler of %s did not say which chats its jobs write (%s); prompts are not "
+                            "checked against it for %g s", self.key, next(j.get("detail") for j in jobs
+                                                                          if j.get("status") == "unknown"),
+                            SCHEDULED_FAIL_SECONDS)
+            self._sched_failed = True
+            self._sched_sids = set()
+            self._sched_until = time.monotonic() + SCHEDULED_FAIL_SECONDS
+            return
+        self._sched_failed = False
+        self._sched_sids = {j["sessionId"] for j in jobs if j.get("status") == "working" and j.get("sessionId")}
+        self._sched_until = time.monotonic() + max(0.0, SCHEDULED_CACHE_SECONDS)
 
     async def _from_client(self, client: Client, msg: dict) -> None:
         if client.closed or self.closed:   # SC-3: a socket of a deleted / disabled / signed-out user

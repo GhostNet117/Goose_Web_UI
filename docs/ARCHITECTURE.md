@@ -255,9 +255,13 @@ if scheduler:
   only the composed hints file and ignores `AGENTS.md` and `.goosehints` in
   working folders and the agents home folder (`extra_env` cannot override
   it).
-- **Working directory.** `workers.worker_start_dir`: for an isolated profile the member's `workspace` (the
-  sandboxed backends start there too), else the profile root; for the native profile its root, or the home
-  directory. It matters because Goose 1.57 gives a scheduled run the worker process's own folder as the run's
+- **Working directory.** `workers.start_dir` (every backend; `worker_start_dir` for this one): for an isolated
+  profile the member's `workspace`, else the profile root; for the native profile its root, or the home
+  directory. A workspace with Goose plugins (`.agents/plugins`) is used only when the member may use plugins
+  (`Worker.plugins_allowed` = `allow_shell`, from `Ctx.plugins_allowed`; a change restarts the worker when quiet),
+  because Goose also loads plugin hooks for every agent and plugin MCP servers for scheduled runs from this
+  folder (the `session/new` rule, NEW-36/SD-2). Other things that follow it: relative paths (recipe search, an
+  extension command configured with a relative path) and Windows' DLL search after the system folders. It matters because Goose 1.57 gives a scheduled run the worker process's own folder as the run's
   working folder (`scheduler/full.rs`: `create_session(std::env::current_dir()?, ...)`): a member's runs belong
   where the member may open them (1.27.1, FIX `scheduled-runs-in-members-history`; before, a member without the
   sandbox got runs in the profile root, next to the profile's config and secrets, and opening one was refused).
@@ -968,8 +972,9 @@ The session list includes them when `sidebar.includeScheduled` is on. A run is a
 schedule, in that profile's worker and working folder (section 3.2), so a member reads and continues their own runs
 like any chat. Goose's scheduler writes a run outside the gateway's sight; `Upstream._written_by_scheduler` (1.27.1)
 asks the worker's scheduler which chats its running jobs write (`schedules/list`: `currentlyRunning`,
-`currentSessionId`; reused for `SCHEDULED_CACHE_SECONDS` = 2 s, only for a worker that runs a scheduler, nothing
-refused when it cannot answer) and refuses `session/prompt` and `conversation/truncate` on such a chat with
+`currentSessionId`; only for a worker that runs a scheduler and is ready - the check never starts one; one question
+at a time (`_ask_scheduler`), reused `SCHEDULED_CACHE_SECONDS` = 2 s; at most `SCHEDULED_ASK_SECONDS` = 3 s; a
+scheduler that does not answer refuses nothing and is not asked for `SCHEDULED_FAIL_SECONDS` = 30 s) and refuses `session/prompt` and `conversation/truncate` on such a chat with
 `-32011` - the same rule as for a chat running elsewhere (spec 020): two writers would corrupt it.
 
 ### 7.8 Deploy busy check and drain (`control.py`)

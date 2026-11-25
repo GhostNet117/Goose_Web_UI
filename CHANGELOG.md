@@ -6,7 +6,8 @@
 scheduled run the worker's own folder as working folder. A member's worker without the sandbox started in the
 profile root, so the member's runs worked next to the profile's configuration and secrets, and opening one was
 refused ("forbidden: folder not allowed"). Members' workers now start in the member's workspace, as the sandboxed
-ones already did. No configuration change; nothing to do on upgrade. Runs made before keep their old folder.
+ones already did. No configuration change. On upgrade: an extension configured with a relative command path now
+resolves it from the member's workspace (use full paths); runs made before keep their old folder.
 
 ### Fixed
 - A member's scheduled runs land in the member's own chat list, in the member's workspace, and the member can read
@@ -15,8 +16,16 @@ ones already did. No configuration change; nothing to do on upgrade. Runs made b
   continued it; on 1.27.0 the same steps ended in "folder not allowed".
 - A message or an edit of a chat that a scheduled job of the same worker is still writing is refused with `-32011`
   ("A scheduled job is writing this chat right now"), as for a chat running elsewhere: two writers would corrupt the
-  chat. The gateway asks the worker's scheduler which chats its running jobs write (at most every 2 seconds, only
-  for a worker that runs a scheduler; nothing is refused when it cannot answer).
+  chat. The gateway asks the worker's scheduler which chats its running jobs write (one question at a time, reused
+  2 seconds, at most 3 seconds; only a running worker that runs a scheduler; nothing is refused when it cannot
+  answer, and it is then not asked for 30 seconds).
+- Goose loads plugins (`.agents\plugins`) from the folder a worker starts in. The rule for starting a chat in a
+  folder with plugins now holds for it too: a member's workspace with plugins is the start folder only when the
+  member has `allow_shell` (also for the sandboxed backends, which started there before).
+
+### Security
+An independent review of this change before release found one Medium (the plugin rule above) and seven Low or
+informational findings; all are fixed or documented (SECURITY-ASSESSMENT 23.13).
 
 ### Docs
 USER-GUIDE 11 (your runs, reading and continuing them), ADMINISTRATION 13, ARCHITECTURE 3.2 and 7.7, API (`-32011`),

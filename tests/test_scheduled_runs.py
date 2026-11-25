@@ -7,7 +7,9 @@ worker in `<profile>\\workspace`; a worker without the sandbox started in the pr
 worked next to the profile's config and secrets and the member could not open them ("folder not allowed")."""
 import asyncio
 import json
+import logging
 import os
+import types
 
 import pytest
 import websockets
@@ -16,7 +18,7 @@ from goose_web import hub as hubmod
 from goose_web import policy as pol
 from goose_web.config import Settings
 from goose_web.hub import Client, Hub
-from goose_web.workers import Worker, worker_start_dir
+from goose_web.workers import Worker, start_dir, worker_start_dir
 
 CWD = os.path.abspath("/ws/p")
 
@@ -46,11 +48,82 @@ def test_the_native_profile_keeps_its_root_or_the_home_folder(tmp_path):
     assert worker_start_dir(mkw(str(tmp_path / "gone"))) == os.path.expanduser("~")
 
 
-def test_every_start_path_uses_the_workspace():
-    """The not-sandboxed start uses worker_start_dir; both sandboxed backends already start in the workspace."""
+def test_the_start_without_sandbox_really_starts_goose_in_the_workspace(tmp_path, monkeypatch):
+    """S-6: WorkerManager._start itself, with a fake Popen (not a reading of the source)."""
+    import goose_web.workers as wk
+    from tests.test_sec_web import make_settings
+    wm = wk.WorkerManager(make_settings(tmp_path))
+    root = tmp_path / "profiles" / "alice"
+    (root / "workspace").mkdir(parents=True)
+    w = wm.register("alice", "alice", str(root), False, [], scheduler_allowed=True, plugins_allowed=False)
+    seen = {}
+
+    class Proc:
+        pid, returncode = 4242, 1
+
+        def poll(self):
+            return 1   # exits at once: _start stops waiting
+
+    def popen(args, **kw):
+        seen["cwd"], seen["args"] = kw.get("cwd"), args
+        return Proc()
+    monkeypatch.setattr(wk.subprocess, "Popen", popen)
+    monkeypatch.setattr(wk, "_Job", lambda: types.SimpleNamespace(add=lambda p: None, close=lambda: None))
+    monkeypatch.setattr(wm, "job", types.SimpleNamespace(add=lambda p: None))
+    with pytest.raises(RuntimeError, match="exited"):
+        asyncio.run(wm._start(w))
+    assert seen["cwd"] == str(root / "workspace") and "--enable-scheduler" in seen["args"]
+
+
+def test_both_sandboxed_backends_use_the_same_rule():
+    """The AppContainer and MXC starts (heavy to run here) call the same start_dir, with the profile root as fallback."""
     src = open(os.path.join(os.path.dirname(hubmod.__file__), "workers.py"), encoding="utf-8").read()
+    assert src.count('cwd = start_dir(spec["profile_root"], False, w.plugins_allowed, w.key, '
+                     'fallback=spec["profile_root"])') == 2
     assert "cwd = worker_start_dir(w)" in src
-    assert src.count('cwd = os.path.join(spec["profile_root"], "workspace")') == 2
+
+
+# ------------------------------------------------------------------ S-1: the plugin rule for the start folder
+def plugin(ws, name="hooks"):
+    (ws / ".agents" / "plugins" / name).mkdir(parents=True)
+
+
+def test_a_workspace_with_plugins_is_not_the_start_folder_without_allow_shell(tmp_path, caplog):
+    root = tmp_path / "profiles" / "carol"
+    plugin(root / "workspace")
+    with caplog.at_level(logging.WARNING):
+        assert start_dir(str(root), False, plugins_allowed=False, key="carol") == str(root)
+    assert "may not use plugins" in caplog.text and "hooks" in caplog.text
+    assert start_dir(str(root), False, plugins_allowed=True) == str(root / "workspace")   # allow_shell: as session/new
+    assert start_dir(str(tmp_path / "gone"), False, False, fallback="X") == "X"
+
+
+def test_the_plugin_permission_follows_the_member_and_restarts_a_worker_when_it_changes(tmp_path):
+    from goose_web.workers import WorkerManager
+    from tests.test_sec_web import make_settings
+    wm = WorkerManager(make_settings(tmp_path))
+    w = wm.register("dave", "dave", str(tmp_path / "p"), False, [])
+    assert w.plugins_allowed is False                      # a new isolated worker: fail safe
+    assert wm.register("admin", "admin", None, True, []).plugins_allowed is True   # the native profile
+    w.state = "ready"
+    wm.register("dave", "dave", str(tmp_path / "p"), False, [])                    # not said: kept, no restart
+    assert w.plugins_allowed is False and w.restart_pending is False
+    wm.register("dave", "dave", str(tmp_path / "p"), False, [], plugins_allowed=True)
+    assert w.plugins_allowed is True and w.restart_pending is True
+
+
+def test_ctx_plugins_allowed_is_allow_shell_for_members():
+    from goose_web.context import Ctx
+
+    class _C:
+        pass
+    c = _C()
+    c.profiles = types.SimpleNamespace(is_native=lambda u: u.get("username") == "native")
+    c.policy_for = lambda u: {"allow_shell": u.get("username") == "shelly"}
+    assert Ctx.plugins_allowed(c, {"username": "shelly", "role": "user"}) is True
+    assert Ctx.plugins_allowed(c, {"username": "nora", "role": "user"}) is False
+    assert Ctx.plugins_allowed(c, {"username": "nora", "role": "admin"}) is True
+    assert Ctx.plugins_allowed(c, {"username": "native", "role": "user"}) is True
 
 
 # ------------------------------------------------------------------ no second writer while a scheduled job runs
@@ -139,10 +212,10 @@ def tab(role="admin", policy=None, roots=()):
 
 @pytest.fixture
 async def mk(monkeypatch):
-    monkeypatch.setattr(hubmod, "SCHEDULED_CACHE_SECONDS", 0.0, raising=False)   # every check asks the scheduler
     servers = []
 
-    async def make(scheduler=True):
+    async def make(scheduler=True, cache=0.0):
+        monkeypatch.setattr(hubmod, "SCHEDULED_CACHE_SECONDS", cache, raising=False)   # 0 = every check asks
         agent = Agent()
         server = await websockets.serve(agent.handler, "127.0.0.1", 0)
         servers.append(server)
@@ -227,3 +300,38 @@ async def test_a_member_is_refused_before_anything_is_loaded(mk):
     r = await msink.wait_for(4)
     assert r["error"]["code"] == hubmod.RPC_ELSEWHERE
     assert agent.methods("run-9") == []   # neither loaded (M-1) nor prompted
+
+
+async def test_two_tabs_sending_at_once_share_one_question_and_both_are_refused(mk):
+    """S-2: at the real 2 s cache, two prompts at once: one schedules/list, both judged on its answer."""
+    agent, hub, up, c, sink = await mk(cache=2.0)
+    agent.jobs = running("run-1")
+    c2, sink2 = tab()
+    hub.attach(up, c2)
+    await asyncio.gather(up.from_client(c, prompt(1, "run-1")), up.from_client(c2, prompt(2, "run-1")))
+    r1, r2 = await sink.wait_for(1), await sink2.wait_for(2)
+    assert r1["error"]["code"] == r2["error"]["code"] == hubmod.RPC_ELSEWHERE
+    assert agent.methods().count(hubmod.P_SCHEDULES_LIST) == 1
+    await up.from_client(c, prompt(3, "run-1"))            # within the 2 s: the same answer, no new question
+    assert "error" in await sink.wait_for(3) and agent.methods().count(hubmod.P_SCHEDULES_LIST) == 1
+
+
+async def test_a_worker_that_is_not_running_is_neither_asked_nor_started_by_the_check(mk):
+    """S-3: a stopped worker has no running job."""
+    agent, hub, up, c, sink = await mk()
+    agent.jobs = running("run-1")
+    hub.workers.workers["alice"].state = "stopped"
+    assert await up._written_by_scheduler("run-1") is False
+    assert hubmod.P_SCHEDULES_LIST not in agent.methods()
+
+
+async def test_a_scheduler_that_does_not_answer_is_not_asked_again_for_a_while(mk, caplog):
+    """S-5: fail open, one warning, and the next prompts do not wait for it again."""
+    agent, hub, up, c, sink = await mk()
+    agent.list_error = {"code": -32603, "message": "scheduler busy"}
+    with caplog.at_level(logging.WARNING):
+        for i in (1, 2, 3):
+            await up.from_client(c, prompt(i, "run-1"))
+            assert "error" not in await sink.wait_for(i)
+    assert agent.methods().count(hubmod.P_SCHEDULES_LIST) == 1
+    assert caplog.text.count("did not say which chats its jobs write") == 1

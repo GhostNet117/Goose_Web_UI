@@ -524,7 +524,7 @@ read-only extensions (`analyze`, `summarize`, `chatrecall`) can read what the wo
 
 | ID | Finding | Severity | Status | Where | Notes |
 |---|---|---|---|---|---|
-| NEW-36 | Goose auto-loads plugins from `<cwd>/.agents/plugins`: a member without `allow_shell` ran commands | High | **Fixed in 1.13.1** | `policy.py: check`, `project_plugins`, `has_agents_component`; `api.py: _refuse_agents_dir` (`fs_mkdir`, `fs_upload`) | Goose 1.50-1.57 treats every folder under `<cwd>/.agents/plugins` of a new chat as an enabled plugin (`plugins/discovery.rs`; unknown plugins are added to config as enabled) and starts its MCP servers (`.mcp.json` or the plugin manifest: any command line) during `session/new` (`acp/server.rs: initial_session_extensions`). No Goose setting or environment variable turns discovery off. A member with every permission off created `.agents/plugins/x/.mcp.json` with the file browser in their workspace or the team folder, started a chat there, and the command ran in their sandbox (measured on Goose 1.50.0 and 1.57.0, sandbox on). In the team folder it would run in every member's worker that opens a chat there, and unsandboxed in an administrator's native worker. Now: non-admins cannot create or upload into any `.agents` folder through the file browser (any case, trailing dots/spaces, NTFS stream names, 8.3 short names via the resolved path; `403 agents_folder_refused`), and a member without `allow_shell` cannot start a chat in a folder whose `.agents/plugins` has a plugin folder (an unreadable one counts). Correction (security review 2026-11-11, section 12): until 1.15.1 Goose's own `sources/create` (skills_edit) could still write `.agents/skills` and `.agents/agents` into the team folder (SD-3), and a plugin in a team folder ran in the chats of members WITH `allow_shell` and of administrators (SD-2); both are closed in 1.15.1. Goose rediscovers plugins only on `session/new`; `session/load`, `fork`, `resume` and working-folder changes do not, and recipe chats skip plugins. Plugin hooks and scheduled jobs use the worker's own folder (the profile root), which members cannot reach through the file API. Tests: `tests/test_agents_plugins.py`. **Upgrade if you have non-admin users.** |
+| NEW-36 | Goose auto-loads plugins from `<cwd>/.agents/plugins`: a member without `allow_shell` ran commands | High | **Fixed in 1.13.1** | `policy.py: check`, `project_plugins`, `has_agents_component`; `api.py: _refuse_agents_dir` (`fs_mkdir`, `fs_upload`) | Goose 1.50-1.57 treats every folder under `<cwd>/.agents/plugins` of a new chat as an enabled plugin (`plugins/discovery.rs`; unknown plugins are added to config as enabled) and starts its MCP servers (`.mcp.json` or the plugin manifest: any command line) during `session/new` (`acp/server.rs: initial_session_extensions`). No Goose setting or environment variable turns discovery off. A member with every permission off created `.agents/plugins/x/.mcp.json` with the file browser in their workspace or the team folder, started a chat there, and the command ran in their sandbox (measured on Goose 1.50.0 and 1.57.0, sandbox on). In the team folder it would run in every member's worker that opens a chat there, and unsandboxed in an administrator's native worker. Now: non-admins cannot create or upload into any `.agents` folder through the file browser (any case, trailing dots/spaces, NTFS stream names, 8.3 short names via the resolved path; `403 agents_folder_refused`), and a member without `allow_shell` cannot start a chat in a folder whose `.agents/plugins` has a plugin folder (an unreadable one counts). Correction (security review 2026-11-11, section 12): until 1.15.1 Goose's own `sources/create` (skills_edit) could still write `.agents/skills` and `.agents/agents` into the team folder (SD-3), and a plugin in a team folder ran in the chats of members WITH `allow_shell` and of administrators (SD-2); both are closed in 1.15.1. Goose rediscovers plugins only on `session/new`; `session/load`, `fork`, `resume` and working-folder changes do not, and recipe chats skip plugins. Plugin hooks and scheduled jobs use the worker's own folder (the profile root), which members cannot reach through the file API. Correction (1.27.1, 23.13): the sandboxed backends already started a member's worker in the member's workspace, and since 1.27.1 every member worker does; the same rule as for `session/new` now applies to that folder (`workers.start_dir`: a workspace with plugins is the start folder only with `allow_shell`, otherwise the worker starts in the profile root). Tests: `tests/test_agents_plugins.py`, `tests/test_scheduled_runs.py`. **Upgrade if you have non-admin users.** |
 
 Still accepted: members with `allow_shell` can create `.agents` folders with their shell (they can run commands
 anyway). Plugin `skills` folders are still read as instructions where the folder already exists. Since 1.15.1 (SD-2)
@@ -2198,26 +2198,50 @@ user-visible messages in pages; `readonly.js` shows them behind a button on the 
 
 **Finding (fixed, Low).** Goose 1.57 creates a scheduled run's chat with the worker process's current folder as its
 working folder (`scheduler/full.rs`: `create_session(std::env::current_dir()?, ..., SessionType::Scheduled)`). The
-sandboxed backends start a member's worker in `<profile>\workspace`; the start without the sandboxed backends used
-the profile root. A member's scheduled run (when the team allows Schedules) therefore ran with the profile root -
-`config.yaml`, `secrets.yaml`, `data\` - as its working folder, and the member could not open their own run: the
-folder rule refused `session/load` ("folder not allowed"). Reproduced end to end on 1.27.0 (sandbox off): the run's
-folder was `<profiles_root>\<user>`, `session/load` and `session/prompt` answered `-32003`.
+sandboxed backends start a member's worker in `<profile>\workspace`; the start without them used the profile root.
+A member's scheduled run (when the team allows Schedules) therefore ran with the profile root - `config.yaml`,
+`secrets.yaml`, `data\` - as its working folder, and the member could not open their own run: the folder rule refused
+`session/load` ("folder not allowed"). Reproduced end to end on 1.27.0 (sandbox off, real Goose 1.57): the run's
+folder was `<profiles_root>\<user>`; `session/load` and `session/prompt` answered `-32003`.
 
-**Fix.** `workers.worker_start_dir`: an isolated profile's worker starts in the member's workspace (the profile root
-when no workspace exists; the native profile unchanged). The member's runs now land in a folder the member may use;
-the folder rule itself is unchanged (no folder was added to anybody's roots). End to end on 1.27.1: the run was in
-the member's chat list with the workspace as folder, opened, and continued.
+**Fix.** `workers.start_dir`, used by all three start paths: an isolated profile's worker starts in the member's
+workspace (the profile root when there is none; the native profile unchanged). No folder was added to anybody's
+roots. End to end on 1.27.1: the run was in the member's chat list with the workspace as folder, opened, and
+continued.
 
-**Second writer.** Goose's scheduler writes a running job's chat outside the gateway's sight. A member (or an
-administrator) opening the run while it is still in progress could prompt or edit it, making two writers of one
-chat. `Upstream._written_by_scheduler` asks the worker's scheduler (`schedules/list`: `currentlyRunning`,
-`currentSessionId`) and refuses `session/prompt` and `conversation/truncate` on such a chat with `-32011`, before
-anything is loaded (also before the M-1 load of 23.2). Reused for 2 s and asked only of a worker that runs a
-scheduler; when the scheduler cannot answer, nothing is refused (fail open: a refusal would block every prompt of the
-profile, and the case it guards is rare). Residual: a job that starts within the 2 s after a check can still meet a
-prompt; a message sent after a job finished is unaffected.
+**What else follows the worker's folder (independent review S-1, S-7).** Goose also loads plugins from it
+(`.agents/plugins`: hooks for every agent of the worker, MCP servers for scheduled runs), resolves relative paths
+(recipe search, a relatively configured extension command) against it, and Windows searches it for DLLs after the
+system folders. For sandboxed members this was already the workspace. The `session/new` plugin rule (NEW-36, SD-2)
+now also applies to the start folder: a workspace with plugins is used only when the member has `allow_shell`;
+otherwise the worker starts in the profile root, where the member cannot write, and logs why. A member without
+`allow_shell` cannot create `.agents` through the file API, and uploads land in `<folder>\Web_Uploads`, never in the
+workspace itself; with `allow_shell` a member can run programs anyway. Changing `allow_shell` restarts the worker
+when it is quiet.
 
-**Tests.** `tests/test_scheduled_runs.py` (10): the start folder per profile kind, every start path, refusal while a
-job writes the chat (prompt, edit, member before any load), other chats unaffected, continuing after the run, a
-worker without a scheduler never asked, fail open. The 4 refusal tests fail on 1.27.0.
+**Second writer.** Goose's scheduler writes a running job's chat outside the gateway's sight.
+`Upstream._written_by_scheduler` asks the worker's scheduler which chats its running jobs write (`schedules/list`:
+`currentlyRunning`, `currentSessionId`) and `session/prompt` and `conversation/truncate` on such a chat are refused
+with `-32011`, after the policy firewall and the spec 020 check, before anything is loaded (also before the M-1 load
+of 23.2) and before the prompt guard. Only a worker that runs a scheduler and is running is asked (the check never
+starts a worker, S-3); one question at a time, its answer stamped when it arrives and shared by every prompt meanwhile
+(S-2), reused 2 s; the question waits at most 3 s, and a scheduler that does not answer refuses nothing (fail open:
+a refusal would block every prompt of the profile) and is not asked again for 30 s, with one warning in the log
+(S-5). A member can query and affect only their own worker. **Residual (S-4):** Goose names a run's chat only after
+the run's extensions have started; until then, and for up to 2 s after a check, a message to that new chat is not
+refused.
+
+**Using a run.** Goose creates runs in the Auto approval mode; in a team that does not allow Auto, the member picks
+an allowed mode in the chat header before continuing the run (the prompt check of 23.2 refuses it until then, S-8).
+
+**Independent review (2026-11-25, before release, read-only, Claude-based reviewer separate from the author).**
+Verdict "ship after fixes"; findings S-1 (Medium: the plugin rule did not cover the new start folder; no exploit
+found) and S-2 to S-8 (Low/Info: the cache race of two tabs, a check that could start a stopped worker, the
+residual, a slow scheduler, test strength, what else follows the worker's folder, the approval mode). All fixed or
+documented in this release as described above.
+
+**Tests.** `tests/test_scheduled_runs.py` (17): the start folder per profile kind and with plugins (with and without
+`allow_shell`), `WorkerManager._start` with a fake `Popen`, both sandboxed starts, the permission's restart, refusal
+while a job writes the chat (prompt, edit, member before any load), two tabs at once at the real cache (one
+question), no question to a stopped worker, a scheduler that does not answer (one question in 30 s, one warning),
+other chats unaffected, continuing after the run. The refusal tests fail on 1.27.0.

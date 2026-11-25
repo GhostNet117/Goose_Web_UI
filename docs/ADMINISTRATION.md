@@ -2219,8 +2219,11 @@ scheduler inside the worker. A worker runs the scheduler when it is started with
   a chat in that member's chat list only, in the member's workspace (as for the sandboxed backends; a member
   without the sandbox got runs in the profile root before 1.27.1 and could not open them). The member reads a run's
   output and continues it like any chat once it has finished; a message or edit while the scheduled job still
-  writes the chat is refused (`-32011`). Administrators see a member's runs only through the usual "view this
-  user's chats". To let a team's members schedule, switch **Schedules** on for the team.
+  writes the chat is refused (`-32011`). Goose creates runs in the Auto approval mode: in a team without Auto the
+  member picks an allowed mode before continuing a run. A member's worker starts in the workspace only when it has
+  no Goose plugins (`.agents\plugins`) or the member has `allow_shell` - the rule for starting a chat there; else it
+  starts in the profile root and the gateway log says why. Administrators see a member's runs only through the
+  usual "view this user's chats". To let a team's members schedule, switch **Schedules** on for the team.
 - The gateway must be running for schedules to fire. With the Windows logon task, that means the gateway user must
   be signed in.
 - Disabled users' workers are not started at gateway start, so their schedules do not run.

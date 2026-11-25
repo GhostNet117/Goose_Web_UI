@@ -661,6 +661,7 @@ Other reasons schedules do not fire:
 | Schedule count shown as zero | The count comes from `<profile>/data/schedule.json`; the file is missing or unreadable. | Check the file and its owner. |
 | A member cannot open their own scheduled run: "forbidden: folder not allowed: `<profiles_root>\<user>`" | Before 1.27.1 a member's worker without the sandbox started in the profile root, and Goose gives a scheduled run the worker's folder; the profile root is not a folder the member may open. | Upgrade to 1.27.1: runs land in the member's workspace. Runs made before keep their old folder; an administrator can read them in the member's profile view. |
 | "A scheduled job is writing this chat right now" | The run is still in progress; a second writer would corrupt the chat (1.27.1). | Wait until the Schedules page no longer shows it as running, then continue the chat. |
+| Gateway log: "worker X starts in its profile root, not the workspace: the workspace has Goose plugins" (and that member's runs again cannot be opened) | The member's workspace has a `.agents\plugins` folder, and the member may not use plugins (`allow_shell` off). | Remove the plugins from the workspace (an administrator), or give the member `allow_shell`; the worker restarts when quiet. |
 
 The gateway's worker for a profile that owns schedules is kept running (no idle shutdown) and is restarted after a
 crash even with no browser connected.
