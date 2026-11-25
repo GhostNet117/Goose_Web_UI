@@ -503,9 +503,11 @@ async def sweep(c, *, now: float | None = None, dry_run: bool = False, days: int
                                "days": days, "subSessions": len(chat["children"][:CHILDREN_PER_CHAT])})
         if stop:
             continue
-        # files not linked to any chat that is kept, uploaded longer ago than the period
+        # files not linked to any chat that is kept, uploaded longer ago than the period (chat attachments only: what
+        # was uploaded on the Files page, target 'folder', is never deleted by retention - spec 041)
         un = unb = 0
-        for r in c.db.query(f"SELECT * FROM uploads WHERE state='done' AND profile IN ({_marks(keys)}) AND "  # nosec B608
+        for r in c.db.query(f"SELECT * FROM uploads WHERE state='done' AND target='chat' AND "  # nosec B608
+                            f"profile IN ({_marks(keys)}) AND "
                             "created_at>=? AND COALESCE(completed_at, created_at)<?", (*keys, since, cutoff)):
             if r["id"] in handled:
                 continue

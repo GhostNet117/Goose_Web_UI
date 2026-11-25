@@ -252,6 +252,11 @@ DEFAULTS: dict[str, Any] = {
     "retention": {
         "chat_days": 180,
     },
+    # Spec 041: what is deleted on the Files page waits this many days in the recycle folder of its location
+    # (<location>\.goose-web-recycle) before it is removed for good; 1..365 (files.py).
+    "files": {
+        "recycle_days": 30,
+    },
     "paths": {
         "profiles_root": _default_profiles_root(),
         "system_dir": "",                 # default: <profiles_root>/_system
