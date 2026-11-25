@@ -1676,6 +1676,34 @@ def test_h5_a_member_does_not_change_a_folder_with_a_part_that_cannot_be_read(en
     assert (tf / "box" / "locked" / "x.txt").exists()
 
 
+def test_i1_paths_too_long_or_too_deep_are_refused_before_they_are_resolved(env):
+    """Verification I-1 / I-2: session/new resolved a member's `cwd` with realpath and no limit, on the event loop
+    (24 s for 32 KB); and 2,000 parts within 4,096 characters still took 1.9 s per request."""
+    import time as _t
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    policy = c.policy_for(dee)
+    roots = c.roots_for(dee, policy)
+    long_cwd = str(tf) + "\\x" * 16000          # 32 KB, 16,000 folders that do not exist
+    deep = str(tf) + "\\y" * 1500                # under 4,096 characters, 1,500 parts
+    t0 = _t.monotonic()
+    for p in (long_cwd, deep):
+        assert pol.path_too_long(p) and not pol.path_allowed(p, roots)
+        assert pol.has_agent_config_component(p)                # fails closed
+        assert pol.project_plugins(p) == ["(path too long)"]   # fails closed
+        for params in ({"cwd": p}, {"cwd": str(tf), "additionalDirectories": [p]}):
+            with pytest.raises(pol.Denied):
+                pol.check("session/new", params, is_admin=False, policy=policy, roots=roots)
+    assert _t.monotonic() - t0 < 2, _t.monotonic() - t0
+    assert pol.path_allowed(str(tf / "a" / "b"), roots) and not pol.path_too_long(str(tf / "a" / "b"))
+    pol.check("session/new", {"cwd": str(tf)}, is_admin=False, policy=policy, roots=roots)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        for route, kw in (("/api/fs/mkdir", {"json": {"path": deep}}), ("/api/fs/list", {"params": {"path": deep}})):
+            r = (tc.post if route.endswith("mkdir") else tc.get)(route, headers=h, **kw)
+            assert r.status_code == 400 and r.json()["error"] == "bad_path", (route, r.text)
+
+
 def test_f12_long_file_work_has_its_own_threads_and_a_person_runs_few_at_a_time(env):
     s, db, pr, c = env
     dee, tid, tf = crew(env, names=("dee",))

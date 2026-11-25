@@ -468,8 +468,23 @@ def _norm(p: str) -> str:
     return p.lower() if sys.platform == "win32" else p
 
 
+# Request paths are bounded before anything resolves them (1.28.0 reviews H-1, I-1, I-2): os.path.realpath walks a
+# long path that does not exist part by part - a 32 KB `cwd` of session/new held the event loop for 24 s, 2,000 parts
+# within 4,096 characters still 1.9 s. No real folder is that long or that deep.
+MAX_PATH_CHARS = 4096
+MAX_PATH_PARTS = 128
+
+
+def path_too_long(path: Any) -> bool:
+    s = str(path or "")
+    return len(s) > MAX_PATH_CHARS or s.count("\\") + s.count("/") > MAX_PATH_PARTS
+
+
 def _real(p: str) -> str | None:
-    """The path with every symlink / junction that exists resolved (None if it cannot be resolved)."""
+    """The path with every symlink / junction that exists resolved (None if it cannot be resolved, or is too long
+    to try: path_too_long)."""
+    if path_too_long(p):
+        return None
     try:
         p = os.path.normpath(os.path.realpath(os.path.expanduser(p)))
     except (OSError, ValueError, RuntimeError):
@@ -496,7 +511,9 @@ def is_agents_name(name: Any) -> bool:
 def has_agents_component(path: str, names: tuple[str, ...] = (AGENTS_DIR,)) -> bool:
     """True if `path` has a `.agents` component (or one of `names`), as written or resolved (realpath expands 8.3
     short names such as AGENTS~1 and links of the parts that exist). Fails closed when the path cannot be
-    resolved."""
+    resolved, or is too long to try (path_too_long)."""
+    if path_too_long(path):
+        return True
     cands = [str(path or "")]
     try:
         cands.append(os.path.realpath(cands[0]))
@@ -526,6 +543,8 @@ def project_plugins(cwd: Any) -> list[str]:
     Goose ignores files there). A plugins folder that exists but cannot be listed counts as one (fail closed)."""
     if not isinstance(cwd, str) or not cwd or "\x00" in cwd:
         return []
+    if path_too_long(cwd):
+        return ["(path too long)"]      # not resolved (I-1); counts as one, like a plugins folder that cannot be read
     base = os.path.expanduser(cwd)
     cands = [base]
     try:   # SD-5: as written, as Win32 normalises it, and with links resolved - whichever Goose ends up opening
@@ -555,7 +574,7 @@ def canonical_dir(p: Any) -> Any:
     dots/spaces Windows drops), so the gateway's checks and Goose see the same string. Links are NOT resolved here
     (a team folder may sit behind a junction); project_plugins also looks at the resolved path. Anything that is
     not an existing absolute folder is left unchanged (the path checks refuse what they must)."""
-    if not isinstance(p, str) or not p or "\x00" in p:
+    if not isinstance(p, str) or not p or "\x00" in p or path_too_long(p):
         return p
     try:
         q = os.path.expanduser(p)
@@ -581,7 +600,7 @@ def path_allowed(path: str, roots: list[str]) -> bool:
     resolved one (os.path.realpath on the candidate and on every root, so a symlink or junction inside an
     allowed root that points elsewhere cannot be used to escape).
     """
-    if not path or "\x00" in path:
+    if not path or "\x00" in path or path_too_long(path):
         return False
     if not os.path.isabs(os.path.expanduser(path)):
         return False

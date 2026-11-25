@@ -691,15 +691,15 @@ UPLOAD_FOLDER = "Web_Uploads"
 READ_ONLY_MESSAGE = "You do not have write access to this folder, so files cannot be uploaded here."
 
 
-MAX_PATH_CHARS = 4096      # no real path is longer; resolving a 10 KB one took 9.6 s (1.28.0 third review H-1)
 MKDIR_MAX_NEW = 32         # folders one "New folder" may create at once (parents included)
 
 
 def _check_path(c: Ctx, u: dict, p: str, write: bool = False) -> Path:
     """The path as a Path when the user may be there; `write`: when the user may create or change things there
     (403 read_only_folder otherwise - a folder the team may only read, spec 031)."""
-    if p and len(p) > MAX_PATH_CHARS:
-        raise HTTPError(400, "bad_path", f"That path is longer than {MAX_PATH_CHARS} characters")
+    if p and acp_policy.path_too_long(p):    # before anything resolves it (1.28.0 reviews H-1, I-2)
+        raise HTTPError(400, "bad_path", f"That path is longer than {acp_policy.MAX_PATH_CHARS} characters or "
+                                         f"deeper than {acp_policy.MAX_PATH_PARTS} folders")
     if not p or not c.path_ok(u, p):
         raise HTTPError(403, "path_forbidden", "That folder is outside your allowed folders")
     if write and not c.path_ok(u, p, write=True):
