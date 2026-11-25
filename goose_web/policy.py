@@ -295,7 +295,8 @@ def effective_policy(user: dict, teams: list[dict], grants: dict | None = None) 
             pol["provider_groups"] = tp["provider_groups"]
     for k, v in (user.get("policy_overrides") or {}).items():
         if k in DEFAULT_POLICY:
-            pol[k] = v
+            # a switch is on only for a real true (an override stored as "false" or "off" is off; F-6 2026-11-25)
+            pol[k] = v is True if k in BOOL_KEYS else v
     add_user_grants(pol, grants)
     if (pol.get("guard") or {}).get("enabled"):
         pol["allowed_modes"] = guarded_modes(pol.get("allowed_modes") or [])

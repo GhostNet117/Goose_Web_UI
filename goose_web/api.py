@@ -1373,6 +1373,10 @@ async def admin_user(request: Request):
         fields["auth_source"] = b["authSource"]
     if "policyOverrides" in b and isinstance(b["policyOverrides"], dict):
         ov = {k: v for k, v in b["policyOverrides"].items() if k in DEFAULT_POLICY}
+        # assessment 2026-11-25 F-6: a switch is true or false - "false", "off" or 0 would have switched it on
+        bad = [k for k in BOOL_KEYS if k in ov and not isinstance(ov[k], bool)]
+        if bad:
+            raise HTTPError(400, "bad_request", f"policyOverrides.{bad[0]} must be true or false (without quotes)")
         # the folder lists of one person's overrides are held to the rules of a team's (C-11, spec 031)
         folders = {k: ov[k] for k in ("allowed_roots", "read_roots") if k in ov}
         if folders:
