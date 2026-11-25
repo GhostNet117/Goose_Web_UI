@@ -18,7 +18,7 @@ import { mdElement } from '../markdown.js';
 import { linkUploads } from '../api.js';
 import { offerReadOnly } from '../readonly.js';
 
-export function renderChat(ctx, sessionId) {
+export function renderChat(ctx, sessionId, query = {}) {
   const chat = getChat(sessionId);
   const failed = agentFor(sessionId);   // read before setCurrentChat marks the chat seen (error -> idle)
   setCurrentChat(sessionId);
@@ -207,6 +207,12 @@ export function renderChat(ctx, sessionId) {
   });
   composer.value = chat.draft || '';
   if (chat.prefill) { composer.value = chat.prefill; chat.prefill = null; }
+  // Spec 041: "Add to a chat" on the Files page (#/chat/<id>?attach=<path>): the file as a chip in this chat's message
+  // box - its link (resource_link), nothing is uploaded. The parameter then leaves the address (Back does not add it again).
+  if (query.attach) {
+    composer.attachExisting(query.attach);
+    history.replaceState(null, '', '#/chat/' + encodeURIComponent(sessionId));
+  }
 
   const renderQueue = () => composer.setQueue(chat.queue, {
     onRemove: (i) => chat.removeQueued(i), onSteer: chat.running ? (i) => chat.steerQueued(i) : null,

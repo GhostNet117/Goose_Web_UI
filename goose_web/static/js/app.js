@@ -3,7 +3,7 @@ import { h, btn, iconBtn, modal, toast, closeTopModal, closeMenu, isMenuOpen, to
 import { icon, logo } from './icons.js';
 import { GET, POST, setCsrf } from './api.js';
 import { rpc, G } from './rpc.js';
-import { store, bus } from './store.js';
+import { store, bus, policy } from './store.js';
 import { router } from './router.js';
 import { loadPrefs, applyTheme, setPref, prefs, resolvedTheme, refreshPrefs, prefsChanged, resetPrefsSync } from './prefs.js';
 import { addAsk, resetAsks, resolvedElsewhere, ASK_METHODS, gotoAsk, noteToolCallSource } from './asks.js';
@@ -16,6 +16,7 @@ import { renderSidebar, NAV } from './views/sidebar.js';
 import { renderHome } from './views/home.js';
 import { renderChat } from './views/chat.js';
 import { renderHerd } from './views/herd.js';
+import { renderFiles } from './views/files.js';
 import { renderRecipes, renderRecipeEditor } from './views/recipes.js';
 import { renderSkills } from './views/skills.js';
 import { renderSchedules } from './views/schedules.js';
@@ -219,8 +220,9 @@ function buildShell() {
 const ROUTES = {
   '': (q) => renderHome(ctx, q.query),
   new: (q) => renderHome(ctx, q.query),
-  chat: (q) => q.args[0] ? renderChat(ctx, q.args[0]) : renderHome(ctx, q.query),
+  chat: (q) => q.args[0] ? renderChat(ctx, q.args[0], q.query) : renderHome(ctx, q.query),
   herd: () => renderHerd(ctx),
+  files: (q) => renderFiles(ctx, q.query),   // spec 041: #/files?path=<folder>&file=<file>
   recipes: (q) => q.args[0] === 'edit' ? renderRecipeEditor(ctx, q.args[1] || 'new') : renderRecipes(ctx),
   skills: () => renderSkills(ctx),
   schedules: () => renderSchedules(ctx),
@@ -423,7 +425,7 @@ function openPalette(initial = '') {
       { group: 'Actions', label: 'Keyboard shortcuts', icon: 'keyboard', hint: '?', run: () => showShortcuts() },
       { group: 'Actions', label: 'Sign out', icon: 'logout', run: () => logout() },
     ];
-    for (const n of NAV) if (!n.admin || me.isAdmin) a.push({ group: 'Go to', label: n.label, icon: n.icon, hint: 'g ' + n.key, run: () => router.go(n.path) });
+    for (const n of NAV) if ((!n.admin || me.isAdmin) && (!n.policy || policy(n.policy))) a.push({ group: 'Go to', label: n.label, icon: n.icon, hint: 'g ' + n.key, run: () => router.go(n.path) });
     const st = [['settings/providers', 'Models & Providers'], ['settings/prompts', 'System prompts'], ['settings/appearance', 'Appearance'], ['settings/notifications', 'Notifications'], ['settings/account', 'Account & security']];
     for (const [p, l] of st) a.push({ group: 'Go to', label: 'Settings › ' + l, icon: 'settings', run: () => router.go('/' + p) });
     if (me.isAdmin) for (const [p, l] of [['users', 'Users'], ['teams', 'Teams & policy'], ['system', 'System'], ['audit', 'Audit log'], ['logs', 'Logs']]) a.push({ group: 'Go to', label: 'Admin › ' + l, icon: 'admin', run: () => router.go('/admin/' + p) });
@@ -510,7 +512,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === '/') { if (shell && shell.sidebar.search) { e.preventDefault(); if (window.matchMedia('(max-width: 860px)').matches) ctx.toggleSidebar(true); shell.sidebar.search.focus(); } return; }
   if (gPending && Date.now() - gPending < 1200) {
     gPending = 0;
-    const n = NAV.find((x) => x.key === e.key.toLowerCase() && (!x.admin || (store.get('me') || {}).isAdmin));
+    const n = NAV.find((x) => x.key === e.key.toLowerCase() && (!x.admin || (store.get('me') || {}).isAdmin) && (!x.policy || policy(x.policy)));
     if (n) { e.preventDefault(); router.go(n.path); }
     return;
   }
