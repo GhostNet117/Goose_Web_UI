@@ -1237,6 +1237,11 @@ a.files-name > .icw { color: var(--accent); }
   .files-locs { width: 170px; }
   .files-detail { width: 300px; }
 }
+/* The list's own width decides (the details pane takes 340px of it): names first, then the other columns.
+   Found in the browser test of 1.28.0 - at 1264px with details open names broke after 4 letters. */
+.files-main { container: files-main / inline-size; }
+@container files-main (max-width: 560px) { .files-tbl .files-bycol { display: none; } }
+@container files-main (max-width: 420px) { .files-tbl .files-datecol { display: none; } }
 @media (max-width: 860px) {
   .files-layout { flex-direction: column; align-items: stretch; }
   .files-locs { width: auto; flex-direction: row; overflow-x: auto; position: static; scrollbar-width: none; gap: 4px; }

@@ -1401,10 +1401,13 @@ class _SentFile(FileResponse):
         batch: list[bytes] = []
 
         async def watch(msg) -> None:
+            n, last = 0, False
             if msg["type"] == "http.response.start":
                 seen["status"] = msg["status"]
             elif msg["type"] == "http.response.body":
                 body = msg.get("body") or b""
+                # taken before `send`: a middleware may replace the body it is handed (GZip did, for downloads)
+                n, last = len(body), not msg.get("more_body", False)
                 if seen["status"] == 200 and body:
                     batch.append(body)
                     if sum(map(len, batch)) >= HASH_BLOCK:
@@ -1413,8 +1416,8 @@ class _SentFile(FileResponse):
                         await asyncio.to_thread(h.update, data)     # off the event loop
             await send(msg)
             if msg["type"] == "http.response.body":
-                seen["sent"] += len(msg.get("body") or b"")
-                if not msg.get("more_body", False):
+                seen["sent"] += n
+                if last:
                     seen["done"] = True
 
         try:

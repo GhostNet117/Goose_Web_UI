@@ -922,9 +922,29 @@ def create_app(settings: Settings) -> Starlette:
     app.add_middleware(BodyLimit, settings=settings)   # innermost: request body cap while streaming (A-1, A-2)
     app.add_middleware(IPBlockGuard)                   # blocked addresses (spec 007), after the Host check
     app.add_middleware(HostGuard, settings=settings)   # inner: its 400 still gets the security headers
-    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+    app.add_middleware(GZipExceptDownloads, minimum_size=1024, compresslevel=5)
     app.add_middleware(SecurityHeaders, hsts=settings.public_url.startswith("https://"))
     return app
+
+
+# Spec 041 (found in the browser test of 1.28.0): file downloads go out as they are. Through GZipMiddleware a 5 GB
+# evidence file was compressed on the fly (CPU on the gateway; random or packed data even grows), lost its
+# Content-Length - the browser showed no size or progress - and its audit row counted the compressed bytes.
+UNCOMPRESSED_SUFFIXES = ("/api/files/download", "/api/fs/download")
+
+
+class GZipExceptDownloads:
+    """GZipMiddleware for everything but the file download routes (any Starlette version)."""
+
+    def __init__(self, app, **kw: Any) -> None:
+        self.app = app
+        self.gzip = GZipMiddleware(app, **kw)
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") == "http" and str(scope.get("path") or "").rstrip("/").endswith(UNCOMPRESSED_SUFFIXES):
+            await self.app(scope, receive, send)
+        else:
+            await self.gzip(scope, receive, send)
 
 
 async def _bad_request(request: Request, exc: ValueError):

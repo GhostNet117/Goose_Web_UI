@@ -1547,6 +1547,47 @@ def test_g3_team_switches_sent_as_words_are_read_as_words(env):
         assert stored["files"] is True          # the refused save changed nothing
 
 
+def test_downloads_go_out_as_they_are_never_compressed_on_the_fly(env):
+    """Browser test of 1.28.0: downloads went through GZipMiddleware - a 5 GB file compressed on the fly, no
+    Content-Length (no size or progress in the browser), and the audit row's `sent` counted compressed bytes."""
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+
+    from goose_web import api
+    from goose_web.context import HTTPError
+
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    data = os.urandom(300_000)
+    (tf / "cap.pcap").write_bytes(data)
+    (tf / "notes.txt").write_text("compressible " * 5000)
+
+    async def on_http_error(request, exc):
+        return exc.response()
+    app = Starlette(routes=api.routes, exception_handlers={HTTPError: on_http_error})
+    app.state.ctx = c
+    app.add_middleware(gw_app.GZipExceptDownloads, minimum_size=1024, compresslevel=5)     # as create_app does
+    assert "add_middleware(GZipExceptDownloads" in inspect.getsource(gw_app.create_app)
+    with TestClient(app, base_url="http://localhost") as tc:
+        h = sign_in(tc, c, dee)
+        for route in ("/api/files/download", "/api/fs/download"):
+            r = tc.get(route, params={"path": str(tf / "cap.pcap")}, headers={**h, "accept-encoding": "gzip"})
+            assert r.status_code == 200 and "content-encoding" not in r.headers, (route, dict(r.headers))
+            assert r.headers["content-length"] == str(len(data)) and r.content == data, route
+        r = tc.get("/api/files/download", params={"path": str(tf / "notes.txt")},
+                   headers={**h, "accept-encoding": "gzip"})
+        assert "content-encoding" not in r.headers           # whatever the content
+        # everything else is still compressed (a listing of 60 entries is well over the 1 KB threshold)
+        (tf / "many").mkdir()
+        for i in range(60):
+            (tf / "many" / f"file-{i:03}.txt").write_text("x")
+        r = tc.get("/api/files/list", params={"path": str(tf / "many")}, headers={**h, "accept-encoding": "gzip"})
+        assert r.status_code == 200 and r.headers.get("content-encoding") == "gzip", dict(r.headers)
+    rows = [x for x in audits(db, "files.download") if x["target"].endswith("cap.pcap")]
+    assert len(rows) == 2 and all(x["detail"]["sha256"] == hashlib.sha256(data).hexdigest() for x in rows)
+    assert all("sent" not in x["detail"] for x in rows)        # all of the file, as it is
+
+
 def test_f12_long_file_work_has_its_own_threads_and_a_person_runs_few_at_a_time(env):
     s, db, pr, c = env
     dee, tid, tf = crew(env, names=("dee",))
