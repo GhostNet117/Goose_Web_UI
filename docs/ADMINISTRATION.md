@@ -1140,13 +1140,15 @@ and the drives).
   (a link leading elsewhere is refused), names are cleaned (Unicode format characters such as a right-to-left override
   are dropped), members cannot create, rename, move or delete Goose hints files (`AGENTS.md`, `.goosehints`,
   `.goose-web-hints.md`, also by an 8.3 short name), a `.gooseignore`, anything in `.agents`, `.goose` or `.claude`
-  folders, or a folder that holds a hints file or an `.agents` folder; nothing is ever replaced; and no location's
+  folders, or a folder that holds a hints file or an `.agents`, `.goose` or `.claude` folder; nothing is ever replaced; and no location's
   top folder - anybody's: a workspace, any team's folder or extra folder, also one that lies inside a folder this
   person may write - nor a folder holding one can be renamed, moved or deleted. A rename, move or delete holds the
   item and both folders open while it runs, so a folder swapped for a link meanwhile moves nothing (`403 denied`).
   A move to another drive copies, then deletes the original; a folder that holds a link (junction, symbolic link)
   is not copied (`409 has_link`: move it on the server), and when part of the original cannot be deleted (in use)
-  the copy stays, the answer says so and `files.move` records `sourceLeft`. Previews
+  the copy stays, the answer says so and `files.move` records `sourceLeft`. A delete or restore that crosses drives
+  (an item behind a mount point) does the same (`files.delete` / `files.restore` record `sourceLeft`); a restore
+  that leaves something in the recycle bin keeps its entry there, so the rest is removed with it. Previews
   are plain text (never interpreted) and PNG / JPEG / GIF / WebP images recognised by their bytes; SVG and everything
   else are only downloaded.
 - **Recycle folder.** Delete moves an item into the hidden folder `.goose-web-recycle` at the top of its location
@@ -1171,8 +1173,9 @@ and the drives).
   folder, Files switched off, a protected name) is recorded as `files.refused` with `ok=false`, at most once a
   minute per person, route and path. Members see the recent successful `files.*` rows of a folder in the page
   (Activity).
-- **Load.** SHA-256 computations and moves run in four threads of their own (never the ones sign-in and listings
-  use); per person at most two SHA-256 computations, two move or delete requests and two previews at a time
+- **Load.** SHA-256 computations, moves and the final read of a Files upload run in four threads of their own (never
+  the ones sign-in and listings use), of which one person holds at most two at a time - the rest of their work
+  waits its turn, so one person cannot stall the others; per person at most two SHA-256 computations, two move or delete requests and two previews at a time
   (`429 busy`), and one forced SHA-256 ("Compute again") of a file per 10 seconds.
 
 #### 9.9e Providers for one person (1.27.0)

@@ -1332,6 +1332,38 @@ def test_f10_a_move_to_another_volume_that_cannot_delete_all_of_the_original_say
     assert len(a) == 1 and [p.lower()[-5:] for p in a[0]["detail"]["sourceLeft"]] == ["a.log"]
 
 
+def test_f10_delete_and_restore_across_volumes_say_what_was_left(env, monkeypatch):
+    """Second review: delete and restore cross volumes like a move does, but dropped its 'could not delete' list."""
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    (tf / "logs").mkdir()
+    for n in "abc":
+        (tf / "logs" / f"{n}.log").write_text(n)
+    other_volume(monkeypatch)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        with open(tf / "logs" / "a.log", "rb"):        # in use: opened without sharing delete
+            j = tc.post("/api/files/delete", json={"paths": [str(tf / "logs")]}, headers=h).json()
+        assert j["failed"] == [] and len(j["deleted"]) == 1, j
+        assert "could not be deleted" in j["deleted"][0]["warning"]
+        rid = j["deleted"][0]["id"]
+        binned = tf / files.RECYCLE_DIR / rid / "logs"
+        assert sorted(os.listdir(binned)) == ["a.log", "b.log", "c.log"] and os.listdir(tf / "logs") == ["a.log"]
+        a = audits(db, "files.delete")
+        assert len(a) == 1 and [p.lower()[-5:] for p in a[0]["detail"]["sourceLeft"]] == ["a.log"]
+        os.remove(tf / "logs" / "a.log")             # the person clears what was left, then restores
+        os.rmdir(tf / "logs")
+        with open(binned / "b.log", "rb"):             # now a file of the bin's copy is in use
+            r = tc.post("/api/files/restore", json={"id": rid}, headers=h)
+        assert r.status_code == 200, r.text
+        assert r.json()["path"] == str(tf / "logs") and "could not be removed" in r.json()["warning"]
+        assert sorted(os.listdir(tf / "logs")) == ["a.log", "b.log", "c.log"] and os.listdir(binned) == ["b.log"]
+        # the row stays, so what is left is still listed in the bin and purged with it
+        assert db.one("SELECT id FROM file_recycle WHERE id=?", (rid,)) is not None
+        a = audits(db, "files.restore")
+        assert len(a) == 1 and [p.lower()[-5:] for p in a[0]["detail"]["sourceLeft"]] == ["b.log"]
+
+
 def test_f11_something_squatting_the_recycle_name_does_not_block_deletes(env):
     s, db, pr, c = env
     dee, tid, tf = crew(env, names=("dee",))
@@ -1362,6 +1394,13 @@ def test_f15_format_characters_are_dropped_from_new_names(env):
         assert j["file"]["name"] == "invoicefdp.exe"
         r = tc.post("/api/files/rename", json={"path": str(tf / "invoicefdp.exe"), "name": "\u202e\u200b"}, headers=h)
         assert r.status_code == 400 and r.json()["error"] == "bad_name"
+        # second review: the folder picker's New folder (/api/fs/mkdir) refuses them in any folder it would make
+        for bad in (tf / "case\u202etxt.exe", tf / "a\u200bb" / "c", tf / "case 1" / "x\ufeff"):
+            r = tc.post("/api/fs/mkdir", json={"path": str(bad)}, headers=h)
+            assert r.status_code == 400 and r.json()["error"] == "bad_name", (bad, r.text)
+        assert sorted(os.listdir(tf / "case 1")) == [] and not (tf / "a\u200bb").exists()
+        r = tc.post("/api/fs/mkdir", json={"path": str(tf / "case 1" / "plain" / "deeper")}, headers=h)
+        assert r.status_code == 200 and (tf / "case 1" / "plain" / "deeper").is_dir()
 
 
 def test_f16_refused_attempts_are_audited_once_a_minute_per_path(env):
@@ -1461,6 +1500,53 @@ def test_f8_a_team_saved_without_the_files_switches_keeps_them_and_the_change_is
         assert audits(db, "team.update")[-1]["detail"]["policy"] == {"files": True, "schedules": None}
 
 
+def test_g2_a_folder_holding_goose_or_claude_folders_is_the_administrators(env):
+    """Second review G-2: like `.agents`, a folder holding the administrator's `.goose` or `.claude` folder (at any
+    depth, any case) is not renamed, moved or deleted by a member."""
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    admin = user(db, "root", role="admin")
+    (tf / "kit" / ".goose" / "recipes").mkdir(parents=True)
+    (tf / "deep" / "x" / ".Claude").mkdir(parents=True)
+    (tf / "plain" / "y").mkdir(parents=True)
+    (tf / "to").mkdir()
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        r = tc.post("/api/files/rename", json={"path": str(tf / "kit"), "name": "other"}, headers=h)
+        assert r.status_code == 403 and r.json()["error"] == "agents_folder_refused", r.text
+        j = tc.post("/api/files/move", json={"paths": [str(tf / "deep")], "to": str(tf / "to")}, headers=h).json()
+        assert j["failed"][0]["error"] == "agents_folder_refused"
+        j = tc.post("/api/files/delete", json={"paths": [str(tf / "kit"), str(tf / "deep"), str(tf / "plain")]},
+                    headers=h).json()
+        assert [x["error"] for x in j["failed"]] == ["agents_folder_refused", "agents_folder_refused"]
+        assert [x["path"] for x in j["deleted"]] == [str(tf / "plain")]
+    assert (tf / "kit" / ".goose" / "recipes").is_dir() and (tf / "deep" / "x" / ".Claude").is_dir()
+    with client_for(c) as tc:      # the administrator may
+        h = sign_in(tc, c, admin)
+        j = tc.post("/api/files/delete", json={"paths": [str(tf / "kit")]}, headers=h).json()
+        assert j["deleted"] and not (tf / "kit").exists()
+
+
+def test_g3_team_switches_sent_as_words_are_read_as_words(env):
+    """Second review G-3: bool("false") is True - a team saved by a script with "false"/"off"/"0" switched it on."""
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    admin = user(db, "root", role="admin")
+    with client_for(c) as tc:
+        h = sign_in(tc, c, admin)
+        for word, want in (("false", False), ("OFF", False), ("0", False), (" no ", False), ("", False),
+                           ("true", True), ("On", True), ("1", True), ("yes", True), (False, False), (True, True)):
+            r = tc.patch(f"/api/admin/teams/{tid}", json={"policy": {**ANYCHAT, "files": word, "files_manage": word}},
+                         headers=h)
+            assert r.status_code == 200, (word, r.text)
+            stored = db.one("SELECT policy FROM teams WHERE id=?", (tid,))["policy"]
+            assert stored["files"] is want and stored["files_manage"] is want, word
+        r = tc.patch(f"/api/admin/teams/{tid}", json={"policy": {**ANYCHAT, "files": "maybe"}}, headers=h)
+        assert r.status_code == 400 and r.json()["error"] == "bad_value", r.text
+        stored = db.one("SELECT policy FROM teams WHERE id=?", (tid,))["policy"]
+        assert stored["files"] is True          # the refused save changed nothing
+
+
 def test_f12_long_file_work_has_its_own_threads_and_a_person_runs_few_at_a_time(env):
     s, db, pr, c = env
     dee, tid, tf = crew(env, names=("dee",))
@@ -1490,6 +1576,35 @@ def test_f12_long_file_work_has_its_own_threads_and_a_person_runs_few_at_a_time(
     asyncio.run(files.heavy(lambda: seen.append(threading.current_thread().name)))
     assert seen[0].startswith("goose-web-files") and files._pool()._max_workers == files.HEAVY_THREADS
     assert "heavy(_move_item" in inspect.getsource(files._move_pinned)
+
+
+def test_g1_one_person_holds_at_most_two_of_the_pool_threads_until_their_work_has_finished():
+    """Second review G-1: one person's two hashes and two moves (or four upload finishes) took all four threads, so
+    everybody else's rename, delete, hash and upload finish waited for them."""
+    import threading
+    release = threading.Event()
+    started: list[str] = []
+
+    def slow(tag):
+        started.append(tag)
+        release.wait(10)
+        return tag
+
+    async def main():
+        mine = [asyncio.ensure_future(files.heavy(slow, f"a{i}", who=1)) for i in range(4)]
+        await asyncio.sleep(0.3)
+        assert sorted(started) == ["a0", "a1"]                 # the other two wait their turn
+        assert await asyncio.wait_for(files.heavy(lambda: "b", who=2), 3) == "b"       # not behind them
+        mine[0].cancel()                  # a request that went away gives the share back only when its thread ends
+        await asyncio.sleep(0.3)
+        assert sorted(started) == ["a0", "a1"]
+        release.set()
+        out = await asyncio.gather(*mine[1:])
+        assert sorted(out) == ["a1", "a2", "a3"] and sorted(started) == ["a0", "a1", "a2", "a3"]
+    asyncio.run(main())
+    for f in ("_move_pinned", "hash_route"):
+        assert 'who=u["id"]' in inspect.getsource(getattr(files, f)), f
+    assert 'who=u["id"]' in inspect.getsource(uploads._finish)
 
 
 def test_f13_stuck_items_wait_behind_the_others_and_an_administrator_can_empty_a_bin(env, monkeypatch):

@@ -225,6 +225,7 @@ function recycleDialog(loc, days, onRestored) {
       { label: '', class: 'right', render: (x) => actionBtn('Restore', async () => {
         const res = await POST('/api/files/restore', { id: x.id });
         toast('Restored: ' + (res.path || x.name), { kind: 'success' });
+        if (res.warning) toast(x.name + ': ' + res.warning, { kind: 'warn', timeout: 12000 });
         await draw();
         if (onRestored) onRestored(res.path);
       }, { size: 'sm', icon: 'refresh', errorPrefix: 'Restore' }) },
@@ -627,6 +628,7 @@ export function renderFiles(ctx, query = {}) {
       const done = r.deleted || [];
       if (done.length) toast((done.length === 1 ? baseName(done[0].path) : done.length + ' items') + ' moved to the recycle bin', { kind: 'success', timeout: 8000, actions: [{ label: 'Undo', onClick: () => restoreIds(done.map((d) => d.id)) }] });
       reportFailed(r.failed, 'not deleted');
+      for (const d of done) if (d.warning) toast(baseName(d.path) + ': ' + d.warning, { kind: 'warn', timeout: 12000 });
       for (const d of done) selected.delete(d.path);
       if (done.some((d) => samePath(d.path, fileSel))) closeDetail();
       load();
@@ -634,7 +636,13 @@ export function renderFiles(ctx, query = {}) {
   }
   async function restoreIds(ids) {
     let n = 0;
-    for (const id of ids) { try { await POST('/api/files/restore', { id }); n++; } catch (e) { toastError(e, 'Restore'); } }
+    for (const id of ids) {
+      try {
+        const res = await POST('/api/files/restore', { id });
+        n++;
+        if (res && res.warning) toast(baseName(res.path || '') + ': ' + res.warning, { kind: 'warn', timeout: 12000 });
+      } catch (e) { toastError(e, 'Restore'); }
+    }
     if (n) toast('Restored ' + n + ' item' + (n === 1 ? '' : 's'), { kind: 'success' });
     if (alive) load();
   }

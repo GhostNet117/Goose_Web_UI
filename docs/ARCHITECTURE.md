@@ -1983,7 +1983,8 @@ and are audited (`files.download`, `files.read`).
   refused whole (`409 has_link`, nothing copied); else each entry is opened, found to be exactly where it should be
   (no link on the way) and held while it is copied under a hidden `.goose-web-move-<hex>` name next to the target,
   which is then renamed into place; the original is deleted the same way, entry by entry through its handle (a
-  link: the link itself). What could not be deleted is answered as a warning and audited (`sourceLeft`). Where
+  link: the link itself). What could not be deleted is answered as a warning and audited (`sourceLeft`) - by a move, a
+  delete and a restore; a restore that leaves something keeps its `file_recycle` row, so the rest is purged with it. Where
   such handles do not exist (not Windows) the item is looked at before and after and put back on a mismatch.
 - **Recycle.** Delete moves an item to `<location top>\.goose-web-recycle\<id>\<name>` (the recycle folder made when
   needed, hidden, and refused when it is a link or does not resolve right inside the location) and writes a
@@ -2019,7 +2020,8 @@ and are audited (`files.download`, `files.read`).
   and path). `GET /api/files/activity` shows the successful rows of a folder and everything in it (and moves out
   of it).
 - **Load.** `heavy()`: SHA-256 computations, moves and the final read of an upload run in a pool of
-  `HEAVY_THREADS` (4) threads of their own; `_limited` allows a person 2 move/delete requests and 2 previews at a
+  `HEAVY_THREADS` (4) threads of their own, at most `HEAVY_PER_PERSON` (2) of them per person at a time (a semaphore
+  per person and event loop, given back when the thread has finished - not when the request went away); `_limited` allows a person 2 move/delete requests and 2 previews at a
   time (`429 busy`).
 
 ### 12.8 MCP Apps

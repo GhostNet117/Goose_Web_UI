@@ -744,6 +744,14 @@ async def fs_mkdir(request: Request):
     p = _check_path(c, u, os.path.abspath(str(b.get("path") or "")), write=True)
     _refuse_hint_name(u, p.name)
     _refuse_agents_dir(u, p)
+    # Files second review (F-15): the folders this makes may not carry Unicode format characters (U+202E shows
+    # "case<RLO>txt.exe" reversed, U+200B is invisible). Refused, not cleaned: the path is the one asked for.
+    new, q = [], p
+    while not q.exists() and q.parent != q:
+        new.append(q.name)
+        q = q.parent
+    if any(unicodedata.category(ch) == "Cf" for n in new for ch in n):
+        raise HTTPError(400, "bad_name", "A folder name cannot contain invisible or direction-changing characters.")
     try:
         p.mkdir(parents=True, exist_ok=True)
     except PermissionError:
@@ -1524,11 +1532,28 @@ def _clean_policy(p: dict, c: Ctx | None = None, team: dict | None = None) -> di
     return out
 
 
+_OFF_WORDS = frozenset({"false", "no", "off", "0", ""})
+_ON_WORDS = frozenset({"true", "yes", "on", "1"})
+
+
+def _policy_bool(key: str, v: Any) -> bool:
+    """A team switch as stored. Files second review G-3: bool("false") is True, so a script that saved a team with
+    "false", "off" or "0" switched the feature ON. Words are read as words; any other word is refused."""
+    if isinstance(v, str):
+        w = v.strip().lower()
+        if w in _OFF_WORDS:
+            return False
+        if w in _ON_WORDS:
+            return True
+        raise HTTPError(400, "bad_value", f"'{key}' must be true or false")
+    return bool(v)
+
+
 def _clean_policy_fields(p: dict) -> dict:
     out: dict[str, Any] = {}
     for k in BOOL_KEYS:
         if k in p:
-            out[k] = bool(p[k])
+            out[k] = _policy_bool(k, p[k])
     for k in LIST_KEYS:
         if k in p:
             v = p[k]

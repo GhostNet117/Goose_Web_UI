@@ -869,7 +869,7 @@ async def _finish(c, u: dict, row: dict, request: Request) -> dict:
     mtime_ns = None
     if folder:     # assessment F-5: the finished file is read once - it must be exactly the bytes that arrived
         try:
-            disk, disk_size, mtime_ns = await files.heavy(_hash_finished, target, row["file_id"])
+            disk, disk_size, mtime_ns = await files.heavy(_hash_finished, target, row["file_id"], who=u["id"])
         except (_Swapped, OSError):
             disk, disk_size = "", -1
         if not sha or disk != sha or disk_size != int(row["size"]):

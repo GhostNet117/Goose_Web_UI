@@ -23,11 +23,11 @@ Uploads use the chunked upload of spec 039 with `target: "folder"` (uploads.py).
 
 Rules: the team switch `files` for everything and `files_manage` on top of it for rename / move / delete / restore
 (administrators always have both); every path through api._check_path (read or write; the path as written and with
-links resolved); new names cleaned like uploaded file names; for members no Goose hints file names and no `.agents`
-(created, renamed, moved or deleted); nothing is ever replaced; a location's top folder (or a folder holding one) is
-never renamed, moved or deleted; the recycle folder is hidden and reached by no route but restore (api._check_path
-refuses it, listings leave it out). Every upload, download, preview and change is audited (files.*), which also
-reaches activity.jsonl and so the SIEM (spec 017).
+links resolved); new names cleaned like uploaded file names; for members no Goose hints file names and no `.agents`,
+`.goose` or `.claude` (created, renamed, moved or deleted, nor a folder holding one); nothing is ever replaced; a
+location's top folder (or a folder holding one) is never renamed, moved or deleted; the recycle folder is hidden and
+reached by no route but restore (api._check_path refuses it, listings leave it out). Every upload, download, preview
+and change is audited (files.*), which also reaches activity.jsonl and so the SIEM (spec 017).
 """
 from __future__ import annotations
 
@@ -342,7 +342,8 @@ def _is_top(path: Any, tops: list[str]) -> bool:
 
 def _protect(c, u: dict, src: Path, tops: list[str]) -> None:
     """What may not be renamed, moved or deleted: a top folder (a location, any team's or person's folder) or a
-    folder holding one; for members a Goose hints file and anything in or named `.agents` (the administrator's)."""
+    folder holding one; for members a Goose hints file and anything in or named `.agents`, `.goose` or `.claude` (the
+    administrator's)."""
     if _is_top(src, tops):
         raise HTTPError(403, "denied", "A location's top folder cannot be renamed, moved or deleted.")
     api = _api()
@@ -366,8 +367,9 @@ HOLDS_SCAN_MAX = 100000      # entries looked at for hints files / .agents in a 
 
 
 def _holds_protected(p: Path) -> tuple[str, str] | None:
-    """(refusal, path) when the folder `p` holds a Goose hints file (or .gooseignore) or a `.agents` folder, at any
-    depth (links not entered); too many entries to look at counts as holding one (fails closed). Blocking."""
+    """(refusal, path) when the folder `p` holds a Goose hints file (or .gooseignore) or a `.agents`, `.goose` or
+    `.claude` folder (second review G-2: the F-4 set, not only `.agents`), at any depth (links not entered); too many
+    entries to look at counts as holding one (fails closed). Blocking."""
     try:
         st = os.lstat(p)
     except OSError:
@@ -381,14 +383,14 @@ def _holds_protected(p: Path) -> tuple[str, str] | None:
         n = e.name.split(":", 1)[0].strip().rstrip(". ").lower()
         if n in names:
             return "hint_file_refused", e.path
-        if pol.is_agents_name(n):
+        if n in pol.AGENT_CONFIG_DIRS:          # `n` is cleaned as is_agents_name cleans it
             return "agents_folder_refused", e.path
     return None
 
 
 async def _protect_tree(u: dict, src: Path) -> None:
-    """F-7: a member does not rename, move or delete a folder holding a Goose hints file or a `.agents` folder (the
-    administrator's) - that would take them away from the chats started there."""
+    """F-7: a member does not rename, move or delete a folder holding a Goose hints file or a `.agents`, `.goose` or
+    `.claude` folder (the administrator's) - that would take them away from the chats started there."""
     if u["role"] == "admin":
         return
     found = await asyncio.to_thread(_holds_protected, src)
@@ -1015,7 +1017,7 @@ async def _move_pinned(c, u: dict, src: Path, dst: Path, pin: _Pin) -> list[str]
     """_move_item in a thread, its refusals as answers: 403 denied when the item or a folder changed meanwhile, 409
     has_link for a folder with a link that would be copied to another volume."""
     try:
-        return await heavy(_move_item, src, dst, pin)
+        return await heavy(_move_item, src, dst, pin, who=u["id"])
     except _HasLink as e:
         log.warning("files: %s holds a link (%s); %s's move to another volume was refused", src, e, u["username"])
         raise HTTPError(409, "has_link", HAS_LINK)
@@ -1049,10 +1051,13 @@ class _Live:
 # pool of its own, never in asyncio's shared one (sign-in, listings and upload writes use that); one person runs at
 # most a few such requests at a time.
 HEAVY_THREADS = 4
+HEAVY_PER_PERSON = 2           # of those threads one person uses at a time; the rest of their work waits its turn
 CHANGES_PER_PERSON = 2         # move / delete requests of one person at the same time
 PREVIEWS_PER_PERSON = 2        # previews (an image holds up to 20 MB) of one person at the same time
 FORCE_PAUSE = 10.0             # seconds between two forced SHA-256 computations of one file by one person
 _POOL: Any = None
+# per event loop: user id -> that person's share of the pool (a semaphore belongs to one loop)
+_GATES: "weakref.WeakKeyDictionary[Any, dict[Any, asyncio.Semaphore]]" = weakref.WeakKeyDictionary()
 
 
 def _pool():
@@ -1063,10 +1068,33 @@ def _pool():
     return _POOL
 
 
-async def heavy(fn, *args: Any) -> Any:
-    """`fn(*args)` in the Files pool (see HEAVY_THREADS)."""
+def _release_soon(loop, gate: asyncio.Semaphore) -> None:
+    try:
+        loop.call_soon_threadsafe(gate.release)
+    except RuntimeError:        # the loop has closed (shutdown): nothing waits any more
+        pass
+
+
+async def heavy(fn, *args: Any, who: Any = None) -> Any:
+    """`fn(*args)` in the Files pool (see HEAVY_THREADS). With `who` (a user id) one person holds at most
+    HEAVY_PER_PERSON of its threads, so two hashes and two moves of one person no longer leave nothing for the
+    others' renames, deletes and upload finishes (second review G-1). The share is given back when the thread has
+    finished - not when the request that waited for it went away, which would let the work pile up."""
     import functools
-    return await asyncio.get_running_loop().run_in_executor(_pool(), functools.partial(fn, *args))
+    loop = asyncio.get_running_loop()
+    call = functools.partial(fn, *args)
+    if who is None:
+        return await loop.run_in_executor(_pool(), call)
+    gates = _GATES.setdefault(loop, {})
+    gate = gates.get(who) or gates.setdefault(who, asyncio.Semaphore(HEAVY_PER_PERSON))
+    await gate.acquire()
+    try:
+        cf = _pool().submit(call)
+    except BaseException:
+        gate.release()
+        raise
+    cf.add_done_callback(lambda _f: _release_soon(loop, gate))
+    return await asyncio.wrap_future(cf)
 
 
 class _slot:
@@ -1313,7 +1341,7 @@ async def hash_route(request: Request):
                                      "has finished.")
     live.hashing[u["id"]] = live.hashing.get(u["id"], 0) + 1
     try:
-        sha, size, mtime, mtime_ns, stable = await heavy(_hash_file, str(p))
+        sha, size, mtime, mtime_ns, stable = await heavy(_hash_file, str(p), who=u["id"])
     except OSError as e:
         raise _os_error(e)
     finally:
@@ -1657,7 +1685,7 @@ async def delete_route(request: Request):
                         detail={"movedTo": aside})
             dst = slot / src.name
             try:
-                await _move_pinned(c, u, src, dst, _pin(c, u, src, slot, slot_real))
+                left = await _move_pinned(c, u, src, dst, _pin(c, u, src, slot, slot_real))
             except HTTPError:
                 await asyncio.to_thread(_remove_empty, slot)
                 raise
@@ -1677,8 +1705,13 @@ async def delete_route(request: Request):
             detail: dict[str, Any] = {"id": rid, "size": size, "dir": is_dir}
             if sha:      # a stored SHA-256 of the unchanged file, with where it came from (F-5)
                 detail.update(sha256=sha, sha256Source=known["sha256Source"])
+            item: dict[str, Any] = {"path": str(src), "id": rid}
+            if left:     # F-10, as for a move: across volumes the copy is in the bin, the rest stays in the old place
+                detail["sourceLeft"] = left[:50]
+                item["warning"] = (f"In the recycle bin, but {len(left)} item(s) of the original could not be deleted "
+                                   "(in use or access denied); they are still in the old place.")
             c.audit(request, "files.delete", u, target=str(src), detail=detail)
-            deleted.append({"path": str(src), "id": rid})
+            deleted.append(item)
         except HTTPError as e:
             failed.append(_failed(raw, e))
             _refused(c, request, u, str(raw)[:4096], e)
@@ -1786,15 +1819,23 @@ async def restore_route(request: Request):
     if not c.path_ok(u, str(parent), write=True):
         raise HTTPError(403, "denied", "The original folder changed; the item is not restored.")
     dst = await asyncio.to_thread(_free_name, orig, bool(r["is_dir"]))
-    await _move_pinned(c, u, src, dst, _pin(c, u, src, parent))
-    await asyncio.to_thread(_remove_empty, src.parent)
-    c.db.execute("DELETE FROM file_recycle WHERE id=?", (rid,))
-    _repath(c, src, dst)
+    left = await _move_pinned(c, u, src, dst, _pin(c, u, src, parent))
+    out: dict[str, Any] = {"path": str(dst)}
     detail: dict[str, Any] = {"id": rid, "size": r["size"], "deletedBy": r["deleted_by"]}
+    if left:
+        # F-10, as for a move: across volumes the copy is back; what could not be deleted stays in the (hidden) bin.
+        # The row stays too, so the rest is still shown there and purged with it - without it nothing would.
+        detail["sourceLeft"] = left[:50]
+        out["warning"] = (f"Restored, but {len(left)} item(s) could not be removed from the recycle bin (in use or "
+                          "access denied); they stay there until it is emptied.")
+    else:
+        await asyncio.to_thread(_remove_empty, src.parent)
+        c.db.execute("DELETE FROM file_recycle WHERE id=?", (rid,))
+    _repath(c, src, dst)
     if str(dst) != str(orig):
         detail["originalPath"] = str(orig)
     c.audit(request, "files.restore", u, target=str(dst), detail=detail)
-    return api.ok({"path": str(dst)})
+    return api.ok(out)
 
 
 async def activity_route(request: Request):
