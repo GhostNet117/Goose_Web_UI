@@ -502,6 +502,15 @@ def test_sha256_is_computed_on_request_and_cached(env):
         row = db.one("SELECT * FROM file_hashes")
         assert row["path"] == os.path.normcase(str(f)) and row["size"] == len(data)
         assert tc.post("/api/files/hash", json={"path": str(f)}, headers=h).json()["cached"] is True
+        # changed in place with the same size and modification time: only `force` reads it again
+        st = os.stat(f)
+        with open(f, "r+b") as fh:
+            fh.write(b"\x00" * 8)
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+        assert tc.post("/api/files/hash", json={"path": str(f)}, headers=h).json()["sha256"] == hashlib.sha256(data).hexdigest()
+        data = b"\x00" * 8 + data[8:]
+        j = tc.post("/api/files/hash", json={"path": str(f), "force": True}, headers=h).json()
+        assert j == {"sha256": hashlib.sha256(data).hexdigest(), "cached": False}
         listing = tc.get("/api/files/list", params={"path": str(tf)}).json()
         assert listing["entries"][0]["sha256"] == hashlib.sha256(data).hexdigest()
         assert tc.get("/api/files/info", params={"path": str(f)}).json()["sha256"] == hashlib.sha256(data).hexdigest()
@@ -871,6 +880,13 @@ def test_an_administrators_delete_in_a_team_folder_lands_in_the_teams_recycle_fo
                                                          str(ws / "w.txt")]}, headers=h).json()
         assert [x["error"] for x in j["failed"]] == ["denied"] * 3 and ws.is_dir()
         assert (ws / files.RECYCLE_DIR / j["deleted"][0]["id"] / "w.txt").exists()
+        # nor a folder holding the system folder (the database, keys, logs)
+        elsewhere = Path(s.profiles_root).parent / "elsewhere"
+        elsewhere.mkdir()
+        (Path(s.system_dir) / "x").mkdir(parents=True, exist_ok=True)
+        j = tc.post("/api/files/move", json={"paths": [str(Path(s.system_dir).parent)], "to": str(elsewhere)},
+                    headers=h).json()
+        assert j["failed"][0]["error"] == "denied" and Path(s.system_dir).is_dir()
     with client_for(c) as tc:
         h = sign_in(tc, c, dee)
         assert [x["id"] for x in tc.get("/api/files/recycle", params={"location": str(tf)}).json()["items"]] == [rid]

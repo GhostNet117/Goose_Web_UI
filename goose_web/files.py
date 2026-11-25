@@ -285,6 +285,8 @@ def _tops(c, u: dict, policy: dict) -> list[str]:
                 tops.append(str(c.profiles.workspace(m)))
             except Exception:
                 continue
+        # ... and no folder holding Goose Web's own data (the system folder itself is out of reach: path_ok)
+        tops += [str(c.settings.system_dir), str(c.settings.profiles_root)]
     return tops
 
 
@@ -714,7 +716,9 @@ async def hash_route(request: Request):
         raise HTTPError(404, "not_found", NOT_FOUND)
     if not stat.S_ISREG(st.st_mode):
         raise HTTPError(400, "bad_request", "Only a file has a SHA-256")
-    known = await asyncio.to_thread(known_sha256, c, p, st)
+    # `force`: read the file again even when its SHA-256 is known (size and modification time can be kept by
+    # whoever changes a file in place)
+    known = "" if b.get("force") is True else await asyncio.to_thread(known_sha256, c, p, st)
     if known:
         return api.ok({"sha256": known, "cached": True})
     live = _live(c.db)
