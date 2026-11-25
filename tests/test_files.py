@@ -1697,9 +1697,23 @@ def test_i1_paths_too_long_or_too_deep_are_refused_before_they_are_resolved(env)
     assert _t.monotonic() - t0 < 2, _t.monotonic() - t0
     assert pol.path_allowed(str(tf / "a" / "b"), roots) and not pol.path_too_long(str(tf / "a" / "b"))
     pol.check("session/new", {"cwd": str(tf)}, is_admin=False, policy=policy, roots=roots)
+    # J-1: every extra folder is resolved - at most MAX_EXTRA_DIRS of them, for administrators too
+    t0 = _t.monotonic()
+    for admin in (False, True):
+        with pytest.raises(pol.Denied):
+            pol.check("session/new", {"cwd": str(tf), "additionalDirectories": [str(tf)] * (pol.MAX_EXTRA_DIRS + 1)},
+                      is_admin=admin, policy=policy, roots=roots)
+        with pytest.raises(pol.Denied):
+            pol.check("session/new", {"cwd": str(tf), "additionalDirectories": str(tf)}, is_admin=admin,
+                      policy=policy, roots=roots)
+    assert _t.monotonic() - t0 < 1
+    pol.check("session/new", {"cwd": str(tf), "additionalDirectories": [str(tf)] * pol.MAX_EXTRA_DIRS},
+              is_admin=False, policy=policy, roots=roots)
+    assert "if pol.path_too_long(path):" in inspect.getsource(gw_app)      # J-3: member_writable fails closed
     with client_for(c) as tc:
         h = sign_in(tc, c, dee)
-        for route, kw in (("/api/fs/mkdir", {"json": {"path": deep}}), ("/api/fs/list", {"params": {"path": deep}})):
+        for route, kw in (("/api/fs/mkdir", {"json": {"path": deep}}), ("/api/fs/list", {"params": {"path": deep}}),
+                          ("/api/files/list", {"params": {"path": deep}})):        # J-4: the same answer
             r = (tc.post if route.endswith("mkdir") else tc.get)(route, headers=h, **kw)
             assert r.status_code == 400 and r.json()["error"] == "bad_path", (route, r.text)
 

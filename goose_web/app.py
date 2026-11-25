@@ -697,6 +697,8 @@ def wire_security_hooks(c: Ctx) -> None:
     def member_writable(path: str) -> bool:
         """SD-2: folders members can write: the profiles root (their profiles, the default team folders) and
         every team's share folder and extra folders."""
+        if pol.path_too_long(path):
+            return True          # 1.28.0 verification J-3: not resolved, so counted as one (fails closed)
         roots = [str(c.settings.profiles_root)]
         for t in c.db.query("SELECT * FROM teams"):
             roots.append(str(c.profiles.team_folder(t)))

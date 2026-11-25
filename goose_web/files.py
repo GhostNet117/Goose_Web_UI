@@ -216,8 +216,11 @@ def _real(p: Any) -> str:
 
 def _arg_path(raw: Any) -> str:
     s = raw.strip() if isinstance(raw, str) else ""
-    if not s or "\x00" in s or len(s) > 4096:
+    if not s or "\x00" in s:
         raise HTTPError(400, "bad_request", "path (an absolute path) is required")
+    if pol.path_too_long(s):      # the rule of api._check_path (verification J-4)
+        raise HTTPError(400, "bad_path", f"That path is longer than {pol.MAX_PATH_CHARS} characters or has more "
+                                         f"than {pol.MAX_PATH_PARTS} levels")
     if not os.path.isabs(s) and not (os.name == "nt" and s.startswith(("\\", "/"))):
         raise HTTPError(400, "bad_request", "path must be an absolute path")
     return os.path.abspath(s)

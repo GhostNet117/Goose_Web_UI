@@ -698,8 +698,8 @@ def _check_path(c: Ctx, u: dict, p: str, write: bool = False) -> Path:
     """The path as a Path when the user may be there; `write`: when the user may create or change things there
     (403 read_only_folder otherwise - a folder the team may only read, spec 031)."""
     if p and acp_policy.path_too_long(p):    # before anything resolves it (1.28.0 reviews H-1, I-2)
-        raise HTTPError(400, "bad_path", f"That path is longer than {acp_policy.MAX_PATH_CHARS} characters or "
-                                         f"deeper than {acp_policy.MAX_PATH_PARTS} folders")
+        raise HTTPError(400, "bad_path", f"That path is longer than {acp_policy.MAX_PATH_CHARS} characters or has "
+                                         f"more than {acp_policy.MAX_PATH_PARTS} levels")
     if not p or not c.path_ok(u, p):
         raise HTTPError(403, "path_forbidden", "That folder is outside your allowed folders")
     if write and not c.path_ok(u, p, write=True):

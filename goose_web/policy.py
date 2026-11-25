@@ -473,6 +473,7 @@ def _norm(p: str) -> str:
 # within 4,096 characters still 1.9 s. No real folder is that long or that deep.
 MAX_PATH_CHARS = 4096
 MAX_PATH_PARTS = 128
+MAX_EXTRA_DIRS = 32       # additionalDirectories of one session/new, load, fork or resume
 
 
 def path_too_long(path: Any) -> bool:
@@ -1017,6 +1018,10 @@ def check(method: str, params: Any, *, is_admin: bool, policy: dict, roots: list
     if method == TOOLS_CALL:
         check_tool_call_target(params)  # every user, admins included (NEW-01)
     if method in ("session/new", "session/load", "session/fork", "session/resume"):
+        # 1.28.0 verification J-1: every extra folder is resolved below, on the event loop - 1,000 deep ones took 8.5 s
+        extra = params.get("additionalDirectories")
+        if extra is not None and (not isinstance(extra, list) or len(extra) > MAX_EXTRA_DIRS):
+            raise Denied(f"additionalDirectories: a list of at most {MAX_EXTRA_DIRS} folders")
         canonical_dirs(params)   # SD-5: every check below and Goose itself see the same, canonical folder
     if is_admin:
         return
