@@ -21,14 +21,15 @@ Contents:
 6. [Watching Goose work (live activity)](#6-watching-goose-work-live-activity)
 7. [Keyboard shortcuts](#7-keyboard-shortcuts)
 8. [Herd](#8-herd)
-9. [Recipes](#9-recipes)
-10. [Skills](#10-skills)
-11. [Schedules](#11-schedules)
-12. [Apps](#12-apps)
-13. [Extensions](#13-extensions)
-14. [Settings](#14-settings)
-15. [What your policy can restrict](#15-what-your-policy-can-restrict)
-16. [FAQ](#16-faq)
+9. [Files](#9-files)
+10. [Recipes](#10-recipes)
+11. [Skills](#11-skills)
+12. [Schedules](#12-schedules)
+13. [Apps](#13-apps)
+14. [Extensions](#14-extensions)
+15. [Settings](#15-settings)
+16. [What your policy can restrict](#16-what-your-policy-can-restrict)
+17. [FAQ](#17-faq)
 
 ## 1. What Goose Web is
 
@@ -46,7 +47,7 @@ Things to know before you start:
 - **Your team decides what you may do.** You belong to one team. Its policy, set by your administrator, decides
   which providers, models and approval modes you can use, which folders you can reach, which hints Goose gets and
   whether you can add extensions. Pages show a "Read-only" note when your policy does not allow a change. See
-  [section 15](#15-what-your-policy-can-restrict).
+  [section 16](#16-what-your-policy-can-restrict).
 - **No team, no chat.** If you are not in a team yet, you can sign in, look around and read your old chats, but
   you cannot start or continue a chat until your administrator adds you to a team.
 
@@ -168,7 +169,7 @@ a drawer: open it with the menu button at the top left, close it with the X or b
 | **New chat** | Opens the new-chat screen (`Alt+N`). |
 | Command button | Opens the command palette (`Ctrl+K`). |
 | Status counters | "N need you", "N working" and, when there are any, "N done" and (administrators, since 1.16) "N elsewhere" - sessions Goose Desktop, the goose CLI or a scheduled job is running (section 8). Click to open the Herd. |
-| Navigation | Herd, Recipes, Skills, Schedules, Apps, Extensions, Settings, and Admin for administrators. |
+| Navigation | Herd, Files (when your team has it, section 9), Recipes, Skills, Schedules, Apps, Extensions, Settings, and Admin for administrators. |
 | **Search chats** | Searches your chats (`/` focuses it, `Esc` clears it). |
 | List options button | Filters and folder controls (see below). |
 | Chat list | Your chats, grouped by working folder. Administrators with the native profile also see a **Working elsewhere** group on top (section 8). |
@@ -367,7 +368,7 @@ usually are:
 | `chat` (chat only) | Goose does not use tools. |
 
 Your team decides which modes you may choose. Only allowed modes appear in the list. Accounts created by
-the gateway normally start in `approve` mode. Apps that call tools need `auto` mode (see [Apps](#12-apps)).
+the gateway normally start in `approve` mode. Apps that call tools need `auto` mode (see [Apps](#13-apps)).
 
 ### Provider, model and thinking level
 
@@ -493,6 +494,8 @@ message box.
   `AGENTS.txt`) if you only want to share its text.
 - Click the X on an attachment to remove it before sending. Goose Web waits for uploads to finish before it
   sends.
+- A file that is already in one of your folders does not need uploading: on the **Files** page, **Ask Goose
+  about this** or **Add to a chat** attaches it as a link (section 9).
 
 #### Slash commands
 
@@ -610,7 +613,7 @@ the current step a spinner, and high-priority steps a "high" badge. The box upda
 
 Some tools come with an interactive app. When such a tool finishes, the app appears inside the tool card. It
 runs in a sandbox and has no access to Goose Web or your sign-in. If the app wants to send a chat message for
-you, or run a tool from a powerful extension, you are asked to confirm first. See [Apps](#12-apps) for the
+you, or run a tool from a powerful extension, you are asked to confirm first. See [Apps](#13-apps) for the
 rules.
 
 ### Reading the transcript
@@ -752,6 +755,7 @@ Press `?` (outside a text field) to see this list in the app. On a Mac, use `Cmd
 |---|---|
 | `g` `c` | New chat |
 | `g` `h` | Herd |
+| `g` `f` | Files |
 | `g` `r` | Recipes |
 | `g` `k` | Skills |
 | `g` `s` | Schedules |
@@ -846,7 +850,103 @@ restarting for an update: send this again in a minute*. If an agent was running 
 restart), its chat shows **Error - Interrupted: Goose Web restarted while this chat was running**; send a message to
 continue.
 
-## 9. Recipes
+## 9. Files
+
+**Files** (since 1.28.0) shows the folders you may use - your own workspace, your team folder and the team's
+other folders - and lets you upload, download and hand files to Goose. It is in the sidebar right under Herd
+(`g` `f`) when your team has the switch **Files** on; administrators always have it and see the folders the folder
+picker shows them. Your teammates see the same team folders: what one of you uploads there, the others see on
+their next refresh.
+
+### What you see
+
+| Part | What it does |
+|---|---|
+| Locations | Your folders: **My workspace**, the **team folder** and the team's other folders. A lock and "read only" mark a folder your team may only read. On a phone they are a row of buttons above the list. |
+| Breadcrumb | Where you are, from the top of the location; the up arrow goes one folder up. It never goes above the location. |
+| Toolbar | **Upload**, **New folder**, Refresh, the filter (filters as you type), the sort order (name, date or size) and **Show hidden**. Upload and New folder are not shown in a read-only folder. |
+| The list | Folders first, then files: name, size, modified, uploaded by. Click a column title to sort by it (again to reverse the order). Tick boxes select several items. A large folder comes in pages of 200: **Load more** is at the bottom. A folder with more than 20,000 items lists the first 20,000; use the filter to find the others. |
+| **Activity**, **Recycle bin** | At the top right: who did what in this folder; what was deleted in this location. |
+
+The list refreshes by itself every 15 seconds while the page is visible (and with the Refresh button). The page's
+address names the folder and the file you opened: **Copy link** gives a link a teammate with the same rights can
+open; anyone else gets "You may not open this folder".
+
+### Upload
+
+Click **Upload** and pick files, or drag files from your computer onto the list. They go into the folder shown
+(not into `Web_Uploads`), in resumable pieces like attachments ([section 5](#5-the-chat-screen)): each file shows
+its progress, its X cancels it, two files go up at the same time and the others wait. Uploads keep going while you
+use other pages of Goose Web (a message says when one has finished); closing or reloading the tab stops them, and
+the browser asks first. When a file fails after the automatic tries (the network was gone for too long),
+**Retry** goes on from what the server already has.
+
+- The largest file is your administrator's upload limit (5 GB by default).
+- An existing file is never overwritten: a second `capture.pcap` becomes `capture (1).pcap`.
+- Folders cannot be dropped: create the folder with **New folder**, open it and drop its files there.
+- The same names are refused as for attachments (`AGENTS.md`, `.goosehints`, `.goose-web-hints.md`, `.agents`
+  folders).
+- Files uploaded here are never deleted by the clean-up of old chats and their attachments.
+
+### Details, SHA-256 and download
+
+Click a file's name: its details open next to the list (on a phone, over it; the X or `Esc` closes them).
+
+- **Size**, **Type** (recognised from the file's first bytes, for example "PNG image", "ZIP archive", "PDF
+  document", "pcap capture", "Windows executable", "text"), **Modified**, **Created**, **Uploaded** (who and when,
+  for files uploaded through Goose Web) and the **Path**.
+- **SHA-256**: computed while the file was uploaded through Goose Web. For other files click **Compute** (a large
+  file takes a while); the value is kept until the file changes. The copy button next to it copies it.
+- **Download** saves the file with the browser's normal download - any size, and the browser can resume an
+  interrupted download. Every download is recorded.
+
+### Preview
+
+**Preview** shows a text file as plain text (the first 256 KB; never run or formatted) and PNG, JPEG, GIF and WebP
+images. Other files have no preview: download them or ask Goose about them. Previews are recorded too.
+
+### Asking Goose about a file
+
+- **Ask Goose about this** opens New chat in the file's folder with the file attached in the message box. Type
+  your question and send it: Goose reads the file where it lies (nothing is uploaded or copied again).
+- **Add to a chat** lists your recent chats; pick one and the file is attached in that chat's message box.
+- **Copy path** copies the file's full path, for a message or a tool.
+
+If you may not read the file (for example a link from someone with other rights), the attachment is removed again
+with the reason.
+
+### Rename, move and delete
+
+With the team switch **Rename, move and delete files**, in a folder you may change: **Rename** (never replaces an
+existing name), **Move...** (to a folder you may change; never into the moved folder itself) and **Delete...**
+(asks first). Use them in the details, or tick several items and use the bar above the list. The top folder of a
+location cannot be renamed, moved or deleted.
+
+A delete moves the item into the location's hidden recycle folder. The message that follows offers **Undo**; later
+the **Recycle bin** lists what was deleted in this location (by anyone), with **Restore**: the item goes back to its
+folder, with " (restored)" added when its name is taken by then. After 30 days (your administrator may choose
+another number) the items are removed for good.
+
+### Activity
+
+**Activity** lists the last 50 uploads, downloads, previews, new folders, renames, moves, deletes and restores in
+the folder and its sub-folders: when, who, what, and the size or SHA-256. They are all in the audit log your
+administrator sees as well.
+
+### Who can do what
+
+| You can | When |
+|---|---|
+| See **Files**, browse, download, preview, compute SHA-256, see the activity | The team switch **Files: browse, download and upload** is on (it is on for every team unless your administrator switched it off) |
+| Upload and create folders | The same, in a folder you may change (not "read only") |
+| Rename, move, delete and restore | The switch **Rename, move and delete files** is on too, in a folder you may change |
+| Use other folders | Never: only the folders your team may use, which your administrator decides |
+
+Administrators always have both. Your administrator can also switch either off for you alone. Without **Files** the
+page is not in the sidebar and the file download and read routes of the API are refused as well; choosing a chat's
+working folder still works.
+
+## 10. Recipes
 
 A recipe is a reusable setup: instructions, a first prompt, parameters, model settings and extensions. You can
 run, share and schedule recipes.
@@ -905,12 +1005,12 @@ If you leave with unsaved changes, Goose Web asks you to confirm.
 
 - **Slash command...**: enter a name with letters, numbers, `-` and `_`. Then type `/name` in any chat to run the
   recipe. Leave it empty to remove it.
-- **Schedule...**: opens the cron helper (see [Schedules](#11-schedules)). **Remove schedule** stops it.
+- **Schedule...**: opens the cron helper (see [Schedules](#12-schedules)). **Remove schedule** stops it.
 
 Recipes provided by your team cannot be deleted by you. Without the `recipes_edit` permission you can still run
 recipes, but not change them.
 
-## 10. Skills
+## 11. Skills
 
 Skills are Markdown instructions that Goose loads when they are relevant.
 
@@ -940,7 +1040,7 @@ New skills are saved in your global skills.
 
 Skills marked "read-only" cannot be changed. Without the `skills_edit` permission the page is read-only.
 
-## 11. Schedules
+## 12. Schedules
 
 A schedule runs a recipe automatically at set times. Each run creates a chat in **your own** chat list (the
 schedules, their runs and their chats belong to your profile; nobody else's list shows them, and you do not see
@@ -1000,7 +1100,7 @@ If the page says the scheduler is not active on this server, schedules are read-
 the same profile is used by Goose Desktop, which then runs the schedules. Without the `schedules` permission you
 can view schedules but not change them.
 
-## 12. Apps
+## 13. Apps
 
 Apps (MCP Apps) are small interactive HTML tools that run in a sandbox and can call Goose tools.
 
@@ -1038,7 +1138,7 @@ Goose Web shows a warning that says so. Switch the chat's mode to `auto` if you 
 
 Importing, deleting and app tool calls need the `apps` permission.
 
-## 13. Extensions
+## 14. Extensions
 
 Extensions give Goose its tools. They are MCP servers or Goose built-ins.
 
@@ -1070,7 +1170,7 @@ Adding, removing and enabling extensions needs the `extensions_edit` permission,
 non-administrators. Extensions that can run commands (`developer`, `computercontroller`, `code_execution`,
 `orchestrator` and any command extension) also need `allow_shell`.
 
-## 14. Settings
+## 15. Settings
 
 Open **Settings** from the sidebar. The tabs are on the left (a drop-down list on phones). A tab that your
 policy does not allow shows a "Read-only" note or is hidden.
@@ -1292,7 +1392,7 @@ it to see when it ends). Click **Revoke** to sign out another one, for example a
 Scripts send it in the header `Authorization: Bearer gwt_...`. Click **Revoke** to delete a token. All tokens
 are revoked when your password changes or is reset.
 
-## 15. What your policy can restrict
+## 16. What your policy can restrict
 
 You belong to one team, and your administrator sets that team's policy (and sometimes a few settings for you
 alone). Administrators themselves have no restrictions. Since version 1.5.0 policies follow least privilege: a
@@ -1314,6 +1414,8 @@ new team allows nothing until the administrator turns things on. If a button is 
 | `config_edit` | Raw Goose configuration (Advanced config tab) | Not allowed |
 | `allow_shell` | Shell and command extensions, command (stdio) MCP extensions | Not allowed |
 | `notify_webhook` | A personal notification webhook | Not allowed |
+| `files` | The **Files** page: browse, download, preview, SHA-256, activity; upload and new folders where you may write ("Files: browse, download and upload") | Allowed (since 1.28.0, also on teams that existed before) |
+| `files_manage` | Rename, move and delete files and folders, restore from the recycle bin, where you may write ("Rename, move and delete files") | Allowed (since 1.28.0, also on teams that existed before) |
 
 Lists and limits:
 
@@ -1340,7 +1442,7 @@ If your team uses the prompt guard, Goose Web checks what you type and the tool 
   allow* button. If your team uses *guarded auto*, calls that pass the guard run without a card.
 - Depending on your team, a block may also be silent (the message simply gets no answer).
 
-## 16. FAQ
+## 17. FAQ
 
 **Does Goose stop when I close the browser?**
 No. The server keeps the agent running. Open the chat again later to see the result. Turn on notifications or a
@@ -1410,7 +1512,7 @@ If your account uses the same Goose profile as Goose Desktop, yes. Chats continu
 schedule refresh in the open web chat within a few seconds.
 
 **Why is a page read-only?**
-Your policy does not allow changes there. See [section 15](#15-what-your-policy-can-restrict).
+Your policy does not allow changes there. See [section 16](#16-what-your-policy-can-restrict).
 
 **Why does an app say it needs Auto mode?**
 Goose only allows app tool calls in `auto` mode. Switch the chat to `auto` if you trust the app.
