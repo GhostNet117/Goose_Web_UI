@@ -231,7 +231,8 @@ def clean_name(raw: Any) -> str:
     s = raw.strip() if isinstance(raw, str) else ""
     if not s or "/" in s or "\\" in s or "\x00" in s or s in (".", ".."):
         raise HTTPError(400, "bad_name", "Give a name without \\ or /")
-    name = _api().safe_upload_name(s)
+    # ":" goes first: Windows would read "c:name" as a drive and "name:x" as a stream of "name"
+    name = _api().safe_upload_name(s.replace(":", ""))
     if (name == "upload.bin" and s != "upload.bin") or is_recycle_name(name) or \
             name.lower().startswith((PARTIAL_PREFIX, MOVE_PREFIX)):
         raise HTTPError(400, "bad_name", "That name cannot be used")
