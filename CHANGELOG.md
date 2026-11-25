@@ -1,5 +1,138 @@
 # Changelog
 
+## 1.28.0 - 2026-11-25
+
+**Files: browse the folders you are granted, upload large files into them, download them and hand them to Goose
+(spec 041).** A team that works on shared material in its team folder - an incident's captures, logs and exports -
+can now do it in Goose Web. The **Files** page (sidebar, right under Herd) shows each person exactly the folders the
+administrator already grants them (workspace, team folder, the team's other folders; read-only ones stay read-only).
+It takes uploads of files up to the upload limit (at most 5 GB) in resumable pieces straight into the folder shown,
+downloads any file the person may read, shows a file's details with its SHA-256 and the type recognised from its
+content, previews text and common images safely, hands a file to Goose ("Ask Goose about this", "Add to a chat"),
+renames, moves and deletes with a recycle bin, and shows a folder's activity. Every upload, download and change is
+audited with size and SHA-256, for a chain of custody. An independent review of the release candidate found five
+Medium and twelve lower findings; all are fixed in this release (SECURITY-ASSESSMENT 24).
+
+### Upgrade notes - read these before you upgrade
+- **Two new team switches, on by default.** **Files: browse, download and upload** (`files`) and **Rename, move and
+  delete files** (`files_manage`) are on for new teams and are switched on once, at the first start of 1.28.0, for
+  every team that exists (each audited as `team.update` by the system; settings key `files_switches_applied`). So
+  after the upgrade every member can browse, download, upload, rename, move and delete in the folders they already
+  have (read-only folders stay read-only) - also in teams without Shell, because the gateway does the work. A switch
+  an administrator turns off stays off; to keep a team out, switch both off in Admin > Teams (the team's Folders
+  switches) after the upgrade. Administrators always have both.
+- **`/api/fs/download` and `/api/fs/read` need the Files switch** (`403 files_off` without it) and are audited
+  (`files.download`, `files.read`): scripts that use them need the switch. The folder picker (`/api/fs/roots`,
+  `/api/fs/list`, `/api/fs/mkdir`) works without it.
+- **Members can no longer create or upload into `.goose` or `.claude` folders, nor a file named `.gooseignore`** -
+  in the folder picker, in chat attachments and on the Files page (`403 agents_folder_refused` /
+  `403 hint_file_refused`), as for `.agents` folders and the hints file names before. Goose reads skills, recipes
+  and agents from these folders, and its ignore rules from `.gooseignore`, in the folder a chat starts in; an
+  administrator puts them in place.
+- **A per-person override of a switch must be `true` or `false`.** Admin > Users refuses anything else
+  (`400 bad_request`), and a stored override that is not `true` - such as `"true"`, `"false"` or `1` - now counts
+  as off, for every switch (before, any such value counted as on). Check the overrides in Admin > Users.
+- **Files uploaded on the Files page are never deleted by chat retention** (spec 040): they belong to no chat. Chat
+  attachments in `Web_Uploads` are handled as before.
+- **New configuration `files.recycle_days`** (default 30, 1 to 365): what is deleted on the Files page waits that
+  long in the hidden folder `.goose-web-recycle` at the top of its location, where it can be restored; then the
+  maintenance loop removes it for good. Recycled items use disk space until then. `goose-web check` shows the value.
+- At the first start the database gets two tables (`file_hashes`, `file_recycle`) and three columns of `uploads`
+  (`target`, `sha256`, `mtime_ns`); the schema number stays 6; nothing to do. Service worker cache `gw-shell-v31`
+  (new modules `uploader.js` and `views/files.js`): reload open tabs once.
+
+### New
+- **The Files page** (`#/files?path=<folder>&file=<file>`; in the sidebar right under Herd, `g f`, the command
+  palette) for everyone with the Files switch: their locations (workspace, team folder, the team's other folders,
+  read-only ones marked; administrators: their workspace and the drives, as in the folder picker), a breadcrumb up to
+  the location's top, folders first, sort by name, size or date, filter as you type, hidden files on request, pages
+  of 200 with **Load more**, multi-select, an automatic refresh every 15 s while the page is visible. **Copy link**
+  gives a link that a teammate with the same rights can open.
+- **Upload into the folder itself** (not `Web_Uploads`): **Upload** or drag-and-drop onto the list, files up to the
+  upload limit (Admin > Settings > Files and chats) in resumable pieces (the spec 039 client, with
+  `target: "folder"`), two at a time, with progress, cancel and a **Retry** that goes on from what the server has;
+  uploads go on while you use other pages, and the tab asks before it closes while they run. A file is never
+  replaced (`name (1).ext`). **New folder**.
+- **Details**: size, dates, the type recognised from the first bytes (PNG image, ZIP archive, PDF document, Windows
+  executable, pcap capture, Windows event log and more), who uploaded it and when (uploads through Goose Web), and
+  the SHA-256 - computed while an upload arrives and checked against the finished file, or on request
+  (**Compute**). A stored SHA-256 is shown only while the file's size and modification time are exactly unchanged,
+  and says where it comes from ("recorded at upload" or "computed", with the time); **Compute again** reads the
+  file anew. **Download**: a plain browser download of any size, resumable.
+- **Previews** of text (shown as text, never interpreted) and of PNG, JPEG, GIF and WebP images recognised by their
+  bytes (never SVG); everything else is only downloaded.
+- **Hand a file to Goose**: **Ask Goose about this** opens New chat in the file's folder with the file as an
+  attachment chip (its link; nothing is uploaded), **Add to a chat** puts the chip into one of your recent chats,
+  **Copy path**. The agent reads the file where it lies, with your rights. `#/new?cwd=<folder>&attach=<path>` and
+  `#/chat/<id>?attach=<path>` open the message box with that file attached; nothing is sent before you press Send.
+- **Rename, move and delete** (switch **Rename, move and delete files**; in folders you may write): a rename never
+  replaces a file; a move goes to another folder you may write (to another drive: copied, then the original
+  deleted); a delete moves the items into the hidden recycle folder of their location (**Undo** in the toast), and
+  the location's **Recycle bin** lets anyone who may write there restore them for `files.recycle_days` days. The bin
+  shows its size; administrators can **Empty now**. No location's top folder - anybody's workspace, any team's
+  folder or extra folder - can be renamed, moved or deleted.
+- **Activity** of a folder: the last 50 file actions in it and below it (who, what, when; moves out of it too).
+- **Audit for chain of custody**: `files.upload`, `files.download`, `files.read`, `files.preview`, `files.mkdir`,
+  `files.rename`, `files.move`, `files.delete`, `files.restore`, `files.purge` and `files.recycle_conflict`, with
+  the path, size, SHA-256 and from / to; a download records the SHA-256 of the bytes it actually sent when they were
+  the whole file. Requests refused with 403 are recorded as `files.refused` (`ok=false`, at most once a minute per
+  person, route and path). All of them reach `activity.jsonl` and so the SIEM.
+- **API**: `/api/files/*` - locations, list, info, hash, download, preview, mkdir, rename, move, delete, recycle,
+  recycle/empty (administrators), restore, activity - and `target: "folder"` for `POST /api/fs/uploads`; new error
+  codes `403 files_off`, `409 has_link`, `409 upload_changed`, `415 no_preview`, `429 busy` (API.md).
+
+### Changed
+- The folder picker no longer lists `.goose-web-recycle`, and every file route answers `404 not_found` for anything
+  in it; only restore reaches the recycle folder.
+- Unicode format characters (right-to-left override, zero-width characters, byte order mark) are dropped from the
+  names of uploaded files - chat attachments included - and of new folders (`invoice<U+202E>fdp.exe` showed as
+  `invoiceexe.pdf`).
+- A team saved without the two Files keys (a script, an Admin page from before 1.28.0) keeps the stored values;
+  `team.update` records the policy values a save changed.
+- The chunked upload client moved from `api.js` to the new `uploader.js`, shared by the message box and the Files
+  page; the message box behaves as before.
+- `goose-web check` has a Files line (the recycle period in force).
+
+### Fixed
+Found before release by an independent review of the release candidate (SECURITY-ASSESSMENT 24.3); none of them
+was in a released version.
+- **Medium (F-1):** a move to another drive copied what a junction inside the moved folder points to - with the
+  gateway's rights, into a folder the person reads. A folder that holds a link is now not copied (`409 has_link`),
+  and every entry is held open and checked while it is copied.
+- **Medium (F-2):** a rename, move or delete checked only its target folder again, so a source folder swapped for a
+  link in between moved someone else's files. The item and both folders are now held open while it moves; if one
+  was swapped, nothing moves (`403 denied`).
+- **Medium (F-3):** a member could rename, move or delete another team's location lying inside a folder they may
+  write. Everybody's locations are now protected for members too.
+- **Medium (F-4):** a member with every Goose permission off could put skills, recipes or agents into `.goose` or
+  `.claude` folders, or a `.gooseignore`, in a shared folder, where every chat started - an administrator's
+  included - would load them. Refused for members (upgrade notes).
+- **Medium (F-5):** the SHA-256 recorded for an upload was of the bytes received, not of the file, and stayed shown -
+  and went into download audit rows - after the file had changed. Now the finished upload is read once and must
+  match (`409 upload_changed` otherwise; the file is not kept), a stored SHA-256 is shown only for the unchanged
+  file and labelled, and a download is audited with the SHA-256 of what it sent.
+- **Low:** an override such as `"false"` switched Files on (F-6); hints files could be renamed, moved or deleted
+  through their 8.3 short name or with their folder (F-7); a team saved without the two keys lost both switches
+  (F-8); switching Files off did not stop an upload already running (F-9); a move to another drive that could not
+  delete all of the original answered "denied" and left an unrecorded copy (F-10; now answered as moved with a
+  warning, audited `sourceLeft`); anything named `.goose-web-recycle` blocked deletes (F-11; now moved aside,
+  `files.recycle_conflict`); hashing and copies shared the thread pool of sign-in (F-12; now four threads of their
+  own and per-person limits, `429 busy`); purge retried stuck items first, for ever (F-13; they now wait an hour,
+  behind the others); the candidate's own front-end test failed (F-14).
+- **Info:** format characters in names (F-15); refused attempts were not audited and a `HEAD` request wrote a
+  download row (F-16); the version and the release documents were missing (F-17).
+
+### Security
+The independent review of the release candidate - a code review, the test suites and 21 probes against the real
+routes with real NTFS junctions and 8.3 names - found no Critical issue, five Medium findings (F-1 High where a
+writable folder holds a link made outside the sandbox), nine Low and three informational ones; all are fixed in
+this release, the code findings each with a regression test (Fixed, above). The threat model, the mitigations, the
+findings, the second review of the fixes and the residual risks: SECURITY-ASSESSMENT 24.
+
+### Docs
+USER-GUIDE 9 Files (new; sections 9-16 are now 10-17), ADMINISTRATION (9.4, 9.7, 9.9f, 10, 16), API (Files),
+ARCHITECTURE (file map, 4, 10.2, 10.3, 12.7), CONFIGURATION (2, 4), TROUBLESHOOTING 16, SECURITY-ASSESSMENT 24.
+
 ## 1.27.1 - 2026-11-25
 
 **Each person's scheduled runs are chats in their own list that they can open and continue.** Goose gives a

@@ -2245,3 +2245,274 @@ documented in this release as described above.
 while a job writes the chat (prompt, edit, member before any load), two tabs at once at the real cache (one
 question), no question to a stopped worker, a scheduler that does not answer (one question in 30 s, one warning),
 other chats unaffected, continuing after the run. The refusal tests fail on 1.27.0.
+
+## 24. Addendum: 1.28.0 (2026-11-25) - Files
+
+The **Files** page (spec 041): people browse the folders they are already granted, upload large files into them,
+download them, see their SHA-256, preview text and common images, hand a file to Goose, rename, move and delete them
+(with a recycle bin) and see a folder's activity. It was built for a team that works on shared material - an
+incident's captures, logs and exports - in its team folder, where the audit of who uploaded, downloaded or changed
+what serves as a chain of custody. Built in two packages (server, browser), merged into a release candidate
+(`a4f31a0`), assessed independently before release (24.3), corrected after that assessment (commits `cb0957e` to
+`3cf2842`), and the fixes reviewed again (24.4). Sections 24.1 and 24.2 describe the feature as released, including
+what the assessment changed.
+
+### 24.1 What the feature exposes, and to whom
+
+- **New surface.** Fourteen routes under `/api/files/*` (locations, list, info, hash, download, preview, mkdir,
+  rename, move, delete, recycle, recycle/empty, restore, activity; API.md), `POST /api/fs/uploads` with
+  `target: "folder"` (a chunked upload into the folder itself instead of `<chat folder>\Web_Uploads`), the page
+  `#/files`, and `?attach=` on New chat and in a chat. Before, a member could put a file into a folder only as a
+  chat attachment, and no page offered a file download; `/api/fs/download` and `/api/fs/read` existed for API
+  clients, without an audit row.
+- **Folder rights unchanged.** Everything works only in the folders the administrator already grants - a member's
+  workspace, the team folder, the team's extra and read-only folders (spec 031, 21.1) - checked by the same
+  `api._check_path` / `Ctx.path_ok` as every file route; read-only folders stay read-only; there is no new kind of
+  folder right. The members' agents already reach these folders; the page gives the people the same view. New is
+  that the gateway - not sandboxed, with its account's rights - renames, moves, copies and deletes in folders that
+  the members' agents can change at the same time; most of 24.2 is about that.
+- **Two switches.** `files` (the page and its API: browse, download, preview, SHA-256; upload and new folder where
+  the person may write) and `files_manage` (rename, move, delete, restore; counts only with `files`). Both are in
+  `BOOL_KEYS`, so per-person overrides apply; an override must be JSON `true` or `false` (400 otherwise) and a
+  stored one that is not `true` counts as off (F-6). Both are on for new teams (`NEW_TEAM_POLICY`) and were switched
+  on once for every existing team at the first start (`policy.apply_files_switches`, settings key
+  `files_switches_applied`, each change audited `team.update` by the system); only keys a team does not have are
+  added, so an explicit off stays off, even when the settings key is lost, and a team saved without the keys keeps
+  the stored values (F-8). Without `files` the page is hidden and every `/api/files/*` route answers
+  `403 files_off`, and so do `/api/fs/download`, `/api/fs/read` and each piece and the finish of a folder upload
+  (F-9); the folder picker (`/api/fs/roots|list|mkdir`) keeps working.
+- **On by default** is a decision of 2026-11-25: on upgrade every member gains download, upload, rename, move and
+  delete in the folders they already have - also in a team without Shell, where the gateway now does what the
+  member's agent may not. Administrators who do not want that switch it off per team.
+- **Administrators** always have both switches. Their locations are those of the folder picker - their workspace
+  and the drives - where they act with the gateway's rights (never in the system folder, on UNC or device paths).
+  Every team's folders, every workspace, the system folder and the profiles root are protected tops for them as for
+  everyone (24.2), so their deletes in a team folder or a workspace land in the recycle bin that team or person
+  sees, and no folder holding a workspace or Goose Web's data can be moved or deleted from the page. Only
+  administrators can empty a recycle bin early (`POST /api/files/recycle/empty`).
+- **Who sees what.** Listings, details, previews and a folder's activity need read access to the folder; the
+  recycle listing shows the items whose original folder the caller may write; restore needs `files_manage` and
+  write access there. Whoever may read a folder sees who uploaded a file and when, and the folder's activity: the
+  successful `files.*` rows of that folder and everything below it - teammates' and administrators' actions
+  included, with the other end of a move in or out.
+
+### 24.2 Threat model and mitigations
+
+Assumptions: a member can write in their writable folders through the page and, with Shell, through their agent;
+the gateway is not sandboxed and acts in those folders while the members' agents can change them; a link inside them
+can come from outside the sandbox (an administrator, a native profile's agent, a host tool, an unpacked archive, a
+folder tree that already carries junctions) - a sandboxed agent cannot create a link to a place it may not write
+(13.3, 16.2).
+
+- **Authorization on every route.** Sign-in; `files.gate` (`files`; `files_manage` too for rename, move, delete and
+  restore; `403 files_off`); then each path through `api._check_path`: absolute only (`400 bad_request`), inside
+  the person's folders as written and as resolved (`403 denied`), in a writable folder for anything that creates or
+  changes something (`403 read_only_folder`), never the system folder, a UNC or a device path. Every POST needs the
+  CSRF header and passes the Origin check (tested per route). Upload ids stay their owner's (`404` for anyone else,
+  administrators included); restoring an item of a folder the caller cannot reach is `404`. The assessment's
+  isolation probes - other workspaces, other teams' folders, the profiles root, a profile folder, the system
+  folder, recycle items and ids, upload ids, read-only folders, traversal, UNC and device paths, NTFS stream names,
+  trailing dots and spaces, case - all held on the candidate (24.3).
+- **Links, junctions and races between the check and the change (TOCTOU).**
+  - *Rename, move, delete, restore* (F-2). Right after the checks `_pin` records the item's identity (volume:file
+    index) and both folders as resolved, each checked again against the person's resolved writable folders (a team
+    folder that itself sits behind a junction keeps working). On Windows the move then opens the item (the link
+    itself, delete access, no `FILE_SHARE_DELETE`) and the target folder and holds both while it runs: nobody can
+    rename or delete them, and NTFS refuses to rename any folder above an open item, so no path the move uses can
+    be swapped meanwhile. The item must be the one checked, in the folder checked, and the target must resolve to
+    the folder checked; otherwise `403 denied` and nothing moves. The rename goes through the item's handle and
+    never replaces anything. A delete makes its recycle slot first and measures the item and looks up its SHA-256
+    after the move, so the candidate's window (a walk of up to 20,000 entries between check and move) is gone.
+    Elsewhere than on Windows identity and folders are compared before and after, with a put-back on a mismatch.
+  - *Across volumes* (F-1, F-10). A folder that holds a link (symbolic link, junction, mount point) is refused
+    whole before anything is copied (`409 has_link`); every entry is opened, must be exactly where it should be
+    (its final path is the expected one, so a link on the way is found) and is held while it is copied under a
+    hidden `.goose-web-move-<hex>` name next to the target; a link item itself is never copied to another volume.
+    The rename of the finished copy is the commit; the original is then deleted entry by entry through handles (a
+    link as a link), and what cannot be deleted is answered as a warning and audited (`sourceLeft`).
+  - *Uploads* keep the defences of spec 039 (23.6): the folder as written and as resolved at the start and before
+    every piece, the partial file's identity, a final rename that never replaces, checked afterwards. A folder
+    upload goes into the folder itself, which must exist (nothing is created on the way). *New folders* are checked
+    again once made and removed when they no longer lie in a folder the person may write.
+  - *Restore and purge* never follow links: the recycle folder, the id folder and the item must not be links and
+    must resolve where Goose Web put them, otherwise restore answers `409 denied` and purge drops the record
+    without touching anything; purge removes a link as a link, never what it points to, and does not follow links
+    inside a folder it removes (probe: a recycle slot and a recycle folder swapped for junctions - purge removed
+    only the links' own records).
+  - *Reads* (download, preview, info, hash) open the file by its path after the check, as `/api/fs/download` always
+    did (24.5).
+- **Protected tops** (F-3). No location's top folder, nor a folder holding one, is renamed, moved or deleted from
+  the page, and the tops are everybody's, for members too: every person's workspace and extra folders, every team's
+  folder and extra folders (read and write), the system folder and the profiles root, compared as written and as
+  resolved (a member's list is only compared, never shown). What is deleted inside nested locations goes to the
+  recycle folder of the deepest one - the bin its team or person sees.
+- **Goose's hint and agent folders** (F-4, F-7). Goose takes instructions and code from the folder a chat starts
+  in: the hints files (`AGENTS.md`, `.goosehints`, `.goose-web-hints.md`), `.gooseignore` (which files its tools
+  may touch), plugins in `.agents\plugins` (NEW-36), and project skills, recipes and agents in `.agents`, `.goose`
+  and `.claude` (Goose's `skills/mod.rs`; summon runs a recipe it finds there). "Ask Goose about this" starts chats
+  in exactly such shared folders, for teammates and for administrators, whose agents are not sandboxed. For members
+  every route that creates or changes something - the folder picker, chat attachments, folder uploads and the Files
+  page - refuses a path with an `.agents`, `.goose` or `.claude` component (any case, trailing dots and spaces,
+  stream names, 8.3 short names through the resolved path; `403 agents_folder_refused`) and the names of the hints
+  files and `.gooseignore` (`403 hint_file_refused`). On the Files page members also cannot rename, move or delete
+  such a file (also by its 8.3 short name) or anything in those folders, nor a folder that holds a hints file, a
+  `.gooseignore` or an `.agents` folder (a walk of at most 100,000 entries that enters no link; a larger folder is
+  refused). A member's agent that may write a folder (with Shell) can still write such files there, as before
+  (spec 009, NEW-36).
+- **Content of downloads and previews.** Downloads (`/api/files/download`, `/api/fs/download`) are always
+  `application/octet-stream` with `Content-Disposition: attachment` (RFC 5987 for odd names), the CSP
+  `sandbox; default-src 'none'`, `nosniff` and `Cache-Control: no-store`; the page starts them as a plain
+  navigation, so a file is never loaded into the page (any size, resumable with `Range`). Text previews are JSON -
+  the first 256 KB as UTF-8, or UTF-16 with a byte order mark, with replacement characters - which the page puts
+  into a `<pre>` with `textContent`, never with `innerHTML` (a test checks `views/files.js` has none) or Markdown.
+  An image is previewed only when its first bytes are PNG, JPEG, GIF or WebP, and sent with that type whatever its
+  name, with `nosniff`, `inline` and the sandbox CSP, at most 20 MB, shown from a blob URL that is revoked when the
+  preview closes; SVG is text, never an image; anything else is `415`. Probes: HTML, SVG and UTF-16 markup came
+  back as JSON text; a GIF/JS polyglot and a PNG header with HTML behind it went out as images with `nosniff` and
+  the sandbox CSP. Names, paths, user names and activity details are text nodes, links are built with `qs()` and
+  `encodeURIComponent`, and the page's CSP allows images only from `'self'`, `data:` and `blob:`. An `?attach=`
+  link places a visible chip only after `GET /api/files/info` confirmed the person may read the file; nothing is
+  sent before the person presses Send.
+- **Resource limits** (F-12, F-13). A listing looks at 20,000 entries of a folder at most (`truncated`; a probe
+  listed 21,000 files in 0.11 s) and pages of at most 500; a move or delete takes 200 paths at most; the recycle
+  listing 1,000 items, the activity 200 rows. SHA-256 computations, moves and the final read of an upload run in
+  four threads of their own, not in the shared pool that sign-in, listings and upload writes use; per person at
+  most two SHA-256 computations, two move or delete requests and two previews at a time (`429 busy`), and one
+  forced SHA-256 of a file every 10 s. Previews read at most 256 KB of text or 20 MB of an image. Uploads keep the
+  limits of spec 039 (23.6). Purge removes at most 500 items a run; an item it cannot remove waits an hour and then
+  goes behind the others.
+- **Recycle bin and purge.** A delete moves the item into `<location top>\.goose-web-recycle\<id>\<name>` (same
+  volume, hidden, made when needed; refused when it is a link or does not resolve right inside the location).
+  Anything else under that name - a file or a link a teammate's agent made - is moved aside to
+  `.goose-web-recycle.conflict-<hex>` and audited `files.recycle_conflict` (F-11). No route but restore reaches the
+  recycle folder: `api._check_path` answers `404` for any path with that component, as written or resolved, and no
+  listing shows it. Restore puts the item back into its folder (made again when it is gone; `name (restored).ext`
+  when the name is taken). Purge (maintenance loop) removes items older than `files.recycle_days` (default 30, 1 to
+  365) with the checks above and ends their records (folder upload rows marked deleted, cached hashes dropped); an
+  administrator can empty one location's bin at once (`files.purge` with `early`).
+- **Retention (spec 040).** A folder upload is recorded with `uploads.target = 'folder'`: it belongs to no chat,
+  the link call never takes it, and retention's sweep takes only `target = 'chat'` - chat retention never deletes a
+  file uploaded on the Files page. A chat attachment moved out of `Web_Uploads` on the page keeps its row's old
+  path, and retention deletes only a file still in a `Web_Uploads` folder with the recorded file index, so it does
+  not follow the attachment to its new place. A folder upload's row follows its file through renames, moves, the
+  recycle bin and restore, so "uploaded by" stays right.
+- **Audit and chain of custody** (F-5, F-16). Every upload, download (also through `/api/fs/download`), read
+  (`/api/fs/read`), preview, new folder, rename, move, delete, restore, purge and recycle conflict is audited
+  (`files.*`; the path as target; size, SHA-256 when known, from and to for moves) and reaches `activity.jsonl` and
+  so the SIEM (spec 017). For evidence, a recorded SHA-256 must be the file's:
+  - An upload's SHA-256 is computed from the pieces as they arrive and compared with the finished file, read once
+    through a handle nobody may write meanwhile. A file changed on the server during its upload - the hidden
+    partial file can be written by the teammates' agents - is not kept (`409 upload_changed`; `files.upload` with
+    `ok=false`, `sha256Received` and `sha256OnDisk`).
+  - A stored SHA-256 (of an upload, or computed on request) is given only while the file's size and modification
+    time are exactly - to the nanosecond - what they were, and always with its source (`upload` or `computed`) and
+    time; **Compute again** (`force`) reads the file anew.
+  - A download is audited when its answer has ended, with the SHA-256 of exactly the bytes sent when they were the
+    whole file; a part (`Range`), a download that did not finish or another status records `sha256Omitted` with the
+    reason, `status`, `complete: false` and the bytes sent. No stored hash is ever written into these rows, and a
+    `HEAD` request writes none. Previews and `/api/fs/read` record the SHA-256 of what they read when it was the
+    whole file.
+  - A request refused with 403 is recorded as `files.refused` (`ok=false`; route, refusal and the path asked for),
+    at most once a minute per person, route, refusal and path, so probing for other people's paths shows in the
+    SIEM.
+  - The one-time switch-on and every later change of a team's switches are `team.update` rows with the values that
+    changed (F-8).
+
+### 24.3 The independent assessment (2026-11-25, before release)
+
+- **Who.** An independent review: a separate AI agent, not the one that wrote the changes; read-only on all code,
+  nothing in the repository was changed; its probes ran in-process against the test suite's fixtures.
+- **What.** The release candidate `a4f31a0` against 1.27.1 (`7be00d2`): 33 files, +4,055 / -219 lines - the new
+  `files.py`, `views/files.js`, `uploader.js` and their tests, and changes to `api.py`, `uploads.py`, `policy.py`,
+  `retention.py`, `db.py`, `app.py`, `config.py`, `composer.js`, `home.js`, `chat.js` and `admin.js`. Focus, in
+  this order: authorization and isolation; path and file-system attacks on Windows; content safety in the browser;
+  resource exhaustion; data loss and audit completeness; test quality and the uploader extraction.
+- **How.** (A) A review of the whole server diff - `files.py` line by line - and of what it calls, and of the
+  browser's sinks (`views/files.js`, the composer's attach functions, `?attach=`, `uploader.js` against the code it
+  replaced). (B) The test suites of the feature: 147 passed, 1 failed (F-14), 1 skipped. (C) 21 probes that drive
+  the real routes in-process with the suite's own fixtures, with real NTFS junctions and 8.3 names enabled on the
+  volume; races were simulated with a hook at the exact point of the window, another volume by a rename that fails
+  as across volumes, as the suite does. (D) One fact checked in Goose's source: its project skill folders.
+- **Not exercised.** No browser session, no real second volume and no real race; Goose was not started (F-4 was
+  not tried against a running Goose); whether a sandboxed agent can create links was not measured again - the
+  assessment relies on 13.3, 16.2 and 22.7 (it cannot link to a place it may not write).
+- **Verdict.** Ship after fixes. The core held: every route goes through the switch and `_check_path`, and none of
+  the direct attempts got out of a person's folders; previews and downloads are served safely; retention leaves
+  Files uploads alone; purge removes only what it recorded; the uploader extraction did not change the chat path.
+  To be fixed before release: F-1 to F-6 and F-14; the rest could follow in a point release.
+- **Fixes.** All seventeen are fixed in this release: F-17 by these release documents, the others each with a
+  regression test that failed on the candidate's code or with its fix taken out (F-10: by construction) -
+  `tests/test_files.py::test_f<N>_*` and `tests/test_frontend_files.py`. After the fixes the same suites: 189
+  passed, 1 skipped; the rest of the suite without the long-running files: 1,149 passed, 4 skipped, 0 failed.
+
+| ID | Severity | Finding | Status |
+|---|---|---|---|
+| F-1 | Medium (High where a writable folder holds a link made outside the sandbox) | A move across volumes copied what a junction inside the moved folder points to, with the gateway's rights, into a folder the person reads | Fixed in `cb0957e`: a folder holding a link is not copied (`409 has_link`); every entry held and checked while copied |
+| F-2 | Medium | Rename, move and delete re-checked only the destination: a source folder swapped for a link moved someone else's files | Fixed in `cb0957e`, `3cf2842`: the item and both folders pinned and held open while it moves |
+| F-3 | Medium | A member could rename, move or delete another team's location top lying inside a folder they may write | Fixed in `ad6824e`: everybody's locations are protected tops for members too |
+| F-4 | Medium | A member with every Goose permission off could plant skills, recipes and agents in `.goose` / `.claude` folders, and a `.gooseignore` | Fixed in `b93e7f9`: refused for members on every route that creates or changes something |
+| F-5 | Medium | The SHA-256 recorded for an upload was of the bytes received, not of the file, and was shown and written into download audit rows after the file changed | Fixed in `cb68222`: the finished file is read and must match; stored values only for the unchanged file, labelled; downloads audited with the SHA-256 of the bytes sent |
+| F-6 | Low | A per-person override that is not a boolean (`"false"`, `"off"`, `"0"`) switched Files and manage on | Fixed in `2f4126a`: 400 when saved; anything but `true` is off |
+| F-7 | Low | Hints files could be renamed, moved or deleted through their 8.3 short name, or with the folder holding them (also an `.agents` folder) | Fixed in `3cede7f`: the long name is checked too; members do not change a folder holding them |
+| F-8 | Low | A team saved without the two keys lost both switches silently; a lost settings key would switch them on again | Fixed in `2524f87`: stored values kept on such a save; the policy change audited |
+| F-9 | Low | The Files switch was checked only when an upload started; its pieces and the finish went on after it was switched off | Fixed in `643cd17`: checked for every piece and at the finish |
+| F-10 | Low | A move across volumes that could not delete the whole source answered "denied", yet left a full copy, a half-deleted source and no audit row | Fixed in `cb0957e`, `643cd17`: answered as moved with a warning, audited `sourceLeft` |
+| F-11 | Low | Anything named `.goose-web-recycle` that is not a folder blocked every delete in that location | Fixed in `643cd17`: moved aside, audited `files.recycle_conflict` |
+| F-12 | Low | Heavy work shared asyncio's default thread pool with sign-in and uploads; no global cap on hashing, none on copies and previews | Fixed in `8d231c6`: four threads of its own; per-person limits; a pause between forced hashes |
+| F-13 | Low | Purge retried the items it could not remove first, for ever, so enough of them starved the rest; no way to empty a bin early | Fixed in `0cdd009`: such items wait an hour, behind the others; administrators can empty a bin; its size is shown |
+| F-14 | Low (release gate) | The candidate's own front-end test failed | Fixed in `cb68222`: expectation corrected; a test for Compute again added |
+| F-15 | Info | Bidirectional and zero-width control characters were kept in names (`invoice<U+202E>fdp.exe` showed as `invoiceexe.pdf`) | Fixed in `643cd17`: Unicode format characters dropped |
+| F-16 | Info | Refused attempts were not audited; a `HEAD` request wrote a `files.download` row | Fixed in `cb68222`, `643cd17`: `files.refused`; `HEAD` not audited; downloads recorded when sent |
+| F-17 | Info | Version, CHANGELOG and this section were missing; two rows of the builders' threat table overstated what was refused | Fixed by the release documents: version 1.28.0, CHANGELOG, this section (written from the code as released) |
+
+### 24.4 Second review of the fixes (2026-11-25)
+
+Pending.
+
+### 24.5 Residual risks
+
+- **On by default.** On upgrade every member of every team gains download, upload, rename, move and delete in the
+  folders they already have, through the gateway - also in teams without Shell (24.1). Switch it off per team
+  where that is not wanted.
+- **The recycle folder is an ordinary folder.** The members' agents that may write in the location, and anyone
+  with access to the server's disk, can read, change or remove recycled items; it is not a backup. A member cannot
+  remove a file uploaded by mistake for good before `files.recycle_days` (an administrator can empty the bin).
+  Recycled items use disk space until purged, and there is no quota per location or person (as 23.6).
+- **Reads by path.** Download, preview, info and hash open the file by its path after the check, so a link swapped
+  in between would be followed - for a read only, and only with a link made outside the sandbox and a won race (the
+  precondition of F-1 and F-2).
+- **SHA-256.** Someone who may write a file can change it in place and restore its size and modification time to
+  the nanosecond; the stored SHA-256 is then still shown - labelled with its source and time - while downloads and
+  previews record the SHA-256 of what they actually sent. For evidence use **Compute again**. An upload whose
+  SHA-256 state is rebuilt after a gateway restart reads the partial file from disk, so a change made before the
+  restart is not caught by the final check. A gateway that stops in the middle of a download leaves no
+  `files.download` row (rows are written when the answer has ended).
+- **What people see.** A folder's activity shows teammates' and administrators' actions in it, and paths in other
+  locations (where an item came from or went to); "uploaded by" shows user names. **Copy link** puts server paths
+  into URLs, browser history and chat messages. A link `#/chat/<id>?attach=<path>` from someone else places a
+  visible chip for a file the reader may read; nothing is sent without Send.
+- **Administrators** act with the gateway's rights on whole drives on their Files page; their deletes there land in
+  `<drive>\.goose-web-recycle` or in the recycle folder of the deepest protected folder (the profiles root's for a
+  profile's own files).
+- **Nested locations** (F-3). What a member deletes inside another team's location that lies within their own
+  folder lands in that team's recycle bin: its owners see it, the member does not.
+- **Goose's folders.** Members' agents with Shell can still write hints files and `.agents`, `.goose` and `.claude`
+  folders where they may write, as before. Goose's memory extension may keep `.goose\memory` in a chat folder;
+  members cannot change it through the file browser any more (their agent can). A member can still rename, move or
+  delete a folder that holds a `.goose` or `.claude` folder (the walk of F-7 looks for hints files, `.gooseignore`
+  and `.agents` only); nothing new is planted that way - the content goes with its folder, or into the recycle bin.
+  Not done: a warning at `session/new` for a folder with project skills when the member has no `skills_edit` (an
+  option the assessment named for F-4), and a `goose-web check` line for something squatting the recycle folder's
+  name (handled at delete time instead, F-11).
+- **Limits.** Members cannot rename, move or delete a folder with more than 100,000 entries (the walk of F-7 fails
+  closed). A file that is itself a reparse point (a deduplicated file, a cloud placeholder) is not moved to another
+  drive (`409 has_link`); inside folders such files are copied as data. A copy to another drive takes the
+  destination's permissions; its times and read-only flag are set by path after it is closed, inside the held
+  temporary folder. The per-person limits and the once-a-minute limit of `files.refused` are kept in memory and
+  start again after a restart. Each preview may hold up to 20 MB in memory (two per person). A Files upload that
+  failed on the network keeps its partial file for **Retry** until its row is removed, or for 24 hours. Listings
+  match upload rows without an index and the activity view scans the audit table; both grow with use.
+- **Platform.** Elsewhere than on Windows the held moves fall back to comparing before and after, with a put-back
+  on a mismatch; the product and its CI are Windows-only.
+- **Not exercised by the assessment:** a browser session, a real second volume, a real race, and F-4 against a
+  running Goose (24.3).
