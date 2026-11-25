@@ -907,13 +907,9 @@ async def fs_download(request: Request):
     u = c.require(request).user
     files_api.gate(c, u)     # spec 041: the Files switch, audited like /api/files/download
     p = _check_path(c, u, os.path.abspath(request.query_params.get("path") or ""))
-    if not p.is_file():
-        raise HTTPError(404, "not_found", "File not found")
-    await files_api.audit_file(c, request, u, p, "files.download", route="/api/fs/download")
-    # Always a download: octet-stream (never a type a browser renders inline) + attachment + sandbox CSP.
-    return FileResponse(p, filename=p.name, media_type="application/octet-stream",
-                        content_disposition_type="attachment",
-                        headers={"Cache-Control": "no-store", "Content-Security-Policy": "sandbox; default-src 'none'"})
+    # Always a download: octet-stream (never a type a browser renders inline) + attachment + sandbox CSP; audited
+    # files.download with the SHA-256 of the bytes sent, like /api/files/download.
+    return await files_api.download_response(c, request, u, p, route="/api/fs/download")
 
 
 async def fs_read(request: Request):
@@ -923,8 +919,8 @@ async def fs_read(request: Request):
     p = _check_path(c, u, os.path.abspath(request.query_params.get("path") or ""))
     if not p.is_file():
         raise HTTPError(404, "not_found", "File not found")
-    await files_api.audit_file(c, request, u, p, "files.read", route="/api/fs/read")
     data = await asyncio.to_thread(lambda: p.open("rb").read(1024 * 1024 + 1))
+    await files_api.audit_file(c, request, u, p, "files.read", route="/api/fs/read", sent=data[:1024 * 1024])
     return ok({"path": str(p), "content": data[:1024 * 1024].decode("utf-8", "replace"),
                "truncated": len(data) > 1024 * 1024})
 

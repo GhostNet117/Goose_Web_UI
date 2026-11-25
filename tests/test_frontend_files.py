@@ -71,7 +71,7 @@ def test_every_contract_route_is_used_with_its_method():
         "GET('/api/files/locations')",
         "GET('/api/files/list' + qs({ path: folder, offset, limit, sort: opts.sort, order: opts.order, q, hidden: opts.hidden ? 1 : 0 })",
         "GET('/api/files/info' + qs({ path }))",
-        "POST('/api/files/hash', { path: i.path })",
+        "POST('/api/files/hash', force ? { path: i.path, force: true } : { path: i.path })",
         "api('GET', '/api/files/preview' + qs({ path: i.path }), undefined, { raw: true })",
         "POST('/api/files/mkdir', { path: listing.path, name: name.trim() })",
         "POST('/api/files/rename', { path, name: name.trim() })",
@@ -95,6 +95,21 @@ def test_every_contract_route_is_used_with_its_method():
     assert "manage = !!r.manage; recycleDays = r.recycleDays || 30;" in files
     # every mutation goes through api.js POST, which sends the CSRF header
     assert "if (csrf) opts.headers['X-CSRF-Token'] = csrf;" in _js("api.js")
+
+
+def test_compute_again_reads_the_file_anew_and_the_source_of_a_sha256_is_shown():
+    """Assessment 2026-11-25 F-14 / F-5: "Compute" asks for the SHA-256 (a stored one comes back when the file is
+    unchanged); "Compute again" sends force: true, so the server reads the whole file; the details say whether the
+    value was recorded at upload or computed, and when."""
+    files = _js("views/files.js")
+    body = _block(files, "const computeHash = async (b, force = false) => {", "\n    };\n")
+    assert "POST('/api/files/hash', force ? { path: i.path, force: true } : { path: i.path })" in body
+    assert "iconBtn('refresh', 'Compute again (reads the whole file)', (e) => computeHash(e.currentTarget, true)" in files
+    assert "btn('Compute', (e) => computeHash(e.currentTarget)," in files
+    assert "Object.assign(i, { sha256: r.sha256, sha256Source: r.sha256Source, recordedAt: r.recordedAt });" in body
+    assert "x.sha256Source === 'upload' ? 'recorded at upload ' + fmtDateTime(x.recordedAt)" in files
+    assert "x.sha256Source === 'computed' ? 'computed ' + fmtDateTime(x.recordedAt)" in files
+    assert "hashSource(i)" in files
 
 
 def test_read_only_folders_and_the_manage_switch_hide_the_changes():

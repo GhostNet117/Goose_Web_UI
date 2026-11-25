@@ -353,6 +353,28 @@ def _hash_partial(row: dict, upto: int) -> Any:
     return h
 
 
+def _hash_finished(target: Path, ident: str) -> tuple[str, int, int]:
+    """Spec 041 / assessment F-5: (SHA-256, size, modification time in ns) of the finished file of a folder upload,
+    read once - on Windows through a handle that lets nobody write while it reads. Only the file this upload created
+    is read. Blocking."""
+    if os.name == "nt":
+        from . import files
+        fd = files._hopen(target, files._GENERIC_READ, follow=False, share=0x1)   # FILE_SHARE_READ only
+    else:
+        fd = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or is_link(st) or (ident and file_ident(st) != ident):
+            raise _Swapped()
+        h = hashlib.sha256()
+        while data := os.read(fd, 4 * MB):
+            h.update(data)
+        st = os.fstat(fd)
+    finally:
+        os.close(fd)
+    return h.hexdigest(), st.st_size, st.st_mtime_ns
+
+
 def _rename_noreplace(src: Path, dst: Path) -> None:
     if os.name == "nt":
         os.rename(src, dst)        # MoveFileExW without MOVEFILE_REPLACE_EXISTING: never replaces a file
@@ -838,6 +860,23 @@ async def _finish(c, u: dict, row: dict, request: Request) -> dict:
                 detail={"name": row["name"], "refused": "folder changed"}, ok=False)
         raise HTTPError(409, "upload_moved", "The upload folder changed while the file was being finished; the file "
                                              "was not kept. Try again.")
+    mtime_ns = None
+    if folder:     # assessment F-5: the finished file is read once - it must be exactly the bytes that arrived
+        try:
+            disk, disk_size, mtime_ns = await asyncio.to_thread(_hash_finished, target, row["file_id"])
+        except (_Swapped, OSError):
+            disk, disk_size = "", -1
+        if not sha or disk != sha or disk_size != int(row["size"]):
+            await asyncio.to_thread(_discard, str(target), row["file_id"])
+            _end(c, row["id"], "aborted", "the file changed on the server while it was uploaded")
+            log.warning("upload: %s in %s (by %s) is not the file that was uploaded; it was not kept", target.name,
+                        d, u["username"])
+            c.audit(request, "files.upload", u, target=str(target),
+                    detail={"name": target.name, "folder": str(d), "size": row["size"], "sha256Received": sha,
+                            "sha256OnDisk": disk, "refused": "the file changed on the server while it was uploaded"},
+                    ok=False)
+            raise HTTPError(409, "upload_changed", "The file was changed on the server while it was being uploaded, "
+                                                   "so it was not kept. Upload it again.")
     _set_hidden(target, False)
     now = time.time()
     mime = row["mime"] or mimetypes.guess_type(target.name)[0] or "application/octet-stream"
@@ -848,7 +887,7 @@ async def _finish(c, u: dict, row: dict, request: Request) -> dict:
         await asyncio.to_thread(_discard, str(target), row["file_id"])
         raise HTTPError(409, "upload_cancelled", "The upload was cancelled")
     if folder:     # spec 041: a file of the Files page - in no chat, audited with its SHA-256
-        c.db.execute("UPDATE uploads SET sha256=? WHERE id=?", (sha, row["id"]))
+        c.db.execute("UPDATE uploads SET sha256=?, mtime_ns=? WHERE id=?", (sha, mtime_ns, row["id"]))
         c.audit(request, "files.upload", u, target=str(target),
                 detail={"name": target.name, "folder": str(d), "size": row["size"], "sha256": sha, "chunked": True})
         return {"name": target.name, "path": str(target), "size": row["size"], "mime": mime, "sha256": sha}

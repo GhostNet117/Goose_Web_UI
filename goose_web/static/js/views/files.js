@@ -487,19 +487,24 @@ export function renderFiles(ctx, query = {}) {
     const can = manage && i.access === 'write';
     const dir = parentOf(i.path);
     const hashEl = h('dd', { class: 'files-hash' });
-    const drawHash = () => hashEl.replaceChildren(i.sha256
-      ? h('span', { class: 'row' }, h('code', { class: 'files-sha' }, i.sha256), iconBtn('copy', 'Copy SHA-256', () => copyText(i.sha256, 'SHA-256 copied'), { size: 'sm' }),
+    // where a shown SHA-256 comes from (assessment F-5): taken when the upload finished, or computed on request - with
+    // the time; it is shown only while the file's size and modification time are exactly what they were then
+    const hashSource = (x) => (x.sha256Source === 'upload' ? 'recorded at upload ' + fmtDateTime(x.recordedAt)
+      : x.sha256Source === 'computed' ? 'computed ' + fmtDateTime(x.recordedAt) : '');
+    const drawHash = () => hashEl.replaceChildren(...(i.sha256
+      ? [h('span', { class: 'row' }, h('code', { class: 'files-sha' }, i.sha256), iconBtn('copy', 'Copy SHA-256', () => copyText(i.sha256, 'SHA-256 copied'), { size: 'sm' }),
         // a stored SHA-256 is reused while size and date are unchanged; someone who may write the folder can change a
         // file and keep both, so this reads the whole file anew (force)
-        iconBtn('refresh', 'Compute again (reads the whole file)', (e) => computeHash(e.currentTarget, true), { size: 'sm' }))
-      : btn('Compute', (e) => computeHash(e.currentTarget), { size: 'sm', icon: 'shield', title: 'Compute the SHA-256 of this file (large files take a while)' }));
+        iconBtn('refresh', 'Compute again (reads the whole file)', (e) => computeHash(e.currentTarget, true), { size: 'sm' })),
+      h('div', { class: 'muted small files-hash-source', title: 'A stored SHA-256 is shown while the size and modification time of the file are unchanged; "Compute again" reads the file now.' }, hashSource(i))]
+      : [btn('Compute', (e) => computeHash(e.currentTarget), { size: 'sm', icon: 'shield', title: 'Compute the SHA-256 of this file (large files take a while)' })]));
     const computeHash = async (b, force = false) => {
       b.disabled = true; b.replaceChildren(spinner(12), h('span', null, 'Computing…'));
       try {
         const r = await POST('/api/files/hash', force ? { path: i.path, force: true } : { path: i.path });
-        i.sha256 = r.sha256;
+        Object.assign(i, { sha256: r.sha256, sha256Source: r.sha256Source, recordedAt: r.recordedAt });
         const row = entries.find((x) => x.path === i.path);
-        if (row) row.sha256 = r.sha256;
+        if (row) Object.assign(row, { sha256: r.sha256, sha256Source: r.sha256Source, recordedAt: r.recordedAt });
       } catch (e) { toastError(e, 'SHA-256'); }
       if (alive && info === i) drawHash();
     };

@@ -387,8 +387,8 @@ def _decode_text(data: bytes, kind: str) -> str:
 
 
 # ---------------------------------------------------------------------- what is known about a file
-def _hash_file(path: str) -> tuple[str, int, float, bool]:
-    """SHA-256 of a regular file: (hex, size, mtime, unchanged while read)."""
+def _hash_file(path: str) -> tuple[str, int, float, int, bool]:
+    """SHA-256 of a regular file: (hex, size, mtime, mtime in ns, unchanged while read)."""
     with open(path, "rb") as f:
         st = os.fstat(f.fileno())
         if not stat.S_ISREG(st.st_mode):
@@ -397,26 +397,33 @@ def _hash_file(path: str) -> tuple[str, int, float, bool]:
         while chunk := f.read(HASH_BLOCK):
             h.update(chunk)
         st2 = os.fstat(f.fileno())
-    return h.hexdigest(), st2.st_size, st2.st_mtime, (st.st_size, st.st_mtime) == (st2.st_size, st2.st_mtime)
+    return (h.hexdigest(), st2.st_size, st2.st_mtime, st2.st_mtime_ns,
+            (st.st_size, st.st_mtime_ns) == (st2.st_size, st2.st_mtime_ns))
 
 
-def _same_mtime(a: Any, b: Any) -> bool:
-    try:
-        return abs(float(a) - float(b)) < 1e-6
-    except (TypeError, ValueError):
-        return False
+HASH_KEYS = ("sha256", "sha256Source", "recordedAt")
 
 
 def _known(c, items: list[dict]) -> None:
-    """Adds uploadedBy / uploadedAt (uploaded through Goose Web, still the same file) and sha256 (from the upload or
-    the cache, while the file is unchanged) to file entries {path, size, mtime}. Blocking: call in a thread."""
+    """Adds uploadedBy / uploadedAt (uploaded through Goose Web, still the same file: its file index) and a stored
+    SHA-256 with where it comes from - sha256Source "upload" (taken from the file when its upload finished) or
+    "computed" (on request), recordedAt: when - to file entries {path, size, mtime, mtime_ns}. A stored SHA-256 is
+    given only while the file's size and modification time (ns) are exactly what they were when it was taken
+    (assessment F-5); a file changed in place with both kept shows it all the same, labelled with its source and time
+    ("Compute again" reads the file). Blocking: call in a thread."""
     files = [x for x in items if not x.get("dir")]
     if not files:
         return
+    for x in files:
+        if x.get("mtime_ns") is None:
+            try:
+                x["mtime_ns"] = os.stat(x["path"]).st_mtime_ns
+            except OSError:
+                x["mtime_ns"] = -1
     by_key = {_key(x["path"]): x for x in files}
     marks = ",".join("?" for _ in files)
     # the placeholders are "?" only; every value is a bound parameter
-    rows = c.db.query(f"SELECT path, username, completed_at, sha256, size, file_id FROM uploads "  # nosec B608
+    rows = c.db.query(f"SELECT path, username, completed_at, sha256, size, file_id, mtime_ns FROM uploads "  # nosec B608
                       f"WHERE state='done' AND path COLLATE NOCASE IN ({marks}) ORDER BY completed_at",
                       [x["path"] for x in files])
     for r in rows:
@@ -430,34 +437,41 @@ def _known(c, items: list[dict]) -> None:
         if r["file_id"] and file_ident(st) != r["file_id"]:
             continue        # another file with that name now
         x["uploadedBy"], x["uploadedAt"] = r["username"], r["completed_at"]
-        if r["sha256"] and float(x["mtime"]) <= float(r["completed_at"] or 0) + 2:
-            x["sha256"] = r["sha256"]
-        else:
-            x.pop("sha256", None)
-    rows = c.db.query(f"SELECT path, size, mtime, sha256 FROM file_hashes WHERE path IN "  # nosec B608
+        for k in HASH_KEYS:
+            x.pop(k, None)
+        if r["sha256"] and r["mtime_ns"] is not None and int(r["mtime_ns"]) == int(x["mtime_ns"]):
+            x.update(sha256=r["sha256"], sha256Source="upload", recordedAt=r["completed_at"])
+    rows = c.db.query(f"SELECT path, size, mtime_ns, sha256, at FROM file_hashes WHERE path IN "  # nosec B608
                       f"({','.join('?' for _ in by_key)})", list(by_key))
     for r in rows:
         x = by_key.get(r["path"])
-        if x is not None and "sha256" not in x and int(r["size"]) == int(x["size"]) and _same_mtime(r["mtime"],
-                                                                                                    x["mtime"]):
-            x["sha256"] = r["sha256"]
+        if x is not None and "sha256" not in x and int(r["size"]) == int(x["size"]) and r["mtime_ns"] is not None \
+                and int(r["mtime_ns"]) == int(x["mtime_ns"]):
+            x.update(sha256=r["sha256"], sha256Source="computed", recordedAt=r["at"])
 
 
-def known_sha256(c, path: Any, st=None) -> str:
-    """The SHA-256 of a file when it is known (an upload, the cache) and the file is unchanged; '' otherwise."""
+def known_hash(c, path: Any, st=None) -> dict:
+    """{sha256, sha256Source, recordedAt} of a file when a SHA-256 of it is stored and the file is unchanged (size and
+    modification time); {} otherwise."""
     try:
         st = st or os.stat(path)
     except OSError:
-        return ""
-    item = {"path": str(path), "size": st.st_size, "mtime": st.st_mtime}
+        return {}
+    item = {"path": str(path), "size": st.st_size, "mtime": st.st_mtime, "mtime_ns": st.st_mtime_ns}
     _known(c, [item])
-    return item.get("sha256") or ""
+    return {k: item[k] for k in HASH_KEYS if k in item}
 
 
-def _remember_hash(c, path: str, size: int, mtime: float, sha: str) -> None:
-    c.db.execute("INSERT INTO file_hashes(path, size, mtime, sha256, at) VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE "
-                 "SET size=excluded.size, mtime=excluded.mtime, sha256=excluded.sha256, at=excluded.at",
-                 (_key(path), int(size), float(mtime), sha, time.time()))
+def known_sha256(c, path: Any, st=None) -> str:
+    """The stored SHA-256 of an unchanged file (known_hash); '' otherwise."""
+    return known_hash(c, path, st).get("sha256") or ""
+
+
+def _remember_hash(c, path: str, size: int, mtime: float, mtime_ns: int, sha: str, at: float) -> None:
+    c.db.execute("INSERT INTO file_hashes(path, size, mtime, mtime_ns, sha256, at) VALUES(?,?,?,?,?,?) ON CONFLICT(path) "
+                 "DO UPDATE SET size=excluded.size, mtime=excluded.mtime, mtime_ns=excluded.mtime_ns, "
+                 "sha256=excluded.sha256, at=excluded.at",
+                 (_key(path), int(size), float(mtime), int(mtime_ns), sha, at))
 
 
 def _like_prefix(p: str) -> str:
@@ -650,12 +664,12 @@ def _win():
     return _WIN
 
 
-def _hopen(path: Any, access: int, follow: bool) -> int:
+def _hopen(path: Any, access: int, follow: bool, share: int = _SHARE_READ_WRITE) -> int:
     """A handle on `path` as a file descriptor (os.close closes it). `follow`: what a link leads to; else the link
-    itself. Shared for reading and writing, never for deleting."""
+    itself. Shared for reading and writing (or `share`), never for deleting."""
     ctypes, msvcrt, wintypes, k = _win()
     flags = 0x02000000 | (0 if follow else 0x00200000)   # FILE_FLAG_BACKUP_SEMANTICS (folders), _OPEN_REPARSE_POINT
-    h = k.CreateFileW(str(path), access | _READ_ATTRIBUTES | _SYNCHRONIZE, _SHARE_READ_WRITE, None, 3, flags, None)
+    h = k.CreateFileW(str(path), access | _READ_ATTRIBUTES | _SYNCHRONIZE, share, None, 3, flags, None)
     if h is None or h == wintypes.HANDLE(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     try:
@@ -1021,7 +1035,7 @@ def _scan(p: Path, hidden: bool, q: str) -> tuple[list[dict], bool]:
             if (hid and not hidden) or (q and q not in e.name.casefold()):
                 continue
             out.append({"name": e.name, "path": e.path, "dir": is_dir, "size": 0 if is_dir else st.st_size,
-                        "mtime": st.st_mtime, "hidden": hid})
+                        "mtime": st.st_mtime, "mtime_ns": st.st_mtime_ns, "hidden": hid})
     return out, truncated
 
 
@@ -1053,6 +1067,8 @@ async def list_route(request: Request):
     entries = dirs + files
     page = entries[offset:offset + limit]
     await asyncio.to_thread(_known, c, page)
+    for x in page:
+        x.pop("mtime_ns", None)
     tops = [loc["path"] for loc in await asyncio.to_thread(locations, c, u, policy)]
     loc = _location_of(p, tops)
     at_top = loc is None or _norm(p) == _norm(loc) or p.parent == p
@@ -1080,9 +1096,9 @@ async def info_route(request: Request):
             out["type"] = detect_type(await asyncio.to_thread(_read_head, p), st.st_size)
         except OSError:
             out["type"] = "unreadable"
-        item = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+        item = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime, "mtime_ns": st.st_mtime_ns}
         await asyncio.to_thread(_known, c, [item])
-        out.update({k: item[k] for k in ("sha256", "uploadedBy", "uploadedAt") if k in item})
+        out.update({k: item[k] for k in (*HASH_KEYS, "uploadedBy", "uploadedAt") if k in item})
     return api.ok(out)
 
 
@@ -1098,16 +1114,16 @@ async def hash_route(request: Request):
         raise HTTPError(400, "bad_request", "Only a file has a SHA-256")
     # `force`: read the file again even when its SHA-256 is known (size and modification time can be kept by
     # whoever changes a file in place)
-    known = "" if b.get("force") is True else await asyncio.to_thread(known_sha256, c, p, st)
+    known = {} if b.get("force") is True else await asyncio.to_thread(known_hash, c, p, st)
     if known:
-        return api.ok({"sha256": known, "cached": True})
+        return api.ok({**known, "cached": True})
     live = _live(c.db)
     if live.hashing.get(u["id"], 0) >= HASH_PARALLEL:
         raise HTTPError(429, "busy", f"{HASH_PARALLEL} SHA-256 computations of yours are running; try again when one "
                                      "has finished.")
     live.hashing[u["id"]] = live.hashing.get(u["id"], 0) + 1
     try:
-        sha, size, mtime, stable = await asyncio.to_thread(_hash_file, str(p))
+        sha, size, mtime, mtime_ns, stable = await asyncio.to_thread(_hash_file, str(p))
     except OSError as e:
         raise _os_error(e)
     finally:
@@ -1116,24 +1132,28 @@ async def hash_route(request: Request):
             live.hashing[u["id"]] = left
         else:
             live.hashing.pop(u["id"], None)
+    now = time.time()
     if stable:
-        _remember_hash(c, str(p), size, mtime, sha)
-    return api.ok({"sha256": sha, "cached": False, **({} if stable else {"changing": True})})
+        _remember_hash(c, str(p), size, mtime, mtime_ns, sha, now)
+    return api.ok({"sha256": sha, "cached": False, "sha256Source": "computed", "recordedAt": now,
+                   **({} if stable else {"changing": True})})
 
 
-async def audit_file(c, request: Request, u: dict, p: Path, action: str, route: str = "", **extra: Any) -> dict:
-    """Audit a read of a file (download, preview, /api/fs/read): size and the SHA-256 when it is known."""
+async def audit_file(c, request: Request, u: dict, p: Path, action: str, route: str = "", sent: bytes | None = None,
+                     **extra: Any) -> dict:
+    """Audit a read of a file (preview, /api/fs/read): its size and, when `sent` (the bytes that were read and sent)
+    is the whole file, the SHA-256 of exactly those bytes - never a stored one, which may be stale (assessment
+    F-5); a part is recorded as such."""
     try:
         st = await asyncio.to_thread(os.stat, p)
     except OSError:
         raise HTTPError(404, "not_found", "File not found")
     detail: dict[str, Any] = {"size": st.st_size}
-    sha = await asyncio.to_thread(known_sha256, c, p, st)
-    if sha:
-        detail["sha256"] = sha
-    rng = request.headers.get("range")
-    if rng:
-        detail["range"] = rng[:100]
+    if sent is not None:
+        if len(sent) == st.st_size:
+            detail["sha256"] = await asyncio.to_thread(lambda: hashlib.sha256(sent).hexdigest())
+        else:
+            detail["sha256Omitted"] = f"only the first {len(sent)} bytes were sent"
     if route:
         detail["route"] = route
     detail.update(extra)
@@ -1141,17 +1161,100 @@ async def audit_file(c, request: Request, u: dict, p: Path, action: str, route: 
     return detail
 
 
+class _SentFile(FileResponse):
+    """A FileResponse whose body is watched as it goes out (assessment F-5, F-16): the files.download audit row is
+    written when the answer has ended, with the SHA-256 of exactly the bytes that were sent when they were the whole
+    file; a part (Range) or a download that did not finish is recorded as such, without one. HEAD sends nothing and
+    records nothing."""
+
+    def __init__(self, path: Path, *, record, **kw: Any) -> None:
+        super().__init__(path, **kw)
+        self._record = record
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http" or str(scope.get("method") or "GET").upper() == "HEAD":
+            await super().__call__(scope, receive, send)
+            return
+        # every byte passes through `watch` (no zero-copy path send by the server)
+        ext = {k: v for k, v in (scope.get("extensions") or {}).items() if k != "http.response.pathsend"}
+        scope = {**scope, "extensions": ext}
+        h = hashlib.sha256()
+        seen: dict[str, Any] = {"status": 0, "sent": 0, "done": False}
+        batch: list[bytes] = []
+
+        async def watch(msg) -> None:
+            if msg["type"] == "http.response.start":
+                seen["status"] = msg["status"]
+            elif msg["type"] == "http.response.body":
+                body = msg.get("body") or b""
+                if seen["status"] == 200 and body:
+                    batch.append(body)
+                    if sum(map(len, batch)) >= HASH_BLOCK:
+                        data = b"".join(batch)
+                        batch.clear()
+                        await asyncio.to_thread(h.update, data)     # off the event loop
+            await send(msg)
+            if msg["type"] == "http.response.body":
+                seen["sent"] += len(msg.get("body") or b"")
+                if not msg.get("more_body", False):
+                    seen["done"] = True
+
+        try:
+            await super().__call__(scope, receive, watch)
+        finally:
+            sha = ""
+            if seen["status"] == 200 and seen["done"]:
+                h.update(b"".join(batch))
+                sha = h.hexdigest()
+            self._record(seen["status"], seen["sent"], seen["done"], sha)
+
+
+def _download_record(c, request: Request, u: dict, p: Path, size: int, route: str):
+    def record(status: int, sent: int, done: bool, sha: str) -> None:
+        detail: dict[str, Any] = {"size": size}
+        rng = request.headers.get("range")
+        if rng:
+            detail["range"] = rng[:100]
+        if route:
+            detail["route"] = route
+        if status != 200:
+            detail["status"] = status
+        if sha:
+            detail["sha256"] = sha          # of the bytes that were sent
+            if sent != size:
+                detail["sent"] = sent
+        else:
+            detail["sha256Omitted"] = ("the download did not finish" if not done else
+                                       "a part of the file was sent (Range)" if status == 206 else
+                                       "the file was not sent")
+        if not done:
+            detail.update(complete=False, sent=sent)
+        try:
+            c.audit(request, "files.download", u, target=str(p), detail=detail)
+        except Exception:
+            log.exception("files: the download of %s by %s could not be audited", p, u["username"])
+    return record
+
+
+async def download_response(c, request: Request, u: dict, p: Path, route: str = "") -> Response:
+    """The file as a download (both download routes): octet-stream + attachment + sandbox CSP; Range is answered
+    (resuming); audited files.download when it has been sent (_SentFile)."""
+    try:
+        st = await asyncio.to_thread(os.stat, p)
+    except OSError:
+        raise HTTPError(404, "not_found", "File not found")
+    if not stat.S_ISREG(st.st_mode):
+        raise HTTPError(404, "not_found", "File not found")
+    return _SentFile(p, record=_download_record(c, request, u, p, st.st_size, route), filename=p.name,
+                     media_type="application/octet-stream", content_disposition_type="attachment",
+                     headers={"Cache-Control": "no-store", "Content-Security-Policy": SANDBOX_CSP,
+                              "X-Content-Type-Options": "nosniff"})
+
+
 async def download_route(request: Request):
     api, c, u, _ = _begin(request)
     p = _check(c, u, _arg_path(request.query_params.get("path")))
-    if not await asyncio.to_thread(p.is_file):
-        raise HTTPError(404, "not_found", "File not found")
-    await audit_file(c, request, u, p, "files.download")
-    # always a download, as /api/fs/download: octet-stream + attachment + sandbox CSP; Range is answered (resuming)
-    return FileResponse(p, filename=p.name, media_type="application/octet-stream",
-                        content_disposition_type="attachment",
-                        headers={"Cache-Control": "no-store", "Content-Security-Policy": SANDBOX_CSP,
-                                 "X-Content-Type-Options": "nosniff"})
+    return await download_response(c, request, u, p)
 
 
 def _read_upto(p: Path, n: int) -> bytes:
@@ -1181,13 +1284,13 @@ async def preview_route(request: Request):
         # what is sent is looked at again: the file may have changed since its first bytes were read
         if len(data) > PREVIEW_IMAGE_MAX or IMAGE_TYPES.get(detect_type(data[:HEAD_BYTES], len(data))) != mime:
             raise HTTPError(415, "no_preview", "This file has no preview; download it instead.")
-        await audit_file(c, request, u, p, "files.preview", kind="image")
+        await audit_file(c, request, u, p, "files.preview", sent=data, kind="image")
         return Response(data, media_type=mime, headers={
             "Content-Disposition": "inline", "X-Content-Type-Options": "nosniff",
             "Content-Security-Policy": SANDBOX_CSP, "Cache-Control": "no-store"})
     if kind.startswith("text") or kind == "empty":
         data = await asyncio.to_thread(_read_upto, p, PREVIEW_TEXT_BYTES)
-        await audit_file(c, request, u, p, "files.preview", kind="text")
+        await audit_file(c, request, u, p, "files.preview", sent=data, kind="text")
         return api.ok({"kind": "text", "type": kind, "content": _decode_text(data, kind),
                        "truncated": st.st_size > PREVIEW_TEXT_BYTES})
     raise HTTPError(415, "no_preview", f"There is no preview for this kind of file ({kind}); download it instead.")
@@ -1351,15 +1454,16 @@ async def delete_route(request: Request):
                 size, is_dir = await asyncio.to_thread(_measure, dst)
             except OSError:
                 size, is_dir = 0, False
-            sha = "" if is_dir else await asyncio.to_thread(known_sha256, c, dst)
+            known = {} if is_dir else await asyncio.to_thread(known_hash, c, dst)
+            sha = known.get("sha256", "")
             now = time.time()
             c.db.execute("INSERT INTO file_recycle(id, location, original_path, recycle_path, name, is_dir, size, "
                          "sha256, deleted_by, deleted_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                          (rid, str(loc), str(src), str(dst), src.name, 1 if is_dir else 0, size, sha, u["username"],
                           now))
             detail: dict[str, Any] = {"id": rid, "size": size, "dir": is_dir}
-            if sha:
-                detail["sha256"] = sha
+            if sha:      # a stored SHA-256 of the unchanged file, with where it came from (F-5)
+                detail.update(sha256=sha, sha256Source=known["sha256Source"])
             c.audit(request, "files.delete", u, target=str(src), detail=detail)
             deleted.append({"path": str(src), "id": rid})
         except HTTPError as e:

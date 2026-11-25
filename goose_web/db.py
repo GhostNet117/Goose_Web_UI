@@ -30,7 +30,9 @@ AUDIT_RETENTION_DAYS = 365
 #   auth_sessions.remember - 1 = a "keep me signed in" sign-in (spec 037: its own lifetime, its own start-up cut)
 #   uploads.target - 'chat' (an attachment in <chat folder>\Web_Uploads, spec 039) or 'folder' (uploaded on the Files
 #       page into the folder itself, spec 041: never deleted by chat retention); uploads.sha256 - of a folder upload,
-#       computed while its pieces arrived ('' = not known)
+#       computed while its pieces arrived and checked against the finished file ('' = not known)
+#   uploads.mtime_ns / file_hashes.mtime_ns - the file's modification time (ns) when its SHA-256 was taken: a stored
+#       SHA-256 is shown only while size and this time are exactly the file's (assessment 2026-11-25 F-5)
 MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("users", "totp_last_counter", "INTEGER"),
     ("users", "oidc_issuer", "TEXT"),
@@ -39,6 +41,8 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("auth_sessions", "remember", "INTEGER DEFAULT 0"),
     ("uploads", "target", "TEXT NOT NULL DEFAULT 'chat'"),
     ("uploads", "sha256", "TEXT NOT NULL DEFAULT ''"),
+    ("uploads", "mtime_ns", "INTEGER"),
+    ("file_hashes", "mtime_ns", "INTEGER"),
 )
 POST_MIGRATION_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_oidc ON users(oidc_issuer, oidc_subject)"

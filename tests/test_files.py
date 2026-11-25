@@ -489,6 +489,12 @@ def test_info_gives_dates_type_and_who_uploaded(env):
         assert "uploadedBy" not in j and "sha256" not in j
 
 
+def computed(j: dict) -> dict:
+    """A hash answer without its labels, after checking them: computed now (assessment F-5)."""
+    assert j.pop("sha256Source") == "computed" and abs(j.pop("recordedAt") - __import__("time").time()) < 60
+    return j
+
+
 def test_sha256_is_computed_on_request_and_cached(env):
     s, db, pr, c = env
     dee, tid, tf = crew(env, names=("dee",))
@@ -498,7 +504,7 @@ def test_sha256_is_computed_on_request_and_cached(env):
     with client_for(c) as tc:
         h = sign_in(tc, c, dee)
         r = tc.post("/api/files/hash", json={"path": str(f)}, headers=h)
-        assert r.status_code == 200 and r.json() == {"sha256": hashlib.sha256(data).hexdigest(), "cached": False}
+        assert r.status_code == 200 and computed(r.json()) == {"sha256": hashlib.sha256(data).hexdigest(), "cached": False}
         row = db.one("SELECT * FROM file_hashes")
         assert row["path"] == os.path.normcase(str(f)) and row["size"] == len(data)
         assert tc.post("/api/files/hash", json={"path": str(f)}, headers=h).json()["cached"] is True
@@ -510,7 +516,7 @@ def test_sha256_is_computed_on_request_and_cached(env):
         assert tc.post("/api/files/hash", json={"path": str(f)}, headers=h).json()["sha256"] == hashlib.sha256(data).hexdigest()
         data = b"\x00" * 8 + data[8:]
         j = tc.post("/api/files/hash", json={"path": str(f), "force": True}, headers=h).json()
-        assert j == {"sha256": hashlib.sha256(data).hexdigest(), "cached": False}
+        assert computed(j) == {"sha256": hashlib.sha256(data).hexdigest(), "cached": False}
         listing = tc.get("/api/files/list", params={"path": str(tf)}).json()
         assert listing["entries"][0]["sha256"] == hashlib.sha256(data).hexdigest()
         assert tc.get("/api/files/info", params={"path": str(f)}).json()["sha256"] == hashlib.sha256(data).hexdigest()
@@ -518,7 +524,7 @@ def test_sha256_is_computed_on_request_and_cached(env):
         os.utime(f, (NOW + 100, NOW + 100))
         assert "sha256" not in tc.get("/api/files/info", params={"path": str(f)}).json()
         j = tc.post("/api/files/hash", json={"path": str(f)}, headers=h).json()
-        assert j == {"sha256": hashlib.sha256(b"changed").hexdigest(), "cached": False}
+        assert computed(j) == {"sha256": hashlib.sha256(b"changed").hexdigest(), "cached": False}
         assert db.one("SELECT COUNT(*) AS n FROM file_hashes")["n"] == 1
         assert tc.post("/api/files/hash", json={"path": str(tf)}, headers=h).status_code == 400
         assert tc.post("/api/files/hash", json={"path": str(tf / "nope")}, headers=h).status_code == 404
@@ -783,7 +789,8 @@ def test_delete_goes_to_the_recycle_folder_and_restore_brings_it_back(env):
         assert (rec / ids[0] / "e.bin").read_bytes() == data and (rec / ids[1] / "case" / "notes.txt").exists()
         a = audits(db, "files.delete")
         assert [x["target"] for x in a] == [str(p), str(tf / "case")]
-        assert a[0]["detail"] == {"id": ids[0], "size": len(data), "dir": False, "sha256": hashlib.sha256(data).hexdigest()}
+        assert a[0]["detail"] == {"id": ids[0], "size": len(data), "dir": False, "sha256": hashlib.sha256(data).hexdigest(),
+                                  "sha256Source": "upload"}
         assert a[1]["detail"]["dir"] is True and a[1]["detail"]["size"] == 1
         # the teammate sees both in the recycle bin of the location and restores them
         items = ta.get("/api/files/recycle", params={"location": str(tf)}).json()["items"]
