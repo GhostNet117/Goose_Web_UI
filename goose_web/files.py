@@ -472,8 +472,8 @@ def _known(c, items: list[dict]) -> None:
     by_key = {_key(x["path"]): x for x in files}
     marks = ",".join("?" for _ in files)
     # the placeholders are "?" only; every value is a bound parameter
-    rows = c.db.query(f"SELECT path, username, completed_at, sha256, size, file_id, mtime_ns FROM uploads "  # nosec B608
-                      f"WHERE state='done' AND path COLLATE NOCASE IN ({marks}) ORDER BY completed_at",
+    rows = c.db.query(f"SELECT path, username, completed_at, sha256, size, file_id, mtime_ns "  # nosec B608
+                      f"FROM uploads WHERE state='done' AND path COLLATE NOCASE IN ({marks}) ORDER BY completed_at",
                       [x["path"] for x in files])
     for r in rows:
         x = by_key.get(_key(r["path"]))
@@ -517,8 +517,8 @@ def known_sha256(c, path: Any, st=None) -> str:
 
 
 def _remember_hash(c, path: str, size: int, mtime: float, mtime_ns: int, sha: str, at: float) -> None:
-    c.db.execute("INSERT INTO file_hashes(path, size, mtime, mtime_ns, sha256, at) VALUES(?,?,?,?,?,?) ON CONFLICT(path) "
-                 "DO UPDATE SET size=excluded.size, mtime=excluded.mtime, mtime_ns=excluded.mtime_ns, "
+    c.db.execute("INSERT INTO file_hashes(path, size, mtime, mtime_ns, sha256, at) VALUES(?,?,?,?,?,?) "
+                 "ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, mtime_ns=excluded.mtime_ns, "
                  "sha256=excluded.sha256, at=excluded.at",
                  (_key(path), int(size), float(mtime), int(mtime_ns), sha, at))
 
@@ -652,7 +652,7 @@ def _measure(p: Path) -> tuple[int, bool]:
     return total, True
 
 
-# ---------------------------------------------------------------------- an item held while it moves (assessment F-1/F-2)
+# ---------------------------------------------------------------------- an item held while it moves (F-1, F-2)
 class _Changed(Exception):
     """The item, the folder it is in or the folder it goes to is not what was checked (a link or another item put in
     its place)."""

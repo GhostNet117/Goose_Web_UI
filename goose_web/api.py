@@ -19,8 +19,7 @@ from urllib.parse import parse_qs
 
 import httpx
 from starlette.requests import Request
-from starlette.responses import (FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse,
-                                 Response)
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 from . import auth as auth_mod
