@@ -807,8 +807,10 @@ will experience:
 Policies apply to non-admins only. A switch that is off grants nothing. For the three chat lists (approval modes,
 providers, models) an empty list allows **nothing**, and the **Any** switch stores `"*"`, which allows every value.
 A new team starts with every list empty and every switch off except `hints_edit` (since 1.27.0: members may add
-personal hints; the team's hints still come last and take precedence). Teams that existed before keep the value
-they have; switch it on or off on the team's Experience page (Hints).
+personal hints; the team's hints still come last and take precedence) and, since 1.28.0, the two **Files** switches
+`files` and `files_manage` (section 9.9f). Teams that existed before keep the value they have for `hints_edit`;
+switch it on or off on the team's Experience page (Hints). The Files switches were turned on once for every team
+that existed when 1.28.0 first started.
 
 | Key | UI label | New team | When on (or set), members may |
 |---|---|---|---|
@@ -824,6 +826,8 @@ they have; switch it on or off on the team's Experience page (Hints).
 | `config_edit` | Edit raw config | off | read and write the raw Goose configuration (treat like `allow_shell`) |
 | `allow_shell` | Allow shell / stdio extensions | off | use command-running extensions (`developer`, `computercontroller`, `code_execution`, `orchestrator`; `scheduler` also needs Schedules), stdio MCP extensions, per-session MCP servers and direct shell tool calls. See the known risk in section 11.3. Host tools (11.9) do not need it. |
 | `notify_webhook` | Notification webhooks | off | set a personal notification webhook |
+| `files` | Files: browse, download and upload | on (1.28.0; also switched on once for existing teams) | use the **Files** page and its API in the folders they already have (workspace, team folder, extra folders; read-only ones only read): browse, download, preview, SHA-256, and upload and make folders where they may write. Off: also `/api/fs/download` and `/api/fs/read` are refused (`403 files_off`); the folder picker keeps working. Section 9.9f |
+| `files_manage` | Rename, move and delete files | on (1.28.0; also switched on once for existing teams) | with `files`: rename, move and delete in folders they may write; deleted items go to the location's recycle folder, where anyone who may write there can restore them for `files.recycle_days`. Section 9.9f |
 | `allowed_modes` | Allowed approval modes | nothing | only these Goose modes (`auto`, `approve`, `smart_approve`, `chat`); `*` = any. Empty = members cannot chat. |
 | `allowed_providers` | Allowed providers | nothing | only these provider ids; `*` = any. Empty = members cannot chat. |
 | `allowed_models` | Allowed models | nothing | only these model ids; `*` = any. Empty = members cannot chat. |
@@ -1106,6 +1110,43 @@ content to the team. To share a skill that uses links, make it real files first.
 
 **You are sharing text.** Read a skill before you offer it. Whatever its files say (paths, host names, a key someone
 pasted into an example) is copied into every member's profile, where the member's agent reads it.
+
+#### 9.9f The Files page and its two switches (1.28.0, spec 041)
+
+The **Files** page lets members work on the files of the folders you already gave them - their workspace, the team
+folder and the team's extra folders (read-only folders stay read-only) - and nothing more: no new kind of folder
+right. A team works on shared material there (an incident: captures, logs, exports): one member uploads a large
+file into the team folder in resumable pieces, a teammate sees it with who uploaded it, when, its size and SHA-256,
+downloads it, or asks their agent about it. Administrators see what the folder picker shows them (their workspace
+and the drives).
+
+- **Two switches** in the team's switches, both on for new teams and switched on once for every team that existed
+  when 1.28.0 first started (each such change is in the audit as `team.update` by the system; settings key
+  `files_switches_applied`, so a switch you turn off stays off): **Files: browse, download and upload** (`files`)
+  and **Rename, move and delete files** (`files_manage`, needs `files`). Per-person overrides work as for the other
+  switches. Administrators always have both. Without `files` the page is hidden, every `/api/files/*` route answers
+  `403 files_off`, and so do `/api/fs/download` and `/api/fs/read` (the folder picker of New chat keeps working).
+- **Uploads** land in the folder shown, never replacing a file (`name (1).ext`); the largest file is Admin > Settings
+  > Files and chats > Largest file upload, as for attachments. Their SHA-256 is computed while they arrive. They
+  belong to no chat: **chat retention (9.9d) never deletes them.**
+- **Protections** are those of uploads: the folder as written and as it resolves must be one the person may write
+  (a link leading elsewhere is refused), names are cleaned, members cannot create, rename, move or delete Goose hints
+  files (`AGENTS.md`, `.goosehints`, `.goose-web-hints.md`) or `.agents` folders, nothing is ever replaced, and a
+  location's top folder (a workspace, the team folder, an extra folder) cannot be renamed, moved or deleted. Previews
+  are plain text (never interpreted) and PNG / JPEG / GIF / WebP images recognised by their bytes; SVG and everything
+  else are only downloaded.
+- **Recycle folder.** Delete moves an item into the hidden folder `.goose-web-recycle` at the top of its location
+  (`<location>\.goose-web-recycle\<id>\<name>`, same volume). Anyone who may write in that location can restore it
+  (back to its folder, `name (restored).ext` when the name is taken) for `files.recycle_days` days (configuration,
+  default 30, 1 to 365; `goose-web check` shows the period in force and a value it did not take); then the
+  maintenance loop removes it for good (`files.purge`). What you delete as an
+  administrator in a team's folder goes to that team's recycle folder. The recycle folder is never listed and no
+  route but restore reaches it - but it is an ordinary folder on disk: the members' agents (which may write in the
+  location) and anyone with access to the server's disk can see and change it. Do not rely on it as a backup.
+- **Audit.** `files.upload`, `files.download`, `files.read` (`/api/fs/read`), `files.preview`, `files.mkdir`,
+  `files.rename`, `files.move`, `files.delete`, `files.restore`, `files.purge` - the path as target, size, SHA-256
+  when known, from and to for moves; like every audit row they go to `activity.jsonl` and so to the SIEM (section
+  16). Members see the recent `files.*` rows of a folder in the page (Activity).
 
 #### 9.9e Providers for one person (1.27.0)
 
@@ -2340,6 +2381,7 @@ Recorded actions:
 | Teams and hints | `team.create`, `team.update` (with `moved`: users moved here from another team), `team.delete`, `team.migrate.membership` (1.5.0 upgrade: a second team membership was dropped), `team.item.add`, `team.item.remove`, `user.item.add`, `user.item.remove`, `user.item.refresh` (1.27.0: providers for one person, section 9.9e), `hints.create`, `hints.update`, `hints.delete` |
 | Settings | `settings.auth`, `settings.update` |
 | Operations | `worker.restart`, `worker.stop`, `worker.orphan_ended` (the orphan reaper ended an MCP server process Goose had let go: profile, pid, extension, masked command line, seconds cut off; section 12), `hosttask.<action>`, `fs.upload` |
+| Files page (1.28.0, section 9.9f) | `files.upload` (`{name, folder, size, sha256, chunked}`), `files.download` (`{size, sha256 if known, range if resumed, route}`), `files.read` (`/api/fs/read`), `files.preview` (`{size, kind}`), `files.mkdir`, `files.rename` and `files.move` (`{from, to}`), `files.delete` (`{id, size, dir, sha256 if known}`), `files.restore`, `files.purge` (by the system, after `files.recycle_days`); the path is the target. The one-time switch-on of the Files switches for existing teams is `team.update` by the system with `reason` |
 | Agent calls | `acp.denied` (policy denials, with the reason), `acp.<method>` for sensitive methods (configuration, providers and secrets, recipes save/delete, schedules create/delete, apps import/delete, sources, tool permissions, direct tool calls, adding session extensions, defaults, session delete) and for every call on another user's profile, `acp.answer` (answers to permission prompts and forms, with the choice) |
 | Admin access | `ws.impersonate`, `transcript.view` (an administrator read the read-only copy of a chat in another profile, with the session id) |
 | Everyday use (1.11) | `chat.new` (with the folder), `chat.open`, `chat.prompt` (length and number of attachments - never the text), `chat.steer` (1.15, the same), `chat.cancel`, `chat.fork`, `chat.mode`; `settings.tls`, `tls.renewed` |

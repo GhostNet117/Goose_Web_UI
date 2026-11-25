@@ -88,6 +88,8 @@ notify:
   allow_private_targets: false
 retention:
   chat_days: 180                            # 0 = keep forever; 1 to 3650; Admin > Settings overrides it
+files:
+  recycle_days: 30                          # deleted on the Files page: kept in the recycle folder; 1 to 365
 host_tasks:
   enabled: true
   path_filter: "\\*"
@@ -102,7 +104,8 @@ host_tasks:
 | `server.allowed_origins` | `[]` | Extra Origins (`scheme://host[:port]`) accepted for the WebSocket and for cookie-authenticated writes. Without `public_url`, the request's own `scheme://Host` is accepted as well (its Host has passed the allow-list). With `public_url` set, direct access under another address, for example `http://192.168.1.10:8710` or `http://127.0.0.1:8710`, works only if that origin is listed here. |
 | `server.allowed_hosts` | `[]` | Extra host names or IPs (no ports, no wildcards) accepted in the `Host` header. This guards against DNS rebinding (`app.py: HostGuard`). Always allowed: the `public_url` host, `localhost`, `127.0.0.1`, `::1`, and `server.host` unless it is `0.0.0.0` or `::`. Other Host values get `400 invalid host`, and `GET /healthz` is exempt. Environment: `GOOSE_WEB__SERVER__ALLOWED_HOSTS=goose,192.168.1.10` (comma separated) or a YAML list. |
 | `server.max_upload_mb` | `25` | Size limit per uploaded file, 1 to 5120 (5 GB; a larger value counts as 5120 and `goose-web check` reports it). **Admin > Settings > Files and chats > Largest file upload** overrides it once saved (setting `max_upload_mb`, section 4) for the chunked upload (`/api/fs/uploads`, what the message box uses). The single-request `/api/fs/upload` (at most 20 files per request) never goes above this configured value. |
-| `retention.chat_days` | `180` | Chats unused for this many days are deleted, with the files uploaded to them (spec 040, ADMINISTRATION 9.9d); 0 = keep forever; 1 to 3650 (larger counts as 3650). **Admin > Settings > Files and chats** overrides it once saved (setting `retention_days`). |
+| `retention.chat_days` | `180` | Chats unused for this many days are deleted, with the files uploaded to them (spec 040, ADMINISTRATION 9.9d); 0 = keep forever; 1 to 3650 (larger counts as 3650). **Admin > Settings > Files and chats** overrides it once saved (setting `retention_days`). Files uploaded on the **Files** page (spec 041) are never deleted by retention. |
+| `files.recycle_days` | `30` | Spec 041: what is deleted on the **Files** page waits this many days in the hidden recycle folder of its location (`<location>\.goose-web-recycle`), where anyone who may write there can restore it; then the maintenance loop removes it for good (audit `files.purge`). 1 to 365: less counts as 1, more as 365, anything that is not a number as 30 (`goose-web check` reports such a value). Shown to the page as `recycleDays`. |
 | `server.allow_elevated` | `false` | If true, the gateway runs with an elevated token instead of refusing. Leave it false. |
 | `server.priority` | `normal` | `normal`: at start the gateway raises its own CPU priority class, I/O priority and memory priority to normal when they are lower (Task Scheduler starts a task below normal unless the task has a priority), never higher. `inherit`: leave the process as it was started. Any other value means `normal`. |
 | `paths.profiles_root` | `C:\Goose_Web_Profiles` | Parent of all isolated profiles and of `_system`. |
@@ -111,7 +114,7 @@ host_tasks:
 | `server.tls_cert_file`, `server.tls_key_file` | `""` | PEM certificate (chain) and private key for `tls: files`. |
 | `server.tls_names` | `[]` | Extra DNS names or IP addresses for the built-in certificate (it already covers localhost, 127.0.0.1, ::1, the host name, FQDN, the machine's addresses, the bind address, the public_url host and `allowed_hosts`). |
 | `logs.max_disk_percent` | `0.5` | All Goose Web logs (gateway, activity, workers, isolated profiles' Goose logs) stay under this share of the disk volume; the oldest unused files are deleted (ADMINISTRATION 18). |
-| `logs.check_minutes` | `30` | How often the log budget, the audit retention and the built-in certificate are checked; also when partial upload files idle for 24 hours are removed and whether the hourly chat-retention sweep is due. |
+| `logs.check_minutes` | `30` | How often the log budget, the audit retention and the built-in certificate are checked; also when partial upload files idle for 24 hours are removed, whether the hourly chat-retention sweep is due, and when recycled items older than `files.recycle_days` are removed (spec 041). |
 | `logs.activity` | `true` | User activity log `<system_dir>/logs/activity.jsonl` (JSON lines). |
 | `logs.activity_file_mb`, `logs.activity_files` | `20`, `10` | Rotation of the activity log. |
 | `logs.gateway_file_mb`, `logs.gateway_files` | `10`, `5` | Rotation of `gateway.log`. |
@@ -352,6 +355,7 @@ Admins change these in the UI (Admin > Settings / Sign-in). They are stored in t
 | `retention_days` | not stored = `retention.chat_days` | Days without use after which a chat and its uploads are deleted (spec 040); 0 = never, at most 3650. |
 | `retention_armed_at` | not stored = automatic deletion not in force | Set when an administrator confirms the period (saves it in Admin > Settings, or **Start automatic deletion**); never set by itself, so an upgrade deletes nothing until then (M-3). The first automatic sweep runs a day later; a changed period sets it again (Run now does not wait). `retention_confirmed_by` holds who confirmed. |
 | `retention_last` | - | Summary of the last retention sweep: `{at, days, chats, files, bytes, busy, more, manual, by, errors}`. |
+| `files_switches_applied` | - | Spec 041: when the gateway turned the two Files switches (`files`, `files_manage`) on for the teams that existed before 1.28.0 (once; each team audited `team.update` by the system). Deleting it makes the next start do it again for teams that lack the keys (a switch an administrator turned off is kept). |
 | `auth` | see below | Sign-in methods. |
 
 `auth` (`auth.py: DEFAULT_AUTH`). Secrets are write-only: reads return `********`, and saving `********` keeps the

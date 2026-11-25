@@ -120,6 +120,7 @@ The main ideas:
 | `context.py` | `Ctx` (shared services), `HTTPError`, request helpers: identity resolution, `require()` (auth, CSRF, origin, role), allowed origins, client IP, policy and roots for a user, `upstream_for(user)`, `body_json`. |
 | `api.py` | All REST handlers and the `routes` list: auth, current user, preferences, TOTP, API tokens, hints, notifications, file system, MCP App frames, herd, and every `/api/admin/*` endpoint. |
 | `uploads.py` | Spec 039: chunked, resumable uploads (`/api/fs/uploads`, section [12.7](#127-uploads-and-downloads)): the upload limit (Admin > Settings over `server.max_upload_mb`, 1..5120 MB; `limit_mb` for `app.BodyLimit`), start / piece / status / cancel, the hidden partial file and its identity checks, the never-replacing rename, `record_saved` (the single-request upload's files), `cleanup` (partial files idle 24 h), `POST /api/fs/uploads/link` (spec 040). |
+| `files.py` | Spec 041: the Files page's API (`/api/files/*`, section [12.7](#127-uploads-and-downloads)): the person's locations, list / info / type from the first bytes (a small magic-number table) / SHA-256 (in a thread, cached in `file_hashes`) / download / preview, new folder, rename, move (across volumes: copy then delete), delete into the location's recycle folder `.goose-web-recycle` and restore, the folder's activity (`files.*` audit rows), `purge_recycle` (maintenance loop, `files.recycle_days`), `gate` (the `files` / `files_manage` permissions, also used by `/api/fs/download|read` and uploads with `target: "folder"`), `check_lines`. |
 | `retention.py` | Spec 040: chats and their uploads deleted after N days without use (section [10.5](#105-chat-and-attachment-retention-retentionpy-spec-040)): last use (`note_activity` from the audit hook, `chat_access`), Goose's session times (`sessions.db`, read-only), `sessions_in_use` (a read-only look at the hub), the sweep / preview, `/api/admin/retention*`, `check_lines`. |
 | `tls.py` | Spec 015: built-in HTTPS - mode resolution (`auto`/`self-signed`/`files`/`off`, Admin UI override), local CA and server certificate (`cryptography`, EC P-256) with every local name/address, renewal (expiry, new names) and hot reload into the live `SSLContext`. |
 | `activity.py` | Spec 015: user activity log, JSON lines in `<system_dir>/logs/activity.jsonl` (every audit event + connections). |
@@ -403,7 +404,9 @@ sessions and configuration.
 
 1. Creates `<system_dir>`.
 2. Opens `Database(<system_dir>/goose-web.db)`. This runs migrations. (The
-   audit retention is applied by the maintenance loop, section 10.4.)
+   audit retention is applied by the maintenance loop, section 10.4.) Spec 041:
+   once, the Files switches are turned on for the teams that exist
+   (`policy.apply_files_switches`).
 3. Creates `WorkerManager`, `Hub(workers)`, `Profiles` and the `Ctx`, and reads
    the Goose version (`goose --version`, 20 s timeout).
 4. Wires hub callbacks: `on_audit` (writes audit rows; spec 040: also a chat's
@@ -1389,9 +1392,11 @@ secrets, schedules) stays in each profile and is never copied into it.
 | `ip_blocks` | `ip` (address key: IPv4 or IPv6 /64), `failures` (JSON list of timestamps of the current run), `last_username`, `blocked_at` (0 = not blocked), `blocked_until` (0 = until unblocked), `updated_at` (schema version 3) |
 | `chat_state` | Per-chat live state the hub keeps for each profile (spec 019, schema version 6): `(profile, session_id, kind)` primary key, `data` (JSON), `updated_at`. `kind = 'queue'`: the composer queue; `kind = 'mark'`: the herd status not yet seen (`working`, `needs_you`, `done`, `error` with title, folder, last text). Written on queue changes and status changes only; read when the profile's `Upstream` is created (`Upstream.restore_state`). Rows are deleted when the queue empties, the status becomes idle (`_gw/seen`), the chat is deleted, or the user is deleted; marks older than 30 days are dropped. |
 
-| `uploads` | Spec 039: files uploaded through Goose Web. `id` (SHA-256 of the id the browser holds), `user_id`, `username`, `profile` (whose chats it belongs to), `session_id` (the chat named at the start), `dir` (`<chat folder>\Web_Uploads` as written) and `real_dir` (resolved at the start), `name`, `partial` (the hidden partial file while `open`), `path` (the final file), `size` (declared), `received`, `mime`, `state` (`open`, `done`, `aborted`, `abandoned`, `deleted`, `gone`, `kept`), `file_id` (volume:file index of the file written), `note`, `created_at`, `updated_at`, `completed_at`. Ended rows are dropped after 30 days; `done` rows stay for retention. |
+| `uploads` | Spec 039: files uploaded through Goose Web. `id` (SHA-256 of the id the browser holds), `user_id`, `username`, `profile` (whose chats it belongs to), `session_id` (the chat named at the start), `dir` (`<chat folder>\Web_Uploads` as written) and `real_dir` (resolved at the start), `name`, `partial` (the hidden partial file while `open`), `path` (the final file), `size` (declared), `received`, `mime`, `state` (`open`, `done`, `aborted`, `abandoned`, `deleted`, `gone`, `kept`), `file_id` (volume:file index of the file written), `note`, `created_at`, `updated_at`, `completed_at`. Ended rows are dropped after 30 days; `done` rows stay for retention. Spec 041 adds `target` (`chat`: an attachment in `Web_Uploads`; `folder`: uploaded on the Files page into the folder itself - in no chat, never deleted by retention) and `sha256` (of a `folder` upload, computed while it arrived). A `folder` row's `path` follows the file when it is renamed, moved, recycled or restored on the Files page (a chat attachment's does not: retention must not find it at its new place). |
 | `upload_links` | Spec 040: `(upload_id, session_id)` primary key, `profile`, `linked_at` - the chats a file belongs to (set at completion, by New chat after `session/new`, copied to a fork or branch). |
 | `chat_access` | Spec 040: `(profile, session_id)` primary key, `last_access` - when Goose Web last saw the chat used (at most one write a minute per chat). |
+| `file_hashes` | Spec 041: `path` (normcase'd absolute path, primary key), `size`, `mtime`, `sha256`, `at` - SHA-256 computed on the Files page; valid while the file has that size and modification time; follows renames and moves; rows older than a year are dropped by the maintenance loop. |
+| `file_recycle` | Spec 041: `id` (20 hex characters), `location` (the location's top folder), `original_path`, `recycle_path` (`<location>\.goose-web-recycle\<id>\<name>`), `name`, `is_dir`, `size`, `sha256`, `deleted_by`, `deleted_at` - items deleted on the Files page until they are restored or purged after `files.recycle_days`. |
 
 **JSON columns.** `prefs`, `policy_overrides`, `policy`, `payload`, `detail` and
 `value` are decoded automatically in `_row()`, so callers always get Python
@@ -1440,6 +1445,13 @@ newer database. To change the schema, append to `MIGRATIONS` and bump
 `MIGRATIONS`; rows from before count as normal sign-ins) and the table
 `user_items` (`CREATE TABLE IF NOT EXISTS`). Both are created on every open,
 whatever `meta.schema_version` says.
+
+Spec 041 (1.28.0) adds the columns `uploads.target` (`TEXT NOT NULL DEFAULT
+'chat'`) and `uploads.sha256` (`TEXT NOT NULL DEFAULT ''`) through `MIGRATIONS`
+(rows from before are chat attachments) and the tables `file_hashes` and
+`file_recycle`, the same way. The one-time switch-on of the two Files switches
+for existing teams is not a schema migration: it runs at the gateway's start
+(`policy.apply_files_switches`, settings key `files_switches_applied`).
 
 **Policy model migration** (`_migrate_policy_model`, `POLICY_MODEL = 2`). It
 runs in one transaction when `meta.policy_model` is missing or lower than 2,
@@ -1931,7 +1943,52 @@ are audited.
 - `Content-Security-Policy: sandbox; default-src 'none'` and `no-store`, so a
   downloaded HTML file can never run in the gateway's origin.
 
-`/api/fs/read` returns at most 1 MB of text with a `truncated` flag.
+`/api/fs/read` returns at most 1 MB of text with a `truncated` flag. Since spec 041 both need the Files permission
+and are audited (`files.download`, `files.read`).
+
+**The Files page** (`files.py`, spec 041; routes in [API.md](API.md#files-spec-041)):
+
+- **Permission.** `policy.files_allowed` / `files_manage_allowed`: administrators always; members by the team
+  switches `files` and `files_manage` (in `BOOL_KEYS`, so per-person overrides apply; `NEW_TEAM_POLICY` turns both
+  on for new teams; `policy.apply_files_switches` turns them on once for the teams that existed, at the gateway's
+  start, setting `files_switches_applied`, each change audited `team.update` by the system). `files.gate` raises
+  `403 files_off`. The folder picker (`/api/fs/roots|list|mkdir`) does not need it.
+- **Locations.** Members: `Ctx.roots_for` (workspace, team folder, extra folders, read-only folders) with their
+  access; administrators: workspace and drives like `/api/fs/roots`. For protection and the recycle folder an
+  administrator's "tops" also include every team's folder and extra folders, so what an administrator deletes in a
+  team folder lands in the recycle folder the team sees.
+- **Paths.** Every path through `api._check_path` (read, or write for anything that changes something) - the path
+  as written and resolved must lie in the person's (writable) folders. `_check_path` also answers `404` for anything
+  with a `.goose-web-recycle` component (as written or resolved), so the recycle folder is reached by no route but
+  restore; `fs_list` and the Files listing leave it out. New names: `safe_upload_name` after removing `:`;
+  `_refuse_hint_name` / `_refuse_agents_dir` for members on the new name, and on the source of a rename, move or
+  delete. A location's top folder, or a folder holding one, is never renamed, moved or deleted.
+- **Changes never replace anything.** `MoveFileEx` without replace (`os.rename` on Windows); across volumes
+  (`EXDEV` / `ERROR_NOT_SAME_DEVICE`) a copy under a hidden `.goose-web-move-<hex>` name next to the target (links
+  copied as links), renamed, then the original removed (`shutil.rmtree` never follows junctions). After a rename,
+  move, delete or restore the item's new folder must still resolve to the folder that was checked and be writable;
+  otherwise the item is put back and the request refused (a folder swapped for a link meanwhile).
+- **Recycle.** Delete moves an item to `<location top>\.goose-web-recycle\<id>\<name>` (the recycle folder made when
+  needed, hidden, and refused when it is a link or does not resolve right inside the location) and writes a
+  `file_recycle` row. Restore checks the recycle folder, the id folder and the item are no links and resolve where
+  Goose Web put them, recreates the original folder when needed and picks `name (restored).ext` when the name is
+  taken. `purge_recycle` (maintenance loop) removes items older than `files.recycle_days` (1..365, default 30),
+  at most 500 a run, with the same checks; audit `files.purge` by the system.
+- **What is known about a file.** `uploads` rows (`done`, same path, size and volume:file index) give
+  `uploadedBy`/`uploadedAt`, and the SHA-256 of a Files upload while the file was not modified after it; otherwise
+  `file_hashes` (same size and mtime). `POST /api/files/hash` computes it in a thread (2 at a time per person).
+- **Type and preview.** `detect_type` looks at the first 4 KB: a magic-number table (images, PDF, archives,
+  executables, pcap/pcapng, EVTX, registry hives, LNK, E01, SQLite, OLE), RIFF containers, else text (no NUL, at most
+  1% control characters) or data. Preview sends text as JSON (256 KB, shown with `textContent` by the page) and only
+  PNG/JPEG/GIF/WebP by their bytes (never SVG) with `nosniff`, `inline` and a sandbox CSP; anything else `415`.
+- **Uploads.** `uploads.py` with `target: "folder"`: the folder itself (must exist), the same checks as
+  `Web_Uploads`; the SHA-256 state is fed by the writer thread per piece, kept in memory only when a piece is kept
+  whole, and rebuilt from the partial file (read once) when it is missing (a restart). `uploads.target = 'folder'`,
+  `uploads.sha256`; never linked to a chat; retention's sweep only takes `target = 'chat'`.
+- **Audit.** `files.upload`, `files.download`, `files.read`, `files.preview`, `files.mkdir`, `files.rename`,
+  `files.move`, `files.delete`, `files.restore`, `files.purge` - target the path, detail size / SHA-256 / from-to;
+  they reach `activity.jsonl` (the SIEM) like every audit row. `GET /api/files/activity` shows the rows of a folder
+  and everything in it (and moves out of it).
 
 ### 12.8 MCP Apps
 
