@@ -345,7 +345,55 @@ def _protect(c, u: dict, src: Path, tops: list[str]) -> None:
         raise HTTPError(403, "denied", "A location's top folder cannot be renamed, moved or deleted.")
     api = _api()
     api._refuse_hint_name(u, src.name)
+    if u["role"] != "admin":     # F-7: also by its long name (an 8.3 alias such as GOOSEH~1 names the same file)
+        api._refuse_hint_name(u, _long_name(src))
     api._refuse_agents_dir(u, src)
+
+
+def _long_name(p: Any) -> str:
+    """The last component of `p` with an 8.3 short name expanded (a link is not followed)."""
+    if os.name != "nt":
+        return os.path.basename(str(p))
+    import ctypes
+    buf = ctypes.create_unicode_buffer(4096)
+    n = ctypes.windll.kernel32.GetLongPathNameW(str(p), buf, 4096)
+    return os.path.basename(buf.value if 0 < n < 4096 else str(p))
+
+
+HOLDS_SCAN_MAX = 100000      # entries looked at for hints files / .agents in a folder a member renames, moves, deletes
+
+
+def _holds_protected(p: Path) -> tuple[str, str] | None:
+    """(refusal, path) when the folder `p` holds a Goose hints file (or .gooseignore) or a `.agents` folder, at any
+    depth (links not entered); too many entries to look at counts as holding one (fails closed). Blocking."""
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode) or is_link(st):
+        return None
+    names = _api().REFUSED_FILE_NAMES
+    for i, (_, e, _st) in enumerate(_walk(str(p))):
+        if i >= HOLDS_SCAN_MAX:
+            return "hint_file_refused", str(p)
+        n = e.name.split(":", 1)[0].strip().rstrip(". ").lower()
+        if n in names:
+            return "hint_file_refused", e.path
+        if pol.is_agents_name(n):
+            return "agents_folder_refused", e.path
+    return None
+
+
+async def _protect_tree(u: dict, src: Path) -> None:
+    """F-7: a member does not rename, move or delete a folder holding a Goose hints file or a `.agents` folder (the
+    administrator's) - that would take them away from the chats started there."""
+    if u["role"] == "admin":
+        return
+    found = await asyncio.to_thread(_holds_protected, src)
+    if found:
+        code, where = found
+        raise HTTPError(403, code, f"This folder holds Goose settings your administrator manages ({where}); it cannot "
+                                   "be renamed, moved or deleted from the file browser. Ask your administrator.")
 
 
 # ---------------------------------------------------------------------- the type of a file
@@ -1394,6 +1442,7 @@ async def rename_route(request: Request):
     name = clean_name(b.get("name"))
     tops = await asyncio.to_thread(_tops, c, u, policy)
     _protect(c, u, src, tops)
+    await _protect_tree(u, src)
     if not os.path.lexists(src):
         raise HTTPError(404, "not_found", NOT_FOUND)
     dst = src.parent / name
@@ -1436,6 +1485,7 @@ async def move_route(request: Request):
         try:
             src = _check(c, u, _arg_path(raw), write=True)
             _protect(c, u, src, tops)
+            await _protect_tree(u, src)
             try:
                 st = os.lstat(src)
             except OSError:
@@ -1510,6 +1560,7 @@ async def delete_route(request: Request):
         try:
             src = _check(c, u, _arg_path(raw), write=True)
             _protect(c, u, src, tops)
+            await _protect_tree(u, src)
             if not os.path.lexists(src):
                 raise HTTPError(404, "not_found", NOT_FOUND)
             loc = _location_of(src, tops)

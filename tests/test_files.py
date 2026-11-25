@@ -1391,3 +1391,50 @@ def test_f16_refused_attempts_are_audited_once_a_minute_per_path(env):
     with client_for(c) as tc:        # the folder's activity is what happened, not what was refused
         sign_in(tc, c, ann)
         assert tc.get("/api/files/activity", params={"path": str(wa)}).json()["items"] == []
+
+
+def _short(p: Path) -> str:
+    import ctypes
+    buf = ctypes.create_unicode_buffer(1024)
+    n = ctypes.windll.kernel32.GetShortPathNameW(str(p), buf, 1024)
+    leaf = os.path.basename(buf.value) if n else ""
+    return str(p.parent / leaf) if leaf and leaf.lower() != p.name.lower() else ""    # the 8.3 leaf only
+
+
+def test_f7_hints_files_by_short_name_and_folders_holding_them_are_the_administrators(env):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    admin = user(db, "root", role="admin")
+    (tf / ".goosehints").write_text("ADMIN HINTS")
+    (tf / "pack").mkdir()
+    (tf / "pack" / "deep").mkdir()
+    (tf / "pack" / "deep" / "AGENTS.md").write_text("rules")
+    (tf / "plug").mkdir()
+    (tf / "plug" / ".agents").mkdir()
+    (tf / "plain").mkdir()
+    (tf / "plain" / "notes.txt").write_text("n")
+    (tf / "to").mkdir()
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        short = _short(tf / ".goosehints") if WIN else ""
+        if short:       # 8.3 names are on for this volume: the alias is refused like the name
+            r = tc.post("/api/files/rename", json={"path": short, "name": "gone.txt"}, headers=h)
+            assert r.status_code == 403 and r.json()["error"] == "hint_file_refused", r.text
+            j = tc.post("/api/files/delete", json={"paths": [short]}, headers=h).json()
+            assert j["failed"][0]["error"] == "hint_file_refused"
+            j = tc.post("/api/files/move", json={"paths": [short], "to": str(tf / "to")}, headers=h).json()
+            assert j["failed"][0]["error"] == "hint_file_refused"
+        r = tc.post("/api/files/rename", json={"path": str(tf / "pack"), "name": "other"}, headers=h)
+        assert r.status_code == 403 and r.json()["error"] == "hint_file_refused"
+        j = tc.post("/api/files/delete", json={"paths": [str(tf / "pack"), str(tf / "plug"), str(tf / "plain")]},
+                    headers=h).json()
+        assert [x["error"] for x in j["failed"]] == ["hint_file_refused", "agents_folder_refused"]
+        assert [x["path"] for x in j["deleted"]] == [str(tf / "plain")]
+        j = tc.post("/api/files/move", json={"paths": [str(tf / "pack")], "to": str(tf / "to")}, headers=h).json()
+        assert j["failed"][0]["error"] == "hint_file_refused"
+    assert (tf / ".goosehints").read_text() == "ADMIN HINTS" and (tf / "pack" / "deep" / "AGENTS.md").exists()
+    assert (tf / "plug" / ".agents").is_dir()
+    with client_for(c) as tc:      # the administrator may
+        h = sign_in(tc, c, admin)
+        j = tc.post("/api/files/delete", json={"paths": [str(tf / "pack")]}, headers=h).json()
+        assert j["deleted"] and not (tf / "pack").exists()
