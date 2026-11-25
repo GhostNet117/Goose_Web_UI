@@ -409,7 +409,7 @@ export function renderFiles(ctx, query = {}) {
       } });
       const name = e.dir
         ? h('a', { class: 'files-name', href: folderLink(e.path), title: e.name }, icon('folder', 15), h('span', null, e.name))
-        : h('button', { type: 'button', class: 'files-name', title: 'Details of ' + e.name, 'aria-haspopup': 'true', onclick: () => showFile(e.path) }, icon('file', 15), h('span', null, e.name));
+        : h('button', { type: 'button', class: 'files-name', title: 'Details of ' + e.name, onclick: () => showFile(e.path, { focus: true }) }, icon('file', 15), h('span', null, e.name));
       const tr = h('tr', { class: [on ? 'selected' : '', !e.dir && samePath(e.path, fileSel) ? 'active' : '', e.hidden ? 'files-hidden' : ''], dataset: { path: e.path } },
         h('td', { class: 'files-cbcell' }, cb),
         h('td', { class: 'files-namecell' }, name),
@@ -461,7 +461,8 @@ export function renderFiles(ctx, query = {}) {
     if (row) { row.classList.remove('active'); const f = row.querySelector('.files-name'); if (f) f.focus(); }
   };
   detailEl.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); closeDetail(); } });
-  async function showFile(path, { scroll = false } = {}) {
+  // focus: opened by the person (keyboard and screen reader users land on the details; Esc goes back to the row)
+  async function showFile(path, { scroll = false, focus = false } = {}) {
     closePreview();
     fileSel = path; info = null;
     setUrl();
@@ -474,12 +475,13 @@ export function renderFiles(ctx, query = {}) {
       if (!alive || fileSel !== path) return;
       info = i;
       renderDetail();
+      if (focus) { const t = detailEl.querySelector('.files-detail-title'); if (t) t.focus(); }
     } catch (e) {
       if (!alive || fileSel !== path) return;
       detailEl.replaceChildren(detailHead(baseName(path)), h('div', { class: 'files-detail-body' }, banner('error', errMsg(e))));
     }
   }
-  const detailHead = (name) => h('div', { class: 'files-detail-head' }, icon('file', 16), h('h2', { class: 'files-detail-title', title: name }, name), iconBtn('x', 'Close details (Esc)', () => closeDetail()));
+  const detailHead = (name) => h('div', { class: 'files-detail-head' }, icon('file', 16), h('h2', { class: 'files-detail-title', title: name, tabindex: '-1' }, name), iconBtn('x', 'Close details (Esc)', () => closeDetail()));
   const renderDetail = () => {
     const i = info;
     const can = manage && i.access === 'write';
@@ -705,10 +707,10 @@ export function renderFiles(ctx, query = {}) {
           h('div', { class: 'files-pathbar row' }, upBtn, crumbsEl),
           msgEl,
           h('div', { class: 'files-toolbar' }, uploadBtn, mkdirBtn, refreshBtn, h('span', { class: 'grow' }), filterInp, sortSel, hiddenChk, moreBtn),
+          upEl,
           selBar,
           dropZone,
-          footEl,
-          upEl),
+          footEl),
         detailEl)));
   for (const [ev, fn] of [['dragenter', onDragEnter], ['dragover', onDragOver], ['dragleave', onDragLeave], ['drop', onDrop]]) el.addEventListener(ev, fn);
 

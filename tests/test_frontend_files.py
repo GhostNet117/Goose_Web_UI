@@ -154,7 +154,11 @@ def test_previews_are_text_or_a_revoked_blob_url():
     assert "URL.revokeObjectURL(previewUrl); previewUrl = null;" in close
     # closed with the details, before another file is shown, and when the page goes
     assert "closePreview();" in _block(files, "const closeDetail = () => {", "\n  };\n")
-    assert "closePreview();" in _block(files, "async function showFile(path, { scroll = false } = {}) {", "\n  }\n")
+    show = _block(files, "async function showFile(path, { scroll = false, focus = false } = {}) {", "\n  }\n")
+    assert "closePreview();" in show
+    # keyboard and screen reader users land on the details they opened; Esc closes them and goes back to the row
+    assert "if (focus) { const t = detailEl.querySelector('.files-detail-title'); if (t) t.focus(); }" in show
+    assert "showFile(e.path, { focus: true })" in files and "if (e.key === 'Escape') { e.stopPropagation(); closeDetail(); }" in files
     assert "closePreview();" in _block(files, "destroy() {", "\n    },\n")
     assert "res.status === 415" in prev                                 # no_preview: said in words
 
