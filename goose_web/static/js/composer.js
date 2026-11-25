@@ -1,12 +1,13 @@
 // Composer: autosizing input with slash commands, @mentions, attachments, send/stop/steer.
-import { h, btn, iconBtn, autosize, toast, toastError, pickFile, fmtBytes, kbd } from './ui.js';
+import { h, btn, iconBtn, autosize, toast, toastError, pickFile, fmtBytes, kbd, baseName } from './ui.js';
 import { icon } from './icons.js';
-import { uploadFile, uploadLimits } from './api.js';
+import { uploadFile, uploadLimits } from './uploader.js';
+import { GET, qs } from './api.js';
 import { rpc, G } from './rpc.js';
 import { prefs } from './prefs.js';
 import { prepareInline, planInline, NOTES } from './images.js';
 
-// Spec 039: files go up in resumable pieces (api.js uploadFile, 2 at a time) with progress and cancel; images are
+// Spec 039: files go up in resumable pieces (uploader.js uploadFile, 2 at a time) with progress and cancel; images are
 // also shown to the model as a smaller copy (images.js), within a per-message budget. At most MAX_FILES at once.
 const MAX_FILES = 20;
 const cancelled = (e) => !!e && (e.name === 'AbortError' || e.code === 'cancelled');
@@ -238,6 +239,37 @@ export class Composer {
       this.attachments = this.attachments.filter((x) => x !== att);
     }
     this.renderAtts();
+  }
+  // Spec 041: a file that already lies where the agent can read it (Files page: "Ask Goose about this", "Add to a
+  // chat"): a chip with its link (resource_link), nothing is uploaded and nothing is linked to the chat (spec 040).
+  attachPath(path, info = {}) {
+    if (!path || this.attachments.some((a) => a.path === path)) return null;
+    if (this.attachments.length >= MAX_FILES) { toast('At most ' + MAX_FILES + ' files at once', { kind: 'warn' }); return null; }
+    const name = info.name || baseName(path);
+    const att = { name, size: info.size ?? null, mime: '', status: 'ready', sent: 0, id: null, controller: null, inline: null, note: '', path, existing: true };
+    att.link = { type: 'resource_link', uri: fileUri(path), name };
+    if (att.size !== null) att.link.size = att.size;
+    this.attachments.push(att);
+    this.renderAtts();
+    return att;
+  }
+  // The chip at once, then the file's details from the server (GET /api/files/info): the size, or the chip goes
+  // again when this person may not read the file (or it is a folder, or gone).
+  async attachExisting(path) {
+    const att = this.attachPath(path);
+    if (!att) return;
+    try {
+      const i = await GET('/api/files/info' + qs({ path }));
+      if (i.dir) throw new Error('Only a file can be attached, not a folder');
+      if (!this.attachments.includes(att)) return;
+      att.name = i.name || att.name; att.size = i.size ?? null;
+      att.link.name = att.name;
+      if (att.size !== null) att.link.size = att.size;
+      this.renderAtts();
+    } catch (e) {
+      toastError(e, 'Attach ' + att.name);
+      this.removeAtt(att);
+    }
   }
   removeAtt(a) {
     if (a.status === 'loading' && a.controller) a.controller.abort();   // stops the upload; the server deletes what it had

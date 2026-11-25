@@ -141,7 +141,7 @@ function usersTab(body) {
         isNew ? field('Initial password', pw, 'The user must change it at the first sign-in. At least 12 characters with upper- and lower-case letters, a number and a symbol.') : null,
         field('Team', tp, 'One team per user. The team decides hints, providers, models, approval modes and folders. Administrators are not restricted.'), field('Extra hints for this user', hp.el, 'Hints documents for this user only. They come before the team hints, which take precedence.'),
         !isNew && u.profileMode !== 'native' ? h('details', { class: 'user-providers', ontoggle: (e) => { const d = e.currentTarget; if (d.open && !d.querySelector('[data-user-providers]')) d.appendChild(userProviders(u)); } }, h('summary', null, 'Providers for this user only')) : null,   // spec 038: loaded when opened
-        !isNew ? h('details', null, h('summary', null, 'Policy overrides (advanced)'), field(null, ov, 'JSON object merged over the team policy for this user only.')) : null, err),
+        !isNew ? h('details', null, h('summary', null, 'Policy overrides (advanced)'), field(null, ov, 'JSON object merged over the team policy for this user only. The switches (true or false): ' + POLICY_FLAGS.map((f) => f[0]).join(', ') + ' - for example { "files_manage": false } keeps the Files page but not rename, move and delete.')) : null, err),
       footer: [btn('Cancel', () => m.close()), btn(isNew ? 'Create user' : 'Save', async () => {
         err.textContent = '';
         const b = { displayName: dn.value.trim() || undefined, email: em.value.trim() || undefined, role: role.value, team: tp.value ? Number(tp.value) : null, hints: hp.get(), profileMode: mode.value, authSource: src.value };
@@ -176,13 +176,15 @@ export const POLICY_FLAGS = [
   ['schedules', 'Manage schedules'], ['apps', 'Manage apps'], ['prompts_edit', 'Edit system prompts'], ['hints_edit', 'Members may add personal hints'],
   ['tools_permissions', 'Set tool permissions'], ['config_edit', 'Edit raw config'], ['allow_shell', 'Allow shell / stdio extensions'], ['notify_webhook', 'Notification webhooks'],
   ['require_totp', 'Require two-factor sign-in (a member without it can only set it up)'],
+  // spec 041: the Files page and its API (on for existing and new teams; administrators always have both)
+  ['files', 'Files: browse, download and upload'], ['files_manage', 'Rename, move and delete files'],
 ];
 const FLAG_LABEL = Object.fromEntries(POLICY_FLAGS);
 const EXPERIENCE = [
   { id: 'hints', title: 'Hints', flags: ['hints_edit'] },
   { id: 'models', title: 'Providers & models', flags: ['providers_edit'] },   // spec 033: its providers are rows with a switch, not a table of library items
   { id: 'modes', title: 'Approval modes', flags: [] },
-  { id: 'folders', title: 'Folders', flags: [] },
+  { id: 'folders', title: 'Folders', flags: ['files', 'files_manage'] },   // spec 041: the Files page in these folders
   { id: 'ext', title: 'Extensions & tools', flags: ['allow_shell', 'extensions_edit', 'tools_permissions', 'apps'], kinds: ['extension'] },
   { id: 'recipes', title: 'Recipes, skills & schedules', flags: ['recipes_edit', 'skills_edit', 'schedules'], kinds: ['recipe', 'skill'] },
   { id: 'other', title: 'Other', flags: ['prompts_edit', 'config_edit', 'notify_webhook', 'require_totp'] },
@@ -553,7 +555,7 @@ function teamsTab(body) {
     icon('users', 14), h('div', { class: 'litem-main' }, h('div', { class: 'litem-title' }, t.name, (t.warnings || []).some((w) => w.level === 'err') ? h('span', { class: 'muted small' }, ' · cannot chat') : null), h('div', { class: 'litem-sub' }, ((t.members || []).length) + ' members' + (t.description ? ' · ' + t.description : ''))))) : [empty('users', 'No teams')]));
   const newTeam = async () => {
     const n = input({ placeholder: 'InfoSec Ops' }); const d = input({ placeholder: 'optional' });
-    const m = modal({ title: 'New team', size: 'sm', body: h('div', { class: 'stack' }, field('Name', n), field('Description', d), h('div', { class: 'muted small' }, 'A new team starts with nothing allowed and every switch off except "Members may add personal hints" (your team hints still come last and take precedence). Then choose its providers, models, approval modes and hints.')), footer: [btn('Cancel', () => m.close()), btn('Create', async () => {
+    const m = modal({ title: 'New team', size: 'sm', body: h('div', { class: 'stack' }, field('Name', n), field('Description', d), h('div', { class: 'muted small' }, 'A new team starts with nothing allowed and every switch off except "Members may add personal hints" (your team hints still come last and take precedence) and the two Files switches (Folders). Then choose its providers, models, approval modes and hints.')), footer: [btn('Cancel', () => m.close()), btn('Create', async () => {
       if (!n.value.trim()) return;
       try { const r = await POST('/api/admin/teams', { name: n.value.trim(), description: d.value.trim(), policy: {} }); m.close(); selId = (r && (r.id || (r.team && r.team.id))) || null; load(); } catch (e) { toastError(e); }
     }, { variant: 'primary' })] });

@@ -13,6 +13,7 @@ import { elsewhereEnabled, elsewhereList, elsewhereRunningCount, runningElsewher
 export const NAV = [
   { id: 'new', label: 'New chat', icon: 'chat', path: '/new', key: 'c' },
   { id: 'herd', label: 'Herd', icon: 'herd', path: '/herd', key: 'h' },
+  { id: 'files', label: 'Files', icon: 'folder', path: '/files', key: 'f', policy: 'files' },   // spec 041: team switch "Files"
   { id: 'recipes', label: 'Recipes', icon: 'recipe', path: '/recipes', key: 'r' },
   { id: 'skills', label: 'Skills', icon: 'skill', path: '/skills', key: 'k' },
   { id: 'schedules', label: 'Schedules', icon: 'schedule', path: '/schedules', key: 's' },
@@ -70,7 +71,8 @@ export function renderSidebar(ctx) {
   const navEl = h('nav', { class: 'side-nav', 'aria-label': 'Main' });
   const renderNav = () => {
     const r = router.current();
-    navEl.replaceChildren(...NAV.filter((n) => n.id !== 'new' && (!n.admin || (me && me.isAdmin))).map((n) => h('a', {
+    // `policy`: shown when the person's policy has that switch on (administrators always, store.policy)
+    navEl.replaceChildren(...NAV.filter((n) => n.id !== 'new' && (!n.admin || (me && me.isAdmin)) && (!n.policy || policy(n.policy))).map((n) => h('a', {
       class: ['nav-item', r.view === n.id ? 'active' : ''], href: '#' + n.path, title: n.label + ' (g ' + n.key + ')',
     }, icon(n.icon, 16), h('span', null, n.label))));
   };

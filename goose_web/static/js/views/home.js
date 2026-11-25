@@ -14,7 +14,7 @@ import { visibilityContext } from '../providervis.js';
 import { groupsConfig, groupPicker, entryOfProvider, groupDefault, isGroupValue, joinValue, splitValue, labelIn } from '../providergroups.js';
 import { upsertSession, sessionsState, sessionTitle, activityTime } from '../sessions.js';
 import { setBaseTitle, herdList } from '../herd.js';
-import { linkUploads } from '../api.js';
+import { linkUploads, qs } from '../api.js';
 
 export async function createSession({ cwd, recipeId = null, recipeDeeplink = null }) {
   const _meta = {};
@@ -165,6 +165,15 @@ export function renderHome(ctx, query = {}) {
   });
   const status = h('div', { class: 'home-status', hidden: true }, spinner(14), 'Starting session…');
   composer.ta.rows = 3;
+  // Spec 041: "Ask Goose about this" on the Files page (#/new?cwd=<folder>&attach=<path>): the chat starts in that
+  // folder with the file as a chip in the message box - its link (resource_link), nothing is uploaded. The parameter
+  // then leaves the address, so Back does not attach it again.
+  if (query.attach) {
+    composer.attachExisting(query.attach);
+    const rest = { ...query };
+    delete rest.attach;
+    history.replaceState(null, '', '#/new' + qs(rest));
+  }
 
   const startEmpty = btn('Start without a message', async () => {
     if (!cwd) { const d = await pickFolder(); if (!d) return; cwd = d; renderChips(); }
