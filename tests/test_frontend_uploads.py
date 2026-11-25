@@ -34,9 +34,9 @@ def _run(script: str):
     return json.loads(r.stdout.strip().splitlines()[-1])
 
 
-# ------------------------------------------------------------------ the upload client (api.js)
+# ------------------------------------------------------------------ the upload client (uploader.js; in api.js before spec 041)
 UPLOAD_HARNESS = """
-const api = await import(%s);
+const api = { ...(await import(%s)), ...(await import(%s)) };
 const file = (size, name = 'f.bin') => ({ name, size, type: 'application/octet-stream', slice: (a, b) => ({ a, b, size: b - a }) });
 function server(size, { failPuts = [], failWith = () => new api.ApiError(0, 'network', 'down'), gate = null } = {}) {
   const s = { received: 0, log: [], puts: 0, open: 0, maxOpen: 0 };
@@ -64,7 +64,7 @@ const out = {};
 
 
 def test_upload_client_retries_resumes_and_cancels():
-    script = UPLOAD_HARNESS % json.dumps((JS / "api.js").as_uri()) + """
+    script = UPLOAD_HARNESS % (json.dumps((JS / "api.js").as_uri()), json.dumps((JS / "uploader.js").as_uri())) + """
 // 1. a piece fails once: wait 1 s, ask the server, continue from what it has
 { const s = server(10, { failPuts: [1] }); const sleeps = [], prog = [];
   const f = await api.uploadFile('C:\\\\w', file(10), { transport: s.t, session: 'S1', profile: 'dee', onProgress: (n) => prog.push(n), sleep: async (ms) => sleeps.push(ms) });
@@ -157,7 +157,7 @@ console.log(JSON.stringify(out));
 # ------------------------------------------------------------------ wiring in the sources
 def test_composer_uses_chunked_uploads_and_the_image_budget():
     comp = _js("composer.js")
-    assert "import { uploadFile, uploadLimits } from './api.js'" in comp
+    assert "import { uploadFile, uploadLimits } from './uploader.js'" in comp
     assert "import { prepareInline, planInline, NOTES } from './images.js'" in comp
     assert "IMAGE_MAX" not in comp and "readFileBase64" not in comp and "upload(cwd" not in comp
     assert "const MAX_FILES = 20;" in comp and "'At most ' + MAX_FILES + ' files at once'" in comp
@@ -171,13 +171,13 @@ def test_composer_uses_chunked_uploads_and_the_image_budget():
     assert build.index("type: 'image'") < build.index("blocks.push(a.link)")          # text, image, resource_link
     sub = comp.split("submit(steer = false) {", 1)[1].split("\n  }\n", 1)[0]
     assert "a.status === 'loading'" in sub and "{ uploads }" in sub                   # still waits for uploads
-    api_js = _js("api.js")
+    api_js = _js("uploader.js")   # spec 041: the client moved from api.js into uploader.js (shared with the Files page)
     assert "new XMLHttpRequest()" in api_js and "file.slice(offset, end)" in api_js
     assert "x.setRequestHeader('X-CSRF-Token', csrf)" in api_js and "x.upload.onprogress" in api_js
     # a piece without progress is stopped before the server's own idle limit and tried again as a network error
     assert "export const UPLOAD_STALL_MS = 90 * 1000;" in api_js and "new ApiError(0, 'network', 'The upload stalled')" in api_js
     assert "export const UPLOAD_PARALLEL = 2;" in api_js and "export const UPLOAD_RETRIES = 3;" in api_js
-    assert "export async function upload(dir, files)" in api_js                          # the old call stays
+    assert "export async function upload(dir, files)" in _js("api.js")                  # the old call stays
     css = (JS.parent / "css" / "app.css").read_text(encoding="utf-8")
     assert ".att-progress" in css and ".att-bar" in css and ".att-note" in css
 
