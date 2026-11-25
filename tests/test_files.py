@@ -1280,3 +1280,114 @@ def test_f6_a_switch_override_must_be_a_real_boolean(env):
     db.update_user(dee["id"], policy_overrides={"files": True, "files_manage": True})
     eff = c.policy_for(db.user_by_id(dee["id"]))
     assert eff["files"] is True and eff["files_manage"] is True
+
+
+def test_f9_switching_files_off_stops_a_folder_upload_between_pieces_and_at_the_finish(env, monkeypatch):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        k = tc.post("/api/fs/uploads", json={"dir": str(tf), "name": "c.bin", "size": 6, "target": "folder"},
+                    headers=h).json()
+        assert put(tc, h, k["id"], 0, b"abc").status_code == 200
+        set_policy(db, tid, files=False)
+        r = put(tc, h, k["id"], 3, b"def")
+        assert r.status_code == 403 and r.json()["error"] == "files_off" and not (tf / "c.bin").exists()
+        set_policy(db, tid, files=True)          # switched on again: the upload goes on where it was
+        r = put(tc, h, k["id"], 3, b"def")
+        assert r.status_code == 200 and r.json()["done"] and (tf / "c.bin").read_bytes() == b"abcdef"
+        # switched off while the last piece arrives: the file is not placed
+        real = uploads._receive
+
+        async def then_off(*a, **kw):
+            n = await real(*a, **kw)
+            set_policy(db, tid, files=False)
+            return n
+        monkeypatch.setattr(uploads, "_receive", then_off)
+        set_policy(db, tid, files=True)
+        k = tc.post("/api/fs/uploads", json={"dir": str(tf), "name": "d.bin", "size": 2, "target": "folder"},
+                    headers=h).json()
+        r = put(tc, h, k["id"], 0, b"xy")
+        assert r.status_code == 403 and r.json()["error"] == "files_off" and not (tf / "d.bin").exists()
+
+
+@pytest.mark.skipif(not WIN, reason="a file kept open without sharing delete")
+def test_f10_a_move_to_another_volume_that_cannot_delete_all_of_the_original_says_so(env, monkeypatch):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    ws = pr.workspace(dee)
+    (ws / "logs").mkdir()
+    for n in "abc":
+        (ws / "logs" / f"{n}.log").write_text(n)
+    other_volume(monkeypatch)
+    with client_for(c) as tc, open(ws / "logs" / "a.log", "rb"):    # in use: opened without sharing delete
+        h = sign_in(tc, c, dee)
+        j = tc.post("/api/files/move", json={"paths": [str(ws / "logs")], "to": str(tf)}, headers=h).json()
+    assert j["failed"] == [] and j["moved"][0]["to"] == str(tf / "logs"), j
+    assert "could not be deleted" in j["moved"][0]["warning"]
+    assert sorted(os.listdir(tf / "logs")) == ["a.log", "b.log", "c.log"] and os.listdir(ws / "logs") == ["a.log"]
+    a = audits(db, "files.move")
+    assert len(a) == 1 and [p.lower()[-5:] for p in a[0]["detail"]["sourceLeft"]] == ["a.log"]
+
+
+def test_f11_something_squatting_the_recycle_name_does_not_block_deletes(env):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    (tf / files.RECYCLE_DIR).write_text("squat")       # any teammate's agent can make this
+    (tf / "x.txt").write_text("x")
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        j = tc.post("/api/files/delete", json={"paths": [str(tf / "x.txt")]}, headers=h).json()
+    assert j["failed"] == [] and len(j["deleted"]) == 1, j
+    assert (tf / files.RECYCLE_DIR / j["deleted"][0]["id"] / "x.txt").read_text() == "x"
+    aside = list(tf.glob(files.RECYCLE_DIR + ".conflict-*"))
+    assert len(aside) == 1 and aside[0].read_text() == "squat"
+    a = audits(db, "files.recycle_conflict")
+    assert len(a) == 1 and a[0]["username"] == "dee" and a[0]["detail"] == {"movedTo": str(aside[0])}
+
+
+def test_f15_format_characters_are_dropped_from_new_names(env):
+    s, db, pr, c = env
+    dee, tid, tf = crew(env, names=("dee",))
+    from goose_web import api
+    assert api.safe_upload_name("invoice\u202efdp.exe") == "invoicefdp.exe"
+    assert api.safe_upload_name("a\u200bb\u200d\ufeff.txt") == "ab.txt"
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        r = tc.post("/api/files/mkdir", json={"path": str(tf), "name": "case\u202e\u200b 1"}, headers=h)
+        assert r.status_code == 200 and r.json()["path"] == str(tf / "case 1")
+        j = upload(tc, h, tf, "invoice\u202efdp.exe", b"MZ")
+        assert j["file"]["name"] == "invoicefdp.exe"
+        r = tc.post("/api/files/rename", json={"path": str(tf / "invoicefdp.exe"), "name": "\u202e\u200b"}, headers=h)
+        assert r.status_code == 400 and r.json()["error"] == "bad_name"
+
+
+def test_f16_refused_attempts_are_audited_once_a_minute_per_path(env):
+    s, db, pr, c = env
+    dee, ann, tid, tf = crew(env)
+    wa = pr.workspace(ann)
+    with client_for(c) as tc:
+        h = sign_in(tc, c, dee)
+        for _ in range(3):
+            assert tc.get("/api/files/list", params={"path": str(wa)}).status_code == 403
+        assert tc.get("/api/files/download", params={"path": str(wa / "x")}).status_code == 403
+        j = tc.post("/api/files/delete", json={"paths": [str(wa / "y")]}, headers=h).json()
+        assert j["failed"][0]["error"] == "denied"
+        assert tc.post("/api/files/rename", json={"path": str(wa / "z"), "name": "q"}, headers=h).status_code == 403
+        set_policy(db, tid, files=False)
+        assert tc.get("/api/files/locations").status_code == 403
+        assert tc.get("/api/files/list", params={"path": str(tf)}).status_code == 403
+        set_policy(db, tid, files=True)
+        assert tc.get("/api/files/list", params={"path": str(tf)}).status_code == 200      # nothing for an answer
+        assert tc.get("/api/files/list", params={"path": str(tf / "nope")}).status_code == 404   # ... nor a 404
+    rows = db.query("SELECT * FROM audit WHERE action='files.refused' ORDER BY id")
+    assert [(r["target"], r["detail"]["route"], r["detail"]["error"], r["ok"], r["username"]) for r in rows] == [
+        (str(wa), "/api/files/list", "denied", 0, "dee"),
+        (str(wa / "x"), "/api/files/download", "denied", 0, "dee"),
+        (str(wa / "y"), "/api/files/delete", "denied", 0, "dee"),
+        (str(wa / "z"), "/api/files/rename", "denied", 0, "dee"),
+        ("", "/api/files/locations", "files_off", 0, "dee"),
+        (str(tf), "/api/files/list", "files_off", 0, "dee")]
+    with client_for(c) as tc:        # the folder's activity is what happened, not what was refused
+        sign_in(tc, c, ann)
+        assert tc.get("/api/files/activity", params={"path": str(wa)}).json()["items"] == []

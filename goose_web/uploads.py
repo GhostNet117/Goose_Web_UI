@@ -682,6 +682,9 @@ async def _put(c, u: dict, row: dict, request: Request) -> dict:
     if offset != row["received"]:
         raise HTTPError(409, "offset_mismatch", f"The server has {row['received']} bytes of this file; continue from "
                                                 "there.", received=row["received"])
+    if row.get("target") == "folder":   # assessment F-9: the Files switch for every piece, not only at the start
+        from . import files
+        files.gate(c, u)
     declared = _content_length(request)
     if declared is not None and declared > MAX_CHUNK_BYTES:
         raise HTTPError(413, "too_large", f"One piece may carry at most {MAX_CHUNK_BYTES // MB} MB")
@@ -830,6 +833,9 @@ async def _finish(c, u: dict, row: dict, request: Request) -> dict:
     d = Path(row["dir"])
     _recheck(c, u, d)
     folder = row.get("target") == "folder"
+    if folder:     # F-9: ... and at the finish (switched off while the last piece arrived: it is not placed)
+        from . import files
+        files.gate(c, u)
     sha = ""
     if folder:     # spec 041: the SHA-256 of what arrived; the partial file is read once when the state is missing
         st = _live(c.db).hashes.pop(row["id"], None)

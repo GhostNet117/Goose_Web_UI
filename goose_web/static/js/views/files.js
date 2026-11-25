@@ -22,12 +22,13 @@ const KIND_ICON = { workspace: 'user', team: 'users', extra: 'folder', home: 'us
 const ACTIONS = {
   'files.upload': 'Uploaded', 'files.download': 'Downloaded', 'files.preview': 'Previewed', 'files.mkdir': 'New folder',
   'files.rename': 'Renamed', 'files.move': 'Moved', 'files.delete': 'Deleted', 'files.restore': 'Restored',
-  'files.purge': 'Removed for good', 'files.hash': 'SHA-256 computed',
+  'files.purge': 'Removed for good', 'files.hash': 'SHA-256 computed', 'files.read': 'Read',
+  'files.recycle_conflict': 'Recycle folder name freed',
 };
 const REFUSED = {
   exists: 'a file or folder with that name is already there', read_only_folder: 'the folder is read only',
   not_found: 'it is gone', denied: 'not allowed', bad_name: 'not a valid name', bad_request: 'not possible here',
-  files_off: 'Files is switched off for your team',
+  files_off: 'Files is switched off for your team', has_link: 'it holds a link (junction), which is not copied to another drive',
 };
 const SORTS = [
   { value: 'name|asc', label: 'Name A-Z' }, { value: 'name|desc', label: 'Name Z-A' },
@@ -597,6 +598,8 @@ export function renderFiles(ctx, query = {}) {
       const moved = r.moved || [];
       if (moved.length) toast('Moved ' + (moved.length === 1 ? baseName(moved[0].from) : moved.length + ' items') + ' to ' + (baseName(to) || to), { kind: 'success', actions: [{ label: 'Open', onClick: () => router.go(folderLink(to).slice(1)) }] });
       reportFailed(r.failed, 'not moved');
+      // across drives the copy is in place; what of the original could not be deleted is said (assessment F-10)
+      for (const x of moved) if (x.warning) toast(baseName(x.from) + ': ' + x.warning, { kind: 'warn', timeout: 12000 });
       for (const x of moved) selected.delete(x.from);
       if (moved.some((x) => samePath(x.from, fileSel))) closeDetail();
       load();

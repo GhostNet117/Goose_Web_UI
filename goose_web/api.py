@@ -12,6 +12,7 @@ import secrets
 import shutil
 import string
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
@@ -802,7 +803,9 @@ def safe_upload_name(raw: str | None) -> str:
     "upload.bin" when nothing usable is left.
     """
     name = os.path.basename(str(raw or "").replace("\\", "/"))
-    name = "".join(ch for ch in name if ch not in _BAD_NAME_CHARS)
+    # ... and no Unicode format characters (category Cf: right-to-left override, zero-width space / joiner, BOM):
+    # "invoice<U+202E>fdp.exe" would show as "invoiceexe.pdf" (assessment 2026-11-25 F-15)
+    name = "".join(ch for ch in name if ch not in _BAD_NAME_CHARS and unicodedata.category(ch) != "Cf")
     name = name.strip().rstrip(". ")
     name = name[:180]
     while len(name.encode("utf-8")) > 200:  # stay below the 255-byte limit of common Linux file systems

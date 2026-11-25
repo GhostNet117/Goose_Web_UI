@@ -979,6 +979,7 @@ def _os_error(e: OSError, what: str = "") -> HTTPError:
 class _Live:
     def __init__(self) -> None:
         self.hashing: dict[int, int] = {}      # user id -> SHA-256 computations running
+        self.refused: dict[tuple, float] = {}  # (user id, route, refusal, path) -> when last audited (F-16)
 
 
 _LIVE: "weakref.WeakKeyDictionary[Any, _Live]" = weakref.WeakKeyDictionary()
@@ -989,6 +990,67 @@ def _live(db) -> _Live:
     if st is None:
         st = _LIVE[db] = _Live()
     return st
+
+
+# ---------------------------------------------------------------------- refusals are audited (assessment F-16)
+REFUSAL_QUIET = 60.0      # seconds: one files.refused row per person, route, refusal and path in this time
+
+
+async def _body(request: Request, limit: int) -> dict:
+    """body_json, kept on the request for the audit of a refusal."""
+    b = await body_json(request, limit)
+    request.state.files_body = b
+    return b
+
+
+def _refusal_target(request: Request) -> str:
+    qp = request.query_params
+    p: Any = qp.get("path") or qp.get("location")
+    if not p:
+        b = getattr(request.state, "files_body", None) or {}
+        p = b.get("path") or b.get("to") or b.get("id")
+        if not p and isinstance(b.get("paths"), list) and b["paths"]:
+            p = b["paths"][0]
+    return str(p or "")[:4096]
+
+
+def _refused(c, request: Request, u: dict, target: str, e: HTTPError) -> None:
+    """A refused attempt (403: denied, read_only_folder, files_off, a hints or Goose folder name ...) is audited as
+    files.refused with ok=False - once a minute per person, route, refusal and path - so probing for other people's
+    folders shows in the SIEM without flooding it."""
+    if e.status != 403:
+        return
+    try:
+        live, now = _live(c.db), time.monotonic()
+        key = (u["id"], request.url.path, e.code, _norm(target) if target else "")
+        if now - live.refused.get(key, -REFUSAL_QUIET) < REFUSAL_QUIET:
+            return
+        if len(live.refused) > 10000:
+            live.refused.clear()
+        live.refused[key] = now
+        c.audit(request, "files.refused", u, target=target, detail={"route": request.url.path, "error": e.code},
+                ok=False)
+    except Exception:
+        log.exception("files: a refusal of %s could not be audited", request.url.path)
+
+
+def _audited(handler):
+    """A route whose 403 answers are audited (_refused)."""
+    async def endpoint(request: Request):
+        try:
+            return await handler(request)
+        except HTTPError as e:
+            if e.status == 403:
+                try:
+                    api = _api()
+                    c = api.ctx(request)
+                    u = c.require(request).user
+                except Exception:
+                    raise e from None
+                _refused(c, request, u, _refusal_target(request), e)
+            raise
+    endpoint.__name__, endpoint.__doc__ = handler.__name__, handler.__doc__
+    return endpoint
 
 
 # ---------------------------------------------------------------------- handlers
@@ -1104,7 +1166,7 @@ async def info_route(request: Request):
 
 async def hash_route(request: Request):
     api, c, u, _ = _begin(request)
-    b = await body_json(request, 16 * 1024)
+    b = await _body(request, 16 * 1024)
     p = _check(c, u, _arg_path(b.get("path")))
     try:
         st = await asyncio.to_thread(os.stat, p)
@@ -1298,7 +1360,7 @@ async def preview_route(request: Request):
 
 async def mkdir_route(request: Request):
     api, c, u, _ = _begin(request)
-    b = await body_json(request, 16 * 1024)
+    b = await _body(request, 16 * 1024)
     parent = _check(c, u, _arg_path(b.get("path")), write=True)
     name = clean_name(b.get("name"))
     api._refuse_hint_name(u, name)
@@ -1327,7 +1389,7 @@ def _remove_empty(p: Path) -> None:
 
 async def rename_route(request: Request):
     api, c, u, policy = _begin(request, manage=True)
-    b = await body_json(request, 16 * 1024)
+    b = await _body(request, 16 * 1024)
     src = _check(c, u, _arg_path(b.get("path")), write=True)
     name = clean_name(b.get("name"))
     tops = await asyncio.to_thread(_tops, c, u, policy)
@@ -1361,7 +1423,7 @@ def _failed(raw: Any, e: HTTPError) -> dict:
 
 async def move_route(request: Request):
     api, c, u, policy = _begin(request, manage=True)
-    b = await body_json(request, 2 * 1024 * 1024)
+    b = await _body(request, 2 * 1024 * 1024)
     paths = _paths_arg(b)
     to = _check(c, u, _arg_path(b.get("to")), write=True)
     api._refuse_agents_dir(u, to)
@@ -1399,30 +1461,47 @@ async def move_route(request: Request):
             moved.append(item)
         except HTTPError as e:
             failed.append(_failed(raw, e))
+            _refused(c, request, u, str(raw)[:4096], e)
     return api.ok({"moved": moved, "failed": failed})
 
 
-def _recycle_slot(loc: Path, rid: str) -> tuple[Path, str]:
+def _recycle_slot(loc: Path, rid: str) -> tuple[Path, str, str]:
     """<location>\\.goose-web-recycle\\<id>, made (the recycle folder hidden) and checked: a real folder, right in the
-    location (never a link that leads elsewhere). Returns the slot and where it resolves to. Blocking."""
+    location (never a link that leads elsewhere). Something else under that name - a file, a link, made by anyone's
+    agent - is moved aside to `.goose-web-recycle.conflict-<id>` (a link itself, never what it leads to) instead of
+    blocking every delete (assessment F-11). Returns the slot, where it resolves to and what was moved aside ('' for
+    nothing). Blocking."""
     rec = loc / RECYCLE_DIR
+    aside = ""
+
+    def ours() -> bool:
+        st = os.lstat(rec)
+        return not is_link(st) and stat.S_ISDIR(st.st_mode) and os.path.dirname(_real(rec)) == _real(loc)
     try:
         os.mkdir(rec)
     except FileExistsError:
         pass
-    st = os.lstat(rec)
-    if is_link(st) or not stat.S_ISDIR(st.st_mode) or os.path.dirname(_real(rec)) != _real(loc):
-        raise HTTPError(409, "denied", f"{RECYCLE_DIR} in this location is not a folder of Goose Web; ask your "
-                                       "administrator.")
+    if not ours():
+        moved = loc / f"{RECYCLE_DIR}.conflict-{secrets.token_hex(4)}"
+        os.rename(rec, moved)
+        aside = str(moved)
+        log.warning("files: %s was not the recycle folder of Goose Web; moved aside to %s", rec, moved)
+        try:
+            os.mkdir(rec)
+        except FileExistsError:
+            pass
+        if not ours():
+            raise HTTPError(409, "denied", f"{RECYCLE_DIR} in this location is not a folder of Goose Web; ask your "
+                                           "administrator.")
     _set_hidden(rec, True)
     slot = rec / rid
     os.mkdir(slot)
-    return slot, os.path.join(_real(rec), rid)
+    return slot, os.path.join(_real(rec), rid), aside
 
 
 async def delete_route(request: Request):
     api, c, u, policy = _begin(request, manage=True)
-    b = await body_json(request, 2 * 1024 * 1024)
+    b = await _body(request, 2 * 1024 * 1024)
     paths = _paths_arg(b)
     tops = await asyncio.to_thread(_tops, c, u, policy)
     deleted: list[dict] = []
@@ -1439,9 +1518,12 @@ async def delete_route(request: Request):
             _check(c, u, loc, write=True)
             rid = secrets.token_hex(10)
             try:
-                slot, slot_real = await asyncio.to_thread(_recycle_slot, Path(loc), rid)
+                slot, slot_real, aside = await asyncio.to_thread(_recycle_slot, Path(loc), rid)
             except OSError as e:
                 raise _os_error(e)
+            if aside:
+                c.audit(request, "files.recycle_conflict", u, target=str(Path(loc) / RECYCLE_DIR),
+                        detail={"movedTo": aside})
             dst = slot / src.name
             try:
                 await _move_pinned(c, u, src, dst, _pin(c, u, src, slot, slot_real))
@@ -1468,6 +1550,7 @@ async def delete_route(request: Request):
             deleted.append({"path": str(src), "id": rid})
         except HTTPError as e:
             failed.append(_failed(raw, e))
+            _refused(c, request, u, str(raw)[:4096], e)
     return api.ok({"deleted": deleted, "failed": failed})
 
 
@@ -1520,7 +1603,7 @@ def _restore_source(r: dict) -> Path:
 
 async def restore_route(request: Request):
     api, c, u, _ = _begin(request, manage=True)
-    b = await body_json(request, 16 * 1024)
+    b = await _body(request, 16 * 1024)
     rid = b.get("id")
     if not isinstance(rid, str) or not ID_RE.match(rid):
         raise HTTPError(404, "not_found", NOT_FOUND)
@@ -1563,7 +1646,7 @@ async def activity_route(request: Request):
     o = str(p)
     like = _like_prefix(o)
     rows = c.db.query(
-        "SELECT ts, username, action, target, detail FROM audit WHERE action LIKE 'files.%' AND ("
+        "SELECT ts, username, action, target, detail FROM audit WHERE action LIKE 'files.%' AND ok=1 AND ("
         "target=? COLLATE NOCASE OR target LIKE ? ESCAPE '^' OR (action IN ('files.move', 'files.rename') AND "
         "json_valid(detail) AND (json_extract(detail, '$.from')=? COLLATE NOCASE OR "
         "json_extract(detail, '$.from') LIKE ? ESCAPE '^'))) ORDER BY id DESC LIMIT ?", (o, like, o, like, limit))
@@ -1638,17 +1721,17 @@ async def purge_recycle(c, now: float | None = None) -> int:
 
 
 routes = [
-    Route("/api/files/locations", locations_route),
-    Route("/api/files/list", list_route),
-    Route("/api/files/info", info_route),
-    Route("/api/files/hash", hash_route, methods=["POST"]),
-    Route("/api/files/download", download_route),
-    Route("/api/files/preview", preview_route),
-    Route("/api/files/mkdir", mkdir_route, methods=["POST"]),
-    Route("/api/files/rename", rename_route, methods=["POST"]),
-    Route("/api/files/move", move_route, methods=["POST"]),
-    Route("/api/files/delete", delete_route, methods=["POST"]),
-    Route("/api/files/recycle", recycle_route),
-    Route("/api/files/restore", restore_route, methods=["POST"]),
-    Route("/api/files/activity", activity_route),
+    Route("/api/files/locations", _audited(locations_route)),
+    Route("/api/files/list", _audited(list_route)),
+    Route("/api/files/info", _audited(info_route)),
+    Route("/api/files/hash", _audited(hash_route), methods=["POST"]),
+    Route("/api/files/download", _audited(download_route)),
+    Route("/api/files/preview", _audited(preview_route)),
+    Route("/api/files/mkdir", _audited(mkdir_route), methods=["POST"]),
+    Route("/api/files/rename", _audited(rename_route), methods=["POST"]),
+    Route("/api/files/move", _audited(move_route), methods=["POST"]),
+    Route("/api/files/delete", _audited(delete_route), methods=["POST"]),
+    Route("/api/files/recycle", _audited(recycle_route)),
+    Route("/api/files/restore", _audited(restore_route), methods=["POST"]),
+    Route("/api/files/activity", _audited(activity_route)),
 ]
