@@ -255,7 +255,12 @@ if scheduler:
   only the composed hints file and ignores `AGENTS.md` and `.goosehints` in
   working folders and the agents home folder (`extra_env` cannot override
   it).
-- **Working directory.** The profile root, or the home directory.
+- **Working directory.** `workers.worker_start_dir`: for an isolated profile the member's `workspace` (the
+  sandboxed backends start there too), else the profile root; for the native profile its root, or the home
+  directory. It matters because Goose 1.57 gives a scheduled run the worker process's own folder as the run's
+  working folder (`scheduler/full.rs`: `create_session(std::env::current_dir()?, ...)`): a member's runs belong
+  where the member may open them (1.27.1, FIX `scheduled-runs-in-members-history`; before, a member without the
+  sandbox got runs in the profile root, next to the profile's config and secrets, and opening one was refused).
 - **Process group.** On Windows the worker gets
   `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` and is added to a kill-on-close
   Job Object.
@@ -959,7 +964,13 @@ Schedules are Goose's own feature, stored in the profile's
    [3.5](#35-the-monitor-loop)).
 
 Scheduled runs show up in the herd through `session_info_update`/`activeRunId`.
-The session list includes them when `sidebar.includeScheduled` is on.
+The session list includes them when `sidebar.includeScheduled` is on. A run is a chat of the profile that owns the
+schedule, in that profile's worker and working folder (section 3.2), so a member reads and continues their own runs
+like any chat. Goose's scheduler writes a run outside the gateway's sight; `Upstream._written_by_scheduler` (1.27.1)
+asks the worker's scheduler which chats its running jobs write (`schedules/list`: `currentlyRunning`,
+`currentSessionId`; reused for `SCHEDULED_CACHE_SECONDS` = 2 s, only for a worker that runs a scheduler, nothing
+refused when it cannot answer) and refuses `session/prompt` and `conversation/truncate` on such a chat with
+`-32011` - the same rule as for a chat running elsewhere (spec 020): two writers would corrupt it.
 
 ### 7.8 Deploy busy check and drain (`control.py`)
 

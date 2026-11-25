@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.27.1 - 2026-11-25
+
+**Each person's scheduled runs are chats in their own list that they can open and continue.** Goose gives a
+scheduled run the worker's own folder as working folder. A member's worker without the sandbox started in the
+profile root, so the member's runs worked next to the profile's configuration and secrets, and opening one was
+refused ("forbidden: folder not allowed"). Members' workers now start in the member's workspace, as the sandboxed
+ones already did. No configuration change; nothing to do on upgrade. Runs made before keep their old folder.
+
+### Fixed
+- A member's scheduled runs land in the member's own chat list, in the member's workspace, and the member can read
+  their output and continue them like any chat (`workers.worker_start_dir`; FIX `scheduled-runs-in-members-history`).
+  Checked end to end with Goose 1.57: a member created a schedule, ran it, found the run in their chat list and
+  continued it; on 1.27.0 the same steps ended in "folder not allowed".
+- A message or an edit of a chat that a scheduled job of the same worker is still writing is refused with `-32011`
+  ("A scheduled job is writing this chat right now"), as for a chat running elsewhere: two writers would corrupt the
+  chat. The gateway asks the worker's scheduler which chats its running jobs write (at most every 2 seconds, only
+  for a worker that runs a scheduler; nothing is refused when it cannot answer).
+
+### Docs
+USER-GUIDE 11 (your runs, reading and continuing them), ADMINISTRATION 13, ARCHITECTURE 3.2 and 7.7, API (`-32011`),
+TROUBLESHOOTING 12, SECURITY-ASSESSMENT 23.13.
+
 ## 1.27.0 - 2026-11-24
 
 **Chats with a long run open again, idle chats stop holding their MCP servers, and four new things: "Keep me signed

@@ -218,7 +218,8 @@ Frames are JSON-RPC 2.0 text frames.
   subscribes the socket to `_gw/elsewhere` pushes. Others get `{enabled:false, items:[]}`.
 * **Gateway refusals** (1.16.0): `-32010` - the gateway drains before a restart (new `session/prompt`,
   `tools/call` or `schedules/run-now` refused for a moment; send again after the restart); `-32011` - a
-  `session/prompt` or `conversation/truncate` into a chat another program is running.
+  `session/prompt` or `conversation/truncate` into a chat another program is running, or (1.27.1) that a scheduled
+  job of the same worker is still writing.
 * **Responses to agent requests:** `{jsonrpc:"2.0", id:<id of the forwarded request>, result:{...}}`. The
   first answer wins. Later answers get the notification `_gw/ask_resolved` instead.
 

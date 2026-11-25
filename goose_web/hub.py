@@ -71,6 +71,9 @@ P_SCHEDULES_LIST = "_goose/unstable/schedules/list"
 RPC_ELSEWHERE = -32011
 ELSEWHERE_REFUSAL = ("This chat is running elsewhere (Goose Desktop, the goose CLI or a scheduled job). Goose Web shows "
                      "it read-only and cannot stop, steer or message it; wait until it has finished.")
+SCHEDULED_REFUSAL = ("A scheduled job is writing this chat right now. Wait until the run has finished (Schedules shows "
+                     "it as running), then continue the chat here.")
+SCHEDULED_CACHE_SECONDS = 2.0   # how long the worker scheduler's list of running jobs is reused for prompt checks
 SESSION_INFO = "_goose/unstable/session/info"
 WATCH_INTERVAL = 2.0          # seconds between stat() calls on the profile's sessions.db (+ -wal)
 WATCH_FALLBACK_INTERVAL = 15.0  # no sessions.db found: fingerprint-check watched sessions this often
@@ -669,6 +672,9 @@ class Upstream:
         self.starting = 0     # prompts / tool calls between "not draining" and Goose (guard checks, worker start-up)
         # FIX idle-sessions-keep-mcp-servers: which chats Goose holds an agent (and its MCP servers) for; closes idle ones
         self.unloader = Unloader(self)
+        # FIX scheduled-runs-in-members-history: chats the worker's own scheduler is writing (cached briefly)
+        self._sched_at = -1e9
+        self._sched_sids: set[str] = set()
 
     # ------------------------------------------------------------ connection
     @property
@@ -927,6 +933,25 @@ class Upstream:
                             "since": since, "detail": ""})
         return out
 
+    async def _written_by_scheduler(self, sid: str) -> bool:
+        """FIX scheduled-runs-in-members-history: Goose's scheduler writes a run's chat inside this worker, out of the
+        gateway's sight. A member opens such a run from their chat list to read its output and continue it; a prompt or
+        an edit while the job still writes it would make two writers of one chat. Asked only of a worker that runs a
+        scheduler, at most every SCHEDULED_CACHE_SECONDS; when the scheduler cannot answer, nothing is refused."""
+        if not sid:
+            return False
+        try:
+            if not getattr(self.worker, "scheduler", False):
+                return False
+        except Exception:   # no worker registered for this profile (yet)
+            return False
+        now = time.monotonic()
+        if now - self._sched_at > SCHEDULED_CACHE_SECONDS:
+            self._sched_at = now
+            self._sched_sids = {j["sessionId"] for j in await self.running_jobs()
+                                if j.get("status") == "working" and j.get("sessionId")}
+        return sid in self._sched_sids
+
     async def _from_client(self, client: Client, msg: dict) -> None:
         if client.closed or self.closed:   # SC-3: a socket of a deleted / disabled / signed-out user
             return
@@ -966,6 +991,9 @@ class Upstream:
             if method in ("session/prompt", TRUNCATE) and \
                     self.hub.elsewhere_running(self.key, str(params.get("sessionId") or "")):
                 raise RpcError(RPC_ELSEWHERE, ELSEWHERE_REFUSAL)   # spec 020: two writers would corrupt the chat
+            if method in ("session/prompt", TRUNCATE) and \
+                    await self._written_by_scheduler(str(params.get("sessionId") or "")):
+                raise RpcError(RPC_ELSEWHERE, SCHEDULED_REFUSAL)   # the same, for this worker's own scheduler
             if method == TRUNCATE:
                 # Goose deletes every message with created >= truncateFrom and does not check for an active run.
                 s0 = self.sessions.get(str(params.get("sessionId") or ""))

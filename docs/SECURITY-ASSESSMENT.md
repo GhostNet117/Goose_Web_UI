@@ -2193,3 +2193,31 @@ user-visible messages in pages; `readonly.js` shows them behind a button on the 
 - Not run against a real Goose by the independent assessment: retention deletion, unloading, the reaper and chat
   traffic (23.1). Not tested in a browser by anybody independent: the new front end (uploads, images, the read-only
   copy).
+
+### 23.13 1.27.1 (2026-11-25): a member's scheduled runs in the member's own folder; one writer per chat
+
+**Finding (fixed, Low).** Goose 1.57 creates a scheduled run's chat with the worker process's current folder as its
+working folder (`scheduler/full.rs`: `create_session(std::env::current_dir()?, ..., SessionType::Scheduled)`). The
+sandboxed backends start a member's worker in `<profile>\workspace`; the start without the sandboxed backends used
+the profile root. A member's scheduled run (when the team allows Schedules) therefore ran with the profile root -
+`config.yaml`, `secrets.yaml`, `data\` - as its working folder, and the member could not open their own run: the
+folder rule refused `session/load` ("folder not allowed"). Reproduced end to end on 1.27.0 (sandbox off): the run's
+folder was `<profiles_root>\<user>`, `session/load` and `session/prompt` answered `-32003`.
+
+**Fix.** `workers.worker_start_dir`: an isolated profile's worker starts in the member's workspace (the profile root
+when no workspace exists; the native profile unchanged). The member's runs now land in a folder the member may use;
+the folder rule itself is unchanged (no folder was added to anybody's roots). End to end on 1.27.1: the run was in
+the member's chat list with the workspace as folder, opened, and continued.
+
+**Second writer.** Goose's scheduler writes a running job's chat outside the gateway's sight. A member (or an
+administrator) opening the run while it is still in progress could prompt or edit it, making two writers of one
+chat. `Upstream._written_by_scheduler` asks the worker's scheduler (`schedules/list`: `currentlyRunning`,
+`currentSessionId`) and refuses `session/prompt` and `conversation/truncate` on such a chat with `-32011`, before
+anything is loaded (also before the M-1 load of 23.2). Reused for 2 s and asked only of a worker that runs a
+scheduler; when the scheduler cannot answer, nothing is refused (fail open: a refusal would block every prompt of the
+profile, and the case it guards is rare). Residual: a job that starts within the 2 s after a check can still meet a
+prompt; a message sent after a job finished is unaffected.
+
+**Tests.** `tests/test_scheduled_runs.py` (10): the start folder per profile kind, every start path, refusal while a
+job writes the chat (prompt, edit, member before any load), other chats unaffected, continuing after the run, a
+worker without a scheduler never asked, fail open. The 4 refusal tests fail on 1.27.0.

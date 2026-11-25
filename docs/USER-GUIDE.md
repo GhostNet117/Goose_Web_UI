@@ -942,8 +942,16 @@ Skills marked "read-only" cannot be changed. Without the `skills_edit` permissio
 
 ## 11. Schedules
 
-A schedule runs a recipe automatically at set times. Each run creates a chat, which appears in the sidebar
-when **Scheduled runs** is turned on in the list options.
+A schedule runs a recipe automatically at set times. Each run creates a chat in **your own** chat list (the
+schedules, their runs and their chats belong to your profile; nobody else's list shows them, and you do not see
+anyone else's). The chats appear in the sidebar when **Scheduled runs** is turned on in the list options (on by
+default), and under **Past runs...** of the schedule.
+
+- **Read the output:** open the run's chat from the sidebar or from **Past runs...**. A run works in your
+  workspace folder, like your other chats.
+- **Continue it:** once the run has finished, type in its chat like in any other chat: the agent has the run's
+  conversation. While the run is still in progress, a message or an edit is refused with "A scheduled job is
+  writing this chat right now" - wait until it has finished (the Schedules page shows it as running).
 
 ### Create a schedule
 

@@ -344,6 +344,22 @@ class Worker:
                 "proxyPort": self.proxy_port if self.backend == "mxc" else 0}
 
 
+def worker_start_dir(w: "Worker") -> str:
+    """The folder a (not sandboxed) worker is started in. Goose 1.57 gives a scheduled run the worker process's own
+    folder as the run's working folder (scheduler: `std::env::current_dir()`), so for an isolated profile this is
+    the member's workspace - where the sandboxed backends already start the worker - and not the profile root, which
+    holds the profile's config and secrets and is not a folder the member may open (FIX
+    scheduled-runs-in-members-history: a member's scheduled runs land in their own chat list and can be opened and
+    continued). The native profile keeps its root or the home folder."""
+    home = os.path.expanduser("~")
+    cwd = w.path_root or home
+    if w.path_root and not w.native:
+        ws = os.path.join(w.path_root, "workspace")
+        if os.path.isdir(ws):
+            cwd = ws
+    return cwd if os.path.isdir(cwd) else home
+
+
 class SandboxUnavailable(RuntimeError):
     """A sandboxed worker was not started (fail closed). str() is what the member sees; admin_reason is the detail
     for administrators (worker lastError in Admin > System, gateway.log)."""
@@ -580,9 +596,7 @@ class WorkerManager:
         if IS_WINDOWS:
             flags = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         w.state = "starting"
-        cwd = w.path_root or os.path.expanduser("~")
-        if not os.path.isdir(cwd):
-            cwd = os.path.expanduser("~")
+        cwd = worker_start_dir(w)
         try:
             w.proc = subprocess.Popen(args, env=self._env(w), stdin=subprocess.DEVNULL, stdout=logf,
                                       stderr=subprocess.STDOUT, cwd=cwd, creationflags=flags,

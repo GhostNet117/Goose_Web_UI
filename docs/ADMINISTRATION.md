@@ -2214,6 +2214,13 @@ scheduler inside the worker. A worker runs the scheduler when it is started with
   connected, is never stopped for idleness, and is restarted after a crash.
 - When the gateway does not own the scheduler, the Schedules page shows "The scheduler is not active in this Goose
   Web instance" with the reason, and schedules are read-only there.
+- **Each person's schedules are their own (1.27.1).** A member's schedules, their recipes
+  (`data\scheduled_recipes\`) and every run live in the member's profile and run in the member's worker; each run is
+  a chat in that member's chat list only, in the member's workspace (as for the sandboxed backends; a member
+  without the sandbox got runs in the profile root before 1.27.1 and could not open them). The member reads a run's
+  output and continues it like any chat once it has finished; a message or edit while the scheduled job still
+  writes the chat is refused (`-32011`). Administrators see a member's runs only through the usual "view this
+  user's chats". To let a team's members schedule, switch **Schedules** on for the team.
 - The gateway must be running for schedules to fire. With the Windows logon task, that means the gateway user must
   be signed in.
 - Disabled users' workers are not started at gateway start, so their schedules do not run.
